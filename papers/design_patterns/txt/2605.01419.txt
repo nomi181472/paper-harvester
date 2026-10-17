@@ -1,0 +1,2146 @@
+arXiv:2605.01419v1 [cs.AR] 2 May 2026
+
+Understanding Simulated Architecture via
+gem5 Call-Stack Profiling
+Johan Söderström
+
+Rashid Aligholipour
+
+Yuan Yao
+
+johan.soderstrom.9461@student.uu.se
+Uppsala University
+Uppsala, Sweden
+
+rashid.aligholipour@it.uu.se
+Uppsala University
+Uppsala, Sweden
+
+yuan.yao@it.uu.se
+Uppsala University
+Uppsala, Sweden
+
+Abstract—Understanding the behavior of simulated architectures in gem5 is critical for studying complex, deeply integrated
+computing systems. However, conventional analysis methods,
+which rely heavily on simulation statistics, provide only an
+indirect view of the simulated system internals. In this work, we
+show that call-stack profiling of gem5 itself offers a powerful yet
+underutilized perspective: the simulator’s own call-stack directly
+reflects the activity of the simulated system, exposing insights
+that conventional statistics may overlook.
+Profiling gem5’s call-stacks, however, is challenging due to
+its highly layered and complex software design patterns. To
+address this, we introduce a specialized, lightweight profiling
+framework built on Linux’s perf_event interface which samples and analyzes gem5’s runtime call-stacks throughout the
+simulation, resolves symbols on the fly, and merges samples into
+a hierarchical call-tree representation supporting both high-level
+structural views and focused, user-defined, component-specific
+analysis. Moreover, all profiling is performed in a dedicated
+helper process running alongside the main gem5 process, avoiding
+intrusive changes and overheads to the simulation itself.
+We apply our framework to gem5’s three major CPU models—
+AtomicSimpleCPU, TimingSimpleCPU, and O3CPU—together
+with the Ruby memory system, and uncover behaviors that are
+not easily observable in conventional gem5 statistics. Our case
+studies reveal, for example, that TimingSimpleCPU is inefficient
+due to its use of a lockup-cache model and, despite its conceptual
+simplicity, does not simulate faster than a full out-of-order
+core. In addition, our tool makes it straightforward to detect
+cache coherence protocol deadlock and livelock—issues that are
+otherwise difficult to identify, since the simulation either appears
+to run normally or terminates abruptly, making it hard to
+pinpoint when these conditions occur.
+
+I. I NTRODUCTION
+Problem. The gem5 simulator [1], [2] is widely used in
+computer architecture research for its configurability and flexibility in modeling modern computing systems. However, despite its broad adoption, a practical yet fundamental challenge
+remains: understanding exactly what the simulator is doing.
+As architectural complexity grows—particularly with innovative many-core architectures and deep memory hierarchies—
+gem5’s internals become increasingly intricate and difficult
+to reason about, making it challenging to identify simulation
+bottlenecks, examine microarchitectural dynamics, or detect
+performance bugs.
+Prior work has examined gem5 primarily from the perspective of host-machine resource usage (e.g., branch prediction
+Published in the Proceedings of the 2026 IEEE International Symposium on
+Performance Analysis of Systems and Software (ISPASS)
+
+accuracy, cache miss rates, memory footprint) [3], or leverages
+profiling data—specifically hardware and simulated performance counters—to assess how closely gem5 matches real
+hardware behavior [4]. However, the critical question of understanding gem5’s intrinsic software behavior remains largely
+under-studied. These behaviors are buried within gem5’s modular Python/C++ co-implementation, where complexity arises
+from event-based scheduling, inter-object communication, and
+control flow that frequently jumps across different models.
+Conventional profiling tools also offer limited help. For
+example, gprof [5] produces coarse, flattened call graphs
+that obscure the layered structure of gem5’s abstractions
+and make it difficult to reason about relationships between
+simulated components; it also requires code instrumentation,
+further slowing simulation. Hardware-oriented tools like Intel
+VTune [6] can collect software call stacks but tend to generate
+extremely large traces and ultimately suffer from the same
+limitation: it is hard to explore through gem5’s complex callstack hierarchy at the granularity needed for architectural
+design-space exploration (DSE).
+Approach. We address this problem with a new holistic
+profiling toolchain (detailed in subsection III-D) that measures
+simulation-time breakdowns and reveals how execution time
+is distributed across gem5’s modular components. Our work
+differs from prior approaches in two key ways:
+Lightweight and external. We use the Linux
+perf_event syscall to collect gem5 call-stack
+traces non-intrusively. Because profiling is performed
+by a stand-alone helper process rather than by gem5
+itself, no instrumentation is added to gem5’s execution
+binary, thereby minimizing overhead and avoiding any
+perturbation to simulation behavior or performance.
+• Flexible and hierarchical. Unlike the flattened call graphs
+produced by gprof and VTune, our parser preserves
+the full hierarchical call-tree structure, enabling to isolate
+specific gem5 execution paths (e.g., all functions related
+to the out-of-order core’s IEW stage) while ignoring
+unrelated functions. It also supports user-defined zoom-in
+and zoom-out views, allowing both fine-grained analysis
+of individual modules and holistic examination of crosscomponents interactions.
+•
+
+II. M OTIVATION
+A. The limits of understanding a simulated system through
+gem5 statistics
+gem5 simulations typically produce a large number of
+statistics in text-based files (stats.txt). Although these
+
+1.00
+0.75
+0.50
+
+AS
+TS
+O3
+
+0.25
+0.00
+
+bfs_raw-16AS16GBr
+bfs_raw-16AS8GBr
+bfs_raw-1AS16GBr
+bfs_raw-1AS8GBr
+bfs_raw-32AS16GBr
+bfs_raw-32AS8GBr
+cc_raw-16AS16GBr
+cc_raw-16AS8GBr
+cc_raw-1AS16GBr
+cc_raw-1AS8GBr
+cc_raw-32AS16GBr
+cc_raw-32AS8GBr
+blackscholes-16AS16GBr
+blackscholes-16AS3GBr
+blackscholes-1AS16GBr
+blackscholes-1AS3GBr
+blackscholes-4AS16GBr
+blackscholes-4AS3GBr
+freqmine-16AS16GBr
+freqmine-16AS3GBr
+freqmine-1AS16GBr
+freqmine-1AS3GBr
+freqmine-4AS16GBr
+freqmine-4AS3GBr
+bwaves-1AS3GBr
+gcc-1AS3GBr
+mcf-1AS3GBr
+omnetpp-1AS3GBr
+
+Normalized value.
+
+Contributions. We apply this toolchain to gem5, focusing
+on several core models, including AtomicSimpleCPU (ASCPU), TimingSimpleCPU (TS-CPU), and the Out-of-Order
+CPU (O3-CPU), together with their interaction with the Ruby
+memory subsystem. We make three primary contributions:
+• Layer-aware gem5 runtime decomposition. We provide,
+to our knowledge, the first comprehensive, layer-aware
+breakdown of gem5’s simulation runtime. Our profiling
+reveals how gem5 is structured around multiple layers of
+high-level software abstractions and measures execution
+time across all major gem5 components (including major
+core models and their submodules, the Ruby memory
+system, and the Garnet interconnection network, etc),
+revealing cross-component interactions and pinpointing
+bottleneck functions throughout gem5’s software stack.
+• Demystifying gem5 internals and simulation overheads.
+We systematically explain where gem5 spends time across
+simulated components and why. For example, we show
+that TS-CPU—despite its conceptual simplicity and reduced microarchitectural detail—often simulates no faster
+(and sometimes slower) than a detailed out-of-order core,
+due to its lockup-cache behavior, in-order pipeline, and
+busy-wait interaction with Ruby. We clarify when and
+why different gem5 models incur unexpected overheads,
+providing concrete guidance for selecting appropriate
+models for architectural DSE.
+• Correctness debugging beyond statistics. We demonstrate
+that our profiling framework serves as an effective diagnostic tool for gem5 correctness, including the detection of deadlock and livelock in Ruby/SLICC-based
+coherence protocols—issues that often do not manifest
+as explicit simulator errors and are difficult to uncover
+using gem5 simulation statistics (stats.txt). By identifying characteristic call-stack signatures dominated by
+repetitive functions and applying per-component runtimepercentage thresholds, our tool can automatically flag
+potential deadlocks or livelocks and trigger checkpoints,
+enabling low-overhead root-cause analysis that is difficult
+to achieve with existing gem5 debugging mechanisms.
+The rest of the paper is organized as follows: Section II motivates why it is hard to understand gem5 using statistics alone
+why profiling gem5’s call-stack is also challenging. Section III
+provides background on gem5 components and describes the
+design of our profiling toolchain and its interaction with gem5.
+Section IV presents our experimental methodology, including
+simulation configurations and benchmark suites. Section V
+analyzes the profiling results and identifies key performance/correctness bottlenecks. Finally, Section VI concludes the
+paper.
+
+Fig. 1: Committed instructions per host-machine-second for
+the AtomicSimple, TimingSimple, and Out-of-Order gem5
+core models across multiple programs, core counts, and Ruby
+memory configurations (details in Section IV).
+results describe what happened—e.g., how many instructions
+have been simulated—they do not explain how these numbers
+are got or which simulated components are responsible. For
+example, Figure 1 reports the number of committed instructions per host-machine-second, which indicates how much
+simulated progress the program has made. In the figure,
+we normalize all results to AtomicSimpleCPU (AS-CPU),
+the simplest core model in gem5. As expected, we observe
+that TimingSimpleCPU (TS-CPU) and the Out-of-Order CPU
+(O3-CPU) simulate more slowly than AS-CPU. However,
+more interestingly, when comparing TS-CPU and O3-CPU,
+we find that O3-CPU is not always slower—even though it
+models a much more complex core than TS-CPU. Actually, in
+15 out of 28 cases, O3-CPU simulates faster than TS-CPU;
+in other cases, they achieve close results.
+Key insight. These observations raise several critical questions. First, why does O3-CPU sometimes achieve faster simulation progress than TS-CPU, even though O3-CPU models
+many more microarchitectural events—and therefore executes
+more functions—than TS-CPU? Second, in cases where TSCPU and O3-CPU exhibit similar simulation results, does
+this suggest that TS-CPU captures microarchitectural behavior
+at a level comparable to O3-CPU? If so, can TS-CPU be
+considered a “good enough” approximation of O3-CPU for
+certain studies? None of these questions are easy to answer
+by inspecting gem5’s statistics output alone. Instead, our key
+insight is that, because gem5 simulates a hardware system, its
+own call-stack effectively reveals the internals of the simulated
+system. Building on this insight, we introduce a lightweight,
+non-intrusive toolchain that dynamically samples and analyzes
+gem5 call-stacks, providing a new way to efficiently and
+informatively examine gem5’s internal behavior.
+A use case. Applying our toolchain to the results in Figure 1, we draw two key conclusions that address the above
+questions. First, although TS-CPU simulates fewer microarchitectural events, its in-order pipeline, lockup cache behavior,
+and lack of instruction-level parallelism (ILP) make each instruction more expensive to simulate in time (subsection III-B),
+leading to a runtime comparable to that of a much more
+detailed O3-CPU core. Consequently, TS-CPU is not a “good
+
+enough” proxy for O3-CPU, even in cases where they achieve
+a similar number of committed instructions.
+Second, simulation results using O3-CPU must be interpreted with care. In four cases in Figure 1 (highlighted in
+red circles), O3-CPU’s higher committed-instruction rate is
+largely caused by test-and-test-and-set (TTAS) style busywaiting [7], where threads repeatedly spin on locks and
+commit many test loads without making real forward progress
+(subsection III-C). Consequently, with O3-CPU cores, simulation results should be interpreted together with other system activities—e.g., cache-controller actions in Figure 12b—
+to avoid misleading conclusions on performance gains. Our
+toolchain makes such examinations substantially easier and
+more flexible than relying solely on gem5’s statistics alone.
+
+Stack depth (O3-CPU)
+
+Stack depth (TS-CPU)
+
+Stack depth (AS-CPU)
+
+B. Why is it challenging to profile gem5 call-stacks?
+
+III. D ESIGN AND I MPLEMENTATION
+We next describe how AS-CPU, TS-CPU, and O3-CPU
+differ in their execution models and how they interact with
+Ruby. We then introduce the design of our profiling toolchain
+and explain how it works with gem5.
+A. AtomicSimpleCPU (AS-CPU)
+Tick
+
+Instruction
+fetch
+
+Pre-execute
+(Decode)
+
+Ruby functional
+send (no timing)
+
+40
+
+Execute
+
+Post-execute
+(Collect stats)
+
+Ruby functional
+Receive (no timing)
+
+Functional garnet
+(no timing)
+
+20
+
+Fig. 3: Interaction of AtomicSimpleCPU and Ruby, where
+the execution flows from a core into Ruby as a function call
+(no timing modeled).
+
+0
+40
+20
+0
+40
+20
+0
+
+0
+
+200
+400
+600
+800
+Call-stack sampling (one sample every 0.5 second)
+
+1000
+
+Fig. 2: gem5 call-stack depth across CPU models (with Ruby).
+Interpreting gem5’s call-stacks, however, is challenging. The
+call-stack evolves continuously as gem5 processes events from
+cores, Ruby, and Garnet. On one hand, this produces highly
+fluctuating stack depths (Figure 2), with the number of frames
+frequently swinging between nearly 40 and 0. For example, when an instruction fetch or a data-memory instruction
+completes in AS-CPU or TS-CPU, or when the O3-CPU
+transitions between the core EventQueue and the Ruby
+EventQueue, the call-stack becomes shallow because the
+current call-chain temporarily collapses before gem5 begins
+processing the next event.
+On the other hand, many dominant functions in the stack are
+merely bookkeeping routines that provide little architectural
+insight, causing important simulation events to appear only
+briefly and to be buried deep within the depth. For example, on average, roughly 20 frames in a typical gem5 callstack originate from embedded Python (pybind11) used to
+support gem5’s Python-based configuration, rather than from
+any specific microarchitectural component. As a result, gem5’s
+call-chains tend to be deep and noisy, making them difficult
+to relate to concrete microarchitectural simulations.
+Overall, these challenges motivate the specialized tool introduced in this work, which extracts meaningful patterns
+from raw call-stack traces and makes gem5’s behavior more
+interpretable.
+
+AS-CPU uses a single entry function—the tick
+function—to drive simulation. On each call, tick sequentially
+advances all core stages, one after the other: Instruction fetch,
+issuing a memory request to Ruby to fetch the instruction
+from the I-cache; Pre-execute, decoding the instruction;
+Execute, updating the architectural state (register file) and
+issuing additional Ruby requests for load/store instructions to
+the D-cache; and Post-execute, committing the instruction
+and updating internal gem5 statistics. For both instruction and
+data accesses, TLBs are also invoked for address translation.
+As shown in Figure 3, in AS-CPU, core stages are implemented as a chain of function calls. Communication between
+the core and Ruby is modeled using function-call as well,
+bypassing the on-chip interconnect Garnet. Because each
+function runs to completion before returning to its caller,
+simulated timing is fully abstracted, and instructions execute
+strictly in program order—after an instruction completes,
+control returns to the top-level tick function, which initiates
+the life cycle of the next instruction.
+B. TimingSimpleCPU (TS-CPU)
+TS-CPU models timing for memory accesses by simulating
+memory events using Ruby’s EventQueue (Figure 4). As in
+AS-CPU, instructions in TS-CPU are executed via function
+calls and run strictly in order, one at a time. Unlike ASCPU, however, each memory access in TS-CPU exercises the
+full Ruby memory hierarchy with detailed timing, including
+private caches, the last-level cache (LLC), and the on-chip
+interconnect.
+Specifically, when a core issues a memory request, TSCPU generates a corresponding Ruby request packet and
+delivers it to the L1 cache controller (L1 CC). After the
+request incurs the L1 cache latency, it is routed through the
+
+advanceInst
+
+Instruction
+fetch
+
+Comp. I-fetch
+
+Pre-execute
+
+Execute
+
+I-Tick event
+
+Core stall-waits for
+memory response
+
+Post-execute
+
+D-Tick event
+
+Send
+Timing Request
+
+Receive
+Timing Rsponse
+
+OoO core (tick driven)
+
+In-order core
+
+Pipeline stages are
+decoupled.
+
+Mem-Inst
+
+Fetch
+tick
+TB
+
+Tick
+
+Decode
+tick
+1
+
+1
+
+2
+
+Rename
+tick
+TB
+
+3
+
+IEW
+tick
+
+TB 4 5
+
+6 TB
+
+Commit
+tick
+2
+
+3 4 5 6 7 TB
+
+SLICC interface (in/out message buffer)
+
+L1 FSM, L2 FSM
+via Garnet routers
+(Remote) LLC FSM, DRAM Bank
+
+Fig. 4: Interaction of TimingSimpleCPU and Ruby, where
+the execution flow between a core and Ruby is decoupled by
+the Ruby EventQueue.
+on-chip interconnect—either simple crossbar links or Garnet
+routers [8], both of which model timing latency—to the
+LLC and then to the memory controller. Once the request is
+serviced, Ruby creates a response packet and sends it back to
+the TS-CPU core. The response travels the path through the
+memory hierarchy in reverse and ultimately signals completion
+of the memory access. Because TS-CPU cores do not model
+out-of-order execution or speculation, a core stalls whenever it
+is waiting for a memory access (for both I-cache and D-cache)
+to complete, and no other instructions can make progress until
+Ruby returns a response.
+The execution flow of TS-CPU is shown in Figure 4.
+The main entry point is the advanceInst function, which
+initiates an instruction fetch by creating a Ruby request (the
+I-Tick event) and sending it to the I-cache port. When
+Ruby serves this request and returns a response, the I-cache
+response port invokes completeIfetch as a callback, which in
+turn calls the pre-execute function to decode the instruction.
+If the instruction is a non-memory operation, it is executed
+immediately and the architectural registers are updated. If the
+instruction is a load or store, TS-CPU creates another Ruby
+request (the D-Tick event) to initiate a D-cache access. On
+completion, a post-execute callback is triggered to complete
+execution of the memory instruction, and TS-CPU moves to
+advanceInst for the next instruction.
+Summary 1. The TS-CPU model improves memorytiming fidelity relative to AS-CPU. However, the core
+remains in-order, busy-waiting, and stalls on every memory
+access. In addition, simulations execute more slowly because TS-CPU generates and processes substantially more
+events within Ruby.
+C. Out-of-order CPU (O3-CPU)
+O3-CPU models a superscalar out-of-order core with a
+deeply pipelined, stage-based microarchitecture. Unlike ASCPU and TS-CPU, which execute one instruction at a time
+in program order, O3-CPU supports speculation and dynamic
+
+Ruby + Garnet (event driven)
+
+Ruby + Garnet
+
+Sequencer
+
+Core and memory
+events are decoupled.
+
+Send
+Timing Req
+
+Receive
+Timing Rsp
+Sequencer
+
+SLICC interface (in/out message buffer)
+L1 FSM, L2 FSM
+via Garnet routers
+
+(Remote) LLC FSM, DRAM Bank
+
+Fig. 5: Interaction of the O3-CPU and Ruby, where the
+execution flow between core-stages are decoupled with
+TimeBuffer to support out-of-order execution.
+TABLE I: Inter-stage signals used in O3-CPU.
+Category
+
+Description
+
+Squashrelated
+signals
+
+1) Branch misprediction detected in Decode.
+2) Execute sends mis-predicted instruction’s seqNum
+and correct PC or violating load/store seqNum (for
+memory-order violations) to Commit.
+3—6) Commit performs a squash on branch mispredictions, interrupts, or memory-order violations.
+
+Inter-stage
+dataflow
+
+1) Send instructions Fetch → Decode.
+2) Send instructions Decode → Rename.
+3) Rename stall on no free physical registers.
+4) Send instructions Rename → IEW.
+5) Insert instructions into ROB.
+6) IEW updates free entries in ROB/LQ/SQ, and
+wakes dependents on writeback.
+7) Commit reports number of committed instructions.
+
+instruction scheduling, exposing both ILP and MLP at the cost
+of significantly higher complexity and overhead.
+The fundamental difference from AS-CPU/TS-CPU is that,
+in O3-CPU, both the pipeline stages and the core–memory
+interaction are decoupled. Within the core, gem5 uses cycledriven simulation: on each cycle, every pipeline stage executes
+its own tick function, inspects its inputs, and models the
+corresponding stage behavior. As shown in Figure 5, the O3CPU core comprises five OoO stages: 1) Fetch, retrieves
+instructions from I-cache and performs an initial decode to
+construct dynamic instruction objects; 2) Decode, completes
+instruction decoding and resolves unconditional branches;
+3) Rename, manages logical-to-physical register mappings,
+including allocation and reclamation of physical registers;
+4) IEW (Issue/Execute/Writeback), schedules ready instructions, dispatches them to functional units, resolves conditional
+branches, and performs writeback; and 5) Commit, tracks
+instruction completion, handles exceptions and squashes, and
+retires instructions from the reorder buffer.
+In O3-CPU, pipeline stages are decoupled through interstage buffers—specifically, TimeBuffers (TBs)—with the
+associated data-flows and squash-signals summarized in Ta-
+
+Runtime profiler
+N+0.5 s, call-chain 1
+
+1, Launcher
+Run gem5 in cgroup for
+different configs
+
+a1
+
+cgroup
+sand-box
+2, C++ Profiler
+(perf_event)
+Sampling and merging callchains into HTML
+
+b1
+
+a1+a2
+
+b2
+List
+Merge
+d
+
+Fig. 6: Overview of the profiling and analysis toolchain used
+for gem5 experiments.
+ble I. As shown in Figure 5, each stage communicates with
+others via TBs, enabling stages to progress independently
+rather than stall while waiting for their neighbors as in ASCPU and TS-CPU. For example, the red arrow from Commit
+to IEW indicates that Commit issues a squash signal to
+IEW. Once the signal is sent to the TB, Commit continues
+processing subsequent instructions, while IEW performs the
+required squash when its tick function is next executed.
+The core’s interaction with Ruby is also decoupled. Like
+TS-CPU, O3-CPU uses Ruby for timing memory accesses
+in Fetch and IEW. However, because instructions in O3-CPU
+execute out-of-order, the IEW stage also sends speculative
+memory requests to Ruby and enforces memory-ordering
+constraints defined by a system’s memory model. For example,
+under the x86 TSO model in gem5, both loads and stores are
+executed speculatively, with their ordering constraints checked
+by the O3-CPU. For example, if 1) a younger load executes
+and then becomes invalidated, or 2) a younger load executes
+before an older store to the same address executes, the younger
+load will be marked for squashing and enqueued into the core’s
+replay buffer. Such behavior increases simulated program
+performance (e.g., ILP) but incurs the number of gem5 runtime
+events, as more core pipeline and memory activities will be
+simulated.
+Summary 2. The O3-CPU model increases the instructionlevel parallelism (ILP) of simulated programs and improves
+benchmark performance; however, it also generates substantially more events than TS-CPU within the out-oforder pipeline and in Ruby due to speculative instruction
+execution.
+D. Design of the gem5 profiling toolchain
+To examine the simulated core microarchitecture and its
+interactions with Ruby, we develop a lightweight profiling
+toolchain that supports fine-grained, flexible gem5 call-stack
+profiling. This makes it well suited for both performance
+debugging and architectural analysis. As shown in Figure 6,
+the toolchain comprises three components: 1) a launcher that
+
+a1+a2
+
+a1+a2
+
+Result
+plotting
+
+b1+b2
+
+b1+b2
+
+c
+
+d
+
+c
+d
+
+e1
+
+f
+
+e2
+
+4, Python parser
+Tree merge & aggregate
+
+Root@a, flatten Root@a, 3-level
+
+b1+b2
+
+3, gem5 simulation
+
+gem5
+call-chain trees
+
+Runtime percentage
+breakdown
+
+In-memory call-tree
+
+a2
+
+c
+
+Samples
+
+Result analyzer
+
+N+1 s, call-chain 2
+
+e1
+
+f
+
+e2
+
+e1+e2
+(counter
+merged)
+
+c + e1
+
+d + f + e2
+
+f
+
+Fig. 7: Call-stack merging and flexible view-control in the callstack analyzer.
+starts and manages gem5 runs under different simulation
+configurations, 2) a profiler that periodically samples gem5 call
+stacks, and 3) a call-stack analyzer that processes the profiled
+call-stacks at multiple levels of granularity. We next describe
+the design of each component.
+The launcher first creates a Linux cgroup and then runs
+a gem5 process within it to constrain resource usage and
+isolate the gem5 process from other system activities. Inside
+the cgroup, a gem5 process picks up a benchmark program
+from Table III in full-system simulation, with a specified gem5
+configuration shown in Table II.
+The profiler is sampling-based and built on Linux’s
+perf_event interface. It periodically samples a running
+gem5 process and captures its call-chains. Given a gem5
+PID, the profiler first locates the corresponding perf_event
+cgroup via /proc/<pid>/cgroup, then attaches to that
+cgroup using perf_event_open, thereby profiling all
+threads and descendant processes within the same cgroup.
+To resolve symbols, the profiler dynamically loads
+function symbols from the gem5 binary and all linked
+third-party libraries. It scans /proc/<pid>/maps, loads
+ELF images via /proc/<pid>/root, and constructs
+address-to-symbol mappings from the SHT_SYMTAB and
+SHT_DYNSYM tables. Function names are demangled
+using abi::__cxa_demangle, and kernel frames
+are resolved via /proc/kallsyms. The main gem5
+process in the cgroup exposes a shared ring buffer
+perf_event_mmap_page, from which the profiler
+polls and parses records (PERF_RECORD_SAMPLE)
+containing gem5 call chains. We configure the profiler to
+use the software CPU clock (PERF_TYPE_SOFTWARE,
+PERF_COUNT_SW_CPU_CLOCK) with a moderate sampling
+period (0.5 s by default).
+During call-stack sampling, each individual sample is first
+processed as a linked list and then merged into an inmemory call-tree data structure (as illustrated in Figure 7).
+In the call tree, call stacks that share a common prefix are
+merged and diverge at their first differing branch. For example, a1->b1->c->e1 and a2->b2->d->f->e2 share the
+prefix a->b; during merging, the counters for these shared
+nodes accumulate to a1+a2 and b1+b2, respectively. After
+the shared prefix, the paths split, and the same callee (e.g. e1
+
+TABLE II: Modeled O3-CPU microarchitecture (AMD Zen5).
+
+TABLE III: Benchmarks.
+
+Parameter
+
+Value
+
+Parameter
+
+Value
+
+Suite
+
+Fetch/Decode
+Rename
+Issue/Commit
+ROB/IQ entries
+LQ/SQ entries
+Phys. int/FP reg
+
+8/8
+8/8
+8/8
+320/128
+64/64
+256/256
+
+L1I/assoc.
+L1D/assoc.
+L2/assoc. (LLC)
+NoC
+Link/Router
+BP/BTB
+
+32 kB/8
+48 kB/8*
+1 MB/16
+Mesh X-Y
+128-bit link/1-cycle router
+64 Kbit TAGE_SC_L/4096
+
+GAPBS
+PARSEC-3.0
+PARSEC-3.0
+CPU2017
+CPU2017
+
+* Associativity rounded to the nearest power of 2 to satisfy gem5’s
+
+Programs
+
+Input size
+
+Core
+
+Memory
+
+bfs, cc
+blackscholes
+freqmine
+bwaves* , gcc*
+mcf* , omnetpp*
+
+12GB graphs
+SimLarge
+SimLarge
+ref (large)
+ref (large)
+
+1/16/32
+1/4/16
+1/4/16
+1
+1
+
+8/16 GB
+3/16 GB
+3/16 GB
+3 GB
+3 GB
+
+* Because of space constraints, the result figures use the abbreviations b, g,
+
+m, and o to represent these programs.
+
+Tree-PLRU replacement policy.
+
+and e2) reached from different callers (c and f, respectively)
+is treated as originating from distinct call sites, with counters
+maintained separately.
+At the end of a simulation, the profiler exports the collected
+call tree as an interactive HTML/JSON report that enables
+users to visually explore internal gem5 events. The report
+presents hierarchical call stacks consistent with Figure 7 and
+can be interactively expanded or collapsed to quickly identify
+hot simulation events—which are often difficult to extract
+from the gem5 statistics file or from traditional flat profiles
+generated by tools such as gprof.
+Finally, the call-stack analyzer processes the HTML/JSON
+call-stack traces at different granularities, for which the root
+of interest and the maximum depth can be configured. For
+example, Figure 7 shows 1) a flattened view, in which all nodes
+are shown and counters for identical functions are merged,
+and 2) a 3-level view, in which the tree is truncated to show
+at most three levels and all deeper nodes are aggregated into
+their ancestor at the last level (e.g., nodes c and e1 are merged
+into c; d, f, and e2 are merged into d). This flexibility enables
+rapid navigation between overview and detail. In addition, the
+call-stack analyzer automatically generates result figures, some
+of which are used in the evaluation section.
+IV. M ETHODOLOGY
+A. Simulated architecture
+We apply the proposed toolchain through extensive simulations on gem5 full-system mode (FS), running a diverse set
+of benchmarks across multiple gem5 configurations. We use
+the x86_64 ISA with three core models: AS-CPU, TS-CPU,
+and O3-CPU. For O3-CPU, we use the state-of-the-art AMD
+Zen5 microarchitectures (Table II). For the memory system,
+AS-CPU uses functional Ruby, whereas TS-CPU and O3CPU use Ruby+Garnet. All networks use 128-bit links and
+1-cycle routers, together with a directory-based 2-level MOESI
+coherence protocol and 64 Byte cacheline.
+B. Benchmarks
+We use three benchmark suites: GAPBS [9] for multithreaded graph analytics workloads, PARSEC-3.0 [10]
+for general-purpose multithreaded applications, and SPEC
+CPU2017 [11] for CPU-intensive single-threaded workloads.
+From these suites, we select bfs and cc from GAPBS,
+blackscholes and freqmine from PARSEC-3.0, and
+bwaves, gcc, mcf, and omnetpp from SPEC CPU2017.
+
+As shown in Table III, each program uses a large input set and
+is evaluated under multiple gem5 configurations, with varying
+number of cores as well as the total system memory size.
+For GAPBS and PARSEC-3.0 programs, we employ 2×2,
+4×4, and 4×8 meshes with 4-, 16-, and 32-cores, respectively. Further, each experiment samples gem5 call-stack after
+the program reaches its region of interest (ROI). For SPEC
+CPU2017, we use the SimPoint methodology [12] to generate
+checkpoints and resume execution from the SimPoint with the
+highest weight, representing the dominant phase of a program.
+We use 5 Million instructions for warmup and 100 Million
+instructions for simulation. Throughout the evaluation, x-axis
+labels in the result figures encode the core–memory configuration of each run. For example, 4TS3r denotes a configuration
+with 4 TS-CPU cores, 3 GB of memory, and Ruby-enabled
+memory (r).
+V. E VALUATION RESULTS
+A. Results for AS-CPU
+Figure 8a shows the call-stack breakdown of AS-CPU’s
+top-level tick function. We observe that, first, compared with
+GAPBS and PARSEC, SPEC CPU2017 benchmarks generate
+fewer function calls. This is because all four SPEC workloads
+complete their simulated instructions (5 Million) within the
+sampling period, suggesting that AS-CPU handles singlethreaded SPEC applications efficiently and with relatively
+low simulation cost. Second, across different configurations,
+gem5 runtime is consistently dominated by fetch and
+D-inst, where fetch denotes the instruction-fetch stage,
+and D-inst (dynamic instructions) represents the execution
+of simulated instructions, including both memory and nonmemory instructions. As previously discussed in Figure 3,
+both stages request accesses to Ruby via busy-waiting function
+calls, which are expensive to simulate. Second, other functions
+in AS-CPU contribute limited to overall execution time,
+including S-inst (static instructions, i.e., binary-code translation from a program binary into gem5), M-inst (macro instructions, micro-programs defining complex operations such
+as syscall), preExec and postExec, etc.
+Figure 8b further illustrates the call-stack breakdown for
+D-inst. As expected, memory operations dominate D-inst
+runtime across all applications and configurations. Among
+these, LdBig dominates the majority of programs, while
+blackscholes from PARSEC-3.0 relies heavily on Ldfp
+(floating-point loads). Figure 8c examines the execution-time
+breakdown of Ruby for AS-CPU requests. It highlights
+
+Other
+gem5-Infra
+C++-RT
+
+D-inst
+M-inst
+S-inst
+
+Core-other
+advancePC
+postExec
+
+preExec
+fetch
+
+2.0
+1.5
+1.0
+
+0.0
+
+1.0
+0.5
+
+(a) TS-CPU’s advanceInst function runtime breakdown.
+St
+SraFlagsImmBig
+Rdip
+OrFlagsBig
+Mxor
+Movfp
+
+MovFlagsImm
+MovFlags
+Mov
+Mmulf
+Maddf
+LimmBig
+
+Lea
+LdstlBig
+LdstBig
+Ldfp
+LdBig
+
+TimingRequestProtocol::sendReq
+TS::sendFetch
+TS::completeIfetch
+
+Ld
+Cvtf2f
+BrFlags
+AndFlagsBig
+AddFlagsBig
+
+6
+
+TS-CPU fetch
+
+WripImm
+WripFlags
+SubFlagsImmBig
+SubFlagsBig
+Stul
+Stfp
+
+600000
+400000
+
+TS::advanceInst
+TLB::translateTiming
+RequestPort::sendTimingReq
+
+MemResponsePort::recvTimingReq
+FetchTranslation::finish
+BaseMMU::translateTiming
+
+1e6
+
+4
+
+2
+
+0
+
+200000
+
+(b) TS-CPU’s fetch function runtime breakdown.
+
+0
+
+(b) The D-inst stage runtime for AS-CPU.
+
+Other
+gem5-Infra
+
+1e6
+
+(c) AS-CPU’s Ruby execution runtime breakdown.
+
+Fig. 8: AS-CPU runtime breakdown results.
+that: recvAtomic (functional access latency in Ruby),
+mapAddrToMachine (address-to-DRAM-controller mapping latency), and validateAddr (cycles for distinguishing
+DRAM and PIO addresses). In PARSEC-3.0, recvAtomic
+time increases significantly when scaling memory from 3 GB
+to 16 GB, due to the added overhead of accessing a larger
+memory space managed by Ruby. In contrast, GAPBS sees
+minimal change from 8 GB to 16 GB, since memory beyond
+3 GB is managed within a single contiguous range in gem5.
+Observation 1. In AS-CPU, the gem5 call-stack breakdown is largely consistent across different applications and
+therefore fails to reflect program-specific characteristics, as
+AS-CPU is overly abstract. Moreover, the runtime overhead
+of AS-CPU is largely dominated by functional accesses
+in Ruby, which increases noticeably when memory is
+composed of non-contiguous segments.
+
+B. Results for TS-CPU
+The execution of TS-CPU’s top-level advanceInst
+function comprises three parts: I-tick (instruction fetch,
+decoding, and non-memory instruction execution), D-tick
+(load/store execution), and Ruby (memory latency for instruc-
+
+bfs_raw
+
+cc_raw
+
+freqmine
+
+1TS3r
+
+1TS3r
+
+1TS3r
+
+1TS3r
+
+16TS16r
+
+4TS3r
+
+16TS3r
+
+4TS16r
+
+1TS3r
+
+1TS16r
+
+16TS3r
+
+blackscholes
+
+16TS16r
+
+4TS3r
+
+4TS16r
+
+1TS3r
+
+1TS16r
+
+32TS8r
+
+32TS16r
+
+1AS3r
+
+1AS3r
+
+1AS3r
+
+16AS3r
+
+16AS16r
+
+4AS3r
+
+4AS16r
+
+1AS3r
+
+1AS16r
+
+16AS3r
+
+16AS16r
+
+4AS3r
+
+4AS16r
+
+1AS3r
+
+1AS16r
+
+32AS8r
+
+32AS16r
+
+16AS8r
+
+16AS16r
+
+1AS8r
+
+1AS16r
+
+32AS8r
+
+32AS16r
+
+16AS16r
+
+1AS8r
+
+16AS8r
+
+1AS16r
+
+1AS3r
+
+b g m o
+
+16TS8r
+
+0.0
+
+0.25
+
+freqmine
+
+L1Cache
+
+0.5
+
+16TS16r
+
+0.50
+
+blackscholes
+
+L2Cache
+
+Dir
+
+1.0
+
+1TS8r
+
+0.75
+
+cc_raw
+
+garnet-NI
+
+1.5
+
+1TS16r
+
+1.00
+
+32TS8r
+
+TS-CPU Ruby
+
+1e6
+
+bfs_raw
+
+garnet-Router
+garnet-Link
+
+C++-RT
+garnet-other
+
+2.0
+
+validateAddr
+
+32TS16r
+
+mapAddrToMachine
+
+16TS8r
+
+recvAtomic
+
+1TS8r
+
+C++-RT
+
+1TS16r
+
+Other
+
+AS-CPU Ruby
+
+I-tick
+
+1.5
+
+(a) AS-CPU’s tick function runtime breakdown.
+
+0.00
+
+D-tick
+
+0.0
+
+0.5
+
+1.25
+
+Ruby
+
+2.0
+
+16TS16r
+
+AS-CPU overall
+
+2.5
+
+AS-CPU instruction
+
+Other
+
+1e6
+2.5
+
+TS-CPU overall
+
+1e6
+
+Context
+MMU
+Decoder
+
+b g m o
+
+(c) TS-CPU’s Ruby execution runtime breakdown.
+
+Fig. 9: TS-CPU runtime breakdown results.
+tion fetch and load/store), which are discussed in Figure 4,
+with results shown in Figure 9a.
+Compared with AS-CPU, we observe that none of the SPEC
+CPU2017 benchmarks complete under TS-CPU during the
+sampling period. This is because the detailed Ruby model in
+TS-CPU generates substantially more simulation events, significantly slowing simulation progress. Moreover, unlike ASCPU—which fails to differentiate program characteristics—
+the runtime breakdown under TS-CPU varies markedly across
+workloads and begins to reflect differences in applications, as
+TS-CPU uses a finer-grained timing model of Ruby.
+For example, for GAPBS, gem5 spends a larger fraction of
+time in Ruby, indicating that these benchmarks are memorybound. This is because graph workloads exhibit irregular
+memory accesses and higher LLC miss ratio, leading to
+substantial time spent waiting for Ruby to service memory
+requests. In contrast, for PARSEC, gem5 spends more time in
+I-tick, indicating that they are compute-bound, as I-tick
+includes time spent executing non-memory instructions. The
+SPEC CPU2017 benchmarks are in general memory-bound,
+but exhibit varying degrees of memory intensity.
+To further investigate the observed trends, our toolchain
+supports zooming into each part in Figure 9a. For example, Figure 9b presents a zoomed-in view of fetch.
+We observe that PARSEC workloads generate more fetch
+events compared to others, with substantial time spent
+
+hh_store_hit
+
+qq_sendWBDataFromTBEToL2
+k_popMandatoryQueue
+
+h_load_hit
+h_ifetch_hit
+gg_sendUnblockExclusive
+
+2.5
+
+d_issuePUTX
+b_issueGETX
+a_issueGETS
+
+g_sendUnblock
+
+300000
+200000
+
+Ruby
+
+1e6
+
+Commit
+
+Decode
+
+Rename
+
+Fetch
+
+2.0
+1.5
+1.0
+0.5
+0.0
+
+100000
+
+(a) O3-CPU’s tick function runtime breakdown.
+
+0
+
+(a) TS-CPU’s L1 cache controller actions.
+pop-Resp-queue
+send-data-to-GetX
+send-data-to-GetS
+send-WB-to-L1
+
+pop-L1-queue
+unblock
+allocate-L2-block
+GetX
+
+gem5-Infra
+C++-RT
+FUPool
+
+1e6
+
+GetS
+record Sharer
+deallocate-TBE
+allocate-TBE
+
+O3-CPU IEW
+
+Other L2 SLICC actions
+record Exclusive
+send-Exclusive-Data
+L2 writeback
+
+60000
+40000
+
+TimeBuffer
+LSQ
+IQ
+
+IEW-dispatch
+IEW-updateStatus
+IEW-exec-insts
+
+IEW-other
+IEW-checkSignal
+IEW-writeback
+
+1.00
+0.75
+0.50
+0.25
+0.00
+
+20000
+
+1TS3r
+
+Observation 2. Compared to AS-CPU, the detailed timing model in TS-CPU Ruby allows gem5 to distinguish
+between compute-bound and memory-bound workloads.
+Observation 3. TS-CPU does not model ILP or MLP:
+instructions commit in order and busy-wait on memory
+accesses. As a result, the cache behaves like a lockup cache,
+even though it is modeled as lockup-free in SLICC.
+1 SLICC is a domain specific language for specifying cache coherence
+protocols in gem5.
+
+0.6
+0.4
+
+bfs_raw
+
+cc_raw
+
+freqmine
+
+1O33r
+
+1O33r
+
+1O33r
+
+1O33r
+
+16O316r
+
+4O33r
+
+16O33r
+
+4O316r
+
+1O33r
+
+1O316r
+
+16O33r
+
+blackscholes
+
+16O316r
+
+4O33r
+
+4O316r
+
+1O33r
+
+1O316r
+
+32O38r
+
+32O316r
+
+16O38r
+
+16O316r
+
+1O38r
+
+1O316r
+
+0.0
+
+32O38r
+
+0.2
+16O38r
+
+in sendReq/sendTimingReq to access the I-cache,
+completeIfetch to executing non-memory instructions,
+and BaseMMU/TLB::translateTiming to access ITLB. Memory-related instructions are forwarded to D-tick
+via RequestPort::sendTimingReq and then issued to
+Ruby. Meanwhile, Figure 9c shows a zoomed-in view of
+Ruby, where GAPBS spends significantly more time in
+garnet-Router and garnet-NI (network interface), indicating heavy stress on the cache hierarchy and on-chip network, whereas PARSEC devotes only a limited fraction of time
+to Ruby. The SPEC CPU2017 benchmarks fall between these
+two extremes, exhibiting a more balanced mix of computebound and memory-bound behavior.
+Going one level deeper, Figure 10a and Figure 10b show
+the SLICC [13], [14] actions1 of the L1 and L2/LLC cache
+controllers (namely L1CC and L2CC). As expected, PARSEC
+workloads keep most of their activity within the L1 caches,
+with a large fraction attributed to ifetch-hit. In contrast,
+GAPBS generates substantially more traffic to the L2 cache,
+reflecting higher LLC pressure caused by the irregular memory
+accesses during graph traversal.
+
+L2Cache
+L1Cache
+
+garnet-NI
+Dir
+
+0.8
+
+16O316r
+
+Fig. 10: TS-CPU runtime breakdowns for L1/L2 cache.
+
+garnet-Router
+garnet-Link
+
+1.0
+
+1O38r
+
+(b) TS-CPU’s L2 cache controller actions.
+
+gem5-Infra
+C++-RT
+
+1e6
+
+b g m o
+
+1O316r
+
+1TS3r
+
+1TS3r
+
+1TS3r
+
+16TS3r
+
+freqmine
+
+16TS16r
+
+4TS3r
+
+4TS16r
+
+1TS3r
+
+1TS16r
+
+16TS3r
+
+16TS16r
+
+4TS3r
+
+4TS16r
+
+1TS3r
+
+32TS8r
+
+1TS16r
+
+blackscholes
+
+O3-CPU Ruby
+
+cc_raw
+
+32TS16r
+
+16TS16r
+
+1TS8r
+
+16TS8r
+
+1TS16r
+
+32TS8r
+
+bfs_raw
+
+32TS16r
+
+16TS16r
+
+1TS8r
+
+(b) O3-CPU’s IEW stage runtime breakdown.
+16TS8r
+
+0
+
+1TS16r
+
+TS-CPU L2CC
+
+IEW
+
+32O316r
+
+TS-CPU L1CC
+
+i_allocateTBE
+hx_load_hit
+
+forward_eviction_to_cpu
+dd_issuePUTS
+
+O3-CPU overall
+
+xx_store_hit
+
+b g m o
+
+(c) O3-CPU’s Ruby execution runtime breakdown.
+
+Fig. 11: O3-CPU runtime breakdown results.
+C. Results for O3-CPU
+The overall execution time breakdown of O3-CPU is shown
+in Figure 11a. In contrast to TS-CPU, O3-CPU models a detailed out-of-order microarchitecture, resulting in a substantial
+fraction of gem5 runtime spent in the core pipeline stages
+rather than in Ruby. Among these stages, the IEW stage
+as shown in Figure 11b accounts for the largest share of
+execution time, reflecting the high modeling cost of instruction
+scheduling, execution, and writeback in an OoO pipeline.
+Another key difference between TS-CPU and O3-CPU is
+how workloads scale with core count. GAPBS and PARSEC
+exhibit markedly different scaling under O3-CPU. For PARSEC, gem5 runtime breakdown remains stable across the 1-,
+4-, and 16-core configurations, indicating limited sensitivity to
+increased core numbers. In contrast, GAPBS shows substantial
+divergence in simulation time as core count increases from 16
+to 32. In 32-core, Ruby (detailed in Figure 11c) contributes
+only a negligible fraction of total simulation time, which is
+effectively the inverse under TS-CPU, where Ruby dominates
+gem5 execution for 32-core GAPBS.
+Our toolchain enables precise identification of the root
+causes behind such performance differences, which are difficult to uncover using gem5 statistics alone. In the statistics
+output, we find that both the instruction and data caches report
+high hit ratios in this scenario, which can be misleading: it
+appears that the 32-core configuration benefits from improved
+
+finishTranslation
+fetchCacheLine
+
+TLB::translateTiming
+FetchTranslation
+
+BaseMMU::translateTiming
+
+uu_profileDataHit
+jj_allocateL1ICacheBlock
+ii_allocateL1DCacheBlock
+
+i_allocateTBE
+hx_load_hit
+
+bfs_raw
+
+b_issueGETX
+a_issueGETS
+
+32O316r
+
+32O38r
+
+16O38r
+
+1O316r
+
+1O38r
+
+32O38r
+
+16O316r
+
+dd_issuePUTS
+d_issuePUTX
+
+32O316r
+
+forward_eviction_to_cpu
+
+h_load_hit
+h_ifetch_hit
+gg_sendUnblockExclusive
+g_sendUnblock
+
+16O316r
+
+hh_store_hit
+
+25%
+0%
+
+(a) O3-CPU’s fetch function runtime breakdown.
+xx_store_hit
+qq_sendWBDataFromTBEToL2
+k_popMandatoryQueue
+
+50%
+
+16O38r
+
+100000
+
+75%
+
+1O316r
+
+200000
+
+1O38r
+
+300000
+
+0
+
+cc_raw
+
+Fig. 13: O3-CPU L1 runtime under deadlock.
+
+80000
+60000
+40000
+
+bfs_raw
+
+cc_raw
+
+1O33r
+
+1O33r
+
+1O33r
+
+1O33r
+
+16O33r
+
+freqmine
+
+16O316r
+
+4O33r
+
+4O316r
+
+1O33r
+
+1O316r
+
+16O33r
+
+blackscholes
+
+16O316r
+
+4O33r
+
+4O316r
+
+1O33r
+
+1O316r
+
+32O38r
+
+32O316r
+
+16O316r
+
+1O38r
+
+16O38r
+
+1O316r
+
+32O38r
+
+32O316r
+
+16O316r
+
+1O38r
+
+0
+
+16O38r
+
+20000
+
+1O316r
+
+O3-CPU L1CC
+
+g_sendUnblock
+e_sendData
+a_issueGETS
+
+100%
+
+400000
+
+O3-CPU L1CC
+
+O3-CPU fetch
+
+500000
+
+i_allocateTBE
+hx_load_hit
+h_load_hit
+
+b g m o
+
+(b) O3-CPU’s L1 cache controller actions.
+
+Fig. 12: O3-CPU fetch and L1 controller runtime.
+cache locality, as if the benchmark partitions a large input into
+smaller chunks and each core attains higher L1 efficiency.
+However, the breakdowns produced by our tool—Figure 12a
+for the fetch stage and Figure 12b for the L1 cache
+controller—reveal a different story. In the 32-core GAPBS
+runs, L1 cache controller runtime is dominated by data
+load events (h_load_hit), while instruction fetch events
+(h_ifetch_hit) account for only a small fraction of
+L1 activity. This implies that the core repeatedly executes
+the same load operations without fetching new instructions
+from the L1 I-cache, leading to repeated reloads of the
+same memory address. This is a signature behavior of
+the test-and-test-and-set (TTAS)-style self-spinning
+during busy-waiting on a shared lock variable [7].
+By contrast, the PARSEC benchmarks exhibit a far more stable execution profile. Even as core counts increase, Figure 12a
+and Figure 12b show that gem5’s runtime breakdown remains
+largely consistent compared to lower-core settings. This stability suggests that blackscholes and freqmine continue to
+scale effectively with additional cores, spending limited time in
+self-spinning due to limited number of concurrent data sharers.
+
+protocol dead/livelocks. For example, checkpoint-based diagnosis is ineffective because the onset of a dead/livelock is
+often unknown. Likewise, running gem5 in debugging mode
+to monitor repetitive coherence actions provides limited help,
+as it incurs prohibitive overhead. Consequently, identifying
+dead or livelock requires monitoring a large span of simulation
+before the dead or livelock actually happens.
+To address this problem, our tool provides a new, lowoverhead mechanism for identifying coherence dead/livelock
+by monitoring the coherence controller runtime breakdown
+of gem5. The key insight is that when deadlock or livelock
+occurs, gem5 repeatedly executes the same protocol actions,
+causing the runtime breakdown dominated by a certain set
+of functions. Based on this insight, we impose threshold on
+each runtime proportion for an action (e.g. 90%), and when
+an action exceeds its threshold, the profiler checkpoints the
+simulation and emits a warning. By using such event-triggered
+mechanism, we eliminate the high overhead associated with
+traditional methods for dead/livelock detection.
+We demonstrate this mechanism using GAPBS by modifying gem5’s SLICC code to deliberately inject a protocol-level
+deadlock: a load request that enters the L1 input (mandatory)
+queue is never serviced and is instead continuously recycled.
+As shown in Figure 13, this change causes the L1 cache to
+be overwhelmingly dominated by load_hit, which happens
+consistently across different O3 configurations. When the
+profiler detects such a runtime threshold violation—where a
+single activity accounts for more than 90% of execution time—
+it issues a warning, takes a checkpoint, and reports the event
+to the user.
+
+Observation 4. Compared to TS-CPU, O3-CPU simulates
+the full OoO pipeline, enabling ILP and MLP, and is able
+to distinguish the same application running across different
+core counts and memory configurations.
+
+Observation 5. The proposed toolchain facilitates the
+investigation of simulation correctness issues, including
+Ruby SLICC deadlocks and livelocks, and incurs lower
+overhead than conventional approaches such as debuggerbased monitoring.
+
+D. Detecting coherence protocol deadlock and livelock
+
+Comparison to modifying gem5 internals for deadlock/livelock detection. Our approach adopts a non-intrusive
+profiling methodology, which introduces several trade-offs
+compared to directly modifying gem5 internals or simulator
+statistics for deadlock/livelock detection.
+Direct instrumentation of gem5 (e.g., adding custom statistics or explicit dead/live-lock detection logic) can provide
+
+Two problems are particularly important for architectural
+simulation: cache coherence protocol deadlock and livelock.
+In both cases, gem5 makes no forward progress and emits
+no explicit failure signal, leaving the simulation either terminated abruptly or running indefinitely. Moreover, existing
+debugging mechanisms provide limited help in diagnosing
+
+more precise and robust detection, since developers can directly observe architectural states, such as queues, protocol
+transitions, or resource dependencies, to examine a deadlock/livelock. However, such approaches typically require prior
+knowledge of what components in gem5 to instrument.
+In contrast, our method infers abnormal simulator behavior
+by observing distortions in gem5’s call-stack profile using
+external sampling via perf_event. It is completely nonintrusive and requires no modification to gem5 source code,
+lowering the barrier for adoption, especially for complex
+experimental gem5 branches. Moreover, the profiler provides a
+holistic view into gem5 execution without requiring developers
+to predefine which components to monitor.
+In fact, our approach can serve as a monitoring tool to help
+pinpoint potential deadlock causes, after which developers
+can introduce targeted instrumentation inside gem5 for more
+direct monitoring. In this way, the profiler can guide deeper
+instrumentation by identifying suspicious hotspots or abnormal
+execution patterns, helping developers determine where more
+detailed statistics or internal modifications are needed.
+E. Discussions
+Limitations. While the proposed framework provides a
+lightweight method for analyzing gem5 runtime behavior, it
+requires some consideration during use. First, the sampling
+interval must balance detail and runtime overhead. In our
+implementation, a sampling period of 0.5 s provides sufficient
+visibility into gem5 behavior while maintaining negligible
+overhead during long-running simulations. Nevertheless, very
+short-lived events may not always be captured. Second, the
+profiler observes call-stacks of the gem5 process rather than
+the architectural state of the simulated program. Consequently,
+the observed execution patterns reflect the simulator implementation rather than the simulated workload directly. Overall, the proposed profiler is not intended to replace internal
+correctness checks or specialized debugging infrastructure of
+gem5. Instead, it should be viewed as a complementary tool
+that helps developers rapidly identify suspicious behaviors and
+performance bottlenecks in gem5.
+Identifying gem5 optimization opportunities. Beyond
+debugging, the proposed profiler can also reveal performance
+optimization opportunities of gem5. For example, we observe
+that gem5 O3CPU simulations spends a significant portion
+of runtime creating dynamic instruction objects. In particular,
+functions related to dynamic instruction construction (e.g.,
+Fetch::buildInst) frequently appear among the most
+heavily executed routines in the call-stack profile. These functions allocate DynInst objects using C++ dynamic memory
+allocation for each simulated instruction.
+This observation suggests a potential optimization opportunity: introducing a DynInst memoization pool. Instead of
+repeatedly allocating and deallocating dynamic instruction objects, gem5 could reuse a bounded pool of preallocated objects
+up to the number permitted by the reorder buffer (ROB). Such
+reuse mechanisms could reduce memory allocation overhead
+and improve overall simulator runtime efficiency.
+
+VI. C ONCLUSION
+We demonstrate that call-stack profiling in gem5 provides
+a flexible, complementary view of simulated architectures that
+conventional gem5 statistics alone fall short. Using an external sampling-based profiler built on Linux’s perf_event
+interface, we propose a lightweight and external toolchain that
+characterizes how execution time is distributed across gem5’s
+core models and the Ruby memory system. This toolchain
+enables fine-grained analysis of runtime differences among
+core models, helps uncover simulated programs’ performance
+caveats, and supports correctness debugging for gem5, including detection of protocol deadlocks and livelocks.
+ACKNOWLEDGMENTS
+We acknowledge the use of computing resources provided
+by the National Academic Infrastructure for Supercomputing
+in Sweden (NAISS) under project numbers NAISS 2023/221215, NAISS 2024/5-314, and NAISS 2024/6-189. This work
+is supported by the Swedish Research Council (VR) starting
+grant number 2025-04436.
+R EFERENCES
+[1] N. Binkert, B. Beckmann, G. Black, S. K. Reinhardt, A. Saidi, A. Basu,
+J. Hestness, D. R. Hower, T. Krishna, S. Sardashti et al., “The gem5
+Simulator,” ACM SIGARCH Computer Architecture News, vol. 39, no. 2,
+pp. 1–7, 2011.
+[2] J. Lowe-Power, A. M. Ahmad, A. Akram, M. Alian, R. Amslinger,
+M. Andreozzi, A. Armejach, N. Asmussen, B. Beckmann, S. Bharadwaj et al., “The gem5 Simulator: Version 20.0+,” arXiv preprint
+arXiv:2007.03152, 2020.
+[3] J. Umeike, N. Patel, A. Manley, A. Mamandipoor, H. Yun, and M. Alian,
+“Profiling gem5 Simulator,” in IEEE International Symposium on Performance Analysis of Systems and Software (ISPASS), 2023, pp. 103–113.
+[4] J. M. Cebrián González, A. Barredo, H. Caminal, M. Moretó, M. Casas,
+and M. Valero, “Semi-Automatic Validation of Cycle-Accurate Simulation Infrastructures: The Case for gem5-x86,” Future Generation
+Computer Systems, vol. 112, pp. 832–847, 2020.
+[5] S. L. Graham, P. B. Kessler, and M. K. McKusick, “gprof: A Call Graph
+Execution Profiler,” in SIGPLAN Symposium on Compiler Construction,
+1982, pp. 120–126.
+[6] Intel, “Intel VTune Profiler,” https://www.intel.com/content/www/us/en/
+developer/tools/oneapi/vtune-profiler.html, accessed: 2025-11-25.
+[7] A. Alameldeen and D. Wood, “IPC Considered Harmful for Multiprocessor Workloads,” IEEE Micro, vol. 26, no. 4, pp. 8–17, 2006.
+[8] N. Agarwal, T. Krishna, L.-S. Peh, and N. K. Jha, “GARNET: A
+Detailed On-Chip Network Model Inside a Full-System Simulator,” in
+IEEE International Symposium on Performance Analysis of Systems and
+Software (ISPASS), 2009, pp. 33–42.
+[9] S. Beamer, K. Asanović, and D. Patterson, “The GAP Benchmark Suite,”
+arXiv preprint arXiv:1508.03619, 2015.
+[10] X. Zhan, Y. Bao, C. Bienia, and K. Li, “PARSEC 3.0: A Multicore Benchmark Suite with Network Stacks and SPLASH-2X,” ACM
+SIGARCH Computer Architecture News, vol. 44, no. 5, pp. 1–16, 2017.
+[11] SPEC, “SPEC CPU2017 Documentation,” 2017, accessed: 2024-10-29.
+[Online]. Available: https://www.spec.org/cpu2017/Docs/
+[12] Sherwood, Timothy and Perelman, Erez and Hamerly, Greg and Calder,
+Brad, “Automatically Characterizing Large Scale Program Behavior,”
+in International Conference on Architectural Support for Programming
+Languages and Operating Systems (ASPLOS), 2002, pp. 45—57.
+[13] M. M. K. Martin, D. J. Sorin, B. M. Beckmann, M. R. Marty, M. Xu,
+A. R. Alameldeen, K. E. Moore, M. D. Hill, and D. A. Wood, “Multifacet’s General Execution-Driven Multiprocessor Simulator (GEMS)
+Toolset,” SIGARCH Comput. Archit. News, vol. 33, no. 4, p. 92–99,
+2005.
+[14] M. Martin, M. Hill, and D. Wood, “Token Coherence: Decoupling
+Performance and Correctness,” in International Symposium on Computer
+Architecture (ISCA), 2003, pp. 182–193.
+
+A PPENDIX
+A. Abstract
+This artifact provides the complete experimental infrastructure used in the paper Understanding Simulated Architecture
+via gem5 Call-Stack Profiling. It includes the software components, scripts, and workflows necessary to reproduce the
+experimental results. The artifact contains:
+A modified gem5 source tree (version 23) that contains
+a non-intrusive call-stack profiler (src/ext/prof);
+• Configuration files used to run the gem5 simulations;
+• Scripts for launching experiments using a Python Celerybased task queue system;
+• Parsing scripts for processing gem5 simulation outputs;
+• Plotting scripts that reproduce the figures reported in the
+paper.
+•
+
+Using the provided infrastructure, one can reproduce the
+main experimental results shown in Figure 8–Figure 12 of the
+paper.
+B. Artifact check-list (meta-information)
+Algorithm: Call-stack profiling for gem5 and analysis scripts
+Program: gem5 architectural simulator
+• Compilation: scons build system
+• Transformations: • Binary: gem5.debug, gem5.opt
+• Model: AtomicSimpleCPU, TimingSimpleCPU, O3CPU, Ruby
+• Data set: gem5 checkpoints for: GAPBS benchmarks (bfs,
+cc), PARSEC-3.0 (blackscholes, freqmine), SPEC CPU2017
+(bwaves, gcc, mcf, omnetpp)
+• Run-time environment: Linux server environment
+• Hardware: Intel Core i7-12900K, 128 GB RAM (the paper’s
+platform)
+• Run-time state: full-system gem5 simulations
+• Execution: Celery-based parallel task launcher
+• Metrics:
+gem5 call-stack profiling statistics, gem5 runtime
+breakdown
+• Output:
+gem5 call-stack samples and plots corresponding
+to Figure 8–Figure 12 (and more, see subsection G)
+• Experiments: 84 gem5 simulation runs across CPU models
+and benchmark suites
+• How much disk space required (approximately)?: ∼500
+GB, including gem5 checkpoints, generated data, gem5 disks
+and Linux kernel binaries
+• How much time is needed to prepare workflow (approximately)?: 10–20 minutes
+• How much time is needed to complete experiments (approximately)?: ∼21 hours using 4 parallel workers
+• Publicly available?: Yes
+• Code licenses (if publicly available)?:
+gem5 open-source
+license
+• Data licenses (if publicly available)?: research use
+• Workflow automation framework used?: Celery
+• Archived (provide DOI)?: Yes
+•
+•
+
+C. Description
+1) How to access: The artifact can be downloaded via:
+•
+•
+
+https://doi.org/10.5281/zenodo.19126063, or
+https://zenodo.org/records/19126063
+
+2) Hardware dependencies: The experiments require a
+Linux server capable of using perf_event (this probably requires root privileges, depending on the system configuration)
+and gem5 full-system simulations. The system used in our
+evaluation has the following configuration: i) x86 processor
+(Intel Core i7-12900K), ii) 128 GB RAM.
+The workflow launches multiple gem5 simulations in parallel using Celery workers. In our experiments we used 4
+workers to avoid memory exhaustion during full-system simulations.
+3) Software dependencies: The artifact depends on the
+following software: i) Linux operating system, ii) Python and
+Celery task framework, iii) scons build system, iv) gem5
+simulator. System monitoring tools such as htop or btop
+are recommended for observing resource usage during experiments.
+4) Datasets: Due to the large sizes (about 350 GB) of the
+gem5 checkpoints as well as the disk images and kernel binaries required for the simulations, these files cannot be hosted
+on Zenodo. Therefore, users are responsible for preparing
+them locally. Checkpoints can be generated by following the
+tutorials provided by gem5, for example the PARSEC tutorial2 .
+Once prepared, the disk and kernel files can be organized using
+the following directory structure:
+ckpt/ . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . simulation checkpoints
+gapbs-big/
+program-name
+8GB/16GB
+1p-r1/16p-r1/32p-r1
+parsec/
+program-name
+3GB/16GB
+1p-r1/4p-r1/16p-r1
+spec2017/
+program-name
+3GB
+1p-r1
+
+The gem5 checkpoints shall be recorded for the following
+configurations:
+• gapbs-big: bfs, cc, each with 1/16/32 cores with 8 GB
+or 16 GB simulated memory.
+• parsec: blackscholes, freqmine, each with 1/4/16 cores
+with 3 GB or 16 GB simulated memory.
+• spec2017: bwaves, gcc, mcf, omnetpp, each with 1
+core with 3 GB simulated memory.
+Similarly, kernel and disk files can be organized as:
+disk-ker/
+gapbs/ . . . . . . . . . . . . . . . . . . . . . . . . . . kernels and disk images
+parsec-3.0/ . . . . . . . . . . . . . . . . . . . . . . kernels and disk images
+spec2017/ . . . . . . . . . . . . . . . . . . . . . . .kernels and disk images
+
+D. Installation
+Prepare both the ckpt/ and disk-ker/ directories and place
+them in a local path with sufficient storage. Then Download
+2 https://www.gem5.org/documentation/gem5art/tutorials/parsec-tutorial
+
+the modified gem5 repository containing our profiler (gem5prof), which has the following structure:
+gem5-prof/
+ext/
+prof/ . . . . . . . Profiler C++ code. 1, Compile using make
+script/ . . . . . . . . . . . . . . . . . Various scripts used in the project
+x86/
+m5out/ . . . . . . . . . . . Directory for simulation outputs
+gapbs/
+ckpt@ . . 2, User created. Softlink to gapbs-big/
+env.sh . . . 3, Configure disk and kernel paths to
+gapbs/.
+parsec-3.0/
+ckpt@ . . . . . 4, User created. Softlink to parsec/
+env.sh . . . 5, Configure disk and kernel paths to
+parsec-3.0/.
+spec2017/
+ckpt@ . . 6, User created. Softlink to spec2017/
+env.sh . . . 7, Configure disk and kernel paths to
+spec2017/.
+
+After downloading gem5-prof/, please follow the underlined instructions above to:
+• Compile the profiler binary (Step 1).
+• Create the required symbolic links to ckpt/* that point to
+the corresponding gem5 checkpoints (Step 2, 4, 6).
+• Update the environment variables in each env.sh script
+(Step 3, 5, 7) so that the paths in each env.sh correctly
+point to the correspoding disk image and kernel binary
+in disk-ker.
+Note. One can organize the checkpoints and disk/kernel files
+in any way that suits one’s setup. However, please check the
+script script/x86/run-host-gem5.sh and ensure that
+all paths point to the correct places.
+E. Experiment workflow
+
+also provide three additional microarchitectures—lioncove,
+skymont, and zen4—located in script/x86/arch.
+The Celery worker log is located at:
+gem5-prof/script/x86/log
+When all tasks complete successfully, the log will show:
+==============================
+All gem5 tasks finished!
+==============================
+F. Evaluation and expected results
+After all simulations have finished, plots can be generated
+using the provided parsing scripts. Navigate to the parser
+directory:
+cd gem5-prof/script/x86/parser
+Generate the figures corresponding to the results reported
+in the paper:
+./plot-all-AS.sh
+./plot-all-TS.sh
+./plot-all-O3.sh
+These scripts process gem5 output data and generate plots
+corresponding to the evaluation results presented in Figure 8–
+Figure 12 of the paper. All generated figures are located in:
+gem5-prof/script/x86/parser/fig/
+G. Experiment customization (more than what the paper has)
+The artifact also supports additional analysis of various CPU
+and Ruby subsystem components (e.g., individual O3 pipeline
+stages) and their interactions. We provide a large number of
+pre-defined result-exploration scripts (125 in total) beyond
+those used in the paper. These configurations are located in:
+gem5-prof/script/x86/parser/cfg
+
+First compile gem5:
+
+All configurations are defined in Python and provide flexible
+examination
+options, including a whitelist (only the runtimes
+cd gem5-prof
+of
+these
+functions
+are shown in a plotted figure), a blacklist
+scons build/[build_opt]/gem5.debug [-j X]
+(these functions are excluded when calculating gem5 runtime
+All experiments are launched using a Celery-based task breakdown), and various knobs to control figure plotting. For
+framework. Navigate to the experiment launcher:
+example, one can specify the root function and whether to fold
+child functions in a sampled gem5 call-stack: level=1 folds
+cd gem5-prof/script/x86/cescri
+child functions, level=2 expands children by one level, and
+Start the full experiment with:
+level=-1 expands all children to the leaf level.
+We have put more holistic results in the following arXiv re./kickstart.sh 4 3600
+port: Johan Söderström and Yuan Yao, “Anatomy of the gem5
+This command:
+Simulator: AtomicSimpleCPU, TimingSimpleCPU, O3CPU,
+and Their Interaction with the Ruby Memory System,” arXiv
+• schedules all gem5 tasks over 4 Celery workers
+preprint arXiv:2508.18043, 2025. https://arxiv.org/abs/2508.
+• runs each simulation with a timeout of 3600 seconds
+18043
+using the experiment configurations located in:
+gem5-prof/script/x86/cescri/cfg
+These configurations specify the benchmark suites, number
+of cores, CPU models, memory sizes, and CPU microarchitectures. The paper uses zen5 by default; however, we
+
+H. Methodology
+Submission, reviewing and artifact badging methodology:
+• ACM Artifact Review and Badging Policy
+• https://cTuning.org/ae
+

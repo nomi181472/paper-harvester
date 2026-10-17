@@ -1,0 +1,882 @@
+Puffin-Backed Vector Indexes:
+Attaching Approximate Nearest Neighbor Indexes to
+Apache Iceberg Snapshots for Compute-Disaggregated Query
+Engines
+Artur Borycki1
+
+arXiv:2606.04196v1 [cs.DB] 2 Jun 2026
+
+1
+
+Teradata Advanced Research , artur.borycki@teradata.com
+April 2026
+Abstract
+
+We describe a design pattern and concrete implementation for embedding distributed
+approximate nearest neighbor (ANN) indexes inside the Apache Iceberg table format, using
+the Puffin sidecar file as the storage container and the snapshot summary as the binding
+mechanism. Modern analytical query engines increasingly adopt a compute-disaggregated
+architecture: executors are stateless, scale elastically, and read all data from object storage.
+Adding vector similarity search to such an engine traditionally requires a dedicated index
+storage layer with its own lifecycle, consistency model, and operational surface — breaking
+the disaggregation invariant. We show that the Puffin format, originally introduced for tablelevel statistics and deletion vectors, is sufficient to carry full Vamana/DiskANN graphs at
+billion-vector scale, and that linking these blobs through the existing statistics-file
+snapshot summary property reduces ANN index management to standard Iceberg snapshot
+operations. We present (i) a binary layout for sharded graph indexes inside Puffin, (ii) a
+coordinator–executor protocol for distributed index build, probe, and incremental refresh,
+(iii) the integration into the existing optimistic-concurrency commit path of an Iceberg
+REST catalog, and (iv) a tiered probe strategy that places small centroid indexes on the
+coordinator and large DiskANN graphs on executor SSDs. The pattern inherits atomicity,
+time travel, multi-engine readability, and orphan-file garbage collection from the table format
+at zero implementation cost. We discuss the recall/latency trade-offs introduced by the
+independent-shard design and quantify projected query and build performance for tables up
+to 109 vectors. Our implementation extends FlockDB, a distributed MPP engine built on
+DuckDB, and requires approximately 8,000 lines of new code, the majority of which is the
+graph builder itself; the integration with the table format is a few hundred lines.
+
+Keywords: approximate nearest neighbor search, vector databases, Apache Iceberg, Puffin,
+DiskANN, Vamana, compute-storage disaggregation, lakehouse
+
+1
+
+Introduction
+
+The rise of embedding-based retrieval, retrieval-augmented generation, and large-scale semantic
+search has made vector similarity search a first-class operation in analytical systems [9, 19]. The
+standard architectural response has been the dedicated vector database: a stateful service that
+owns its index storage, its query path, and its consistency semantics. This works well for online
+serving workloads, but it sits awkwardly alongside the modern analytical data lake.
+Two architectural trends are in tension. First, analytical engines are converging on a computedisaggregated design [6, 18]: data is stored as immutable files (typically Parquet [4]) in object
+1
+
+storage, organized by an open table format (Apache Iceberg [3], Delta Lake [5], Apache Hudi [1]),
+and queried by stateless executor processes that can be added or removed without data movement. Second, vector indexes for billion-scale corpora are themselves multi-tens-to-hundreds of
+gigabytes [16, 7] and have non-trivial build cost and refresh semantics. Adding such indexes to
+a disaggregated engine without breaking its design tenets is non-obvious.
+The conventional integration paths — running a separate vector database, maintaining a
+private indexed filesystem on executors, or rebuilding the index on every query — each violate
+at least one of the following properties that a lakehouse engine wants to preserve:
+• Stateless executors. Executors must be safe to terminate and replace at any moment.
+• Single source of truth. Derived state (indexes, statistics) must remain consistent with
+the data version it was computed against.
+• Multi-engine interoperability. The table format permits multiple engines to read the
+same data; derived artifacts should not break that.
+• No new lifecycle. Index creation, refresh, and deletion should reuse the table format’s
+transactional commit, time-travel, and garbage-collection mechanisms.
+We observe that the Apache Iceberg specification already includes a mechanism that satisfies
+all four of these properties for arbitrary derived data: the Puffin file format [2]. Puffin was
+introduced for table statistics (Theta sketches for distinct-value estimation, bloom filters for
+partition pruning) and deletion vectors, but the format is intentionally extensible: each blob
+carries an opaque type string, an Iceberg field-ID set, an arbitrary property map, and a payload
+of bytes. A Puffin file is bound to a snapshot via a single property in the snapshot summary
+(statistics-file).
+This paper argues that Puffin is the correct storage container for ANN indexes in disaggregated lakehouse engines, and describes a complete design for using it that way. Our contributions
+are:
+1. A design pattern (Section 3) that maps Vamana/DiskANN [16] graph indexes onto
+Puffin blobs, with one blob per executor shard plus a routing blob, achieving build parallelism that scales linearly with executors while inheriting all consistency guarantees of the
+underlying table format.
+2. A byte-level format specification (Section 4) for two blob types: a small file-level
+centroid index suitable for coordinator-local probing, and a sharded Vamana graph layout
+suitable for executor-local SSD-resident probing.
+3. A distributed build, probe, and refresh protocol (Sections 5–7) that reuses the
+engine’s existing INSERT-SELECT write path, its cache-aware scheduler, and its snapshot
+diffing mechanism, with only the graph operations themselves being genuinely new code.
+4. An incremental refresh algorithm (Section 7) that exploits Iceberg’s manifest-level
+diff to identify only the changed Parquet files, applies Vamana greedy insert for added
+vectors and lazy tombstoning for removed ones, and commits the updated Puffin file as a
+metadata-only snapshot operation.
+5. Quantitative analysis (Section 9) of the projected query latency, build time, and storage
+cost for a representative billion-vector workload, along with an honest discussion of the
+recall trade-off introduced by the independent-shard design (Section 10).
+
+2
+
+We implement this design in FlockDB, a distributed MPP analytical engine built on DuckDB [15]
+and Apache Iceberg, deployed against an AIStor object store. The implementation comprises
+approximately 8,000 lines of new code; we report on the structure of the implementation rather
+than empirical benchmarks, which remain ongoing.
+We frame this work as a systems design paper. The novelty is not in the ANN algorithm —
+we use Vamana with product quantization [10] essentially unchanged — but in the storage and
+lifecycle integration. To our knowledge no prior published system has placed a billion-scale ANN
+graph inside an Iceberg-format sidecar and used the table format’s commit path to manage its
+lifecycle.
+
+2
+
+Background and Related Work
+
+2.1
+
+Open Table Formats and Puffin
+
+Apache Iceberg [3] is an open table format that layers transactional semantics, schema evolution,
+partition evolution, and time travel over immutable Parquet files in object storage. A table is
+described by a chain of immutable snapshots, each referencing a manifest list, which in turn
+references manifest files describing the data files live at that snapshot. Snapshot commit is
+atomic at the REST catalog layer using optimistic concurrency control.
+The Puffin format [2] is a flat binary container introduced to hold table-level derived data
+that does not fit naturally into manifests. The file structure is straightforward: a four-byte
+magic number (PFA1), a concatenated sequence of opaque blob payloads, a UTF-8 JSON footer
+describing each blob (offset, length, type, field-ID set, compression codec, properties), a footer
+length, four flag bytes, and a trailing magic number. Each blob is independently compressible
+(zstd, lz4) and individually addressable via byte-range request, which matters for very large files
+where downloading the full content is impractical.
+The two standardized blob types in the Iceberg ecosystem today are apache-datasketches-theta-v1
+for distinct-value estimation and deletion-vector-v1 for row-level deletion bitmaps. The specification explicitly permits arbitrary additional types and properties, and several engines have
+begun using this extension point for engine-specific statistics. We are not aware of a published
+use of Puffin for ANN indexes prior to this work.
+A Puffin file is bound to a snapshot through the statistics-file summary property: a
+free-form key-value map serialized as part of the snapshot. Any engine reading the snapshot
+can locate the Puffin file, inspect the footer, and selectively read blobs of types it understands;
+unknown blob types are ignored without error. This property forms the basis of our integration.
+
+2.2
+
+Approximate Nearest Neighbor Search
+
+The literature on ANN is extensive; we summarize only the design points that matter for our
+integration. The three dominant families of indexes at billion-vector scale are inverted file with
+product quantization (IVF-PQ) [10], hierarchical small-world graphs (HNSW) [13], and Vamana
+graphs as used in DiskANN [16]. We focus on Vamana because it has two properties that fit a
+disaggregated engine particularly well.
+First, Vamana graphs are designed for SSD-resident operation. The graph adjacency is
+memory-mapped from local disk; only the visited nodes (typically a few hundred per query) are
+paged into RAM. Combined with product quantization for the in-memory distance approximation, a 250M-vector shard fits comfortably in ∼4 GB of RAM and ∼60 GB of SSD — well within
+the resource envelope of a modern analytical executor node. Second, Vamana supports a cheap
+incremental insert (greedy beam search to find candidate neighbors, robust-prune to enforce
+the degree bound, bidirectional edge insertion). This makes the index amenable to incremental
+refresh against new data files, which is essential for any lakehouse use case where the table is
+continuously appended.
+3
+
+A long line of work has explored placing ANN indexes alongside other data systems. Milvus [19] and Vespa [17] are purpose-built vector databases. PASE [21] and pgvector [11] embed
+ANN indexes inside PostgreSQL as extensions. SPANN [7] demonstrates a hybrid memory/SSD
+layout. The work closest to ours in architectural style is AnalyticDB-V [20], which extends
+a distributed analytical engine with vector indexes; however, AnalyticDB-V manages its own
+index storage rather than embedding the index in an open table format. We are not aware of
+prior work that uses the table format’s own derived-data slot to carry ANN indexes.
+
+2.3
+
+Compute-Disaggregated Query Engines
+
+The compute-disaggregated architecture, popularized by Snowflake [8], separates a small persistent metadata service from a fleet of stateless compute nodes that mount object storage as
+their primary store. The lakehouse generalization [6] replaces the closed metadata service with
+an open table format. FlockDB, the host engine for our implementation, follows this design: a
+coordinator process holds query plans and the catalog client; executors are stateless processes
+with local SSDs used only as a cache. All durable state lives in object storage and in the table
+format catalog.
+In such a system, any derived structure must be either (a) recomputable from the underlying
+data, or (b) committed into the table format itself. Local-disk-only state is incompatible with
+elastic scaling, because losing a node loses the work. Our design takes path (b): the ANN index
+is durably stored in Puffin files in object storage, and executor SSDs serve only as a cache for
+active shards.
+
+3
+
+Design
+
+3.1
+
+Architectural Overview
+
+The system has three roles. A coordinator receives SQL queries via a PostgreSQL-compatible
+wire protocol, parses them, resolves table metadata through the Iceberg REST catalog, plans a
+distributed query, and dispatches work to executors. Executors are uniform processes that hold
+local SSD caches keyed by (object_path, credential_fingerprint) and a smaller in-memory
+L1 cache. Executors stream results back as Arrow IPC. The Iceberg REST catalog is the single
+source of truth for table state. Figure 1 sketches the components.
+We add three components: an IndexBuildHandler on the coordinator that orchestrates
+index lifecycle (CREATE / REFRESH / DROP INDEX), an AnnBuilder on each executor that
+constructs and probes graph shards, and a PuffinWriter module that mirrors the existing read
+path to produce Puffin files in the required binary format. All other infrastructure — distributed
+fragment dispatch, cache-aware scheduling, snapshot commit via REST catalog, snapshot diffing
+for incremental refresh — is reused from the existing engine.
+
+3.2
+
+Design Principles
+
+The design follows five principles.
+Principle 1: One blob per executor shard. Rather than building a single global Vamana
+graph and partitioning it, each executor builds an independent local graph over its assigned
+subset of Parquet data files. The resulting graphs are stored as independent blobs in a single
+Puffin file. This trades a small recall loss (a global graph would find slightly better neighbors than
+N independent graphs, recovered partially by an exact rerank phase) for two large architectural
+wins: build time scales linearly with executor count, and probe parallelism falls out of the
+existing fan-out/merge machinery the engine already uses for top-K queries.
+Principle 2: Snapshot-bound index lifecycle. Every Puffin file is bound to exactly one
+snapshot via the statistics-file summary property. Index versions are snapshot versions.
+4
+
+Compute layer (stateless)
+
+Client (psql, JDBC)
+SQL
+
+Coordinator
+QueryFrontend · DistributedPlanner · IndexBuildHandler · PuffinWriter
+
+fragments
+
+catalog API
+
+Arrow IPC
+
+Executor 0
+
+Executor 1
+
+Executor 2
+
+Executor 3
+
+DuckDB kernel
+AnnBuilder
+SSD L2 cache
+
+DuckDB kernel
+AnnBuilder
+SSD L2 cache
+
+DuckDB kernel
+AnnBuilder
+SSD L2 cache
+
+DuckDB kernel
+AnnBuilder
+SSD L2 cache
+
+Parquet reads · Puffin shard writes
+
+Iceberg
+REST Catalog
+
+statistics-file
+
+S3 / object store
+Parquet · *.puffin
+
+Storage layer (durable, object store + catalog)
+
+Figure 1: System architecture. Compute (client, coordinator, executors) is stateless and elastic;
+storage (S3 plus REST catalog) is durable. A Puffin file lives in the same object store as Parquet
+data and is referenced by the snapshot summary’s statistics-file property.
+Time travel queries (AS OF) automatically read the matching index version. Concurrent index
+builds are arbitrated by the same optimistic-concurrency mechanism that arbitrates concurrent
+data writes.
+Principle 3: Tiered probe placement. Not every ANN index needs to be sharded across
+executors. A file-level centroid index for a 10,000-file table is around 30 MB at 768 dimensions,
+and the probe (10,000 distance computations) takes under a millisecond on a single thread. We
+probe such small indexes on the coordinator directly, replacing the full file list with a pruned
+subset before dispatch. Only indexes that exceed a configurable size threshold (default 100 MB)
+are sharded across executors.
+Principle 4: Reuse the write path. An ANN index build is, structurally, an INSERTSELECT that happens to produce a Puffin file instead of Parquet files. We dispatch index build
+fragments through the same PlanFragment/TaskRunner infrastructure that handles ordinary
+writes, with a new IndexBuildTaskInfo struct riding alongside the existing WriteTaskInfo.
+The Iceberg commit that finalizes the build is the same CommitToIceberg call, with one additional summary property.
+Principle 5: Incremental refresh via manifest diff. The expensive operation in any
+ANN system is the rebuild. Iceberg already provides the primitive we need: given two snapshot
+IDs, the manifest diff returns precisely the data files added, removed, and unchanged between
+them. We refresh only the affected shards, using Vamana’s native incremental insert for added
+vectors and a tombstone bitmap for removed ones.
+
+3.3
+
+Tiered Probe Placement
+
+Different ANN algorithms have very different size profiles. Table 1 estimates index sizes for a
+one-billion-vector table at 768 dimensions.
+5
+
+Table 1: Index size at 109 vectors, 768 dimensions. PQ parameters: m = 48, nbits = 8.
+Index type
+
+Size
+
+File-level centroids (104 files)
+IVF-PQ (nlist = 4096)
+HNSW (M = 16)
+DiskANN/Vamana (R = 64)
+
+∼30 MB
+∼16 GB
+∼60 GB
+∼250 GB
+
+Probe location
+Coordinator
+Borderline
+Executor (RAM)
+Executor (SSD)
+
+The coordinator probes any index smaller than coordinator_ann_probe_threshold_mb (default 100 MB), which in practice means only file-level centroid indexes. Larger indexes are
+sharded across executors and probed with a three-stage distributed plan (Section 6). This
+threshold is the cleanest way we found to balance two pressures: coordinator-side probing avoids
+an extra distributed stage and shaves off latency, but only the coordinator’s RAM bounds it;
+executor-side probing scales horizontally and uses SSD, but pays a stage barrier of a few milliseconds.
+
+4
+
+Puffin Format for ANN
+
+We define two new Puffin blob types: flockdb-ann-centroid-v1 for file-level centroid indexes
+and flockdb-ann-index-v1 for Vamana graph shards. A third type, flockdb-ann-routing-v1,
+carries the metadata that ties the shards together.
+
+4.1
+
+The Centroid Index Blob
+
+The centroid blob is a single self-contained binary structure: a 32-byte header (4-byte magic
+ANNI, version, dimensions, entry count, file count, metric code, entry size, file-paths section
+offset), followed by N fixed-size entries each containing a D-dimensional float32 centroid, a
+32-bit file index, and a 32-bit float max_distance (the largest distance from the centroid to
+any vector in the represented file). After the entries comes a length-prefixed UTF-8 file paths
+table. The max_distance field enables exact pruning for threshold queries: any file whose
+centroid_distance minus its max_distance exceeds the user’s threshold can be eliminated
+safely.
+For 10,000 files at 768 dimensions, the entry section is 104 ×(768×4+8) = 30.8 MB. With zstd
+compression on the entire blob, this typically drops to 8–15 MB depending on data distribution.
+The blob’s properties map carries dimensions, metric, entry count, and the snapshot ID the
+centroids were computed against; the fields array contains the single Iceberg field ID of the
+indexed vector column.
+
+4.2
+
+The Sharded Vamana Layout
+
+A sharded Vamana index occupies one Puffin file containing N +1 blobs: one flockdb-ann-routing-v1
+blob and N flockdb-ann-index-v1 blobs (one per executor shard). Figure 2 sketches the layout.
+The routing blob is small (a few megabytes) and is read by every probe; the shard blobs are
+large (tens of gigabytes each) and are downloaded only by the executor that owns the shard.
+Puffin’s footer-based random access is critical here: a coordinator can issue an HTTP range
+request for just the footer (typically a few kilobytes), parse it, and identify the byte offsets of
+each blob without downloading the full file. Executors then issue separate range requests for
+their assigned shard blobs.
+
+6
+
+ann-embedding_idx-snap-Sn .puffin
+PFA1 (4B magic)
+small
+(few MB)
+probe-time
+read
+
+Blob 0: flockdb-ann-routing-v1
+
+large
+executorowned
+range-read
+
+Blob 1: flockdb-ann-index-v1 (shard 0)
+
+Iceberg snapshot Sn
+
+fields=[7] algorithm=diskann
+centroids, shard map, covered files
+
+PQ codebook · adjacency · rerank vectors
+vector_id → (file, row_group, offset)
+
+offset 0
+
+offset 4
+
+offset 4+|B0|
+
+Blob 2: flockdb-ann-index-v1 (shard 1)
+
+summary["statistics-file"]
+
+∼60–250 GB per shard
+
+· · · shards 2 . . . N − 1 · · ·
+Footer: UTF-8 JSON
+{"blobs":[{type, fields, offset, length, compression, props}, . . .]}
+footer_size (4B LE) · flags (4B) · PFA1 magic (4B)
+
+file_size − 12 − |F|
+
+file_size − 12
+
+Figure 2: Puffin file layout for a sharded Vamana index. The Iceberg snapshot binds to the
+file via a single statistics-file summary property. Blob 0 (routing) is small and read on
+every probe to discover shard ownership; the shard blobs are large and downloaded only by
+their assigned executor via HTTP range request driven by the byte offsets in the footer JSON.
+
+4.3
+
+Shard Blob Internals
+
+Each shard blob contains, in order: a fixed header with magic DANN, version, dimensions, vector
+count, graph degree R, beam width L, medoid identifier, and PQ parameters; the PQ codebook
+(K × m centroids of D/m dimensions each); an adjacency offset table (N + 1 uint64 offsets); the
+adjacency lists themselves (zstd-compressed, with per-node degree and neighbor IDs as varints);
+the full float32 vectors used for exact rerank of the top candidates; and finally a vector-IDto-location map providing (file_path, row_group_id, row_offset) tuples for each indexed
+vector. The map is stored in delta-encoded sorted order to keep its size manageable.
+The full-vector section is the dominant cost (N × D × 4 bytes); for 250M vectors at 768
+dimensions, this is approximately 760 GB per shard. In practice we make this optional, with a
+configurable retention policy: if the host engine can re-fetch the vector from Parquet during the
+rerank phase, the shard blob omits this section entirely, dropping shard size from ∼760 GB to
+∼60 GB. The trade-off is an extra round trip per query for vector retrieval during rerank.
+
+5
+
+Distributed Build
+
+Index construction follows a three-stage distributed plan.
+Stage 0: Sampling and centroid training (coordinator). The coordinator samples
+approximately 1% of vectors by reading a random subset of Parquet files (vector column only).
+It runs k-means with k = (num_executors) × (partitions_per_executor) to produce a centroid
+codebook. This codebook becomes the IVF-style partitioning scheme that determines which
+vector goes to which executor’s shard. The codebook is broadcast to all executors as part of the
+next stage’s task info.
+Stage 1: Local shard build (parallel on executors). Each executor receives an
+IndexBuildTaskInfo containing the centroid codebook, its assigned data files, and the algorithm parameters (R, L, α, metric, pq_m, pq_nbits). The executor downloads the assigned Parquet files (with column projection limited to the vector column) into its local SSD cache, decodes
+them in streaming batches, assigns each vector to its nearest centroid to confirm shard ownership, and feeds the assigned vectors into a Vamana builder. Once built, the shard is serialized
+7
+
+into the blob format of Section 4 and written directly to an S3 object whose path was specified
+in the task info. The executor streams back an IndexBuildResult containing the shard’s S3
+path, vector count, byte size, and per-partition centroid distances used to populate the routing
+table.
+Stage 2: Assemble and commit (coordinator). The coordinator downloads only the
+executor-written shard blob bytes (via S3 range request if they were uploaded as separate objects, or concatenates them into a single Puffin if uploaded inline), constructs the routing blob
+with the centroid codebook plus the set of covered file paths, writes the assembled Puffin file
+to <table_location>/metadata/ann-<index_name>-snap-<snapshot_id>.puffin, and commits a new Iceberg snapshot via the REST catalog. The commit is structurally a REPLACE
+operation (no data files change) with a single new property: summary[“statistics-file"] =
+puffin_path.
+The new code introduced by this flow is small. The Vamana builder itself is the largest piece,
+on the order of 2,000 lines of C++ if implemented from scratch, or a thin wrapper if we depend
+on Microsoft’s open-source DiskANN library [14]. The PuffinWriter is approximately 200 lines,
+mirroring the existing PuffinReader. The remaining components — task dispatch, S3 I/O, cacheaware scheduling, REST commit — are reused unchanged from the engine’s INSERT-SELECT
+path. The total integration delta is well under 1,000 lines outside the algorithmic core.
+
+6
+
+Distributed Probe
+
+Query plans containing the pattern ORDER BY <distance>(<column>, <literal>) LIMIT K or
+WHERE <distance>(<column>, <literal>) < threshold are detected during planning. If an
+ANN index exists for the referenced column on the current snapshot, the plan is rewritten into
+a three-stage distributed probe, illustrated in Figure 3.
+
+Coordinator
+
+Stage A
+
+Stage B
+
+Stage C
+
+Shard probe
+(parallel)
+
+Exact rerank
+(parallel)
+
+Final merge
+(coordinator)
+
+Min-heap merge
+
+Input: query vector q, K
+
+r
+
+s/
+
+q, shard refs
+Executor i: load shard blob K
+
+Executors
+(one per shard)
+
+(SSD cache),
+PQ codebook into RAM,
+Vamana beam search
+
+o
+ut
+ec
+ex
+
+Loser-tree merge
+
+top K · c candidates
+
+s
+ce
+
+→ final top-K
+
+n
+
+a
+ist
+
+row groups
+
+e
+pl
+
+ac
+ex
+
+tu
+
+t
+
+d
+
+Executor i: download targeted
+row groups, decode vectors,
+exact distance compute
+
+BARRIER
+BARRIER
+Each candidate from Stage A is a (file_path, row_group, row_offset, approx_distance) tuple.
+Stage B reads only the row groups whose IDs appear in the merged candidate list.
+
+Figure 3: Three-stage distributed ANN probe. Stage A runs an approximate Vamana beam
+search in parallel on each shard owner. The coordinator merges candidate tuples and dispatches
+Stage B, which reads only the row groups containing candidate vectors and computes exact
+distances. Stage C performs a final ordered merge.
+Stage A: Shard probe (parallel on executors). Each executor loads its assigned shard
+blob from the SSD cache (or downloads it on cache miss), deserializes the Vamana graph into a
+memory-mapped structure, loads the PQ codebook into RAM (∼4 GB for a 250M-vector shard),
+and runs the standard Vamana greedy beam search with the query vector. Search proceeds with
+PQ-approximate distances for candidate scoring and full-precision distances for a small final
+rerank, traversing ∼500–1000 nodes per query. The executor emits the top-K candidates as
+(file_path, row_group, row_offset, approx_distance) tuples via Arrow IPC.
+Stage B: Exact rerank (parallel on executors). The coordinator merges the K × N
+8
+
+candidate tuples from the N shards using a min-heap, picks the top K × oversample candidates
+(oversample factor typically 2–4), maps each candidate to its source file and row-group, and
+dispatches per-file row-group masks to the appropriate executors. Each executor downloads
+only the targeted row groups, decodes the vector column for the masked rows, computes exact
+distances, and emits the resulting rows.
+Stage C: Final merge (coordinator). A streaming loser-tree merge on the distance
+column produces the final top-K result.
+The pattern of (a) coarse probe producing candidates, (b) exact rerank against full-precision
+vectors, (c) ordered merge is structurally identical to how the engine handles ORDER BY ...
+LIMIT queries against ordinary columns, with bloom filter or zone-map pruning as the coarse
+stage. The ANN index slots into the same machinery; the only new component is the executorside Vamana probe code.
+
+7
+
+Incremental Refresh
+
+A full rebuild for a billion-vector index is on the order of one hour with our parameters. We
+avoid it by leveraging Iceberg’s manifest diff.
+
+7.1
+
+Detecting What Changed
+
+The engine’s existing IcebergSnapshotDiffer compares two snapshot IDs and classifies every
+data file as EXISTING, ADDED, or DELETED based on manifest entry status flags. A REFRESH INDEX
+statement reads the routing blob of the current Puffin file to discover the base_snapshot_id
+the index was built against, computes the diff against the current snapshot, and obtains three
+sets: unchanged files (whose shard contributions are still valid), added files (whose vectors must
+be inserted), and removed files (whose vectors must be tombstoned).
+
+7.2
+
+Vamana Greedy Insert
+
+For each added vector v, the executor performs a Vamana greedy insert. The algorithm is the one
+described in [16]: greedy beam search from the medoid produces L candidate neighbors; robustprune selects R of them using the α-RNG criterion; forward and reverse edges are inserted;
+over-degree neighbors are robust-pruned back to degree R. The cost per insert is approximately
+1,000 PQ-approximate distance computations plus R full-precision distance computations, on
+the order of 200 microseconds per vector at 768 dimensions with AVX2.
+For a typical incremental batch of 106 new vectors distributed across 4 executors, each executor performs ∼250,000 inserts in roughly 50 seconds of compute. In practice this is dominated
+by the S3 read time for the new Parquet files, not the graph mutation itself.
+
+7.3
+
+Lazy Tombstoning for Deletions
+
+Full removal of a vector from a Vamana graph is expensive: every node that has v as a neighbor
+must be patched, and the resulting holes must be re-linked. We use lazy tombstoning instead.
+The shard maintains a tombstone bitmap; deleted vectors have their bit set, remain in the graph
+for connectivity purposes (so search traversals still function), but are filtered out of the candidate
+set before being returned to the coordinator. Tombstone density is recorded per shard in the
+routing blob:
+ann.shard_0.tombstone_ratio = "0.003"
+ann.shard_1.tombstone_ratio = "0.15"
+
+A shard whose tombstone ratio exceeds 20% is scheduled for a full rebuild (only that shard,
+not the entire index) at the next maintenance window.
+9
+
+7.4
+
+Metadata-Only Commit
+
+The refreshed Puffin file is written to a new S3 object. The Iceberg commit is metadata-only:
+no new data files are added, but the snapshot summary is updated to point to the new Puffin
+path. The Iceberg REST specification supports this directly via the set-properties update
+action. Engines that read the snapshot will see the same data manifest as before, plus a new
+statistics-file reference; older Puffin files become unreferenced and are reaped by the table
+format’s existing orphan-file cleanup.
+
+8
+
+Implementation
+
+We implemented this design in FlockDB, an MPP analytical engine built on DuckDB [15] as
+the per-node execution kernel, with a custom distributed coordinator, an Arrow-IPC fragment
+protocol, and a PostgreSQL wire layer for client compatibility. The engine connects to Iceberg
+via a REST catalog and treats data files as immutable objects in an S3-compatible store.
+The new code falls into four buckets:
+• PuffinWriter (iceberg/puffin_writer.cpp): the inverse of the existing PuffinReader;
+produces files in the same binary layout the reader already parses. Approximately 200
+lines.
+• SQL parsing and routing (extensions to query_frontend.cpp, wire_session.cpp,
+coordinator.cpp): adds CREATE INDEX, DROP INDEX, REFRESH INDEX DDL handling in
+the SqlLexer fallback path, with a typed IndexDDLInfo struct routed to a new IndexBuildHandler.
+Approximately 500 lines.
+• IndexBuildHandler and planning (coordinator/index_planner.cpp, coordinator/
+index_build_handler.cpp): orchestrates the lifecycle, dispatches fragments through the
+existing scheduler, collects results, assembles the Puffin file, and commits the snapshot.
+Approximately 1,500 lines.
+• Vamana builder and probe (executor/ann_builder.cpp, executor/diskann_engine.cpp):
+the algorithmic core. We currently use a from-scratch Vamana implementation rather
+than depending on the Microsoft DiskANN library, to keep the dependency surface small.
+Approximately 5,500 lines including PQ training, graph construction, beam search, and
+serialization.
+The total implementation is approximately 8,000 lines of new code. Notably, no changes
+were required to the Iceberg REST catalog client beyond populating one new property in the
+existing commit body — the statistics-file key under summary, which the REST endpoint
+already serializes verbatim as part of arbitrary summary properties.
+
+9
+
+Analysis
+
+This is a design and implementation paper rather than an empirical evaluation; the system
+is in pre-production state at the time of writing and full benchmarks remain ongoing. We
+present projected resource and performance numbers for a representative configuration and the
+analytical reasoning behind them.
+
+9.1
+
+Target Workload
+
+We consider a table with 109 rows, each carrying a 768-dimensional float32 embedding column
+(approximately 300 GB of vector data), stored as 104 Parquet files in an S3-compatible object
+10
+
+store. The engine is configured with 4 executors, each with 16 cores, 64 GB of RAM, and 350 GB
+of local NVMe SSD. Vamana parameters are R = 64, L = 100, α = 1.2, with PQ at m = 48
+subquantizers and 8 bits per code.
+
+9.2
+
+Projected Build Cost
+
+A 1% sample for centroid training is approximately 3 GB of vector reads, completing in tens
+of seconds. Each executor builds a shard over approximately 2.5 × 108 vectors, with a working
+set dominated by the PQ-compressed representation (2.5 × 108 × 48 = 12 GB in memory) plus
+the graph adjacency. Empirically, Vamana builds at this scale complete in 30–60 minutes on
+16-core hardware with NVMe SSD [16]; the dominant cost is the graph construction itself rather
+than I/O. Cross-executor coordination is limited to the broadcast of centroids in Stage 0 and
+the result IPC in Stage 1. Total build time is dominated by the slowest executor’s shard build,
+projected at 45–60 minutes for a billion-vector table on 4 executors.
+
+9.3
+
+Projected Query Cost
+
+Table 2 summarizes the projected per-query cost for different probe strategies on the target
+workload. Numbers are derived from the per-component costs in the cited literature and our
+own profiling of the engine’s existing fan-out and merge paths.
+Table 2: Projected query performance, 109 vectors, top-100 query, 4 executors.
+
+Files scanned
+Data read from S3
+Cold-cache latency
+Warm-cache latency
+Recall@100 (vs. exact)
+
+No index
+
+Centroid (coord.)
+
+DiskANN (dist.)
+
+10,000
+300 GB
+60–90 s
+15–25 s
+1.00
+
+∼400
+12 GB
+5–10 s
+2–4 s
+0.85–0.95
+
+∼50
+1.5 GB
+1–3 s
+50–200 ms
+0.95–0.99
+
+The recall trade-off for the distributed Vamana case is the main quality concern and stems
+directly from the independent-shard design choice (Principle 1, Section 3.2). A query whose true
+top-K neighbors are concentrated in a single shard incurs no loss; a query whose true top-K
+spans multiple shards loses recall to the extent that the per-shard local top-K misses globallyrelevant candidates. Oversampling (each shard returns top-K × c candidates) and the exact
+rerank stage recover most of the loss. The numbers in Table 2 assume an oversampling factor
+of 4.
+
+9.4
+
+Index Storage Cost
+
+The shard blobs occupy approximately 60 GB each (with full-vector rerank section omitted) or
+250 GB each (with it included). The routing blob is a few megabytes. For the configuration
+above, the total Puffin file is on the order of 240 GB (lean) or ∼1 TB (with rerank vectors).
+Relative to the 300 GB of underlying vector data, this is comparable to or somewhat larger than
+the data itself — the standard trade-off of graph-based ANN indexes.
+
+10
+
+Limitations
+
+We list the limitations of the design honestly.
+Update granularity is the snapshot. A vector cannot become searchable independent
+of an Iceberg commit. For streaming-insert workloads with strict freshness requirements, the
+snapshot commit cadence becomes the bound on index freshness. Iceberg supports streaming
+11
+
+ingest via small frequent commits, but very high commit rates (thousands per minute) eventually
+saturate the REST catalog.
+Recall depends on the data distribution across shards. The independent-shard design
+is statistically equivalent to IVF with one cluster per shard, when the partitioning is centroidbased. Workloads where the query distribution is poorly correlated with the data partitioning
+will see lower recall than workloads where it is well-correlated. We have not yet measured this
+systematically.
+Probe latency floor is set by the stage barriers. The three-stage distributed probe
+adds two stage barriers (probe → rerank, rerank → merge), each contributing approximately
+5–10 ms in our infrastructure. For applications targeting sub-10 ms P50 latency this is too much;
+a single-stage local index would be more appropriate.
+Object store throughput bounds cold-cache performance. On a cold cache, the
+probe and rerank phases must read shard blobs and Parquet row groups from S3 respectively.
+Cold-cache P99 is bounded by S3 latency and throughput, not by the engine.
+No formal recall guarantee. The design provides no analytical lower bound on recall.
+Existing literature on Vamana provides empirical recall numbers for the algorithm itself, but
+the independent-shard composition is not analyzed there.
+Concurrent build/refresh resolution relies on Iceberg optimistic concurrency.
+Two coordinators attempting to refresh the same index simultaneously will see a commit conflict
+at the REST layer; one will succeed, the other must retry against the new base snapshot. We
+do not currently coalesce or queue concurrent refreshes; an operator scheduling background
+refreshes alongside user-issued refreshes can produce wasted work.
+
+11
+
+Discussion and Future Work
+
+The pattern we describe is not specific to ANN. Anything that needs to be derived from table
+data, versioned in lockstep with snapshots, and read by some engines while ignored by others,
+is a candidate for Puffin storage. We see at least three further applications worth exploring:
+Learned indexes and cardinality models. Recurrent neural networks and learned distribution models trained per column [12] can be stored as Puffin blobs and consumed by query
+optimizers that know how to use them.
+Materialized derived columns. Computed aggregates, derived embeddings, or denormalized join columns can be stored as Puffin blobs and queried as virtual columns, with consistency
+to the underlying data guaranteed by snapshot binding.
+Cross-engine acceleration sharing. An ANN index built by one engine could in principle
+be consumed by another, provided they agree on the blob format. We propose a family of three
+Puffin blob types — ann-routing-v1, ann-vamana-graph-v1, and ann-centroid-index-v1 —
+as candidate community standards, with the layouts described in Section 4. A separate companion document defining the wire format at the level of detail required for a Puffin specification
+revision is available alongside this paper. Whether engines will converge on a standard is a
+community question; the Iceberg dev@ list is the appropriate forum.
+The broader observation is that the open table format provides a derived-data lifecycle for
+free. We expect more engines to begin using Puffin not merely for table statistics but as a generalpurpose append-only key-value store bound to snapshot semantics. The pattern transfers cleanly
+to Delta Lake’s deletion vectors and statistics files [5], which occupy similar architectural slots,
+and to Hudi’s metadata table [1].
+
+12
+
+Conclusion
+
+We have described a design and implementation for placing distributed ANN indexes inside
+Apache Iceberg Puffin files, with the index lifecycle bound to the table format’s snapshot life12
+
+cycle. The pattern preserves the compute-disaggregated invariants of a modern lakehouse engine: executors remain stateless, derived state is durably stored in object storage and snapshotversioned, and no new lifecycle is required for index creation, refresh, or deletion. The recall
+trade-off introduced by the independent-shard design is real but well-understood and bounded by
+oversampling. We believe the pattern is the most natural way to add vector search to lakehousestyle engines, and we have begun upstreaming the relevant blob-type definitions for community
+discussion.
+
+References
+[1] Apache Software Foundation. Apache Hudi: Streaming data lake platform. https://hudi.
+apache.org. Accessed 2026-04.
+[2] Apache Software Foundation. Apache Iceberg Puffin format specification.
+iceberg.apache.org/puffin-spec/. Accessed 2026-04.
+[3] Apache Software Foundation. Apache Iceberg table specification.
+apache.org/spec/. Accessed 2026-04.
+
+https://
+
+https://iceberg.
+
+[4] Apache Software Foundation. Apache Parquet: Columnar storage for the hadoop ecosystem.
+https://parquet.apache.org. Accessed 2026-04.
+[5] Michael Armbrust, Tathagata Das, Liwen Sun, Burak Yavuz, Shixiong Zhu, Mukul Murthy,
+Joseph Torres, Herman van Hovell, Adrian Ionescu, Alicja Łuszczak, Michal Switakowski,
+Michal Szafranski, Xiao Li, Takuya Ueshin, Mostafa Mokhtar, Peter Boncz, Ali Ghodsi,
+Sameer Paranjpye, Pieter Senster, Reynold Xin, and Matei Zaharia. Delta lake: Highperformance ACID table storage over cloud object stores. Proceedings of the VLDB Endowment, 13(12):3411–3424, 2020.
+[6] Michael Armbrust, Ali Ghodsi, Reynold Xin, and Matei Zaharia. Lakehouse: A new generation of open platforms that unify data warehousing and advanced analytics. In Proceedings
+of the Conference on Innovative Data Systems Research (CIDR), 2021.
+[7] Qi Chen, Bing Zhao, Haidong Wang, Mingqin Li, Chuanjie Liu, Zheng Li, Mao Yang, and
+Jingdong Wang. SPANN: Highly-efficient billion-scale approximate nearest neighborhood
+search. In Advances in Neural Information Processing Systems (NeurIPS), 2021.
+[8] Benoit Dageville, Thierry Cruanes, Marcin Zukowski, Vadim Antonov, Artin Avanes, Jon
+Bock, Jonathan Claybaugh, Daniel Engovatov, Martin Hentschel, Jiansheng Huang, Allison W. Lee, Ashish Motivala, Abdul Q. Munir, Steven Pelley, Peter Povinec, Greg Rahn,
+Spyridon Triantafyllis, and Philipp Unterbrunner. The snowflake elastic data warehouse.
+In Proceedings of the ACM SIGMOD International Conference on Management of Data,
+pages 215–226, 2016.
+[9] Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy, PierreEmmanuel Mazaré, Maria Lomeli, Lucas Hosseini, and Hervé Jégou. The Faiss library.
+arXiv preprint arXiv:2401.08281, 2024.
+[10] Hervé Jégou, Matthijs Douze, and Cordelia Schmid. Product quantization for nearest neighbor search. IEEE Transactions on Pattern Analysis and Machine Intelligence, 33(1):117–
+128, 2011.
+[11] Andrew Kane. pgvector: Open-source vector similarity search for Postgres. https://
+github.com/pgvector/pgvector. Accessed 2026-04.
+13
+
+[12] Tim Kraska, Alex Beutel, Ed H. Chi, Jeffrey Dean, and Neoklis Polyzotis. The case for
+learned index structures. In Proceedings of the ACM SIGMOD International Conference
+on Management of Data, 2018.
+[13] Yury A. Malkov and Dmitry A. Yashunin. Efficient and robust approximate nearest neighbor
+search using hierarchical navigable small world graphs. IEEE Transactions on Pattern
+Analysis and Machine Intelligence, 42(4):824–836, 2018.
+[14] Microsoft Research. DiskANN: Graph-structured indices for scalable, fast, fresh and filtered
+approximate nearest neighbor search. https://github.com/microsoft/DiskANN. Accessed
+2026-04.
+[15] Mark Raasveldt and Hannes Mühleisen. DuckDB: An embeddable analytical database. In
+Proceedings of the ACM SIGMOD International Conference on Management of Data, pages
+1981–1984, 2019.
+[16] Suhas Jayaram Subramanya, Fnu Devvrit, Harsha Vardhan Simhadri, Ravishankar Krishnaswamy, and Rohan Kadekodi. DiskANN: Fast accurate billion-point nearest neighbor
+search on a single node. In Advances in Neural Information Processing Systems (NeurIPS),
+2019.
+[17] Verizon Media. Vespa: The open big data serving engine. https://vespa.ai. Accessed
+2026-04.
+[18] Midhul Vuppalapati, Justin Miron, Rachit Agarwal, Dan Truong, Ashish Motivala, and
+Thierry Cruanes. Building an elastic query engine on disaggregated storage. In Proceedings
+of the 17th USENIX Symposium on Networked Systems Design and Implementation (NSDI),
+2020.
+[19] Jianguo Wang, Xiaomeng Yi, Rentong Guo, Hai Jin, Peng Xu, Shengjun Li, Xiangyu Wang,
+Xiangzhou Guo, Chengming Li, Xiaohai Xu, Kun Yu, Yuxing Yuan, Yinghao Zou, Jiquan
+Long, Yudong Cai, Zhenxiang Li, Zhifeng Zhang, Yihua Mo, Jun Gu, Ruiyi Jiang, Yi Wei,
+and Charles Xie. Milvus: A purpose-built vector data management system. In Proceedings
+of the ACM SIGMOD International Conference on Management of Data, 2021.
+[20] Chuangxian Wei, Bin Wu, Sheng Wang, Renjie Lou, Chaoqun Zhan, Feifei Li, and Yuanzhe
+Cai. AnalyticDB-V: A hybrid analytical engine towards query fusion for structured and
+unstructured data. Proceedings of the VLDB Endowment, 13(12):3152–3165, 2020.
+[21] Wen Yang, Tao Li, Gai Fang, and Hong Wei. PASE: PostgreSQL ultra-high-dimensional
+approximate nearest neighbor search extension. In Proceedings of the ACM SIGMOD International Conference on Management of Data, pages 2241–2253, 2020.
+
+14
+

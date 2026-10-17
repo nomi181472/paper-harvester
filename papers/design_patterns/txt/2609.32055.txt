@@ -1,0 +1,907 @@
+arXiv:2609.32055v1 [cs.DC] 25 Sep 2026
+
+Towards Simple Models of Complex SmartNICs
+Robert Chang
+
+Teng Jiang
+
+Wonsup Yoon
+
+University of California, Los
+Angeles
+
+University of California, Los
+Angeles
+
+The University of Texas at Austin
+
+Daehyeok Kim
+
+Sam Kumar
+
+George Varghese
+
+The University of Texas at Austin
+
+University of California, Los
+Angeles
+
+University of California, Los
+Angeles
+
+tenant isolation in firmware, without swapping hardware.
+But doing all this at line rate has made NICs remarkably
+heterogeneous, complex, and messy.
+Modern SmartNICs mix general-purpose CPUs, specialized accelerators, tiers of fast and slow memory, and interconnects. Where a task runs matters as much as what it does. For
+example, NVIDIA’s BlueField-3 (BF-3) [5] packs four kinds of
+processing between the network port and the server it plugs
+into: a match-action eSwitch that filters and forwards at 400
+Gbps, a 256-thread RISC-V Data-Path Accelerator (DPA) directly in the fast path, 16 general-purpose ARM cores backed
+by their own DDR5 memory, and an assortment of fixedfunction accelerators for encryption, compression, etc. Any
+nontrivial NIC program can be mapped onto this hardware
+in many ways, with no simple way to judge the best choice
+other than time-consuming implementation.
+
+Abstract
+Cloud vendors push ambitious in-network processing (e.g.,
+crypto, telemetry) onto the NIC to offload servers even as link
+rates climb to terabit speeds. Vendors have responded with
+heterogeneous SmartNICs. For example, NVIDIA BlueField-3
+interposes — between the wire and the host CPUs — a linerate eSwitch, a multithreaded Data-Path Accelerator, generalpurpose ARM cores, and a sea of fixed-function accelerators.
+These devices are notoriously hard to program, and harder
+still to predict. Applications can be implemented in many
+ways, with each choice potentially hitting a different bottleneck. A designer ideally needs to know — cheaply, and
+before a line of code is written — feasible choices and their
+bottlenecks, and design patterns to improve performance.
+Our paper offers a starting point to answer these questions using what we call the zram model. It pairs a platform
+graph of processing zones and their channels with a program
+graph of tasks and their traffic fractions. The application
+designer or a compiler chooses a placement that maps the
+program graph onto the platform graph. Three metrics computed directly from this mapping — capability, roofline, and
+capacity — score the placement, deciding its feasibility and
+naming the bottleneck resource. We use a DDoS detector as
+a primary case study, and briefly explore two other applications, decision-tree inference and RDMA traversal. We distill
+seven design patterns for programming SmartNICs including
+a key one we call sifting. zram generalizes to other SmartNICs such as Intel IPU E2200 and AMD Pensando Salina 400,
+and opens a new research agenda that includes compilers
+and hardware design.
+
+1
+
+Motivating example: Consider a hierarchical DDoS detector for distinguishing innocuous traffic spikes from genuine
+attacks: meter each destination’s rate, group the sources of
+over-rate destinations into buckets to gauge diversity, and
+count unique sources on the suspicious destinations. Where
+should each stage run? Metering is cheap and touches every
+packet, so placement on the eSwitch is natural. The uniquesource sketch is stateful, but whether its working set fits
+in the DPA’s on-chip cache governs the sustainable packetprocessing rate. Single-zone placements are dead ends. AlleSwitch is unworkable, since the restrictive match-action
+pipeline cannot express per-packet read-modify-write operations that bucketing and diversity counting require. All-ARM
+or all-host is legal but wasteful, forcing every packet off the
+fast path for work that is almost always a no-op. The interesting designs spread work across zones, escalating rare,
+expensive cases off the fast path, but which task lands where
+is far from obvious.
+
+Introduction
+
+. . . build models that capture the essential core of a problem
+rather than its literal messiness. — Paul Samuelson
+SmartNICs are now core cloud infrastructure. As link rates
+climb toward 800 Gbps, cloud vendors offload infrastructure
+work — virtual switching, encryption, firewalling, and DDoS
+protection — to these programmable cards, reclaiming host
+cores to rent to tenants and filtering threats before they reach
+host memory. Programmability lets providers such as AWS
+Nitro [2] and Microsoft Azure [13] roll out new protocols and
+
+Today’s landscape: Placement design runs largely on informed guesswork. A designer picks a promising placement,
+builds it, and measures the result. Whether a design works,
+and what will limit it, only reveal themselves after the implementation already exists. Previous work targets the implementation side of this problem. Compiler frameworks such
+1
+
+Robert Chang, Teng Jiang, Wonsup Yoon, Daehyeok Kim, Sam Kumar, and George Varghese
+
+as Alkali [20] automatically port and parallelize concrete
+programs across SmartNICs, freeing the designer from reimplementing for each target. But none answers the core
+questions before implementation: which placements are feasible, and which resources are bottlenecks?
+Our solution: The RAM model [15] abstracts a sequential
+computer, and PRAM [19] extends it to many processors
+sharing memory. Neither is faithful to any real machine, yet
+both let algorithm designers predict running time within
+constant factors before implementation. Reasoning about
+SmartNIC placement needs similar abstraction. We propose
+zram, a lightweight model of computation for SmartNICs. The
+SmartNIC is modeled once as a platform graph: processing
+zones connected by channels. Each zone is annotated with
+its operation menu, cache threshold, memory bandwidth
+and capacity, and width. A candidate design is modeled as a
+program graph of tasks and traffic fractions. Simple checks —
+capability, roofline, and capacity — decide feasibility and reveal the bottleneck resource. Like the RAM model, zram
+trades precision for cheap, portable prediction: to explore a
+new design, edit the program graph and recompute; to adapt
+to hardware changes, edit the platform graph and recompute.
+Beyond BlueField: The placement problem is not unique
+to NVIDIA. Intel’s IPU E2200 [14] combines 24 ARM Neoverse N2 cores with a P4 packet-processing pipeline, and
+AMD’s Pensando Salina 400 [1] pairs 16 ARM Neoverse N1
+cores with 232 P4 Match Processing Units. The architectures
+differ, but each is a heterogeneous SmartNIC whose many
+processing zones pose the same placement challenge. zram
+applies to all of them by defining a new platform graph for
+each hardware target. Here, we focus on BF-3 because it has
+been extensively benchmarked [7, 22].
+A research agenda: zram is a starting point, not a final answer. Treating placement as a modeling problem opens a line
+of inquiry that can seed several follow-on efforts: compilers
+that search the placement space automatically, models that
+capture cross-tenant contention when many programs share
+one NIC, cyclic formulations for closed-loop transports such
+as credit-based flow control, and running zram in reverse to
+guide SmartNIC hardware design.
+Contributions:
+• zram, a model of computation that pairs a platform graph
+with a program graph and scores a placement with three
+metrics — capability, roofline, and capacity — that decide
+feasibility and identify the bottleneck. A lightweight simulator computes them from the two graphs.
+• A primary study, a hierarchical DDoS detector, plus two
+shorter ones: decision-tree inference and RDMA traversal.
+• Seven design patterns for programming heterogeneous
+SmartNICs, including sifting: shrinking the traffic fraction
+zone by zone, from the wire toward the host.
+
+2
+
+The zram Model
+
+A SmartNIC is a platform graph 𝐺 𝐻 = (𝑍, 𝐶) of zones 𝑍
+connected by directed channels 𝐶. A program is a program
+graph 𝐺 𝑃 = (𝑉 , 𝐸), a directed acyclic graph (DAG) whose
+vertices 𝑉 are tasks and whose edges 𝐸 carry dataflow. A
+placement 𝜇 : 𝑉 → 𝑍 assigns each task to a zone.
+
+2.1
+
+Platform graph
+
+Every zone 𝑧 ∈ 𝑍 is described by five fields.
+Operation menu 𝑀𝑧 : the operations the zone supports,
+drawn from a shared vocabulary that includes match (exact,
+LPM, ternary, range), meter, counter, hash, encrypt, compress, regex, and general compute.
+Cache threshold 𝜅𝑧 : the working-set size below which
+the zone runs at its fast cached rate. In practice, a zone’s
+bandwidth falls in steps as its working set grows, because
+real caches are multi-level. 𝜅𝑧 marks the step whose crossing
+incurs an order-of-magnitude drop.
+Memory bandwidth: the aggregate memory bandwidth
+the zone can sustain (bits/s). A zone with a modeled 𝜅 carries
+two — an upper (cached) bound 𝐵𝑧↑ and a lower (uncached)
+bound 𝐵𝑧↓ ; every other zone carries a single bound 𝐵𝑧 .
+Memory capacity Cap𝑧 : the size of the zone’s memory.
+Width 𝑤𝑧 : the number of independent lanes (threads or
+cores) the zone can run in parallel. The per-lane rate is 𝐵𝑧 /𝑤𝑧 .
+A channel 𝑐 ∈ 𝐶 carries a single field: a channel bandwidth
+𝐵𝑐 (bits/s). Each channel is unidirectional — a two-way link
+counts as two separate channels.
+
+2.2
+
+Program graph
+
+Every task 𝑣 ∈ 𝑉 is described by four fields.
+Operation op(𝑣): the operation the task performs, drawn
+from the same vocabulary as the operation menus.
+Processing work 𝑠 𝑣 : the bits the task reads, modifies, and
+writes to process one packet. For payload-touching tasks 𝑠 𝑣
+is roughly the packet size; for stateful tasks it is the state read
+and updated per packet, which can far exceed the packet.
+Memory footprint 𝑚 𝑣 : the size of the data structures
+(e.g., lookup tables, bitmaps, counters) the task keeps.
+Traffic fraction 𝜌 𝑣 ∈ [0, 1]: the share of the line-rate
+stream that reaches the task. Fractions need not sum to one.
+An edge (𝑢, 𝑣) ∈ 𝐸 carries a single field: a transfer size
+𝑡𝑢,𝑣 , the bits moved from 𝑢 to 𝑣 per packet. Cross-zone edges
+consume channel bandwidth; same-zone edges do not.
+
+2.3
+
+Core metrics
+
+M1: Capability. Every task must be placed on a zone whose
+menu supports its operation.
+∀𝑣, op(𝑣) ∈ 𝑀𝜇 (𝑣)
+
+(1)
+
+General compute admits any operation, at the software rate.
+2
+
+Towards Simple Models of Complex SmartNICs
+
+M2: Roofline. A placement is feasible only if every zone
+and channel can sustain its offered load. Let 𝑅line be the line
+rate in packets per second, so the packet rate reaching task
+𝑣 is 𝜌 𝑣 𝑅line and its memory-traffic demand is 𝜌 𝑣 𝑅line𝑠 𝑣 bits/s.
+Because 𝑠 𝑣 counts every bit the task reads, modifies, and
+writes per packet, this demand can exceed the line bitrate
+whenever a task touches more state than the packet carries.
+Zones. A zone’s
+Í sustained rate depends on whether its
+working set 𝑆𝑧 = 𝑣:𝜇 (𝑣)=𝑧 𝑚 𝑣 stays cached:
+( ↑
+𝐵𝑧 if 𝑆𝑧 ≤ 𝜅𝑧 (cached),
+eff
+𝐵𝑧 = ↓
+(2)
+𝐵𝑧 if 𝑆𝑧 > 𝜅𝑧 (uncached).
+
+Figure 1: The BF-3 platform graph. Green zones (eSwitch,
+DPA, ARM cores, host CPU) and solid channels are the scope
+of this paper; yellow accelerators and dashed channels are
+shown to suggest additional zones zram could expand to.
+
+Taking 𝑆𝑧 to be the full footprint rather than the actively
+touched hot set is deliberately conservative. Since a task’s
+hot set is no larger than its footprint 𝑚 𝑣 , this can only push a
+zone past 𝜅𝑧 , never below, so zram never overstates a zone’s
+sustained rate. Width sets how much of 𝐵𝑧eff a task can reach.
+A data-parallel task spreads its packets across all 𝑤𝑧 lanes
+and draws on the zone’s aggregate rate, whereas a serial
+task — a dependent per-packet chain — is pinned to one lane
+and sees only 𝐵𝑧eff /𝑤𝑧 . A feasible placement must satisfy the
+aggregate bound over all co-located tasks and, for each serial
+task, its per-lane bound:
+∑︁
+𝜌 𝑣 𝑅line 𝑠 𝑣 ≤ 𝐵𝑧eff,
+(3)
+
+When a new hardware version ships and platform constants
+shift, only the platform graph needs to be modified.
+
+3
+
+We model the BF-3 with four primary zones (Fig. 1). The
+eSwitch performs hardware matching at 400 Gbps, but has a
+very restrictive operation menu. The DPA sits directly on the
+datapath, but its cores are weak: even with its working set
+cached, its aggregate memory bandwidth runs roughly 8×
+below the host’s. The ARM runs full Linux across 16 cores,
+but sits a hop off the fast path. The host is the strongest zone,
+but a full PCIe round trip away. No zone dominates.
+Tables 1 and 2 report the BF-3’s parameters. A few entries
+merit explanation. For the eSwitch↔ARM, eSwitch↔host,
+and ARM↔host channels, no public benchmarks exist. We
+bound each by the line rate. This is safe here: the underlying
+PCIe link exceeds it, and our case studies move only modest
+state per packet. We estimate the eSwitch’s 8 GB memory
+capacity from driver limits: up to 8M flow rules, each with
+roughly 16 steering-table entries of 64 B. We measure the
+ARM and host memory bandwidths with LMbench streaming
+reads on our Intel Xeon Gold 6430 testbed.
+Cache thresholds: The 𝜅 rule of §2 yields one threshold:
+1.5 MB for the DPA. We record none for the ARM or host: a
+large per-packet state workload could push either’s demand
+𝜌 𝑣 𝑅line𝑠 𝑣 past line rate and would earn a 𝜅 exactly like the
+DPA, but our case studies keep per-packet state small.
+Width: Width splits a zone’s two speeds — parallel work sees
+the aggregate bound, a single packet’s serial work sees one
+lane. The DPA’s aggregate divides across 256 hardware lanes
+(16×16), the ARM’s across 16. Thus per lane — and hence for
+serial code — the ARM is far faster, while on embarrassingly
+parallel work the DPA’s aggregate bandwidth is competitive.
+The DPA wins on proximity and parallelism, the ARM on
+per-core strength and memory.
+Placement intuition: Two features drive most placement
+decisions. First, the DPA is the only zone with two bounds
+an order of magnitude apart; every DPA placement lives
+
+𝑣:𝜇 (𝑣)=𝑧
+
+𝜌 𝑣 𝑅line 𝑠 𝑣 ≤ 𝐵𝑧eff /𝑤𝑧
+
+(serial 𝑣).
+
+(4)
+
+Channels. A cross-zone edge’s demand on its channel is its
+traffic times its transfer size; the total over all edges through
+the channel must fit its bound.
+∑︁
+∀𝑐,
+𝜌 𝑣 𝑅line 𝑡𝑢,𝑣 ≤ 𝐵𝑐 .
+(5)
+(𝑢,𝑣) on 𝑐
+
+M3: Capacity. The data structures placed on a zone must fit
+within its total memory capacity.
+∑︁
+∀𝑧,
+𝑚 𝑣 ≤ Cap𝑧 .
+(6)
+𝑣:𝜇 (𝑣)=𝑧
+
+2.4
+
+The BlueField-3 Platform Graph
+
+Prediction using a simulator
+
+A design study is a cheap loop. The designer writes the platform graph (a Python description) once and expresses each
+candidate design as a program graph (a JSON file). A Python
+simulator performs the mapping, evaluates the three metrics,
+and prints a feasibility verdict along with the bottleneck.
+The bottleneck then suggests how to revise the design —
+sift earlier to reduce 𝜌, move a task to a zone with more
+headroom, pull a working set below a 𝜅, or trade a handoff
+for co-location. A re-run takes seconds, so a designer can
+examine dozens of placements before building any implementation. Like other models of computation [15, 19], zram aims
+to be accurate to within constant factors rather than exact.
+3
+
+Robert Chang, Teng Jiang, Wonsup Yoon, Daehyeok Kim, Sam Kumar, and George Varghese
+
+Table 1: BlueField-3 zone parameters. Flags: [e] measured on our testbed.
+Zone
+
+Operation menu
+
+Cache threshold
+
+Memory bandwidth
+
+Memory capacity
+
+Width
+
+eSwitch
+DPA
+ARM
+Host
+
+match, meter, counter
+general compute
+general compute
+general compute
+
+—
+1.5 MB [7]
+—
+—
+
+400 Gbps [5]
+8 Gbps / 200 Gbps [7]
+610 Gbps [e]
+1,560 Gbps [e]
+
+8 GB [e]
+1 GB [7]
+32 GB [22]
+256 GB [5]
+
+1 [5]
+256 (16×16) [5]
+16 [22]
+16 [5]
+
+small residue that survives each check. The detector (Fig. 2)
+has three stages plus an asynchronous host alert.
+Stage 1: meter and steer. A hardware meter per protected
+destination—one exact-match rule each—marks a packet red
+iff the destination’s rate exceeds a threshold; a second pipe
+steers on the color: green forwards out, red enters Stage 2.
+Stage 2a: bucket filter. Each source is mapped into one
+of eight buckets by its lower three bits. Per destination, the
+stage keeps a deduplicated set of active buckets and their
+count; when the count crosses a threshold the destination is
+promoted, and a steering rule sends its subsequent packets
+straight to Stage 2b. This per-packet set-insertion must live
+in a general compute zone.
+Stage 2b: source bitmap. Per promoted destination, one
+packed 32-bit word: a 28-bit bitmap plus a sampling exponent 𝑠𝑟 . Each source hashes to a bit, so the bitmap counts
+distinct sources. When it half-fills, the count is folded into
+a floor, the bitmap clears, and 𝑠𝑟 increments—halving the
+sampling rate so the word never saturates; the estimate
+max(floor, popcount · 2𝑠𝑟 ) is monotone. Crossing a second
+threshold flags the destination.
+Stage 3: host alert. On a flag, (dst, estimate, timestamp) is
+shipped to the host and logged; in production the host installs
+eSwitch drop or rate-limit rules to divert attack traffic.
+
+Table 2: BlueField-3 channel parameters. Flags: [b] bounded
+by line rate; [e] measured on our testbed.
+Channel
+
+Bandwidth (→)
+
+Bandwidth (←)
+
+Network ↔ eSwitch
+eSwitch ↔ DPA
+eSwitch ↔ ARM
+eSwitch ↔ Host
+DPA ↔ ARM
+ARM ↔ Host
+
+400 Gbps [5]
+44 Gbps [e]
+400 Gbps [b]
+400 Gbps [b]
+200 Gbps [7]
+400 Gbps [b]
+
+400 Gbps [5]
+100 Gbps [7]
+400 Gbps [b]
+400 Gbps [b]
+200 Gbps [7]
+400 Gbps [b]
+
+or dies by whether its working set fits within the 1.5 MB 𝜅.
+Second, measurements upend the intuition that on-die means
+wide: the eSwitch→DPA ingress is the narrowest channel in
+Table 2. DPA-resident buffers offer only 44 Gbps while ARMmemory buffers [7] provide line rate. Thus decomposing
+a program across zones is governed by budgets and buffer
+placement, not proximity.
+Accelerators: The BF-3’s fixed-function accelerators (inline
+crypto; look-aside RegEx, compression, DMA) are zones. The
+model extends naturally — a vertex with a one-entry menu
+and channels from invoking zones. A program that invokes
+one is doing exactly that function — there is no contested
+placement decision. Therefore, we set accelerators aside.
+All-eSwitch designs: Table 1 shows that the eSwitch has
+8 GB of flow-table space, so why place work elsewhere?
+Unfortunately, the eSwitch’s menu is restrictive and cannot
+represent complex data structures and operations. Also, the
+eSwitch’s flow-tables are heavily shared: they serve L2/L3
+forwarding, tenant isolation, ACLs, and telemetry; filling
+them for one program impacts the rest. Placement is therefore dictated first by capability and second by stewardship.
+
+4
+
+We modeled this program graph under three placements
+of Stages 2a/2b (Table 3) and ran the simulator against the
+BF-3 platform graph on a real DNS-DDoS trace of 30,556,090
+packets and 5,074,414 flows.
+Verdict: feasible. M1 places the stages: metering and steering are native eSwitch actions, but the per-packet set-insertion
+of Stages 2a/2b is not in the eSwitch menu, so both move to
+the DPA (all-eSwitch fails M1 outright). M3 clears easily—151
+meters and two steering pipes fit the eSwitch’s ≈8 GB budget,
+and the bucket counters and distinct-source bitmaps exactly
+fit 1.5 MB of the 1 GB DPA region. The binding constraint is
+the DPA hot-set at 100% of 𝜅.
+Comparing placements. Each row of Table 3 is one placement, scored by zram; 𝜌 max is the largest escalation fraction
+it can absorb before its first constraint saturates, and the M2
+cell names the placement’s tightest roofline term. Stage 1 is
+pinned to the eSwitch by capability, so the free variable is
+where Stages 2a/2b land. In the chosen DPA/DPA row that
+
+Case Study: Hierarchical DDoS Detector
+
+DDoS detection is a vast area [23, 30]. Our simple algorithm
+adapts ideas in [12, 28]. We target volumetric attacks in
+which many distinct sources converge on one destination
+(e.g., DNS reflection). Volume alone is not a reliable signal—
+legitimate traffic can also be heavy—so the detector measures
+source diversity toward one destination, and it is organized
+around sifting: cheap hardware checks run on all traffic, and
+progressively more expensive software runs only on the
+4
+
+Towards Simple Models of Complex SmartNICs
+
+logic of the DDoS detector, applied to a channel rather than
+a cache. zram also makes a limit explicit: one might hope to
+shrink 𝜌 ahead of the DPA with a SYN-only eSwitch filter,
+but the eSwitch matches only on shallow header fields, not
+on the content an effective discriminant needs, so the sift
+cannot move earlier.
+
+5.2
+
+A single one-sided RDMA operation offers little placement
+freedom, since the host must issue it and reap its completion regardless. Freedom appears once a chain of dependent
+operations is offloaded. Consider walking a linked list in
+far memory [27] with one-sided RDMA, where each read
+returns the address of the next node. Driven from the host,
+each hop is a separate command the host can issue only after
+the previous read returns, so an 𝑛-node walk serializes 𝑛
+round trips. Offloaded, the host issues one command, the
+NIC follows the whole chain on its own, and a single completion returns the result — paying the host round trip once
+and amortizing it over the list. The same shape underlies
+SmartNIC systems that originate messages or RPCs, such as
+iPipe [21] and Xenic [26].
+zram guides where the chain should run. The traversal
+is serial — each hop waits on the previous pointer — so by
+P3 the per-lane rate governs, not aggregate throughput. An
+ARM or host core walks the chain far faster per hop than
+a slow DPA thread, favoring the ARM for a latency-bound
+chase; the DPA wins only when many independent chains
+run in parallel. Where the data lands is a separate decision:
+the list lives in far memory, so the driving zone need not
+hold it, and the NIC’s DMA steers each fetched node into
+whatever zone has capacity while a small zone issues the
+operations. On the DPA, the cache threshold sets the rate — if
+the nodes the traversal revisits fit under 𝜅 it runs cached,
+otherwise it drops to the uncached bound.
+
+Figure 2: The DDoS detector program graph. Grey nodes are
+tasks. Tasks are grouped into stages for exposition.
+
+tightest term is the working set against 𝜅 (1.5/1.5 MB): feasible at the cached bound, but with zero cache margin. Moving
+2b (or both stages) to the ARM relieves the cache—the tables
+sit comfortably in 32 GB of DDR—at the price of a cross-zone
+hop per escalated packet; the tightest remaining term is then
+Stage 1’s own work, identical in every row: roughly 56 B
+of header and meter state touched per packet, i.e., 267 Gbps
+against the eSwitch’s 400 Gbps line-rate bound.
+Attack headroom. The maximum escalation fraction the
+DPA can absorb follows directly from the zone roofline,
+Eq. (3). Each escalated packet touches 𝑝 ≈ 1,344 bits (168 B)
+of DPA state, derived from the trace, so
+𝜌 · 595 Mpps · 1,344 bits ≈ 𝜌 · 800 Gbps.
+
+(7)
+
+Resolving Eq. (2) against the cached versus uncached DPA
+bounds,
+200
+8
+uncached
+cached
+𝜌 max
+=
+= 0.25,
+𝜌 max
+=
+= 0.01. (8)
+800
+800
+
+5
+
+Additional Case Studies
+
+We briefly explore how zram can be applied to decision-tree
+inference and RDMA traversal.
+
+5.1
+
+Offloaded RDMA traversal
+
+Decision-tree inference
+
+Consider classifying traffic with a random forest: parse header
+features, evaluate each tree’s top levels, and descend into the
+deeper levels only for packets the top cannot resolve [32, 33].
+The design question is where the forest lives, and M2 answers
+it through the cache threshold. A forest’s shallow levels are
+small — a handful of nodes per tree, kilobytes in total — so
+they sit comfortably under the DPA’s 1.5 MB 𝜅. The full trees
+run to megabytes, and placed whole on the DPA they spill
+past 𝜅 and drop to the uncached rate, a 25× penalty.
+The state must therefore bifurcate: the heavily used shallow prefixes belong on the DPA within its cache bound, and
+the rarely used deep tails live in ARM memory. The channel
+now binds. Every packet the DPA cannot resolve crosses
+DPA→ARM and spends its transfer size against that budget,
+so the design lives or dies by the crossing fraction, which the
+required classification accuracy fixes. This is the sift-early
+
+6
+
+Design Patterns
+
+zram does more than score a finished placement; it also
+guides how to improve one. When the simulator exposes a
+bottleneck (§2.4), the fix is usually one of a few recurring
+moves; re-running the three metrics confirms whether the
+move helped. We distill seven such moves that recur across
+our case studies and in prior SmartNIC and switch designs.
+Each activates a specific lever in the model: P1, P6, and P7
+shrink or redirect the traffic fraction 𝜌; P4 and P5 hold a
+working set under the cache threshold 𝜅; P2 resolves a capability failure; P3 matches a task to a zone’s width.
+P1: Sift early. Do cheap, common-case checks close to the
+wire so only a small residue continues to later stages [28],
+shrinking the traffic fraction 𝜌 at every hop. In the DDoS
+detector, 99.99% of packets never leave the eSwitch.
+5
+
+Robert Chang, Teng Jiang, Wonsup Yoon, Daehyeok Kim, Sam Kumar, and George Varghese
+
+Table 3: Feasibility and attack headroom for three placements of the DDoS detector, computed by zram from the platform and
+program graphs. All three pass M1–M3; the binding constraint and maximum escalation fraction 𝜌 max differ by placement.
+Stage 1
+
+Stage 2a
+
+Stage 2b
+
+Stage 3
+
+M1 (capability)
+
+eSwitch
+
+DPA
+
+DPA
+
+Host
+
+✓
+
+M2 (roofline)
+
+𝝆 max (attack)
+
+✓
+
+0.25
+
+✓ : DPA 𝜅: 1.5/1.5 MB
+
+eSwitch
+
+DPA
+
+ARM
+
+Host
+
+✓
+
+✓ : eSwitch: 267/400 Gbps
+
+✓
+
+0.50
+
+eSwitch
+
+ARM
+
+ARM
+
+Host
+
+✓
+
+✓ : eSwitch: 267/400 Gbps
+
+✓
+
+0.50
+
+P2: Offload to a specialist. When one operation dominates,
+move it to the fixed-function zone built for it and keep everything else on a general core [21, 24]. Use this when a zone
+fails capability on a compute-intensive transform — crypto,
+regex, hashing — that an accelerator runs at wire speed.
+P3: Match width to work. Parallel packet streams are well
+matched to the DPA’s hundreds of slow lanes [7]; serial control loops require a few fast ARM or host cores. Inspect the
+aggregate bound for parallel work and the per-lane floor for
+serial work to determine which zone is a better fit.
+P4: Fit under threshold. Keep a zone’s working set below
+its cache threshold 𝜅 to reap the fast bound [6]; spill past it
+and throughput collapses (25× on the DPA).
+P5: Bifurcate state. Split state into a small highly used part
+that remains within the 𝜅 bound, and a less used portion in
+zones with large DRAM.
+P6: Steer by a shallow discriminant. Let the eSwitch classify on a few header bits [4]—a color, a method ID, a prefix—
+and route each class straight to the zone that handles it,
+thereby using hardware matching for software dispatch.
+P7: Escalate, then bypass. Change placement when conditions change. For example, on a DDoS alert, the host may
+install eSwitch drop rules to divert attack traffic [30].
+
+7
+
+M3 (capacity)
+
+8
+
+Limitations
+
+Latency: zram scores bandwidth, not latency, by deliberate
+choice. Latency depends on queueing, invocation overheads,
+and handoff scheduling, and far more on the workload (arrival process, batch sizes, cache state) than a steady-state
+bandwidth bound does [10]. Bandwidth, however, maps directly to the hardware a design needs, and hence its cost.
+Validation: The DDoS detector experiment is a usability result, showing the model is cheap and clear enough to apply
+in an afternoon. Confirming its predictions on real BF-3 hardware — that the named bottleneck saturates and throughput
+lands within constant factors — is the natural next step.
+Scope: zram currently assumes line-rate, steady-state designs on a single BF-3 running a single program, with feedforward dataflow and per-zone own-memory. Making memory regions first-class vertices would disaggregate memory
+from processing [8], and credit-based flow control or Receiver Not Ready (RNR) retry would need a cyclic formulation for their back-edges.
+Shared resources: A zram program is analyzed in isolation,
+but zones are shared. The DPA’s 𝜅 is one global cache, and
+channels and memory controllers serve every flow and tenant, so a placement feasible by itself can fail once instances
+co-locate [16]. Extending zram means summing each zone’s
+budget over co-resident programs, making feasibility a property of the entire workload.
+
+Related Work
+
+Hardware models: cram [6] is a model for single-pipeline
+RMT [4] router chips. cram is a special case of zram using
+one line-rate lookup zone with 𝜌 = 1. zram’s contribution is
+the graph structure cram lacks along with heterogeneous
+zones. LogP [9] and BSP [29] model homogeneous hardware.
+Offload systems: iPipe [21], Xenic [26], Floem [24], Azure
+AccelNet [13], LineFS [18], and FaRM [11] each pick a placement empirically, per application; zram predicts feasibility
+before implementation. Alkali [20] ports programs across
+NICs, operating below zram at the instruction level.
+Applications: IIsy [32] and Planter [33] map trees to matchaction tables. White-Boxing RDMA [31], BluesMPI [3], and
+Palladium [25] inform the RDMA traversal study. Sifting
+was used for worm detection [28] but was implemented in a
+single software zone, not on many SmartNIC zones.
+
+9
+
+Research Agenda
+
+zram turns weeks of firmware-specific measurement into
+a script that runs in seconds and names the bottleneck resource. Across DDoS detection, decision trees, and RDMA,
+one insight recurs — a little sifting goes a long way. Cutting 𝜌
+upstream, at the eSwitch, relaxes every downstream roofline
+at once. And because a new device is just a new platform file,
+the same approach extends to Intel IPU E2200 [14], AMD
+Pensando Salina 400 [1], and beyond.
+Beyond improving the model itself, zram suggests a broader
+research agenda.
+Validate on hardware: Our immediate next step is to implement the DDoS detector’s placements on a real BlueField-3
+and test whether the bottleneck zram names is the one that
+6
+
+Towards Simple Models of Complex SmartNICs
+
+saturates first, and whether measured throughput and 𝜌 max
+land within constant factors of the predictions.
+Refine with more applications: Other offloads (e.g., RPCs,
+TCP, transaction processing) will help evolve and refine
+zram.
+Automate design: A compiler could pair zram’s cost model
+with an abstract functional spec (e.g., a DSL) and emit an
+implementation plan on the platform graph using the design
+idioms and integer linear programming [17].
+Inform SmartNIC design: Revealing which resources bottleneck a design, and why, can prioritize hardware upgrades.
+If the DPA binds, zram indicates whether to strengthen its
+cores or its memory hierarchy (e.g., L2 cache).
+
+Practice of Parallel Programming, PPOPP ’93, page 1–12, New York,
+NY, USA, 1993. Association for Computing Machinery.
+[10] Jeffrey Dean and Luiz André Barroso. The tail at scale. Commun. ACM,
+56(2):74–80, February 2013.
+[11] Aleksandar Dragojević, Dushyanth Narayanan, Orion Hodson, and
+Miguel Castro. FaRM: fast remote memory. In Proceedings of the 11th
+USENIX Conference on Networked Systems Design and Implementation,
+NSDI’14, page 401–414, USA, 2014. USENIX Association.
+[12] Cristian Estan, George Varghese, and Mike Fisk. Bitmap algorithms
+for counting active flows on high speed links. In Proceedings of the
+3rd ACM SIGCOMM Conference on Internet Measurement, IMC ’03,
+page 153–166, New York, NY, USA, 2003. Association for Computing
+Machinery.
+[13] Daniel Firestone, Andrew Putnam, Sambhrama Mundkur, Derek Chiou,
+Alireza Dabagh, Mike Andrewartha, Hari Angepat, Vivek Bhanu,
+Adrian Caulfield, Eric Chung, Harish Kumar Chandrappa, Somesh
+Chaturmohta, Matt Humphrey, Jack Lavier, Norman Lam, Fengfen
+Liu, Kalin Ovtcharov, Jitu Padhye, Gautham Popuri, Shachar Raindel,
+Tejas Sapre, Mark Shaw, Gabriel Silva, Madhan Sivakumar, Nisheeth
+Srivastava, Anshuman Verma, Qasim Zuhair, Deepak Bansal, Doug
+Burger, Kushagra Vaid, David A. Maltz, and Albert Greenberg. Azure
+accelerated networking: SmartNICs in the public cloud. In Proceedings of the 15th USENIX Conference on Networked Systems Design and
+Implementation, NSDI’18, page 51–64, USA, 2018. USENIX Association.
+[14] Pat Fleming, Chihjen Chang, Derek Collier, Anjali Singhai, Stephen
+Doyle, Eliel Louzoun, David Lee, Vetrivel Ayyavu, Sarig Livne, Robert
+Hathaway, Tony Hurson, Jackson Ellis, Tamar Bar-Kanarik, Jonathan
+Kenny, Cristine Dumitrescu, and Yaron Wolberger. Intel IPU E2200:
+Second Generation Infrastructure Processing Unit (IPU). In 2025 IEEE
+Hot Chips 37 Symposium (HCS), pages 1–16, 2025.
+[15] Matteo Frigo and Victor Luchangco. Computation-centric memory
+models. In Proceedings of the Tenth Annual ACM Symposium on Parallel
+Algorithms and Architectures, SPAA ’98, page 240–249, New York, NY,
+USA, 1998. Association for Computing Machinery.
+[16] Stewart Grant, Anil Yelam, Maxwell Bland, and Alex C. Snoeren. SmartNIC Performance Isolation with FairNIC: Programmable Networking
+for the Cloud. In Proceedings of the Annual Conference of the ACM
+Special Interest Group on Data Communication on the Applications,
+Technologies, Architectures, and Protocols for Computer Communication,
+SIGCOMM ’20, page 681–693, New York, NY, USA, 2020. Association
+for Computing Machinery.
+[17] Lavanya Jose, Lisa Yan, George Varghese, and Nick McKeown. Compiling packet programs to reconfigurable switches. In Proceedings of
+the 12th USENIX Conference on Networked Systems Design and Implementation, NSDI’15, page 103–115, USA, 2015. USENIX Association.
+[18] Jongyul Kim, Insu Jang, Waleed Reda, Jaeseong Im, Marco Canini, Dejan Kostić, Youngjin Kwon, Simon Peter, and Emmett Witchel. LineFS:
+Efficient SmartNIC Offload of a Distributed File System with Pipeline
+Parallelism. In Proceedings of the ACM SIGOPS 28th Symposium on
+Operating Systems Principles, SOSP ’21, page 756–771, New York, NY,
+USA, 2021. Association for Computing Machinery.
+[19] Clyde P. Kruskal, Larry Rudolph, and Marc Snir. A complexity theory
+of efficient parallel algorithms. Theor. Comput. Sci., 71(1):95–132,
+March 1990.
+[20] Jiaxin Lin, Zhiyuan Guo, Mihir Shah, Tao Ji, Yiying Zhang, Daehyeok
+Kim, and Aditya Akella. Enabling portable and high-performance
+SmartNIC programs with Alkali. In Proceedings of the 22nd USENIX
+Symposium on Networked Systems Design and Implementation, NSDI
+’25, USA, 2025. USENIX Association.
+[21] Ming Liu, Tianyi Cui, Henry Schuh, Arvind Krishnamurthy, Simon
+Peter, and Karan Gupta. Offloading distributed applications onto
+smartNICs using iPipe. In Proceedings of the ACM Special Interest
+
+References
+[1] Advanced Micro Devices, Inc. AMD Pensando Salina DPU: Product
+Brief.
+https://www.amd.com/content/dam/amd/en/documents/
+pensando-technical-docs/product-briefs/pensando-salina-productbrief .pdf, 2025. Accessed: 2026-07-12.
+[2] Amazon Web Services, Inc.
+AWS Nitro System.
+https://
+aws.amazon.com/ec2/nitro/, 2025. Accessed: 2026-07-16.
+[3] Mohammadreza Bayatpour, Nick Sarkauskas, Hari Subramoni, Jahanzeb Maqbool Hashmi, and Dhabaleswar K. Panda. BluesMPI:
+Efficient MPI Non-blocking Alltoall Offloading Designs on Modern
+BlueField Smart NICs. In High Performance Computing: 36th International Conference, ISC High Performance 2021, Virtual Event, June
+24 – July 2, 2021, Proceedings, page 18–37, Berlin, Heidelberg, 2021.
+Springer-Verlag.
+[4] Pat Bosshart, Glen Gibb, Hun-Seok Kim, George Varghese, Nick McKeown, Martin Izzard, Fernando Mujica, and Mark Horowitz. Forwarding
+metamorphosis: fast programmable match-action processing in hardware for SDN. In Proceedings of the ACM SIGCOMM 2013 Conference
+on SIGCOMM, SIGCOMM ’13, page 99–110, New York, NY, USA, 2013.
+Association for Computing Machinery.
+[5] Idan Burstein. NVIDIA Data Center Processing Unit (DPU) Architecture. In 2021 IEEE Hot Chips 33 Symposium (HCS), pages 1–20,
+2021.
+[6] Robert Chang, Pradeep Dogga, Andy Fingerhut, Victor Rios, and
+George Varghese. Scaling IP lookup to large databases using the CRAM
+lens. In Proceedings of the 22nd USENIX Symposium on Networked
+Systems Design and Implementation, NSDI ’25, USA, 2025. USENIX
+Association.
+[7] Xuzheng Chen, Jie Zhang, Ting Fu, Yifan Shen, Shu Ma, Kun Qian,
+Lingjun Zhu, Chao Shi, Yin Zhang, Ming Liu, and Zeke Wang. Demystifying Datapath Accelerator Enhanced Off-path SmartNIC. In
+2024 IEEE 32nd International Conference on Network Protocols (ICNP),
+pages 1–12, 2024.
+[8] Sharad Chole, Andy Fingerhut, Sha Ma, Anirudh Sivaraman, Shay Vargaftik, Alon Berger, Gal Mendelson, Mohammad Alizadeh, Shang-Tse
+Chuang, Isaac Keslassy, Ariel Orda, and Tom Edsall. dRMT: Disaggregated Programmable Switching. In Proceedings of the Conference of
+the ACM Special Interest Group on Data Communication, SIGCOMM
+’17, page 1–14, New York, NY, USA, 2017. Association for Computing
+Machinery.
+[9] David Culler, Richard Karp, David Patterson, Abhijit Sahay, Klaus Erik
+Schauser, Eunice Santos, Ramesh Subramonian, and Thorsten von
+Eicken. LogP: towards a realistic model of parallel computation. In
+Proceedings of the Fourth ACM SIGPLAN Symposium on Principles and
+7
+
+Robert Chang, Teng Jiang, Wonsup Yoon, Daehyeok Kim, Sam Kumar, and George Varghese
+
+Group on Data Communication, SIGCOMM ’19, page 318–333, New
+York, NY, USA, 2019. Association for Computing Machinery.
+[22] Benjamin Michalowicz, Kaushik Kandadi Suresh, Hari Subramoni,
+Dhabaleswar K. DK Panda, and Steve Poole. Battle of the BlueFields:
+An In-Depth Comparison of the BlueField-2 and BlueField-3 SmartNICs. In 2023 IEEE Symposium on High-Performance Interconnects
+(HOTI), pages 41–48, 2023.
+[23] Jelena Mirkovic and Peter Reiher. A taxonomy of DDoS attack
+and DDoS defense mechanisms. SIGCOMM Comput. Commun. Rev.,
+34(2):39–53, April 2004.
+[24] Phitchaya Mangpo Phothilimthana, Ming Liu, Antoine Kaufmann, Simon Peter, Rastislav Bodik, and Thomas Anderson. Floem: a programming system for NIC-accelerated network applications. In Proceedings
+of the 13th USENIX Conference on Operating Systems Design and Implementation, OSDI’18, page 663–679, USA, 2018. USENIX Association.
+[25] Shixiong Qi, Songyu Zhang, K. K. Ramakrishnan, Diman Zad
+Tootaghaj, Hardik Soni, and Puneet Sharma. Palladium: A DPUenabled Multi-Tenant Serverless Cloud over Zero-copy Multi-node
+RDMA Fabrics. In Proceedings of the ACM SIGCOMM 2025 Conference,
+SIGCOMM ’25, page 1257–1259, New York, NY, USA, 2025. Association
+for Computing Machinery.
+[26] Henry N. Schuh, Weihao Liang, Ming Liu, Jacob Nelson, and Arvind
+Krishnamurthy. Xenic: SmartNIC-Accelerated Distributed Transactions. In Proceedings of the ACM SIGOPS 28th Symposium on Operating
+Systems Principles, SOSP ’21, page 740–755, New York, NY, USA, 2021.
+Association for Computing Machinery.
+[27] Yizhou Shan, Yutong Huang, Yilun Chen, and Yiying Zhang. LegoOS:
+a disseminated, distributed OS for hardware resource disaggregation.
+
+In Proceedings of the 13th USENIX Conference on Operating Systems
+Design and Implementation, OSDI’18, page 69–87, USA, 2018. USENIX
+Association.
+[28] Sumeet Singh, Cristian Estan, George Varghese, and Stefan Savage.
+Automated worm fingerprinting. In Proceedings of the 6th Conference
+on Symposium on Operating Systems Design & Implementation - Volume
+6, OSDI’04, page 4, USA, 2004. USENIX Association.
+[29] Leslie G. Valiant. A bridging model for parallel computation. Commun.
+ACM, 33(8):103–111, August 1990.
+[30] Saman Taghavi Zargar, James Joshi, and David Tipper. A Survey of Defense Mechanisms Against Distributed Denial of Service (DDoS) Flooding Attacks. IEEE Communications Surveys & Tutorials, 15(4):2046–
+2069, 2013.
+[31] Chenxingyu Zhao, Jaehong Min, Ming Liu, and Arvind Krishnamurthy.
+White-boxing RDMA with packet-granular software control. In Proceedings of the 22nd USENIX Symposium on Networked Systems Design
+and Implementation, NSDI ’25, USA, 2025. USENIX Association.
+[32] Changgang Zheng, Zhaoqi Xiong, Thanh T. Bui, Siim Kaupmees,
+Riyad Bensoussane, Antoine Bernabeu, Shay Vargaftik, Yaniv BenItzhak, and Noa Zilberman. IIsy: Hybrid In-Network Classification
+Using Programmable Switches. IEEE/ACM Transactions on Networking,
+32(3):2555–2570, 2024.
+[33] Changgang Zheng, Mingyuan Zang, Xinpeng Hong, Liam Perreault,
+Riyad Bensoussane, Shay Vargaftik, Yaniv Ben-Itzhak, and Noa Zilberman. Planter: Rapid Prototyping of In-Network Machine Learning
+Inference. SIGCOMM Comput. Commun. Rev., 54(1):2–21, August 2024.
+
+8
+

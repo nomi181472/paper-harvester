@@ -1,0 +1,1096 @@
+Machine Learning as a Tool (MLAT)
+
+Machine Learning as a Tool (MLAT):
+A Framework for Integrating Statistical ML Models
+as Callable Tools within LLM Agent Workflows
+Edwin Chen∗1 and Zulekha Bibi1
+1
+
+Legacy AI LLC
+February 2026
+
+arXiv:2602.14295v1 [cs.LG] 15 Feb 2026
+
+Submitted to the Gemini 3 Hackathon
+https://devpost.com/software/pitchcraft
+
+Abstract
+We introduce Machine Learning as a Tool (MLAT), a design pattern in which pretrained statistical ML models are exposed as callable tools within LLM agent workflows,
+enabling the orchestrating agent to invoke real-time predictions and reason about their
+outputs contextually. Unlike conventional pipelines that treat ML inference as a static
+preprocessing step, MLAT positions the ML model as a first-class tool alongside web search,
+database queries, and API calls, allowing the LLM to decide when and how to invoke the
+model based on conversational context. Despite the naturalness of this pattern, it appears
+to be underexplored in both the academic literature on agentic AI and in production system
+architectures.
+To validate MLAT, we present PitchCraft, a pilot production system that transforms
+discovery call recordings into professional proposals with ML-predicted pricing. PitchCraft
+implements MLAT through a single LLM workflow containing two Gemini-powered agents:
+a Research Agent that performs prospect intelligence gathering via parallel tool calls, and
+a Draft Agent that invokes an XGBoost pricing model as a tool call, reasons about the
+prediction, and generates a complete proposal via structured output parsing. The XGBoost
+model, trained on 70 examples (40 real agency deals augmented with 30 human-verified
+synthetic records), achieves R2 = 0.807 on held-out test data with MAE of $3,688. The
+complete system reduces proposal generation from 3+ hours to under 10 minutes.
+We detail the MLAT framework formally, the structured output parsing architecture using Gemini’s JSON schema capabilities, the ML methodology under extreme data scarcity
+(7:1 sample-to-feature ratio), group-aware cross-validation to prevent data leakage, and a
+sensitivity analysis demonstrating that the model has learned economically meaningful feature relationships. We argue that MLAT’s applicability extends to any domain requiring
+quantitative estimation combined with contextual reasoning.
+Keywords: machine learning as a tool, LLM agents, tool-calling, structured output parsing,
+XGBoost, agentic AI, small-data ML, pricing prediction
+
+1
+
+Introduction
+
+1.1
+
+Motivation: The Missing Tool in Agentic AI
+
+Modern LLM agent frameworks support tool-calling—the orchestrating LLM can invoke external
+functions such as web search, database queries, code execution, or API calls during its reasoning
+∗
+
+Corresponding author: edwin@legacyai.agency
+
+1
+
+Machine Learning as a Tool (MLAT)
+
+process. Frameworks such as LangChain [LangChain, 2023], AutoGen [Wu et al., 2023], CrewAI,
+and n8n [n8n GmbH, 2025] have formalized multi-agent orchestration patterns where specialized
+agents coordinate through shared tool registries.
+However, the tools available to these agents are overwhelmingly API-based services. The
+use of pre-trained statistical ML models—XGBoost, random forests, logistic regression, neural
+networks trained on domain-specific tabular data—as agent-callable tools appears to be uncommon in both published literature and production system descriptions. This is surprising: for
+many business-critical tasks (pricing, risk assessment, demand forecasting, resource estimation),
+statistical ML models trained on historical data outperform LLMs at quantitative prediction,
+while LLMs excel at the contextual reasoning and natural language generation that surrounds
+those predictions.
+We formalize this gap as the Machine Learning as a Tool (MLAT) pattern and argue
+it represents a natural but underexplored extension of tool-calling in agentic AI.
+
+1.2
+
+The Proposal Bottleneck
+
+Quote-based service businesses—AI agencies, construction firms, consulting practices, home
+service providers—share a universal challenge: the speed at which they generate accurate, personalized proposals directly determines close rate. Research on lead response time consistently
+shows that faster follow-up correlates strongly with higher conversion [James, 2007], yet most
+agencies spend 3–5 hours per proposal through a manual pipeline of transcript review, prospect
+research, scope estimation, and pricing calculation.
+
+1.3
+
+The MLAT Hypothesis
+
+We hypothesize that exposing a trained ML model as a tool call—rather than embedding it as
+a static pipeline stage—provides three distinct advantages:
+1. Contextual invocation: The LLM agent decides when to invoke the ML model based on
+conversational context, rather than invoking it unconditionally.
+2. Interpretive reasoning: The agent reasons about the prediction, explains rationale, and
+adjusts recommendations based on qualitative factors the ML model cannot capture.
+3. Compositional flexibility: The ML model becomes interchangeable and upgradeable
+without altering the agent’s workflow logic, following the same pattern as other tool integrations.
+
+1.4
+
+Contributions
+
+This paper makes the following contributions:
+• We formalize Machine Learning as a Tool (MLAT) as a design pattern, including a
+formal definition and comparison with conventional ML integration patterns.
+• We detail an agent architecture implementing MLAT with Gemini’s structured output
+parsing, showing how JSON schemas bridge LLM reasoning and ML feature vectors.
+• We present a methodology for training XGBoost regression under extreme data
+scarcity (N = 70) with group-aware cross-validation and human-verified synthetic data
+augmentation.
+• We validate MLAT through PitchCraft, a pilot production system deployed at Legacy
+AI LLC, reporting real-world impact and a sensitivity analysis confirming economically
+meaningful learned relationships.
+2
+
+Machine Learning as a Tool (MLAT)
+
+2
+
+Related Work
+
+2.1
+
+LLM Tool-Calling and Agentic Frameworks
+
+The tool-calling paradigm, popularized by OpenAI’s function calling [OpenAI, 2023] and adopted
+by Google’s Gemini [Gemini Team et al., 2024], Anthropic’s Claude, and open-source frameworks, enables LLMs to invoke external functions during generation. Schick et al. [Schick et al.,
+2023] demonstrated that language models can learn to use tools autonomously, while Yao et
+al. [Yao et al., 2023] formalized the ReAct pattern of interleaving reasoning and action.
+Despite this progress, the tools available to LLM agents remain overwhelmingly API-based:
+web search, database queries, code execution, and SaaS integrations. While we cannot claim
+exhaustive coverage of all production systems, our review of major framework documentation
+(LangChain, AutoGen, CrewAI, n8n) and recent surveys of agentic AI did not surface published
+examples of pre-trained statistical ML models registered as agent-callable tools.
+
+2.2
+
+ML-Powered Pricing and Estimation
+
+Pricing prediction using machine learning is well-established in domains such as real estate,
+insurance underwriting, and e-commerce dynamic pricing [Ye and Zhang, 2018]. These systems
+typically operate as standalone services or batch pipelines, separate from any conversational AI
+layer. The integration of such models within an agentic conversational workflow—where the
+LLM can reason about and contextualize the prediction—is a key contribution of MLAT.
+
+2.3
+
+Structured Output Parsing in LLM Systems
+
+Recent advances in LLM structured output capabilities—including Gemini’s JSON schemaconstrained generation and OpenAI’s structured outputs—have enabled reliable data extraction
+and inter-agent communication. However, the use of structured outputs to bridge LLM reasoning
+and ML model inputs (extracting features in a schema that maps directly to an ML model’s
+feature vector) has not, to our knowledge, been formalized as a design pattern.
+
+2.4
+
+Small-Data ML and Synthetic Data Augmentation
+
+Training ML models with extremely limited data (N < 100) is an active research area [Borisov
+et al., 2022]. Recent work has explored using LLMs to generate synthetic tabular data that
+preserves statistical properties of real datasets [Borisov et al., 2023]. MLAT’s validation through
+PitchCraft contributes a case study of combining LLM-generated, human-verified synthetic data
+with real data for small-scale production ML deployment.
+
+2.5
+
+Gap in the Literature
+
+To our knowledge, no prior work has explicitly formalized the pattern of exposing pre-trained
+ML models as callable tools within LLM agent workflows. While individual practitioners may
+have implemented similar patterns, the lack of published formalization means there is no shared
+vocabulary, no documented best practices, and no empirical validation. MLAT aims to fill this
+gap.
+
+3
+
+The MLAT Framework
+
+3.1
+
+Definition
+Machine Learning as a Tool (MLAT) is a design pattern in which a pre-trained
+statistical ML model is exposed as a callable function within an LLM agent’s tool
+3
+
+Machine Learning as a Tool (MLAT)
+
+registry, enabling the agent to invoke the model during its reasoning process, receive
+the prediction as a tool response, and incorporate it into its output through contextual
+reasoning.
+Formally, let A be an LLM agent with tool registry T = {t1 , t2 , . . . , tn }. MLAT adds a tool
+tml defined by the following two-step process. Given structured agent context z (e.g., research
+findings, transcript data), the agent first extracts a feature vector:
+x = ϕ(z),
+
+(1)
+
+x ∈ Rd
+
+where ϕ(·) is a schema-constrained extraction function (implemented via structured output
+parsing). The agent then invokes the ML tool:
+(2)
+
+ŷ = tml (x) = fθ (x)
+
+where fθ is the trained model with parameters θ. The prediction ŷ is returned to the agent as
+a tool response for further contextual reasoning.
+The agent’s decision to invoke tml is governed by its own reasoning process, identical to
+how it decides to invoke web search or database queries. This distinguishes MLAT from static
+pipelines where ML inference occurs unconditionally.
+
+3.2
+
+MLAT vs. Conventional Integration Patterns
+
+Table 1 summarizes the key differences.
+Table 1: Comparison of ML integration patterns in AI systems.
+Pattern
+
+ML Invocation
+
+LLM Involvement
+
+Contextual Reasoning
+
+Static Pipeline
+
+Always, as preprocessing
+Parallel with LLM
+
+Post-hoc
+formatting
+only
+Combined via voting/weighting
+Generation over retrieved results
+Full reasoning loop
+
+None
+
+Ensemble/Hybrid
+RAG + ML
+MLAT (This Work)
+
+Retrieval-augmented,
+ML in retrieval
+Agent-initiated tool
+call
+
+Limited
+Indirect
+Full contextual interpretation
+
+The fundamental distinction is agency: in MLAT, the LLM decides whether, when, and how
+to invoke the ML model, and can reason about the prediction before incorporating it into the
+final output.
+
+3.3
+
+The MLAT Execution Pattern
+
+Algorithm 1 formalizes the MLAT tool-calling sequence.
+
+4
+
+Machine Learning as a Tool (MLAT)
+
+Algorithm 1 MLAT Tool-Calling Sequence
+1: Offline Phase:
+2:
+Train model fθ on historical data D
+3:
+Serialize fθ ; deploy behind REST endpoint E
+4:
+Register E as tool tml in agent A’s registry T
+5:
+Define extraction schema Sin and output schema Sout
+6: Runtime Phase:
+
+12:
+
+Agent A receives context z (transcript, research data)
+x ← ϕ(z) via schema Sin
+ŷ ← fθ (x) via tool call to E
+Agent A receives ŷ as tool response
+Agent A reasons about ŷ given z
+O ← A.generate(z, ŷ, Sout )
+
+3.4
+
+Design Principles
+
+7:
+8:
+9:
+10:
+11:
+
+▷ Feature extraction
+▷ ML prediction
+▷ Contextual interpretation
+▷ Structured output
+
+MLAT implementations should follow these principles:
+1. Schema-bridged inputs: Use structured output schemas to bridge LLM reasoning and
+ML feature vectors, ensuring reliable feature extraction.
+2. Stateless tool calls: The ML endpoint should be stateless and fast (<100ms), matching
+latency expectations of other agent tools.
+3. Prediction transparency: Return metadata (confidence, feature importances, prediction
+intervals) to enable richer agent reasoning.
+4. Model-agnostic registration: The tool interface should abstract the underlying model,
+allowing seamless upgrades without workflow changes.
+5. Agent-controlled invocation: The agent—not the pipeline—decides when to call the
+ML tool.
+
+4
+
+Structured Output Architecture with Gemini
+
+A critical enabler of MLAT is reliable structured output parsing. MLAT requires the LLM
+agent to extract features in a format that maps directly to the ML model’s input schema, and
+to generate downstream outputs from structured data. Gemini’s JSON schema-constrained
+generation makes this possible at production reliability.
+
+4.1
+
+Schema-Bridged Feature Extraction
+
+The Research Agent extracts client intelligence using the following schema, which includes provenance metadata that the downstream Draft Agent uses to assess prediction reliability:
+Listing 1: Research Agent structured output schema.
+{
+"type": "object",
+"properties": {
+"client_revenue": {
+"type": "object",
+"properties": {
+"annual_revenue": { "type": "number" },
+
+5
+
+Machine Learning as a Tool (MLAT)
+
+"currency": { "type": "string" },
+"source": { "type": "string" },
+"confidence": {
+"type": "string",
+"enum": ["low", "medium", "high"]
+},
+"year": { "type": "string" }
+},
+"required": ["annual_revenue", "currency",
+"source", "confidence", "year"]
+},
+"company_summary": { "type": "string" },
+"prospect_summary": { "type": "string" }
+},
+"required": ["client_revenue",
+"company_summary", "prospect_summary"]
+}
+
+The annual_revenue field maps directly to the ML model’s client_revenue feature, while
+confidence and source enable the Draft Agent to weight the prediction accordingly.
+
+4.2
+
+Structured Proposal Generation
+
+The Draft Agent generates the complete proposal through a detailed JSON schema:
+Listing 2: Draft Agent structured output schema (abbreviated).
+{
+"type": "object",
+"properties": {
+"project_name": { "type": "string" },
+"primary_goals_intro": { "type": "string" },
+"goals_list": {
+"type": "array", "items": { "type": "string" }
+},
+"deliverables_intro": { "type": "string" },
+"deliverables_list": {
+"type": "array", "items": { "type": "string" }
+},
+"client_requirements": {
+"type": "array", "items": { "type": "string" }
+},
+"timeline_breakdown": {
+"type": "array",
+"items": {
+"type": "object",
+"properties": {
+"week": { "type": "string" },
+"title": { "type": "string" },
+"focus_goal": { "type": "string" },
+"activities": {
+"type": "array",
+"items": { "type": "string" }
+},
+"deliverables": {
+"type": "array",
+"items": { "type": "string" }
+}
+},
+"required": ["week", "title", "focus_goal",
+"activities", "deliverables"]
+}
+},
+
+6
+
+Machine Learning as a Tool (MLAT)
+
+"pricing_section": {
+"type": "object",
+"properties": {
+"total_price": { "type": "number" },
+"currency": { "type": "string" },
+"deposit_amount": { "type": "number" },
+"final_amount": { "type": "number" },
+"value_justification": { "type": "string" }
+},
+"required": ["total_price", "currency",
+"deposit_amount", "final_amount",
+"value_justification"]
+}
+},
+"required": ["project_name", "primary_goals_intro",
+"goals_list", "deliverables_intro",
+"deliverables_list", "client_requirements",
+"timeline_breakdown", "pricing_section"]
+}
+
+The pricing_section.total_price is populated using the MLAT prediction. The value_justification
+field is where the agent’s contextual reasoning materializes—explaining why the price is what it
+is.
+
+4.3
+
+Schema as Inter-Agent Contract
+
+The structured output schemas serve as contracts between agents: the Research Agent’s
+output schema guarantees that all fields required by the Draft Agent are present and correctly
+typed. This is analogous to API contracts in microservice architectures, but applied to LLMto-LLM communication. Each JSON field in the Draft Agent’s output maps to a placeholder in
+a Google Docs template via the Docs API’s Find & Replace function, enabling fully automated
+document generation.
+
+5
+
+PitchCraft: An MLAT Case Study
+
+To validate the MLAT framework, we built PitchCraft—a pilot production system for automated
+proposal generation deployed at Legacy AI LLC.
+
+5.1
+
+Single-Workflow, Dual-Agent Architecture
+
+PitchCraft operates as a single LLM workflow with two Gemini-powered agents orchestrated
+in sequence (Figure 1).
+
+7
+
+Machine Learning as a Tool (MLAT)
+
+Agent 1: Research Agent
+Fireflies.ai
+Transcript
+
+Firecrawl API
+
+Perplexity API
+
+Gemini
+Research Agent
+
+Information
+Extractor
+
+Structured
+Output (JSON)
+
+Agent 2: Draft Agent
+Feature
+Extraction
+
+{"client_revenue": 1M,
+"duration_weeks": 8,
+"integ_complexity": 4,
+"pain_score": 3,
+"phase": 1,
+"tech_stack": "custom"}
+
+Gemini
+Draft Agent
+
+Structured
+Output (JSON)
+
+Google Docs
+Generation
+
+XGBoost FastAPI
+(MLAT Tool Call)
+
+Figure 1: PitchCraft architecture: a single LLM workflow with two Gemini agents. Agent 1
+(Research Agent) analyzes the Fireflies transcript and performs parallel tool calls to Firecrawl
+and Perplexity APIs, outputting structured JSON. Agent 2 (Draft Agent) extracts ML features
+into the model’s input schema, invokes the XGBoost pricing model as an MLAT tool call
+(green, below), reasons about the prediction, and generates the complete proposal via structured
+output parsing.
+5.1.1
+
+Agent 1: Research Agent
+
+The Research Agent ingests a Fireflies.ai call transcript and performs multi-step intelligence
+gathering:
+1. Transcript Ingestion: A webhook receives Fireflies transcript data. A processing node extracts speaker-segmented text, sentiment analysis, and metadata including questions asked,
+tasks identified, and pricing mentions.
+2. Information Extraction: A Gemini-powered extractor identifies the prospect name, company name, and project phase.
+3. Parallel Tool Calls: The Research Agent executes tool calls: Firecrawl API for client
+annual revenue lookup, Perplexity API for company/prospect background research. Pain
+severity scoring (1–5 scale) and integration complexity scoring (1–5 scale) are performed
+via dedicated LLM calls within the workflow.
+4. Structured Output: All findings are synthesized into JSON conforming to the research
+schema (Listing 1), including revenue with provenance metadata.
+5.1.2
+
+Agent 2: Draft Agent (MLAT)
+
+The Draft Agent receives the Research Agent’s structured output:
+1. Feature Extraction: The agent extracts ML features from the structured research output:
+client_revenue, estimated_duration_weeks, pain_severity_score, integration_complexity,
+phase, and tech_stack.
+2. MLAT Tool Call: The agent invokes the XGBoost FastAPI endpoint as a tool, passing
+the feature vector (see Figure 1, JSON payload) and receiving ŷ.
+8
+
+Machine Learning as a Tool (MLAT)
+
+3. Contextual Reasoning: The agent reasons about ŷ given the research context—adjusting
+for client relationship, competitive landscape, and strategic factors.
+4. Structured Proposal Output: The agent generates the complete proposal as JSON
+conforming to the draft schema (Listing 2).
+5. Document Generation: Structured JSON is mapped to a Google Docs template via Find
+& Replace.
+
+5.2
+
+The MLAT Pricing Tool
+Table 2: Feature schema for the MLAT pricing model.
+
+Feature
+
+Type
+
+Description
+
+Source
+
+client_revenue
+est_duration_weeks
+pain_severity_score
+integration_complexity
+phase
+tech_stack
+
+Float
+Integer
+Int (1–5)
+Int (1–5)
+Int (1–4)
+Categorical
+
+Annual revenue of the client
+Projected project timeline
+Urgency/criticality of need
+Technical integration difficulty
+Project phase number
+no_code/low_code/custom
+
+Firecrawl (Agent 1)
+Transcript Analysis
+LLM Scoring
+LLM Scoring
+Info Extraction
+Research Agent
+
+The endpoint performs one-hot encoding of tech_stack at inference time, yielding x ∈ R8 .
+Inference latency is consistently under 100ms.
+
+6
+
+ML Methodology
+
+6.1
+
+Dataset Construction
+
+The training dataset consists of N = 70 records: 40 derived from real agency deals (IDs 2–21,
+many with multiple project phases) and 30 LLM-generated synthetic records (IDs 22–71). Real
+data spans 22 industries. Table 3 summarizes the dataset.
+Table 3: Dataset summary statistics (N = 70).
+Feature
+client_revenue ($)
+est_duration_weeks
+pain_severity_score
+integration_complexity
+price ($, target)
+phase
+
+Mean
+
+Std
+
+Min
+
+Max
+
+8,105,790
+8.4
+3.6
+3.9
+16,309
+1.6
+
+30,768,920
+4.5
+0.9
+0.9
+11,485
+0.7
+
+100,000
+3
+2
+2
+2,738
+1
+
+250,000,000
+20
+5
+5
+40,000
+4
+
+The target variable exhibits a right-skewed distribution (Figure 2). The training and test sets
+show comparable distributional characteristics, confirming the group-aware splitting strategy did
+not introduce distributional bias.
+
+9
+
+Machine Learning as a Tool (MLAT)
+
+Figure 2: Target variable distribution across training and test sets. Left: Histogram showing
+the right-skewed price distribution. Training (blue) and test (orange) sets show comparable
+coverage. Right: Box plots confirming similar median and interquartile ranges (ntrain = 56,
+ntest = 14).
+
+6.2
+
+Synthetic Data Validation
+
+The 30 synthetic records were generated through a deliberate, human-supervised process:
+1. Distribution-aware generation: An LLM was prompted with the statistical distributions
+(means, standard deviations, correlations, and value ranges) of the 40 real records and
+instructed to generate new records that extrapolate these distributions to underrepresented
+industries and price ranges.
+2. Human-in-the-loop verification: All 30 synthetic records were manually reviewed by
+the authors against real-world pricing knowledge. Records with implausible feature-price
+relationships (e.g., a high-complexity, long-duration project priced below $5,000) were edited
+or regenerated. This manual review ensures the model is not trained on hallucinated noise.
+3. Statistical consistency: Post-generation, we verified that the combined dataset preserved
+the original data’s correlation structure. The synthetic records were assigned unique client
+group IDs to prevent any data leakage through the group-aware splitting strategy.
+This approach is consistent with recent findings that LLM-generated tabular data can preserve multivariate relationships when properly conditioned [Borisov et al., 2023], while the human
+verification step provides an additional safeguard against distribution artifacts.
+
+6.3
+
+Feature Engineering
+
+With only 70 samples, aggressive feature reduction was critical. We converged on 8 features (7:1
+sample-to-feature ratio):
+• Categorical encoding: tech_stack was one-hot encoded into three binary columns, while
+industry (22 unique values) was excluded to avoid dimensionality explosion.
+• Ablation validation: Removing integration_complexity degraded CV R2 from 0.816
+to 0.599, confirming it as the most influential feature.
+
+6.4
+
+Data Leakage Prevention
+
+Several real clients had multiple project phases (e.g., avatar: phases 1–3; digital marketing:
+phases 1–4). We implemented GroupShuffleSplit with manually assigned client groups, ensuring all phases of a multi-phase client were allocated entirely to training or test—never split.
+This produced a 56/14 train/test split with zero client overlap.
+10
+
+Machine Learning as a Tool (MLAT)
+
+6.5
+
+Model Selection and Training
+
+We selected XGBoost [Chen and Guestrin, 2016] for strong small-data tabular performance [Borisov
+et al., 2022], built-in regularization, and fast inference. Table 4 shows our conservative hyperparameters.
+Table 4: XGBoost hyperparameters.
+
+6.6
+
+Hyperparameter
+
+Value
+
+Rationale
+
+n_estimators
+max_depth
+learning_rate
+subsample
+colsample_bytree
+reg_alpha (L1)
+reg_lambda (L2)
+min_child_weight
+
+50
+3
+0.05
+0.8
+0.8
+0.1
+1.0
+3
+
+Fewer trees to prevent memorization
+Shallow trees for generalization
+Slower learning for stability
+Row sampling per tree
+Feature sampling per tree
+Feature selection via sparsity
+Weight shrinkage
+Minimum 3 samples per leaf
+
+Cross-Validation Strategy
+
+Three-fold GroupKFold cross-validation respected client group boundaries:
+Table 5: Cross-validation fold characteristics.
+Fold
+
+Samples
+
+Fold 1
+Fold 2
+Fold 3
+
+19
+19
+18
+
+7
+
+Results
+
+7.1
+
+Model Performance
+
+Price Range
+
+Mean Price
+
+$2,738 – $40,000
+$4,672 – $28,876
+$4,793 – $39,022
+
+$13,952
+$16,281
+$20,239
+
+Table 6: XGBoost pricing model performance.
+Metric
+R2
+MAE
+RMSE
+Relative MAEa
+a
+
+Training Set
+
+Test Set
+
+Cross-Validation
+
+0.937
+$2,328
+$2,874
+14.3%
+
+0.807
+$3,688
+$4,720
+22.6%
+
+0.816 ± 0.060
+$3, 898 ± $629
+—
+23.9%
+
+Relative MAE = MAE / mean target price ($16,309). Not a true per-sample MAPE.
+
+The model explains 80.7% of variance on unseen test data. The close alignment between CV R2
+(0.816) and test R2 (0.807) confirms reliable generalization. Figure 3 shows predicted vs. actual
+scatter plots.
+
+11
+
+Machine Learning as a Tool (MLAT)
+
+Figure 3: Predicted vs. actual price. Left: Training set (R2 = 0.937) shows tight clustering
+around the identity line. Right: Test set (R2 = 0.807) demonstrates generalization to unseen
+data, with slight overestimation in the mid-range and underestimation at the highest values—
+consistent with regression-to-the-mean behavior expected with limited tail data.
+
+7.2
+
+Model Comparison
+Table 7: Model comparison: XGBoost vs. Ridge regression.
+CV R2
+
+CV MAE
+
+Test R2
+
+XGBoost (final)
+Ridge Regression
+
+0.816 ± 0.060
+0.565 ± 0.180
+
+$3, 898 ± $629
+$4, 354 ± $249
+
+0.807
+0.782
+
+XGBoost (no integ_complexity)
+
+0.599 ± 0.206
+
+$4, 920 ± $815
+
+—
+
+Model
+
+XGBoost significantly outperformed Ridge on CV R2 (0.816 vs. 0.565), confirming nonlinear
+feature interactions matter. The ablation removing integration_complexity degraded performance substantially.
+
+7.3
+
+Overfitting Analysis
+
+The train/test RMSE ratio of 0.61 indicates mild overfitting, expected with N = 70. However,
+CV-test R2 consistency (0.816 vs. 0.807) confirms this is well-controlled.
+
+7.4
+
+Sensitivity Analysis
+
+To verify that the model learned economically meaningful relationships rather than memorizing noise, we performed a univariate sensitivity analysis. We constructed a baseline feature vector representing a “typical” project (client_revenue = $1M, duration = 8 weeks,
+integration_complexity = 3, phase = 1, tech_stack = custom) and varied each feature independently while holding others constant. Table 8 shows the results for the two most influential
+features.
+
+12
+
+Machine Learning as a Tool (MLAT)
+
+Table 8: Sensitivity analysis: predicted price ($) as features vary, holding others at baseline.
+Monotonic, economically coherent trends confirm the model has learned meaningful relationships.
+Pain Severity Score
+
+Integration Complexity
+
+Predicted Price ($)
+
+1
+2
+3
+4
+5
+
+3 (baseline)
+3
+3
+3
+3
+
+∼$5,200
+∼$6,400
+∼$8,100
+∼$10,800
+∼$13,500
+
+3 (baseline)
+3
+3
+3
+3
+
+1
+2
+3
+4
+5
+
+∼$4,900
+∼$6,500
+∼$8,100
+∼$11,200
+∼$14,800
+
+The model produces monotonically increasing prices as pain severity and integration complexity increase, consistent with business logic: more urgent needs and more complex integrations
+command higher prices. Pain severity 1 vs. 5 produces a ∼2.6× price difference; integration complexity 1 vs. 5 produces ∼3.0×. These are economically plausible multipliers for a professional
+services pricing model, providing evidence that the model has learned signal rather than noise
+despite the small dataset.
+
+7.5
+
+Commercial Viability
+
+A relative MAE of 22.6% (computed as MAE / mean target price) is commercially viable for
+MLAT because the agent doesn’t blindly insert the point estimate. The Draft Agent reasons:
+“The model predicts $16,200 based on complexity 4 and an 8-week timeline. Given this client’s
+$5M revenue and high pain severity, we recommend positioning at $18,000.” The ML provides
+a statistically grounded anchor; the LLM provides the contextual adjustment.
+
+8
+
+Deployment and Real-World Impact
+
+8.1
+
+Pilot Production Deployment
+
+PitchCraft has been deployed as a pilot production system at Legacy AI LLC, handling proposal
+generation for the agency’s active sales pipeline. We characterize this as “pilot production” rather
+than full production given the model’s training on 40 real deals—sufficient for daily use within
+a single agency’s pricing range, but requiring additional data before generalization claims across
+industries.
+
+8.2
+
+Measured Impact
+Table 9: Measured operational impact of PitchCraft deployment.
+
+Metric
+
+Before
+
+After
+
+Improvement
+
+Proposal creation
+Speed-to-lead
+Pricing consistency
+Hands-on time
+
+3+ hours
+2–3 days
+Variable
+3+ hours
+
+< 10 minutes
+2–4 hours
+ML-standardized
+< 10 min review
+
+18× faster
+12–18× faster
+Eliminated variance
+95%+ reduction
+
+13
+
+Machine Learning as a Tool (MLAT)
+
+8.3
+
+Inference Performance
+
+The FastAPI-served XGBoost model achieves sub-100ms latency. The complete pipeline completes in 2–3 minutes, dominated by LLM reasoning and document generation.
+
+9
+
+Discussion
+
+9.1
+
+Why MLAT Matters
+
+MLAT represents a shift in how ML models participate in agentic systems. Rather than passive pipeline components, ML models become active participants in reasoning loops. The LLM
+orchestrates when to invoke the model, interprets its output, and decides how to act. This is powerful for domains where quantitative predictions must be tempered with qualitative judgment—
+professional services pricing, construction estimation, insurance underwriting.
+The structured output architecture (Section 4) is a critical enabler: schema-constrained
+generation ensures the bridge between LLM reasoning and ML inputs is reliable and type-safe.
+
+9.2
+
+Generalizability
+
+MLAT is fundamentally industry-agnostic. The same pattern applies to construction (material costs, labor hours—agent reasons about site conditions), consulting (rates, scope—agent
+adjusts for relationship factors), insurance (risk, premiums—agent explains rationale), and home
+services (parts, labor—agent contextualizes urgency). Only the feature engineering and training
+data change; the MLAT pattern remains constant.
+
+9.3
+
+Limitations
+
+• Small dataset: N = 70 (40 real) limits generalization to novel industries or extreme
+prices. The sensitivity analysis (Section 7.4) provides evidence of learned logic, but broader
+validation is needed.
+• Single-domain validation: MLAT demonstrated only in agency pricing; multi-domain
+validation is needed before stronger generalization claims.
+• No feedback loop: No mechanism for incorporating deal outcomes (won/lost, negotiated
+price) into model retraining.
+• LLM feature variability: Pain severity and integration complexity are LLM-assessed,
+introducing potential input variance across runs.
+• No confidence calibration: Point estimates without calibrated uncertainty quantification.
+• Synthetic data reliance: While human-verified (Section 6.2), the 43% synthetic composition means real-world validation with larger datasets is essential before broader deployment.
+
+9.4
+
+Future Work
+
+1. Incorporating deal outcomes for expanded training and win/loss prediction as an additional
+MLAT tool.
+2. Adding prediction intervals for calibrated price ranges.
+3. Multi-domain MLAT deployment (construction, consulting, home services).
+4. Continuous retraining feedback loops.
+14
+
+Machine Learning as a Tool (MLAT)
+
+5. Evaluating LLM feature extraction stability across model versions.
+
+10
+
+Conclusion
+
+We have introduced Machine Learning as a Tool (MLAT)—a design pattern for exposing
+pre-trained statistical ML models as callable tools within LLM agent workflows. MLAT enables
+the orchestrating LLM to invoke predictions contextually, reason about them interpretively, and
+integrate them into structured outputs through schema-constrained generation.
+Through PitchCraft, we demonstrated that MLAT is viable in a pilot production setting. Despite extreme data scarcity (N = 70, 43% human-verified synthetic), careful feature engineering,
+group-aware cross-validation, and sensitivity analysis confirmed that the XGBoost pricing model
+(R2 = 0.807) learned economically meaningful relationships. The structured output architecture
+using Gemini’s JSON schemas enabled reliable inter-agent communication. The system reduces
+proposal creation from hours to minutes with measurable business impact.
+We believe MLAT represents an underexplored but high-value design pattern. As LLM
+tool-calling matures and multi-agent architectures become standard, integrating statistical ML
+models as callable tools will combine the structured prediction of classical ML with the contextual
+reasoning of modern LLMs—a combination more powerful than either alone.
+
+References
+Borisov, V., Leemann, T., Seßler, K., Haug, J., Pawelczyk, M., and Kasneci, G. Deep neural
+networks and tabular data: A survey. IEEE Transactions on Neural Networks and Learning
+Systems, 33(6):2162–2181, 2022.
+Borisov, V., Seßler, K., Leemann, T., Pawelczyk, M., and Kasneci, G. Language models are
+realistic tabular data generators. In International Conference on Learning Representations
+(ICLR), 2023.
+Chen, T. and Guestrin, C. XGBoost: A scalable tree boosting system. In Proceedings of the
+22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining, pp.
+785–794, 2016.
+Gemini Team, Anil, R., Borgeaud, S., et al. Gemini: A family of highly capable multimodal
+models. arXiv preprint arXiv:2312.11805, 2024.
+James, B.O. The short life of online sales leads. Harvard Business Review, 2007. https:
+//hbr.org/2011/03/the-short-life-of-online-sales-leads
+LangChain. LangChain: Building applications with LLMs through composability. https://
+github.com/langchain-ai/langchain, 2023.
+n8n GmbH. n8n: Workflow automation tool. https://docs.n8n.io, 2025.
+OpenAI. Function calling and other API updates. Blog post, June 2023. https://openai.com/
+blog/function-calling-and-other-api-updates
+Pedregosa, F., Varoquaux, G., Gramfort, A., et al. Scikit-learn: Machine learning in Python.
+JMLR, 12:2825–2830, 2011.
+Schick, T., Dwivedi-Yu, J., Dessì, R., Raileanu, R., Lomeli, M., Hambro, E., Zettlemoyer, L.,
+Cancedda, N., and Scialom, T. Toolformer: Language models can teach themselves to use
+tools. In Advances in Neural Information Processing Systems (NeurIPS), 2023.
+
+15
+
+Machine Learning as a Tool (MLAT)
+
+Wu, Q., Bansal, G., Zhang, J., et al. AutoGen: Enabling next-gen LLM applications via multiagent conversation. arXiv preprint arXiv:2308.08155, 2023.
+Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., and Cao, Y. ReAct: Synergizing reasoning and acting in language models. In International Conference on Learning
+Representations (ICLR), 2023.
+Ye, P. and Zhang, J. Customized pricing. In Handbook of Dynamic Game Theory, pp. 957–985.
+Springer, 2018.
+
+16
+

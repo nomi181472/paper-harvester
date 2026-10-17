@@ -1,0 +1,666 @@
+A research framework for writing differentiable PDE
+discretizations in JAX
+
+arXiv:2111.05218v1 [cs.LG] 9 Nov 2021
+
+Antonio Stanziola
+University College London
+a.stanziola@ucl.ac.uk
+
+Simon R. Arridge
+University College London
+s.arridge@ucl.ac.uk
+
+Ben T. Cox
+University College London
+b.cox@ucl.ac.uk
+
+Bradley E. Treeby
+University College London
+b.treeby@ucl.ac.uk
+
+Abstract
+Differentiable simulators are an emerging concept with applications in several
+fields, from reinforcement learning to optimal control. Their distinguishing feature
+is the ability to calculate analytic gradients with respect to the input parameters.
+Like neural networks, which are constructed by composing several building blocks
+called layers, a simulation often requires computing the output of an operator that
+can itself be decomposed into elementary units chained together. While each layer
+of a neural network represents a specific discrete operation, the same operator
+can have multiple representations, depending on the discretization employed and
+the research question that needs to be addressed. Here, we propose a simple
+design pattern to construct a library of differentiable operators and discretizations,
+by representing operators as mappings between families of continuous functions,
+parametrized by finite vectors. We demonstrate the approach on an acoustic
+optimization problem, where the Helmholtz equation is discretized using Fourier
+spectral methods, and differentiability is demonstrated using gradient descent to
+optimize the speed of sound of an acoustic lens. The proposed framework is
+open-sourced and available at https://github.com/ucl-bug/jaxdf
+
+1
+
+Introduction
+
+In the last decade, the exponential growth of machine learning has been mirrored by a comparable
+advancement in frameworks for automatic differentiation (AD) and parallelization. This has paved
+the path for the emergence of a new research field, sometimes named scientific machine learning
+[1], where elements of machine learning are blended with scientific models and simulators. In
+particular, AD, the main algorithm employed for neural network training and generally for analytical
+gradient estimation, can be used to differentiate with respect to any continuous parameter involved in
+a simulator [2, 3]. Conversely, a simulator that allows for AD can be used inside a machine learning
+model, for example, to implement an implicit layer [4] or a physics loss function.
+Differentiable simulators are also of broad interest for several fields of research, such as for inverse
+problems [5, 6], system identification [7], optimal control [8], Bayesian inference [9], optimization
+under uncertainty [10], reinforcement learning [11] and also to improve the performance of simulators
+themselves [12]. Differentiable simulators can also be used to construct physics losses. There’s now a
+rapidly growing list of differentiable simulators for a large variety of applications, such as molecular
+dynamics [13], Finite Element Analysis [14], computational fluid dynamics [15], Physics Informed
+Neural Networks (PINNs) [16] and neural differential equations [17], to name a few.
+35th Conference on Neural Information Processing Systems (NeurIPS 2021), Sydney, Australia.
+
+However, most of the available simulators are often tied to a specific discretization that solves a
+continuous problem, meaning that different representations require different implementations of
+the same equations. Furthermore, it is hard to modify the given discretization method for research
+purposes, at least in ways that the software maintainer does not specifically intend. Additionally, it is
+of interest for such simulators to be compatible with a machine learning library, to potentially include
+it as a component of a larger machine learning model.
+Aim We propose a customizable framework, called jaxdf (Jax- Discretization Framework) for
+writing differentiable simulators, that decouples the mathematical definition of the problem from the
+underlying discretization. The underlying computations are performed using JAX [3], and are thus
+compatible with the broad set of program transformations that the package allows, such as AD and
+batching. This enables rapid prototyping of multiple customized representations for a given problem,
+to develop physics-based neural network layers and to write custom physics losses, while maintaining
+the speed and flexibility required for research applications. It also contains a growing open-source
+library of differentiable discretizations compatible with the JAX ecosystem.
+
+2
+
+Software model
+
+Writing a simulator requires a mathematical expression defined over continuous functions, often a
+Partial Differential Equation (PDE), to be translated into a program that manipulates a finite set of
+numerical values. This fundamental step is called discretization. Here, we assume that functions are
+defined on a rectangular interval Π ⊆ RD of the D-dimensional Euclidean space.
+Given a function f : Π → RM , a simulation often requires to evaluate and manipulate multiple
+expressions of the form Lf , where L is a (possibly non-linear) operator acting on the function f . To
+implement this in a computer, a restriction is often made to a parametrized family of functions, such
+that we can identify elements of this family using a mapping from finite vectors to functions. That is,
+there’s a mapping D such that
+D
+θ −→ f
+(1)
+with f ∈ Range(D) or, in other words, fθ (x) = D(θ, x) is a function parametrized by θ. We will
+call D the discretization family of f , while θ is the discrete representation of f over D. The latter is
+analogous to the interpolation function defined in other libraries.1
+Examples of discretization families A simple example of discretization family is the set of N -th
+order polynomials on the interval [0, 1):
+PN (θ, x) =
+
+N
+X
+
+θ i xi ,
+
+θ ∈ RN +1
+
+(2)
+
+i=0
+
+Another common example is the Fourier-spectral representation F̂ given by the iDFT of the sequence
+θ ∈ CN , which is defined on a regular collocation grid in frequency space, i.e.
+F̂(θ, x) =
+
+N
+X
+
+θi ei(ki ·x) .
+
+(3)
+
+i
+
+Alternatively, the Fourier representation is given by defining θ in signal space on a regular spatial
+collocation grid, using the periodic sinc function:
+F(θ, x) =
+
+N
+X
+i
+
+θi
+
+sin((N + 1/2)(x − xi ))
+.
+sin((x − xi )/2)
+
+(4)
+
+Another important kind of mappings is neural networks, often used in this context to implement
+Physics-Informed Neural Networks (PINNs). Many other discrete representations are possible, such
+as Finite Elements, Finite Differences, radial basis functions and splines. In general, the choice of the
+right representation is application dependent, subject to hardware and software constraints, and often
+a topic of research on its own.
+1
+
+See for example the Operator Discretization Library at https://odl.readthedocs.io
+
+2
+
+2.1
+
+Operator representation
+
+Let fθ be a member of the discretization family D with parameters θ. Representing the action of an
+operator L over the discretization family, means to find the function G(γ, x) with parameters γ such
+that G(γ, x) is close to L(fθ ) in some sense.
+In general, the parameters θ and γ can be different. Similarly, also the discretization families D and
+G may be different. Rather than implementing the discretized mapping only as an operator acting on
+the discrete representation, the corresponding discrete operator L̂ is instead represented as
+L̂
+
+(D, θ) −
+→ (G, γ).
+
+(5)
+
+This means that the operator also specifies the output discretization family G. Most often G is
+independent of the parameters, and we can split the mapping into two functions
+L̂
+
+(D, θ) −
+→ (Lf (D), Lp (D)(θ)),
+
+(6)
+
+where Lf is a discrete mapping between discretization families, and Lp (D) is a differentiable function
+of the parameters θ. Thus, defining an operator L over a discretization family D, boils down to
+implementing Lf (D) and Lp (D).
+Representing the derivative operator As an example, consider discretizing the derivative operator
+D = ∂/∂x into D̂. Discretizing it over F, which corresponds to a Fourier spectral method, boils
+down to applying the derivative rule of the Fourier transform over the parameters:
+
+where i =
+is then
+
+√
+
+γ = Dp (F)(θ) = iDFT(−ikx · DFT(θ)),
+
+(7)
+
+1. The discretization family is still F, that is Df (F) = F, and the discretized operator
+
+D̂(F, θ) = (F, Dp (F)(θ)).
+Applying the same operator on the family PN gives instead
+N
+N
+−1
+X
+∂ X
+i
+DPN (θ, x) =
+θi x =
+iθi xi−1 .
+∂x i=0
+i=1
+
+(8)
+
+(9)
+
+The parameter function Dp (PN ) is
+
+
+Dp (PN )(θ) = θ1 , 2θ2 , 3θ3 , . . . , (N − 1)θN −1 ,
+
+(10)
+
+while Df (PN ) maps to the space of polynomials with one degree less
+Df (PN ) (θ, x) =
+
+N
+−1
+X
+
+θ i xi .
+
+(11)
+
+i=0
+
+Note that here not only the parameters are changed, but also the discretization family. Doing the
+same procedure on a neural network to obtain a PINN leaves the parameters unchanged, while the
+output discretization family is obtained by applying AD on the interpolation function of the input.
+For a spline representation, the discrete parameters are processed by filtering with an FIR filter, while
+the discretization family is given by splines of a lower degree on a staggered collocation grid [18].
+In general, one may want to control both the choice of discretization family and the corresponding
+representation of various operators. For example, the product between two functions in F should
+be described over a denser collocation grid, to account for the larger spectral support of the output
+[19]; however, when working with low-frequency signals an acceptable approximation is given by
+maintaining the original discretization, and simply multiplying element-wise the parameters on the
+two original spatial grids.
+Binary operators Binary operators B(f, g) = h that take two fields can be defined analogously to
+the standard operators above, as
+B̂(D, θf , θg ) = (Bf (D), Bp (D)(θf , θg )) ,
+assuming that f and g share the same discretization family D.
+3
+
+(12)
+
+Composing operators A nice characteristic of defining operators in this way can be seen when
+two operators are composed together. Given two operators L and M, then the discretization of the
+composition operator H(f ) = M ◦ L(f ) = M(L(f )) is found as
+L̂(D, θ) = (E, γ)
+M̂ ◦ L̂(D, θ) = (Mf (E), Mp (E)(γ))
+
+=(Lf (D), Lp (D)(θ))
+
+
+= Mf (Lf (D)), Mp (Lf (D))(Lp (D)(θ))
+
+(13)
+(14)
+
+This shows that the final discretization family Mf (Lf (D)) and the function which transforms the
+parameters are simply given by function compositions, and can be found ahead of computation once
+D is known. Importantly, if Mp (Lf (D)) and Lp (D) are written in a differentiable language, then
+Hp (D) can also be differentiated. We choose to implement them in JAX [3].
+Operator parameters Operators often have parameters associated with them, similarly to neural
+network layers. As an example, discretizing the derivative operator with finite differences corresponds
+to the following mapping (ignoring boundary conditions):
+D̂(Q, θ) = (Q, w ∗ θ) ,
+
+(15)
+
+where Q is the Finite Differences (FD) discretization family, ∗ denotes convolution and w ∈ RK is an
+appropriate kernel with K elements. We may want to explicitly learn the discretized PDE from data
+[20], meaning that we must be able to find the gradient with respect to w. For a general operator L,
+we account for this possibility by allowing Lp to accept an extra appropriately initialized parameter,
+such that
+L(D, θ) = (Lf (D), Lp (D)(θ, w)).
+
+(16)
+
+Finally, we may want to share some parameters between different operators that are computing similar
+quantities. Those extra parameters complicate the composition rules, but this can be accounted for by
+appropriately tracing and initializing the various parameters when building the computational graph
+of Lp .
+2.2
+
+Software abstraction
+
+In the proposed software, fields are represented as couples (D, θ) made of a discretization family and
+set of parameters. Each discretization must define its own interpolation function. They are subclasses
+of a common base discretization, with operators defined as class methods using function composition
+and AD: this ensures that most operators work on arbitrary user-defined discretizations, albeit not
+necessarily in the most efficient way.
+Specific implementations of new or existing operators can be created by overriding the corresponding
+method, by providing the rules for evaluating Lf and Lp , as well as the initialization of the operator
+parameters w. The software discretizes the operator by building and tracing a lower level computational graph, translating every single operation in the corresponding JAX function for the given
+discretization. The output is a set of discrete parameters, collected in a dictionary, and the sampling
+operator, as a pure JAX function. The latter can be differentiated, jit-compiled, parallelized and
+manipulated using JAX program transformations. The resulting discretization also natively runs on
+GPUs and TPUs.
+In its essence, this library works in a similar way as most machine learning libraries currently
+available: using self-contained composable operations as computational layers, where each module
+depends on a set of parameters and an input. The key difference is that each operation represents
+an abstract mathematical mapping, which is replaced by an appropriate algorithm depending on the
+input discretization. This decouples the mathematical definition of the equation from the actual implementation. For example, the operation gradient can be implemented using AD on the interpolation
+function, as is done in PINNs, or by a convolution operator as in FD, or by an elementwise product in
+the Fourier domain. Another source of difference to standard ML libraries, is that different operators
+may share common parameters, if required by the user. Lastly, it is easy to customize or write new
+discretizations, as well as building hierarchical families of discretizations, using inheritance and
+method overloading.
+4
+
+3
+
+Numerical examples
+
+3.1
+
+Differentiability
+
+To demonstrate differentiability and automatic discretization, we apply the framework to the solution
+of a time-harmonic acoustic optimization problem, where the physics is described by the Helmholtz
+equation with frequency ω = 1. The goal is to maximize the complex wavefield amplitude at a target
+location xT . The source is given by an omnidirectional point transducer. The speed of sound map
+c(ρ) is parametrized in the central region by an array of real values ρ, constrained between 1 and 2
+using a sigmoid function. The array ρ is initialized randomly and c = 1 outside the central region.
+The optimization problem requires the following function to be minimized:
+
+
+ω2
+2
+L = −ku(xT )k + λTV(c(ρ)), s.t. ∇ + 2 u = −SM ,
+c
+
+(17)
+
+where u is the solution of the Helmholtz equation, SM is the complex source field, λ is an arbitrary
+positive constant set to 10−4 and TV(c(ρ)) is a Total-Variation regularization term, defined as
+Z
+1
+TV(c) =
+k∇ck dx.
+(18)
+kΠk Π
+The derivative operators need to be modified at the boundary, to enforce radiating boundary conditions,
+using a Perfectly Matched Layer as:
+X
+∂j
+∇2 =
+∂ˆj2 ,
+∂ˆj =
+,
+(19)
+γj (x)
+j=(x,y)
+
+where γj are appropriate complex fields [21].
+Discretization This equation can then be expressed using a language very close to the mathematical
+formulation in the proposed library. We define two operators: the Helmholtz operator and the
+integrand of the TV functional:
+from jaxdf import operator
+from jaxdf import operators as jops
+@operator()
+def helmholtz(u, c, x):
+pml = gamma(x)
+mod_grad_u = jops.gradient(u)*pml
+mod_diag_jacobian = jops.diag_jacobian(mod_grad_u)*pml
+laplacian = jops.sum_over_dims(mod_diag_jacobian)
+return laplacian + ((1./c)**2)*u
+@operator()
+def integrand_TV(u):
+nabla_u = jops.gradient(u)
+return jops.sum_over_dims(jops.elementwise(jnp.abs)(nabla_u))
+
+This operator can be discretized arbitrarily, by calling it with a field defined over a discretization
+family. For example, if we aim to use a feed-forward neural network to represent u, we can do so by
+defining a new Arbitrary discretization where the interpolation function is defined using the neural
+network forward function. If instead one wants to solve the equation using Fourier spectral methods,
+as we will do in this example, it suffices to instantiate a FourierSeries discretization and call the
+operators with the corresponding fields. The full code for this experiment is listed in Appendix A.
+Optimization With the operator discretized, we are equipped with two differentiable pure functions
+(see Appendix A). Such functions accept as input the discrete parameters of u and c, as well as the
+parameters required by the intermediate operators. Because a Fourier discretization preserves the
+linearity of the Helmholtz operator, the acoustic field can be found using the Generalized minimal
+residual method (GMRES), while gradients are computed with constant memory size via the Implicit
+5
+
+Wavefield amplitude
+
+k∇ck
+
+Optimized lens
+
+0.10
+
+1.4
+0.08
+
+1.8
+
+0.06
+
+1.6
+
+0.04
+
+1.4
+
+0.02
+
+1.2
+
+1.2
+1.0
+0.8
+0.6
+0.4
+0.2
+
+Target
+
+Figure 1: Wavefield, lens and total variation integrand after optimization.
+Function Theorem [22]. The loss function is minimized using 100 steps of the Adam optimizer, with
+the learning rate set to 0.1 and βs set to (0.9, 0.9).
+The result of the optimization is shown in Fig. 1, showing that the speed of sound of the lens has
+been successfully optimized to provide focus at the location of interest.
+3.2
+
+Swapping discretization
+
+A key feature of the proposed framework is the ability to quickly change discretization for a given
+operator. To demonstrate this, we’ll focus on solving the initial value problem for the heat equation
+Z t
+u=
+
+∇2 u(τ ) dτ,
+
+s.t. u(0) = u0
+
+(20)
+
+0
+
+Note that we don’t enforce specific boundary conditions here. In the current version of the framework,
+boundary conditions are not yet implemented and are implicitly defined by the discretization (e.g.
+periodic for Fourier Series, zero-padding for Finite Differences etc.). This is not suitable for proper
+integration with arbitrary boundary conditions, but works for equations where it is feasible to construct
+an absorbing layer at the boundary: that is the majority of situations, for example, when investigating
+wave phenomena. While the user is always free to use a custom discretization that satisfies the
+boundary conditions by construction, more suitable handling of generic boundary conditions would
+be a great addition to the package and will be part of future work.
+Boundary conditions aside, the code for defining and discretizing the operator using Finite Differences
+is the following:
+@operator()
+def heat_rhs(u):
+return jops.laplacian(u)
+# Discretize using Finite Differences\
+discr = RealFiniteDifferences(domain, accuracy=2)
+u_params, u = discr.empty_field(name='u')
+# Construct numerical function and collect parameters
+RHS_FD = heat_rhs(u=u)
+num_op = RHS_FD.get_field_on_grid(0)
+global_parameters = RHS_FD.get_global_params()
+
+Suppose we now want to switch to a Fourier Series discretization, rather than Finite Differences. To
+reuse the previously defined operator, we need to perform three steps: define a new field with the new
+discretization, call the operator and extract the parameters and numerical function
+# New Field
+discr = RealFourierSeries(domain)
+
+6
+
+Figure 2: Integration of the heat equation for an arbitrary initial field, using a Fourier spectral
+discretization for the Laplacian.
+u_params, u = discr.empty_field(name='u')
+u0 = u_params.at[...,0].set(img)
+# Compile operator, generates the new discretization
+RHS_Fourier = heat_rhs(u=u)
+# Get parameters and pure function
+gp = RHS_Fourier.get_global_params()
+num_op = RHS_Fourier.get_field_on_grid(0)
+
+The result of integrating the heat equation for a given initial field is shown in Fig. 2, where the
+Laplacian operator has been discretized using Fourier spectral methods.
+
+4
+
+Conclusions
+
+In this paper, we have proposed a design framework for using and implementing custom discretizations, employed to compute the effect of operators using differentiable functions. New discretizations
+can be easily defined, by providing the corresponding interpolation function. The behaviour of each
+operator, for a given discretization, can be specified by the user or automatically evaluated using
+AD and function composition over the interpolation function. Future work will implement boundary
+conditions, which can still be seen as the mapping between different families of functions with the
+caveat of reducing the number of free parameters, and the conversion from one discretization to
+another within the same operator, for example by defining projection operators.
+
+References
+[1]
+[2]
+[3]
+[4]
+[5]
+[6]
+
+[7]
+
+Christopher Rackauckas et al. “Universal differential equations for scientific machine learning”.
+In: arXiv preprint arXiv:2001.04385 (2020).
+Mike Innes et al. “A differentiable programming system to bridge machine learning and
+scientific computing”. In: arXiv preprint arXiv:1907.07587 (2019).
+James Bradbury et al. JAX: composable transformations of Python+NumPy programs. Version 0.2.5. 2018. URL: http://github.com/google/jax.
+Ricky TQ Chen et al. “Neural ordinary differential equations”. In: arXiv preprint
+arXiv:1806.07366 (2018).
+Jonas Adler and Ozan Öktem. “Solving ill-posed inverse problems using iterative deep neural
+networks”. In: Inverse Problems 33.12 (2017), p. 124007.
+Jonas Adler, Holger Kohr, and Ozan Öktem. “ODL-a Python framework for rapid prototyping
+in inverse problems”. In: Code and documentation available at: https://odlgroup.github.io/odl/
+(2017).
+Krishna Murthy Jatavallabhula et al. “gradSim: Differentiable simulation for system identification and visuomotor control”. In: arXiv preprint arXiv:2104.02646 (2021).
+
+7
+
+[8]
+[9]
+
+[10]
+
+[11]
+[12]
+[13]
+
+[14]
+
+[15]
+
+[16]
+[17]
+[18]
+[19]
+[20]
+[21]
+
+[22]
+
+Philipp Holl, Vladlen Koltun, and Nils Thuerey. “Learning to control pdes with differentiable
+physics”. In: arXiv preprint arXiv:2001.07457 (2020).
+Kyle Cranmer, Johann Brehmer, and Gilles Louppe. “The frontier of simulation-based inference”. In: Proceedings of the National Academy of Sciences 117.48 (2020), pp. 30055–
+30062.
+Adam R Gerlach et al. “The Koopman expectation: an operator theoretic method for efficient analysis and optimization of uncertain hybrid dynamical systems”. In: arXiv preprint
+arXiv:2008.08737 (2020).
+Miguel Angel Zamora Mora et al. “PODS: Policy Optimization via Differentiable Simulation”.
+In: International Conference on Machine Learning. PMLR. 2021, pp. 7805–7817.
+Eric Heiden et al. “NeuralSim: Augmenting differentiable simulators with neural networks”.
+In: arXiv preprint arXiv:2011.04217 (2020).
+Samuel S. Schoenholz and Ekin D. Cubuk. “JAX M.D. A Framework for Differentiable
+Physics”. In: Advances in Neural Information Processing Systems. Vol. 33. Curran Associates, Inc., 2020. URL: https : / / papers . nips . cc / paper / 2020 / file /
+83d3d4b6c9579515e1679aca8cbc8033-Paper.pdf.
+Ivan Yashchuk. “Bringing PDEs to JAX with forward and reverse modes automatic differentiation”. In: ICLR 2020 Workshop on Integration of Deep Neural Models and Differential
+Equations. 2020.
+Dmitrii Kochkov et al. “Machine learning–accelerated computational fluid dynamics”. In: Proceedings of the National Academy of Sciences 118.21 (2021). ISSN: 0027-8424. DOI: 10.1073/
+pnas.2101784118. eprint: https://www.pnas.org/content/118/21/e2101784118.
+full.pdf. URL: https://www.pnas.org/content/118/21/e2101784118.
+Lu Lu et al. “DeepXDE: A deep learning library for solving differential equations”. In: SIAM
+Review 63.1 (2021), pp. 208–228.
+Chris Rackauckas et al. “Diffeqflux.jl-A julia library for neural differential equations”. In:
+arXiv preprint arXiv:1902.02376 (2019).
+Michael Unser. “Splines: A perfect fit for signal and image processing”. In: IEEE Signal
+processing magazine 16.6 (1999), pp. 22–38.
+Marco Luise et al. Teoria dei segnali. Terza edizione. The McGraw-Hill Companies, 2009.
+Zichao Long et al. “Pde-net: Learning pdes from data”. In: International Conference on
+Machine Learning. PMLR. 2018, pp. 3208–3216.
+Alfredo Bermúdez et al. “An optimal perfectly matched layer with unbounded absorbing
+function for time-harmonic acoustic scattering problems”. In: Journal of Computational
+Physics 223.2 (2007), pp. 469–488.
+Mathieu Blondel et al. “Efficient and Modular Implicit Differentiation”. In: arXiv preprint
+arXiv:2105.15183 (2021).
+
+8
+
+A
+
+Full code for the Helmholtz example
+
+from jaxdf import operators as jops
+from jaxdf.core import operator, Field
+from jaxdf.discretization import FourierSeries, Coordinate
+from jaxdf.geometry import Domain
+from jaxdf.utils import join_dicts
+from jax import numpy as jnp
+from jax.scipy.sparse.linalg import gmres
+from jax.experimental import optimizers
+import jax
+# Settings
+domain = Domain((256, 256), (1., 1.))
+seed = jax.random.PRNGKey(42)
+# Speed of sound parametrization
+lens_params = jax.random.uniform(seed, (168,40)) - 4
+def get_sos(p):
+lens = jnp.zeros(domain.N).at[44:212,108:148].set(jax.nn.sigmoid(p)) + 1
+return jnp.expand_dims(lens, -1)
+# Defining operators
+@jops.elementwise
+def pml_absorption(x):
+abs_x = jnp.abs(x)
+return jnp.where(abs_x > 110, (jnp.abs(abs_x-110)/(128. - 110)), 0.)**2
+gamma = lambda x: 1./(1 + 1j*pml_absorption(x))
+@operator()
+def helmholtz(u, c, x):
+pml = gamma(x)
+mod_grad_u = jops.gradient(u)*pml
+mod_diag_jacobian = jops.diag_jacobian(mod_grad_u)*pml
+laplacian = jops.sum_over_dims(mod_diag_jacobian)
+return laplacian + ((1./c)**2)*u
+@operator()
+def integrand_TV(u):
+nabla_u = jops.gradient(u)
+return jops.sum_over_dims(jops.elementwise(jnp.abs)(nabla_u))
+# Defining discretizations
+fourier_discr = FourierSeries(domain)
+u_fourier_params, u = fourier_discr.empty_field(name='u')
+src_fourier_params, src = fourier_discr.empty_field(name='src')
+src_fourier_params = u_fourier_params.at[128, 40].set(1. + 0j) # Monopole source
+_, c = fourier_discr.empty_field(name='c')
+_, x = fourier_discr.empty_field(name='x')
+x_params = Coordinate(domain).get_field_on_grid()({}) # Coordinate field
+# Discretizing operators: getting pure functions and parameters
+H = helmholtz(u=u, c=c, x=x)
+TV = integrand_TV(u=u)
+global_params = join_dicts(H.get_global_params(), TV.get_global_params())
+H_on_grid = H.get_field_on_grid(0)
+tv_on_grid = lambda x: TV.get_field_on_grid(0)(global_params, {"u": x})
+# Helmholtz solver function
+def solve_helmholtz(speed_of_sound):
+params = {"c":speed_of_sound, "x":x_params}
+def helm_func(u):
+params["u"] = u
+
+9
+
+return H_on_grid(global_params, params)
+sol, _ = gmres(helm_func, src_fourier_params, maxiter=1000, tol=1e-3, restart=50)
+return sol
+# Loss function
+def loss(p):
+sos = get_sos(p)
+tv_term = jnp.mean(tv_on_grid(sos))
+field = solve_helmholtz(sos)
+return -jnp.sum(jnp.abs(field[70,210])) + 1e-4*tv_term
+# Optimization loop
+init_fun, update_fun, get_params = optimizers.adam(.1, b1=0.9, b2=0.9)
+opt_state = init_fun(lens_params)
+@jax.jit
+def update(opt_state, k):
+lossval, gradient = jax.value_and_grad(loss)(get_params(opt_state))
+return lossval, update_fun(k, gradient, opt_state)
+for k in range(100):
+lossval, opt_state = update(opt_state, k)
+print(f"Step {k}, Loss {lossval}")
+
+10
+

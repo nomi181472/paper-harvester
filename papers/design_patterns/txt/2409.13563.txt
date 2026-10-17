@@ -1,0 +1,1778 @@
+Proxion: Uncovering Hidden Proxy Smart Contracts
+for Finding Collision Vulnerabilities in Ethereum
+Cheng-Kang Chen∗
+
+Wen-Yi Chu∗
+
+Muoi Tran
+
+National Taiwan University
+
+National Taiwan University
+
+ETH Zürich
+
+Laurent Vanbever
+
+Hsu-Chun Hsiao
+
+ETH Zürich
+
+National Taiwan University
+
+arXiv:2409.13563v1 [cs.CR] 20 Sep 2024
+
+ABSTRACT
+The proxy design pattern allows Ethereum smart contracts to be
+simultaneously immutable and upgradeable, in which an original
+contract is split into a proxy contract containing the data storage
+and a logic contract containing the implementation logic. This architecture is known to have security issues, namely function collisions
+and storage collisions between the proxy and logic contracts, and
+has been exploited in real-world incidents to steal users’ millions of
+dollars worth of digital assets. In response to this concern, several
+previous works have sought to identify proxy contracts in Ethereum
+and detect their collisions. However, they all fell short due to their
+limited coverage, often restricting analysis to only contracts with
+available source code or past transactions.
+To bridge this gap, we present Proxion, an automated crosscontract analyzer that identifies all proxy smart contracts and their
+collisions in Ethereum. What sets Proxion apart is its ability to
+analyze hidden smart contracts that lack both source code and
+past transactions. Equipped with various techniques to enhance
+efficiency and accuracy, Proxion outperforms the state-of-the-art
+tools, notably identifying millions more proxy contracts and thousands of unreported collisions. We apply Proxion to analyze over
+36 million alive contracts from 2015 to 2023, revealing that 54.2% of
+them are proxy contracts, and about 1.5 million contracts exhibit at
+least one collision issue.
+ACM Reference Format:
+Cheng-Kang Chen, Wen-Yi Chu, Muoi Tran, Laurent Vanbever, and HsuChun Hsiao. 2024. Proxion: Uncovering Hidden Proxy Smart Contracts
+for Finding Collision Vulnerabilities in Ethereum. In Proceedings of ACM
+Conference (Conference’17). ACM, New York, NY, USA, 13 pages. https:
+//doi.org/10.1145/nnnnnnn.nnnnnnn
+
+1
+
+INTRODUCTION
+
+Ethereum is a well-established, open-source blockchain platform
+that enables decentralized applications on the Internet, such as
+decentralized finance, voting systems, and non-fungible token marketplaces, through the creation and execution of smart contracts.
+∗ Both authors contributed equally to this research.
+
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than ACM
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior specific permission and/or a
+fee. Request permissions from permissions@acm.org.
+Conference’17, July 2017, Washington, DC, USA
+© 2024 Association for Computing Machinery.
+ACM ISBN 978-x-xxxx-xxxx-x/YY/MM. . . $15.00
+https://doi.org/10.1145/nnnnnnn.nnnnnnn
+
+These smart contracts are deployed onto the Ethereum blockchain
+network (i.e., being replicated across all participating nodes), facilitating autonomous and trustless execution of the contract’s
+functions. Smart contracts are immutable — once deployed, they
+cannot be changed or tampered with. While immutability ensures
+the integrity and reliability of smart contract execution, it poses
+challenges for updating smart contracts (e.g., to fix bugs or introduce new features) since existing states (e.g., stored data, balances)
+must be migrated to new smart contracts.
+To enable smart contracts’ upgradeability while still adhering to
+their immutability, the proxy design pattern has recently emerged
+in several Ethereum Improvement Proposals (EIPs) (e.g., [3, 20,
+30, 31, 38]) as well as in major blockchain-based companies like
+OpenSea [35] and Compound [8]. Under this pattern, an original
+smart contract is decoupled into two contracts: a proxy contract
+that contains the data storage and a logic contract that contains the
+implementation logic. The two contracts interact via delegate calls
+that allow the logic contract’s functions to be executed in the context of the proxy contract’s storage. To update the implementation
+of smart contracts under this scheme, developers simply deploy a
+new logic contract and change the logic contract’s address stored
+in the proxy contract accordingly.
+The emerging proxy architecture also comes with new security
+issues, of which function collisions and storage collisions are the
+most notable ones. Particularly, smart contract developers may
+deliberately or accidentally create conflicts in the storage layouts or
+function identifiers between the proxy and logic contracts. When
+users execute these colliding contracts, such conflicts can lead to
+stored data and functions being incorrectly accessed. Worse, they
+can also be exploited by sophisticated adversaries to steal assets
+from the victims who wrongfully execute malicious functions or
+data. For example, attackers can create malicious contracts with
+function collisions that disguise their scamming functionalities,
+often known as honeypot contracts [46]. Outside of the academic
+realm, adversaries have leveraged storage collisions to overwrite the
+owner of Audius contracts, stealing more than a million worth of
+tokens in the process [2]. Also, a bounty hunter discovered storage
+collisions in the contract connecting the Ethereum and Arbitrum
+blockchains, which could potentially be exploited to compromise
+funds exceeding 250 million dollars [47].
+Considering the severe consequences of proxy smart contracts
+vulnerable to function and storage collisions in Ethereum, a few
+prior works have focused on finding them [5, 11, 13, 41, 42]. Unfortunately, however, these research efforts fail to cover all smart
+contracts, thus missing out on potential collision exploits. Notably,
+
+Conference’17, July 2017, Washington, DC, USA
+
+Cheng-Kang Chen, Wen-Yi Chu, Muoi Tran, Laurent Vanbever, and Hsu-Chun Hsiao
+
+Smart contract coverage
+With source code
+Without source code
+With tx
+Without tx
+With tx
+Without tx
+
+Collision coverage
+With source code
+Without source code
+Function
+Storage
+Function
+Storage
+
+EtherScan [11]
+✓
+✓
+Slither [13]
+✓
+✓
+✓
+✓
+Salehi et al. [42]
+✓
+✓
+USCHunt [5]
+✓
+✓
+✓
+✓
+CRUSH [41]
+✓
+✓
+✓
+✓
+Proxion (this work)
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+Table 1: Proxion uncovers more proxy smart contracts than previous works, especially including the hidden contracts that
+do not have source code and past transactions (acronym: tx) available. As a result, Proxion also discovers more collision
+vulnerabilities, notably function collisions in contracts lacking source code. Proxion’s novel coverage is highlighted in green.
+
+EtherScan [11], Slither [13], and USCHunt [5] are limited to analyzing contracts with source code published by the developers.
+Meanwhile, over 80% of smart contracts are only available as deployed bytecode (i.e., the compiled source code), see Section 3.1.
+Moreover, CRUSH [41] and Salehi et al. [42] can identify proxy
+smart contracts only if they have previously interacted with logic
+smart contracts through transactions. This constraint causes them
+to overlook nearly half of the active Ethereum contracts, particularly the newly deployed ones.
+Failing to cover all smart contracts for proxy detection can lead
+to undesirable outcomes. A clear consequence is that the scope of
+current tools in identifying collision problems is also limited. Indeed, no prior research has successfully detected function collisions
+using only the bytecode of proxy and logic contracts. For example, USCHunt [5] and Slither [13] are restricted to contracts with
+accessible source code, whereas CRUSH [41] is tailored to detect
+only storage collisions. Worse, adversaries might deploy malicious
+contracts (e.g., honeypot contracts [46]) and hide them from these
+analysis tools by not publishing their source code or interacting
+with other contracts. These shortcomings highlight the necessity
+for a novel, effective assessment method for all contracts, thereby
+enabling thorough collision checks.
+To that end, we introduce Proxion, an automated cross-contract
+analyzer that aims to uncover all proxy smart contracts in Ethereum.
+In essence, Proxion emulates the execution of the contract under
+test with carefully crafted inputs that trigger distinct behaviors
+of proxy contracts (e.g., making delegate calls to other contracts).
+Therefore, Proxion does not require the contract’s source code
+or its past transactions like prior works. Once a proxy contract
+is identified, Proxion efficiently locates the associated logic contracts throughout the blockchain history. Subsequently, for each
+proxy and logic contract pair, Proxion identifies function and storage collisions using various analysis techniques, depending on the
+availability of their source codes. Table 1 compares Proxion with
+related works, highlighting its novel ability to cover hidden contracts lacking source code and historical transactions, as well as
+function collisions when contract source codes are unavailable.
+In addition to providing broader coverage of smart contracts and
+collisions compared to previous studies, Proxion stands out for its
+efficiency, effectiveness, and precision, as shown in our thorough
+evaluation. Specifically, Proxion can analyze all 36 million active
+smart contracts in just 65 hours on a commodity server, processing
+
+an average of about 150 contracts per second. Moreover, Proxion
+has identified thousands of vulnerable contracts with unreported
+collision issues, affecting at least 11 entities in control of a total of
+19 billion USD in stakes. In terms of accuracy, Proxion achieves
+78.2% in detecting storage collisions and 99.5% in detecting function
+collisions, also surpassing the performance of state-of-the-art tools.
+In summary, we claim the following contributions.
+• We introduce Proxion, an automated cross-contract analyzer designed to assess proxy smart contracts in Ethereum
+for their function and storage collisions without the need
+for access to their source codes or historical transactions.
+• We implement Proxion and demonstrate that it is efficient,
+effective, and accurate while covering significantly more contracts and collisions than state-of-the-art contract analyzers.
+• We use Proxion to analyze all alive Ethereum smart contracts, uncovering nearly 20 million proxy contracts, detecting 1.5 million collision issues, and capturing several insightful trends in developing proxy contracts over the years.
+
+2
+
+BACKGROUND
+
+In this section, we provide the background by introducing the
+Ethereum blockchain (§2.1), reviewing proxy smart contracts (§2.2),
+and describing their collision issues (§2.3).
+
+2.1
+
+Ethereum Blockchain
+
+Ethereum stands as a widely adopted cryptocurrency. It operates
+on the principles of a distributed state machine where peer-to-peer
+nodes collaboratively maintain a global state consisting of users’
+accounts and balances. A typical Ethereum node comprises a consensus client implementing the proof-of-stake algorithm and an
+execution client responsible for propagating and executing transactions within the Ethereum Virtual Machine (EVM), thereby deterministically generating a new blockchain state. These transactions
+serve the purpose of deploying specialized programs known as
+smart contracts onto the Ethereum network or executing functions
+within deployed smart contracts.
+Specifically, a smart contract is a program written in high-level
+languages such as Solidity [14] or Viper [6], which is then compiled
+into EVM bytecode. Deploying a smart contract to the Ethereum
+blockchain essentially means creating a new contract account containing its compiled bytecode and data storage. The data storage
+
+Proxion: Uncovering Hidden Proxy Smart Contracts for Finding Collision Vulnerabilities in Ethereum
+
+stores variables consecutively based on the order in which they are
+declared. Subsequently, users can trigger the EVMs to execute functions within the deployed smart contract by sending transactions
+that meet the predefined conditions, such as proper input data (i.e.,
+call data1 ), to the contract account’s address. These transactions are
+termed external transactions and can be initiated by any externally
+owned account that interacts with a contract on the blockchain. In
+contrast, internal transactions occur when a smart contract invokes
+the functions of another smart contract.
+To execute a smart contract function, the transaction’s call data
+encodes a series of bytes, including a function selector (also known
+as the function signature) and the function’s arguments. The function selector is created by hashing the function’s prototype string
+using the Keccak-256 hashing function and truncating the output to the first four bytes. For instance, the function selector for
+free_ether_withdrawal() is 0xdf4a3106. This selector is followed by a series of bytes representing the function’s arguments,
+encoded depending on the compilers.
+During the execution of smart contract bytecode, EVMs sequentially interpret and execute lower-level, machine-readable instructions known as opcodes. Specifically, the EVM extracts the function
+selector, parses its arguments, and executes the function body. If
+the call data’s function selector does not match any defined function, the EVM will execute a fallback function if one is present in
+the smart contract. It is also worth noting that execution occurs
+within a stack machine, where a stack—acting as a list of 32-byte elements—holds the inputs and outputs of smart contract instructions.
+Items added to the stack are placed at the top, and instructions
+typically interact with the stack’s topmost elements. Additionally,
+during the execution, the EVMs may use a transient memory that
+is cleared after each transaction or access the persistent storage of
+the smart contracts.
+
+2.2
+
+Proxy Smart Contracts in Ethereum
+
+Ethereum smart contracts are designed to be immutable, meaning
+their bytecode remains unchanged after being deployed on the
+blockchain. Nonetheless, similar to conventional programs, smart
+contracts require updates to introduce new features, correct errors,
+or address security flaws. A naive solution to updating a smart contract’s logic is migrating its states and balances into a new contract
+with the updated program. Obviously, such a migration does not
+scale, as all affected users need to update their workflows to use a
+new contract address. The need for smart contract upgradability
+motivates several proposals for splitting a smart contract into two
+parts: a proxy contract storing the data and a logic contract storing
+the implementation logic [3, 20, 30, 31, 38].
+We illustrate the essence of proxy smart contracts in Figure 1.
+The proxy smart contract facilitates a delegate call to a function
+in the logic contract. Here, the delegate call allows the execution
+of the logic contract’s function in the context of the proxy contract’s storage. In particular, the user encodes the call data for that
+function in an Ethereum transaction sent to the proxy contract.
+This call data contains a function selector that does not match any
+1 Call data is used to call a specific contract’s function, which should not be confused
+with calldata, which is the temporary location where function arguments are stored
+in the EVM.
+
+Conference’17, July 2017, Washington, DC, USA
+
+Proxy contract
+
+contract Proxy {
+address private logic;
+[...]
+
+function impl_() {
+[...]
+}
+
+call data
+
+fallback(bytes calldata input) {
+[...]
+logic.delegatecall(input)
+}
+
+User
+
+Logic contract v1
+
+Logic contract v2
+
+Figure 1: An example of proxy and logic smart contracts. The
+proxy contract’s delegate call forwards the call data to the
+upgraded logic contract.
+
+existing proxy contract functions, allowing it to be passed to the
+proxy contract’s fallback function. As a result, the delegate call in
+the fallback function is triggered, executing the logic contract’s
+functions while accessing the proxy contract’s storage.
+Naturally, an important application of proxy smart contracts is
+upgrading the logic implementations. To enable upgradeability, the
+proxy contract stores the logic contract’s address, usually in one of
+its storage slots, see logic variable in Figure 1. When upgrading
+to a new logic contract (e.g., v2 in Figure 1), the user only needs
+to replace the logic contract’s address stored in the proxy contract
+(e.g., using a setter call). Another notable application of proxy
+smart contracts is cloning exact contract functionalities [31]. Often,
+these proxy contracts contain no function but only delegate calls
+to a fixed logic contract’s address stored directly in the bytecode.
+This paper excludes library contracts with reusable code for general use, such as SafeMath [19], from the definition of logic smart
+contracts and, therefore, does not automatically classify contracts
+that call them as proxy smart contracts. Specifically, in these external library calls, delegate calls occur at different code locations, not
+in the fallback function. This eliminates the possibility of upgradability, as it prevents users from choosing whether to execute the
+library contract’s functions. Indeed, all Ethereum Improvement Proposals (EIPs) concerning the proxy smart contract pattern exclude
+library contracts from their scope.
+In short, Proxion considers a contract to be a proxy contract if
+it uses the delegate call in its fallback function to forward the call
+data it has received to another contract, and any contract receiving
+forwarded call data from a proxy contract is a logic contract.
+
+2.3
+
+Collision Vulnerabilities
+
+Separating storage and implementation logic in proxy architecture
+leads to various issues, notably function and storage collisions.
+These collisions have posed significant risks to proxy and logic
+contracts, potentially enabling attacks that aim to steal stored assets.
+Function collision vulnerability. A function collision occurs
+when a proxy contract’s function has the same signature as a logic
+contract’s function. When it happens, users cannot execute the
+collided functions in the logic contract because the call data is not
+passed to the fallback function in the proxy contract. The most
+
+Conference’17, July 2017, Washington, DC, USA
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+
+contract Proxy {
+address private owner ;
+address private logic ; // Logic contract 's address
+address constant USDT =
+0 xdAC17F958D2ee523a2206206994597C13D831ec7 ;
+constructor ( address impl ) {
+owner = msg . sender ;
+logic = impl ;
+}
+function impl_LUsXCWD2AKCc () public {
+// a malicious function stealing 1000 USDT from the caller
+USDT . delegatecall ( abi . encodeWithSignature (
+" transfer ( address , uint256 )" , owner , 1000
+));
+}
+
+}
+
+fallback ( bytes calldata input ) external
+returns ( bytes memory ) {
+( bool success , bytes memory output ) =
+logic . delegatecall ( input );
+return output ;
+}
+
+contract Logic {
+function free_ether_withdrawal () public {
+// an attractive function that sends the caller 10 Ethers
+payable ( msg . sender ). transfer (10 ether );
+}
+}
+
+Listing 1: An example of function collisions between
+the proxy and logic contracts. The proxy contract’s
+impl_LUsXCWD2AKCc() function collides with a logic contract’s
+free_ether_withdrawal() due to their same signatures.
+
+obvious scenario of function collisions is when a proxy contract’s
+function has the same name as a logic contract’s function. The
+two collided functions may also differ as long as they share the
+same first 4 bytes in their hashes. Listing 1 illustrates an example of
+function collisions, in which two functions impl_LUsXCWD2AKCc()
+(line 12) and free_ether_withdrawal() (line 28) have the same
+4-byte signature of 0xdf4a3106. As a result, when the user encodes this signature in the call data, the proxy contract will execute impl_LUsXCWD2AKCc() instead of calling the logic contract’s
+free_ether_withdrawal().
+Potential exploits. Malicious contract developers can exploit function collisions to trick users into executing honeypot contracts [46].
+In such attacks, the adversary creates a logic contract with an enticing function, such as transferring cryptocurrencies to the function
+caller, which actually collides with a proxy contract’s function that
+steals funds from the caller. We exemplify the honeypot contracts in
+Listing 1, where function free_ether_withdrawal() in the logic
+contract allows the caller to withdraw 10 ETH from the contract’s
+balance (line 30). However, since this function has the same function selector with impl_LUsXCWD2AKCc(), the user transfers 1,000
+USDT to the contract owner instead (lines 14–16).
+We note that creating a pair of functions that share the same
+4-byte signature is remarkably easy and achievable within seconds on even modest computers. Attackers might also craft functions that follow a certain naming pattern or share the same signature with existing functions, requiring more time. For instance,
+after approximately 600 million attempts in 1.5 hours with a commodity laptop, we found a function with the same signature as
+
+Cheng-Kang Chen, Wen-Yi Chu, Muoi Tran, Laurent Vanbever, and Hsu-Chun Hsiao
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+
+contract Proxy {
+address private owner ; // Storage slot [0 x0 ]
+[...]
+address private logic ; // Logic contract 's address
+
+}
+
+constructor ( address impl ) {
+logic = impl ;
+}
+[...]
+fallback ( bytes calldata input ) external
+returns ( bytes memory ) {
+( bool success , bytes memory output ) =
+logic . delegatecall ( input );
+return output ;
+}
+
+contract Logic {
+bool private initialized ; // Storage slot [0 x0 ]
+bool private initializing ; // Storage slot [0 x0 ]
+
+}
+
+function initialize () external {
+require ( initializing || ! initialized );
+initialized = true ;
+initializing = false ;
+owner = msg . sender ;
+}
+[...]
+
+Listing 2: An example of storage collisions between the proxy
+and logic contracts. The storage collision occurs at slot 0
+between the owner variable (20 bytes) in the proxy contract
+versus initialized and initializing variables (1 byte each)
+in the logic contract.
+
+free_ether_withdrawal(). Overall, the process of finding colliding functions remains highly accessible for motivated adversaries,
+emphasizing the significant risks posed by function collisions.
+Storage collision vulnerability. A storage collision happens
+when two variables with different types or interpretations are assigned to the same storage slots across proxy and logic contracts.
+To see why such collisions may occur, recall that the logic contract
+is executed in the context of the proxy contract’s storage, meaning that two contracts share the same storage layout. For example,
+the first variable declared in the logic contract, regardless of its
+name and type, will access the storage slot 0 of the proxy contract.
+Commonly, if multiple contiguous variables require less than 32
+bytes (for example, a bool is 1 byte or an address is 20 bytes), they
+will be packed into a single storage slot (e.g., in Solidity). Thus,
+collisions often come from mismatched storage layouts (i.e., the
+orders of variable declarations) and can cause data to be incorrectly
+read or overwritten. The most frequent cause of storage collisions
+is when one contract writes to a slot, and another reads from that
+slot with a different interpretation. Upgrading the logic contract to
+newer versions that change the order or types of variables also facilitates storage collisions. We show an example of storage collisions
+in Listing 2 where proxy contract’s owner variable (20 bytes) and
+logic contract’s initialized and initializing variables (1 byte
+each) use the same storage slot 0. Thus, when the user executes a
+logic contract function involving the initialized variable, it may
+access 1 byte of the owner variable in the proxy contract.
+Potential exploits. Storage collisions can be exploited to seize
+control of vulnerable contracts by overwriting the owner’s address
+with that of the attacker [2]. Additionally, adversaries can deceive
+users into executing malicious logic contracts in which variables
+
+may have names that seem harmless but are designed to access
+storage slots in the proxy contract, leading to actions that differ
+from the user’s expectations.
+For example, Listing 2 presents a simplified illustration of the
+vulnerable proxy and logic contracts exploited in the real-world
+attacks against the Audius cryptocurrency [2]. In this example,
+the logic smart contract contains an initialize() function that
+sets the transaction’s sender as the owner of the contract (line 26)
+if the owner has not been set previously (line 23). This function
+is intended to be called only once during contract deployment.
+However, the owner variable in the proxy contract (line 2) and the
+initialized and initializing variables in the logic contract are
+both allocated to the same storage slot number 0. Consequently,
+even after the initialized and initializing variables are updated (lines 24–25), indicating the owner has been assigned, the
+storage slot is immediately overwritten by the new owner value
+(line 26) in the proxy contract. Consequently, the initializing
+variable in the logic contract is always true, wrongly indicating
+that the contracts have not completed the initialization. This allows
+the initialize() function to be executed multiple times and the
+owner variable to be reassigned. Attackers indeed exploited this
+vulnerability to take control of the Audius governance contracts,
+as detailed in Audius’s post-mortem report [2].
+
+3
+
+PROXION OVERVIEW
+
+This section provides an overview of our tool Proxion. First, we discuss the necessity for a novel tool to uncover proxy smart contracts
+within Ethereum and outline the challenges that current solutions
+fail to address (§3.1). We then briefly present the methods by which
+Proxion overcomes these challenges (§3.2).
+
+3.1
+
+Motivation
+
+Proxy smart contracts are crucial in the Ethereum ecosystem due
+to their upgradability, yet they are vulnerable to exploitation if
+collision vulnerabilities are present. Unfortunately, the best practices of proxy smart contracts fall short for both developers and
+users. Specifically, users must manually review the source code
+of both proxy and logic contracts before any interaction, such as
+sending a transaction. Should a proxy contract lack available source
+code, it is advised that users avoid engaging with it to prevent potential misuse despite possibly missing out on legitimate services.
+Developers of proxy smart contracts are recently equipped with
+the new Transparent Upgradeable Proxy design proposed by OpenZeppelin [36] that minimizes the impacts of function collisions.2
+However, adopting a new proxy design is time-consuming, while
+existing proxy contracts may already contain vulnerabilities due to
+human errors.
+To facilitate the safety assessment of proxy smart contracts, various systems have been recently introduced to automatically identify
+collision vulnerabilities [5, 13, 41]. At the high level, these systems
+typically involve two main phases: (1) identifying proxy contracts
+and their corresponding logic contracts from historical data, and (2)
+examining each contract pair to determine if there are any colliding
+2 In the Transparent Upgradeable Proxy pattern, the owner of the contracts is able
+
+to execute all functions with the exception of the fallback function, whereas other
+users always delegate calls. This architecture, by distinguishing between the callers,
+prevents unintended function executions and inherently avoids function collisions.
+
+Number of alive smart contracts (million)
+
+Proxion: Uncovering Hidden Proxy Smart Contracts for Finding Collision Vulnerabilities in Ethereum
+
+40
+
+Conference’17, July 2017, Washington, DC, USA
+
+Only source code
+Source code + transaction
+Only transaction
+No source code, no transaction
+
+35
+30
+25
+20
+15
+10
+5
+0
+
+2015
+
+2016
+
+2017
+
+2018
+
+2019
+
+2020
+
+2021
+
+2022
+
+2023
+
+Figure 2: The accumulated number of alive Ethereum smart
+contracts till 31 October 2023. Prior works only cover about
+18% of smart contracts with source code (blue and orange) [5]
+or 53% of smart contracts with past transactions (orange and
+green) [41], while Proxion also applies to the hidden contracts without source code or past transactions (red).
+
+functions or storage slots. While the approach seems straightforward, several challenges remain, leaving a non-negligible number
+of proxy smart contracts unchecked and potentially vulnerable to
+exploitation.
+First, the source code of smart contracts may not be available
+because the public blockchain contains only their runtime bytecode.
+The contract bytecode is not human-readable, making the analysis
+(e.g., checking for delegate calls in the fallback function) difficult.
+Indeed, several existing tools (e.g., USCHunt [5], Slither [13]) can
+only analyze smart contracts when their source code is published
+(e.g., on EtherScan [11]). Figure 2 shows the accumulated number of
+alive3 Ethereum smart contracts from 2015 to 2023. Unfortunately,
+we notice that smart contracts with source code available only
+account for less than 20% of all contracts.
+Second, uncovering proxy smart contracts through their historical interactions with other (logic) smart contracts might also not
+always be feasible. Specifically, existing tools (e.g., CRUSH [41],
+Salehi et al. [42]) analyze all blockchain transactions to detect
+DELEGATECALL instructions, identifying contracts involved as proxy
+and logic contract pairs. This approach is applicable to all smart
+contracts, even those with only bytecode available. However, it
+can result in numerous false positives, as common library calls
+may also contain DELEGATECALL instructions. Furthermore, many
+smart contracts have never interacted with others, such as those
+freshly deployed on the blockchain. In fact, our data in Figure 2
+indicates that only about half of the active smart contracts have had
+interactions with other contracts and are therefore detectable by
+these tools. Intuitively, adversaries may exploit these by concealing
+malicious proxy contracts, such as not releasing their source code
+and avoiding prior interactions with other smart contracts.
+Third, even when proxy and logic smart contracts with only
+bytecode are uncovered (e.g., using CRUSH [41]), detecting their
+function collisions is highly error-prone due to the lack of information obtained from their bytecode. As we will show shortly below,
+3We exclude the destroyed smart contracts.
+
+Conference’17, July 2017, Washington, DC, USA
+
+Cheng-Kang Chen, Wen-Yi Chu, Muoi Tran, Laurent Vanbever, and Hsu-Chun Hsiao
+
+function signatures, which are four bytes long, always appear after
+a specific byte (i.e., the PUSH4 opcode) in the contract’s bytecode.
+A naive function collision detection would cross-check any four
+bytes following the PUSH4 opcode in the proxy and logic contracts
+pair. However, this method is flawed as arbitrary data may also
+follow the PUSH4 opcode, leading to numerous false positives. For
+this reason, no previous research has managed to detect function
+collisions solely from bytecode; for example, USCHunt [5] and
+Slither [13] are limited to contracts with available source code,
+whereas CRUSH [41] is designed to identify storage collisions only.
+
+3.2
+
+PUSH1
+MSTORE
+GASPRICE
+…
+
+PUSH1
+MSTORE
+DELEGATECALL
+…
+call data:
+0x025313a2…
+
+Solutions
+
+In this paper, we propose Proxion, an automation tool that aims
+to reveal all proxy smart contracts and their corresponding logic
+contracts. The main novelty of Proxion is its capability to identify
+the hidden proxy smart contracts that lack both source code and
+previous transactions. To achieve that, Proxion employs dynamic
+analysis to verify whether the delegate calls forward the transaction
+call data in the fallback function. Specifically, for a given smart contract, Proxion emulates its EVM execution using carefully crafted
+call data. If a smart contract is indeed a proxy, a DELEGATECALL
+instruction will appear in the EVM stack and vice versa. Through
+the emulation of EVM execution, Proxion can also identify the
+storage locations of the logic contracts’ addresses, enabling their
+easy retrieval from historical blockchain data. Consequently, unlike
+previous methods, Proxion is not dependent on the source code or
+historical transactions of the smart contracts under test.
+Thereafter, given a pair of proxy and logic smart contracts, Proxion searches for potential storage and function collisions. For storage collisions, Proxion utilizes symbolic execution and program
+slicing techniques from the state-of-the-art tool CRUSH [41] to
+identify exploitable contracts. Regarding function collisions, Proxion compares the function signatures pairwise using Slither [13]
+if both proxy and logic contracts have their source code available.
+Here, another innovation of Proxion lies in detecting function
+collisions, even when one or both of the contracts do not have
+available source code. Specifically, when a contract exists solely in
+bytecode, Proxion examines the disassembled opcodes to identify
+the jump instructions corresponding to code blocks of functions.
+Proxion then extracts the 4-byte data of the function signature
+that precedes these jump instructions. While the exact function
+names remain undisclosed, retrieving these signatures is sufficient
+for Proxion to cross-reference and detect any function collision.
+A prototype of Proxion, featuring the proxy smart contract
+finder and the collision detector, is accessible at https:// github.com/
+Proxion-anonymous/ Proxion.
+
+4
+
+disassembling
+into opcodes
+PUSH1
+CALLER
+DELEGATECALL
+…
+call data:
+0x42966c68…
+
+emulating
+EVM execution
+
+0x42966c68
+
+Figure 3: Proxion identifies proxy smart contracts in two
+steps. First, Proxion disassembles the tested contract’s bytecode into opcodes. Contracts without a DELEGATECALL opcode
+(e.g., ➊) are not proxies. Second, Proxion executes the tested
+contract under an emulated EVM with carefully created transaction call data. If this data is not forwarded to another contract in the emulated EVM, the contract is not a proxy (e.g.,
+➋) and vice versa (e.g., ➌). Proxion then identifies the associated logic contracts of the identified proxy contract.
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+
+0000 60 PUSH1 0 x80
+0002 60 PUSH1 0 x40
+0004 52 MSTORE
+0005 34 CALLVALUE
+0006 80 DUP1
+0007 15 ISZERO
+0008 61 PUSH2 0 x000f
+000 B 57 * JUMPI
+[...]
+// function selection process
+001 A 35 CALLDATALOAD
+001 B 60 PUSH1 0 xe0
+001 D 1C SHR
+001 E 80 DUP1
+001 F 63 PUSH4 0 xdf4a3106 // signature of impl_LUsXCWD2AKCc ()
+0024 14 EQ
+0025 61 PUSH2 0 x00ce
+0028 57 * JUMPI
+[...]
+// fallback () :
+007 C 5B JUMPDEST
+007 D 5F 5F
+007 E 60 PUSH1 0 x40
+0080 51 MLOAD
+0081 80 DUP1
+0082 83 DUP4
+0083 03 SUB
+0084 81 DUP2
+0085 85 DUP6
+0086 5A GAS
+0087 F4 DELEGATECALL
+[...]
+// impl_LUsXCWD2AKCc () :
+00 CE 5B JUMPDEST
+[...]
+
+UNCOVERING PROXY SMART CONTRACTS
+
+We illustrate the two-step approach to check if a given smart contract is a proxy contract in Figure 3. The approach includes disassembling smart contracts to locate DELEGATECALL instructions
+(§4.1) and emulating the EVM execution to verify the contract’s interaction with other contracts (§4.2). Then, Proxion also identifies
+all logic contracts associated with identified proxy contracts from
+historical blockchain data (§4.3).
+
+Listing 3: The disassembled opcodes for the proxy smart
+contract’s bytecode presented in Listing 1.
+
+4.1
+
+Disassembling Smart Contracts
+
+In the first step, Proxion determines the tested smart contract
+is not a proxy if its bytecode does not contain the DELEGATECALL
+
+Proxion: Uncovering Hidden Proxy Smart Contracts for Finding Collision Vulnerabilities in Ethereum
+
+opcode, which is the defining factor of all proxy smart contracts.
+To learn the opcodes of a smart contract, Proxion disassembles its
+bytecode, which results in a sequence of assembly representation
+known as opcodes and operands (e.g., [16, 18]).
+We implement this disassembler component of Proxion based
+on Octopus, an open-source security analysis framework that is capable of translating contract bytecode into opcodes and operands [49].
+Particularly, we extend Octopus so that it covers recently introduced
+opcodes in Ethereum, such as CALL, DELEGATECALL, CREATE, and
+CREATE2. This is easily achievable since the opcodes have fixed
+corresponding bytes. Listing 3 illustrates an example of the opcodes
+after being disassembled from the proxy contract’s bytecode shown
+previously in Listing 1.
+Thereafter, Proxion spots if any DELEGATECALL opcode exists,
+concluding the smart contract is not a proxy (e.g., contract ➊) or
+proceeding to the next step (e.g., contracts ➋ and ➌).
+
+4.2
+
+Conference’17, July 2017, Washington, DC, USA
+
+Algorithm 1 Finding addresses contained in a storage slot.
+Require: P S C: The tested proxy smart contract.
+ℎ𝑙𝑜𝑤𝑒𝑟 , ℎ𝑢𝑝𝑝𝑒𝑟 : The lower and upper bounds for the height of considered blocks (e.g., the genesis block and the latest block).
+Ensure: A: The set of logic contracts’ addresses associated with P S C.
+1: procedure PartitionBlocks(ℎ𝑙𝑜𝑤𝑒𝑟 , ℎ𝑢𝑝𝑝𝑒𝑟 )
+2:
+V𝑙𝑜𝑤𝑒𝑟 ← getStorageAt( P S C, ℎ𝑙𝑜𝑤𝑒𝑟 )
+3:
+V𝑢𝑝𝑝𝑒𝑟 ← getStorageAt( P S C, ℎ𝑢𝑝𝑝𝑒𝑟 )
+4:
+if V𝑙𝑜𝑤𝑒𝑟 = V𝑢𝑝𝑝𝑒𝑟 then
+⊲ Storage slot values are the same.
+5:
+return {𝑉𝑙𝑜𝑤𝑒𝑟 }
+6:
+end if
+7:
+ℎ𝑚𝑖𝑑 ← ⌊ (ℎ𝑙𝑜𝑤𝑒𝑟 + ℎ𝑢𝑝𝑝𝑒𝑟 )/2⌋
+⊲ Binary search.
+8:
+A𝑙𝑜𝑤𝑒𝑟 ← PartitionBlocks(ℎ𝑙𝑜𝑤𝑒𝑟 , ℎ𝑚𝑖𝑑 )
+9:
+A𝑢𝑝𝑝𝑒𝑟 ← PartitionBlocks(ℎ𝑚𝑖𝑑 + 1, ℎ𝑢𝑝𝑝𝑒𝑟 )
+10:
+A ← A𝑙𝑜𝑤𝑒𝑟 + A𝑢𝑝𝑝𝑒𝑟 − {∅}
+11:
+return A
+12: end procedure
+
+Emulating EVM Execution
+
+In the second phase, Proxion checks if delegate calls are triggered
+in the tested smart contract’s fallback function, and they indeed
+forward the transaction call data to another smart contract. To do so,
+Proxion triggers the tested smart contract with an emulated EVM
+and carefully crafted call data. Particularly, this call data contains a
+random function signature (i.e., with 4 bytes in size) that is different
+from signatures of all other functions in the proxy contract. Thus,
+it enables the execution of the proxy contract’s fallback function.
+To learn the potentially existing functions’ signatures, Proxion
+identifies the locations of PUSH4 opcodes in the contract’s bytecode
+and extracts the 4-byte data following each of them. This approach
+is based on an observation that popular contract compilers (e.g.,
+Solidity, Vyper) always include the function signatures following
+PUSH4 opcodes. While not all 4-byte data following PUSH4 opcodes
+is a function signature, Proxion safely avoids all of them. Next,
+Proxion emulates the EVM execution of the tested smart contract
+along with the generated transaction call data and observes the
+memory, stack, and storage of each instruction. If Proxion does
+not observe this data is passed to the logic contract’s context after
+the execution of the DELEGATECALL instruction, Proxion marks the
+tested smart contract as not a proxy (e.g., contract ➋). Otherwise,
+the tested smart contract is a proxy (e.g., contract ➌).
+Here, we again extend Octopus to implement our EVM emulator.
+Specifically, our EVM emulator can also handle opcodes that have
+values depending on the state of the blockchain. For example, to
+support the NUMBER opcode that pushes the current block’s number
+to the EVM stack, we use the values from the latest block on the
+blockchain since all alive contracts are supposed to be executable
+at any block’s numbers. Similarly, we use the values in the latest
+block for the BLOCKHASH, DIFFICULTY, GASLIMIT, TIMESTAMP, and
+GASPRICE opcodes. We also assign fixed values for a few other opcodes, such as CHAINID, BASEFEE, and COINBASE, using the most
+probable values (e.g., the chain ID of Ethereum’s mainnet is 1).
+Adding these blockchain-related opcodes enhances the fidelity of
+the EVM emulation (e.g., with fewer runtime errors when encountering them).
+Moreover, we implement our EVM emulator to support CALL
+and DELEGATECALL opcodes that specifically call another contract
+
+and obtain the execution results before proceeding. To do so, we
+create two EVM emulator instances, one for the caller and another
+for the callee, and copy the results back from the callee to the stack
+of the caller instance to simulate the function returning.
+For the opcodes that place bytecode on Ethereum at a smartcontract address (e.g., CREATE and CREATE2), we use a fixed address
+to ensure that we can retrieve the exact address of a newly created
+contract. If our EVM emulator encounters this fixed address, we
+treat it like a normal smart contract. This method is acceptable
+because of the negligible probability of address collision (e.g., only
+1 out of 2160 in Ethereum).
+
+4.3
+
+Finding associated logic contracts
+
+Upon identifying a proxy smart contract, Proxion finds its associated logic contracts, which also can be done by looking into the
+EVM stack when the DELEGATECALL instruction is executed. Indeed,
+the address of the current logic contract is one of the stack inputs
+following the DELEGATECALL instruction.
+Next, Proxion also finds all other logic smart contracts that are
+ever associated with the tested proxy contract. If Proxion observes
+the found logic contract’s address is hard-coded in the proxy contract’s bytecode, it considers the test proxy contract follows the
+minimal proxy pattern (i.e., EIP-1167). These minimal proxy contracts include no function but only a delegate call in the fallback
+function and fix the address of the logic contract in the bytecode.
+Thus, they are lightweight (e.g., their bytecode is less than 100
+bytes) and have only one associated logic smart contract throughout history.
+If the found logic contract’s address is in a proxy contract’s
+storage slot, Proxion employs a binary search to uncover all addresses that have been stored in that slot. Naively, one can utilize
+Ethereum APIs such as getStorageAt to check the slot’s content
+at specific blockchain height (e.g., from the genesis block to the
+latest one), which is time-consuming when millions of Ethereum
+blocks exist. Instead, Proxion assumes that logic contracts of the
+same proxy contract are unique throughout history since reusing
+old versions of logic contracts (e.g., containing bugs or missing
+features) is intuitively uncommon. Leveraging this observation,
+
+Conference’17, July 2017, Washington, DC, USA
+
+Cheng-Kang Chen, Wen-Yi Chu, Muoi Tran, Laurent Vanbever, and Hsu-Chun Hsiao
+
+Proxion implements a binary search for blocks in which the value
+of the storage slot changes.
+We illustrate how Proxion finds the logic contracts’ addresses in
+Algorithm 1. Particularly, Proxion starts with the genesis block and
+the latest block and compares the storage slot values at these two
+blocks (i.e., lines 2–3). If the values are the same, the storage slot
+does not change during this block range (i.e., lines 4–6). Otherwise,
+Proxion splits the range into two halves and repeats this procedure
+(i.e., lines 7–9). Proxion finally returns a set of all values ever stored
+in the tested proxy smart contract; see line 11.
+
+to disassemble the bytecode and identify the code blocks. Proxion then parses Panoramix’s outputs to identify the functions and
+retrieve their signatures.
+
+5
+
+CHECKING FOR COLLISIONS
+
+Once Proxion identifies proxy and logic contracts, it detects if they
+are susceptible to function (§5.1) and storage collisions (§5.2).
+
+5.1
+
+Function collisions
+
+Once the proxy contract and its associated logic contracts are identified, Proxion utilizes Etherscan [11], a widely-used Ethereum
+explorer, to obtain their source code. To maintain a uniform format
+for the contract source code, we have developed a parser that processes the source code provided by the Etherscan APIs, which may
+be in the form of dictionaries or arrays.
+For a pair of proxy and logic contracts with available source
+code, Proxion implements a static analyzer based on Slither [13]
+to detect their function collisions. In particular, we generate a list
+of signatures for all functions in each contract. If there is an intersection between these lists, the contracts are considered to have
+a collision. To speed up the collision detection in a large dataset
+of contracts (see Section 7), Proxion also groups contracts based
+on their bytecode hash, indicating that the contracts are identical
+despite being deployed at different addresses.
+When one or both of the proxy or logic contracts do not have
+source code, Proxion analyzes the disassembled opcodes instead.
+It is important to remember that function signatures are always
+preceded by a PUSH4 opcode, although the converse is not true (i.e.,
+the data following a PUSH4 opcode can be arbitrary). Therefore,
+the challenge lies in identifying which 4-byte data subsequent to
+the PUSH4 opcodes actually constitutes a function signature. To
+achieve this, Proxion begins by identifying the jump instructions
+(e.g., JUMP or JUMPI opcodes), which divide the disassembled code
+into several basic blocks. These code blocks may represent if-else
+statements, loops, or function calls, which are distinguishable by
+how the EVM execution reaches them via the jump instructions. In
+particular, the EVM execution typically jumps to a specific function
+after a condition involving its function signature is satisfied (e.g.,
+when call data contains that signature). Thus, Proxion searches
+for a pattern of opcodes containing PUSH4 (i.e., pushing 4 bytes),
+EQ (i.e., equal), and *JUMPI (i.e., conditional jump), see line 15–18
+in Listing 3. Proxion then extracts the 4-byte sequence following
+the PUSH4 opcode within these patterns, treating it as the function
+signature. Once Proxion has gathered function signatures from
+both the proxy and logic contracts, Proxion simply cross-checks
+them pairwise, similarly to when both contracts have source code.
+In terms of implementation, Proxion utilizes the state-of-theart decompiler tool Panoramix [24], an integral part of Etherscan,
+
+5.2
+
+Storage collisions
+
+Proxion utilizes techniques from CRUSH [41] to identify exploitable
+storage collisions. To ensure a comprehensive understanding, we
+briefly explain the fundamental operations of CRUSH.
+First, CRUSH identifies the storage slots possibly accessed by
+the SLOAD or SSTORE instructions, which can be found after disassembling the contract’s bytecode. Subsequently, CRUSH employs
+program slicing to extract all instructions that contribute to the computation of the storage slots. Following this, CRUSH symbolically
+executes these instructions to learn the size of the variables within
+the specified slots, thereby deducing their types. Then, CRUSH compares all storage slots pairwise to uncover any type discrepancies
+suggesting a possible collision.
+Upon detecting storage collisions, CRUSH identifies those that
+are potentially exploitable. CRUSH specifically targets sensitive
+storage slots involved in access control decisions, such as read-only
+slots or those written exclusively by certain users. It then generates
+test transactions to trigger collisions in these sensitive slots by
+writing one variable type and then reading a different type from
+the same slot. These transactions are subsequently fed to the EVM
+execution to verify the exploit.
+
+6
+
+EVALUATION
+
+This section evaluates Proxion’s performance, effectiveness, and
+accuracy. We first demonstrate that Proxion is efficient, capable
+of performing hundreds of proxy contract checks per second on a
+commodity computer (§6.1). Next, we show that Proxion effectively
+identifies unknown proxy and logic contracts that are susceptible
+to function and storage collisions within already examined datasets
+(§6.2). Lastly, we demonstrate that Proxion’s accuracy surpasses
+that of the state-of-the-art tools (§6.3).
+
+6.1
+
+Performance
+
+Setup. We operate Proxion on a system equipped with Ubuntu
+22.04 OS, featuring 12 cores (24 threads) at 3.8 GHz each, and 64
+GB of RAM. The input for Proxion is a list of all 36 million active
+contract addresses in Ethereum (see Section 7). Its output includes
+a list of proxy contracts and the logic contracts associated with
+each of them. Additionally, Proxion provides details of function
+and storage collisions for each proxy and logic contract pair, if such
+collisions exist.
+Results. On average, Proxion analyzes a smart contract in just
+6.4 milliseconds to determine if it is a proxy, translating to 156.3
+contracts per second. This efficiency enables Proxion to process
+roughly 36 million active contracts on the Ethereum network within
+approximately 65 hours.
+Moreover, Proxion’s binary search method for identifying logical contracts linked to a proxy contract significantly increases its efficiency. For each proxy contract, Proxion makes 26 getStorageAt
+API calls on average, which is a substantial improvement over the
+naive method of querying all 15 million Ethereum blocks.
+
+Proxion: Uncovering Hidden Proxy Smart Contracts for Finding Collision Vulnerabilities in Ethereum
+
+Conference’17, July 2017, Washington, DC, USA
+
+In terms of function collision detection, Proxion averages 6.7
+milliseconds to check if a contract pair has a collision issue. The
+storage collision detection based on CRUSH averages a longer execution time of 1.3 minutes per contract pair. Proxion overcomes
+this performance bottleneck by leveraging previously analyzed
+contract information with the same bytecode. Indeed, by avoiding
+re-testing identical contracts, Proxion requires only 48 days to test
+the storage collision vulnerabilities of 36 million smart contracts.
+
+TP
+
+FP
+
+TN
+
+FN
+
+Accuracy
+
+33
+26
+27
+
+83
+76
+28
+
+79
+86
+134
+
+11
+18
+17
+
+54.4%
+54.4%
+78.2%
+
+6.2
+
+USCHunt
+CRUSH
+Proxion
+
+Function USCHunt 299
+1
+0
+261
+53.3%
+0
+1
+3
+99.5%
+collision Proxion 557
+Table 2: Proxion has higher accuracy than the state-of-theart tools in detecting both storage and function collisions.
+
+Effectiveness
+
+Datasets. We evaluate the effectiveness of Proxion in uncovering
+more proxy and logic contracts (and subsequently, more collisions)
+by comparing it with state-of-the-art tools, specifically USCHunt [5]
+and CRUSH [41], utilizing their original datasets.
+First, we use the Smart Contract Sanctuary dataset [37], which
+is used to evaluate USCHunt originally. The Smart Contract Sanctuary dataset contains 329,764 smart contracts that were deployed
+between 2017 and 2022 and have their source code published on
+EtherScan [11].
+Second, we also use the dataset used by CRUSH [41] that includes
+53,580,899 contracts deployed from July 2015 to April 2023. These
+contracts may or may not have source code and past transactions.
+Results. Proxion discovers more proxy contracts than both
+USCHunt and CRUSH when testing against their respective datasets.
+When running with the entire Smart Contract Sanctuary dataset,
+we observe that Proxion experiences notably fewer failure cases
+than USCHunt. Specifically, USCHunt encounters halt due to contract compilation errors (e.g., unknown compiler versions) in about
+30% of cases.4 Meanwhile, Proxion fails to emulate the execution,
+for instance, due to insufficient values on the EVM stack in only
+about 1.2% of contracts. In total, Proxion identifies 35,924 proxy
+contracts, whereas USCHunt detects only 29,023, which is roughly
+seven thousand fewer. As a result, Proxion detects 257 function
+collisions that USCHunt has not reported.
+Furthermore, CRUSH indicates that 26.6% of the examined smart
+contracts, totaling 14,237,696, are identified as proxy contracts.
+Among them, CRUSH also detects that 956 contract pairs are vulnerable to storage collisions with verified exploits. Proxion reports
+about 1.2 million fewer proxy contracts than CRUSH in this dataset,
+totaling 13,042,496 proxy smart contracts. This outcome occurs because CRUSH categorizes any contracts that involve DELEGATECALL
+instructions as proxy contracts, including the one making library
+calls. In contrast, Proxion does not consider this condition when
+classifying proxy contracts (cf. Section 2.2). When excluding those
+proxy smart contracts, Proxion uncovers more 1,667,905 proxy
+contracts than CRUSH does, none of which have past transactions
+available. Moreover, Proxion identifies an additional 1,480 contracts
+with exploitable storage collisions that CRUSH did not report.
+
+6.3
+
+Storage
+collision
+
+Accuracy
+
+Methodology. We also compare the accuracy of Proxion with
+USCHunt and CRUSH in detecting storage and function collisions.
+For a fair comparison, we execute Proxion, USCHunt, and CRUSH
+on the Smart Contract Sanctuary dataset [37]. This dataset includes
+4We run USCHunt with the default compiler flags. There may be fewer errors if the
+
+compiler versions are provided when compiling each contract.
+
+only contracts with available source code, enabling us to manually
+examine them and establish the ground truth data.
+Specifically, within this dataset, USCHunt, CRUSH, and Proxion identify 116, 102, and 55 storage collisions, respectively. Altogether, the three tools detect 206 unique storage collisions, of which
+we manually inspect the code. In the case of function collisions,
+USCHunt identifies 300, while Proxion reports 557, resulting in
+a total of 561 unique instances for manual verification. Here, it is
+worth reminding that CRUSH does not detect function collisions.
+Results. We report the collision detection accuracy in Table 2.
+Regarding storage collisions, Proxion achieves an accuracy of 78.2%,
+surpassing both USCHunt and CRUSH, which each achieve an accuracy of 54.4%. USCHunt and CRUSH generate more false positives
+than Proxion, albeit for different reasons. Specifically, USCHunt
+mistakenly identifies variables with different names in separate contracts as collisions, often overlooking that one variable may serve
+as storage padding and is not exploitable. Proxion and CRUSH
+report a similar number of true positives (27 versus 26) thanks
+to their shared approach to detecting storage collisions. However,
+the higher accuracy of Proxion over CRUSH is attributed to its
+effective identification of proxy smart contracts, wherein Proxion
+precisely excludes library contracts.
+Regarding function collisions, Proxion achieves an accuracy of
+99.5%, with no false positives and only three false negatives. In contrast, USCHunt has a notable lower accuracy of 53.3%, with numerous false negatives due to the underlying Slither fails to identify
+proxy contracts. Here, Proxion also misses three function collisions
+due to runtime errors when emulating the EVM execution.
+
+7
+
+PROXY SMART CONTRACTS’ LANDSCAPE
+
+In this section, we present the comprehensive landscape of proxy
+smart contracts in Ethereum, resulting from Proxion analyzing all
+alive contracts and detecting their function and storage collisions.
+
+7.1
+
+Datasets
+
+We utilize Proxion to examine all active smart contracts on the
+Ethereum network, deployed from the genesis block up to block
+18473542 (the final block of October 2023). We begin by querying
+the addresses and deployment blocks of all contracts from Google
+BigQuery [4]. Then, we retrieve their source code from EtherScan
+if available [11], and bytecode and storage states from a locally
+established Ethereum archive node [10]. For efficient analysis, we
+assign the source code of a contract to all other contracts with
+the same bytecode hash. As previously shown in Figure 2, among
+roughly 64 million deployed smart contracts, 36 million are active
+
+Conference’17, July 2017, Washington, DC, USA
+
+ERC-1167
+
+Cheng-Kang Chen, Wen-Yi Chu, Muoi Tran, Laurent Vanbever, and Hsu-Chun Hsiao
+
+ERC-2535
+ERC-1822
+ERC-1967
+
+Year
+
+Function collisions
+
+Storage collisions
+
+2017
+2018
+2019
+2020
+2021
+2022
+2023
+
+24
+5,341
+16,136
+28,448
+705,801
+808,493
+2,541
+
+0
+7
+37
+34
+725
+2,082
+137
+
+Total
+1,566,784
+3,022
+Table 3: Number of function and storage collisions detected
+by Proxion. Notably, 1,545,722 (or 98.7%) proxy contracts
+with function collisions are actually identical.
+
+7.2
+
+Findings
+
+We present several findings regarding the growth of proxy contracts
+over the years, the number of found collisions, and the trends in
+their design patterns and deployments.
+First, over half of the active contracts are proxy or logic contracts,
+and the majority of proxy contracts do not publish their source code.
+We show the number of active proxy contracts identified by Proxion in Figure 4. As of October 2023, there are 19,599,317 proxy
+contracts, which represent 54.2% of all contracts. Of these, approximately 2 million are pairs of proxy and logic contracts with available
+source codes for both, as indicated by the blue line. Conversely,
+about 90% of proxy contracts lack available source codes, as shown
+by the orange and red lines. It should also be noted that in total,
+Proxion reveals approximately 1.5 million hidden proxy contracts
+for which neither source code nor past transactions are available.
+Furthermore, there has been a noticeable divergence in the
+growth trends of proxy contracts before and after 2020. From 2015
+to 2020, a total of only 2 million proxy contracts were deployed.
+However, the deployment of proxy contracts surged after 2020; for
+instance, 7.6 million proxy contracts were deployed in just the first
+ten months of 2023. These figures closely track the historical adoption of the proxy pattern in the development of Ethereum smart
+contracts. Particularly, before the first proxy-related EIPs [20, 31]
+in 2018, there was a clear demand for upgradeability and functionality cloning in smart contracts, demonstrated in about 1.3 million
+contracts already exploiting delegate calls. The period between
+2018 and 2020 appears to be the testing phase, in which several
+EIPs [3, 30, 31, 38] were proposed to standardize the proxy pattern,
+thus seeing a stable development in the number of proxy contracts.
+Proxy contracts have become mainstream since 2020, especially
+in 2022 and 2023, when more than 93% of contracts deployed are
+proxy contracts.
+Second, Proxion detects about 1.5 million function collisions, 98.7%
+of which are duplicated contracts with the same code, and about
+3 thousand exploitable storage collisions. We report the number
+
+105
+Number of duplicates (log)
+
+as of October 2023. Proxion successfully analyzes 95.1% of those
+active contracts without any errors from the EVM execution.
+
+107
+Number of duplicates (log)
+
+Figure 4: Accumulated number of pairs of proxy and logic
+contracts identified by Proxion from 2015 to 2023. In the vast
+majority of them, the proxy contracts only have bytecode
+available.
+
+105
+10
+
+3
+
+101
+0
+
+50000
+100000
+Indexes of unique contracts
+
+(a) Proxy contracts
+
+103
+101
+0
+
+10000 20000 30000 40000
+Indexes of unique contracts
+
+(b) Logic contracts
+
+Figure 5: Most contracts are duplicates: only 96, 420 and 38, 707
+unique proxy and logic contracts, respectively. (5a): three
+proxy contracts are duplicated more than 1 million times.
+(5b): two logic contracts have the same bytecode with more
+than ten thousand other contracts.
+
+of function and storage collisions found by Proxion in Table 3.
+Specifically, starting from the 19.5 million pairs of proxy and logic
+contracts, Proxion detects a total of 1, 566, 784 pairs having function collisions and 3, 022 pairs having storage collisions. Notably,
+98.7% of the detected function collisions come from many proxy
+contracts duplicated from the OwnableDelegateProxy5 contract. In
+those cases, function collisions are caused by the proxyType(),
+implementation(), upgradeabilityOwner() functions appearing in both proxy and logic contracts, possibly due to contract
+inheritance [53].
+Regarding storage collisions, we identified 91 instances out of
+3,022 where both proxy and logic contracts have their source code
+available. This availability enables us to study their owners and the
+potential impacts of exploiting them. Specifically, we pinpointed
+11 entities with smart contracts vulnerable to storage collisions,
+including Ape Finance, Compound, Convex, Curve, GolduckDAO,
+LeverFi, Poly, Polyhedra Network, Polymath, Tokeny, and Zora. As
+of this writing, these entities manage stakes totaling 19 billion USD.
+However, it is important to acknowledge that they may manage
+stakes in other contracts that are not prone to such vulnerabilities.
+Third, we find the distributions of bytecode uniqueness are heavily skewed, with 42% of proxy contracts duplicating from just three
+popular contracts. We highlight the number of unique proxy and
+5 https://etherscan.io/address/0x0a08e6058eaaa847a1adb55b0a69b8469ea5a5b3
+
+Proxion: Uncovering Hidden Proxy Smart Contracts for Finding Collision Vulnerabilities in Ethereum
+
+105
+
+Ratio
+
+EIP-1167 [31]
+17, 453, 264
+89.05%
+EIP-1822 [3]
+22, 789
+0.12%
+EIP-1967 [38]
+196, 688
+1.00%
+Others
+1, 926, 576
+9.83%
+Table 4: The number of proxy contracts following certain
+design standards. The vast majority of proxy contracts follow
+the minimal design (EIP-1167). Proxion misses only a few
+hundred of the diamond proxy contracts (EIP-2535).
+
+Number of proxy contracts (log)
+
+# Contracts
+
+Conference’17, July 2017, Washington, DC, USA
+
+104
+103
+102
+101
+100
+0
+
+logic contracts in Figure 5. Interestingly, while Proxion identifies approximately 19.6 million proxy contracts and 70 thousand
+associated logic contracts, most of them are actually duplicates
+(i.e., having the same compiled bytecode) deployed at different
+addresses. Particularly, Figure 5 reports only 96, 420 and 38, 707
+unique proxy and logic contracts, respectively. We see that the
+distributions of bytecode uniqueness are heavily skewed, in which
+a small number of contracts are duplicated significantly more than
+others. To be more specific, the three most popular proxy contracts
+have more than a million of duplicated contracts, and they are
+CoinTool_App6 , XENTorrent7 , and OwnableDelegateProxy contracts.
+We also notice that while most logic contracts are not duplicated
+frequently, there are two standout logic contracts8,9 having more
+than 10, 000 duplicates. We conjecture that these contracts have
+source code, which renders cloning them uncomplicated and relates to the popularity of the non-fungible token marketplaces in
+recent years (e.g., OwnableDelegateProxy is a core component of the
+popular Wyvern protocol [51]). It is worth noting that all the duplicates of the popular proxy contracts above associate with the same
+logic contracts. For example, the CoinTool_App logic contract10 is
+referenced by almost 3.5 million proxy contracts that are duplicates of the CoinTool_App proxy contract. These findings indicate
+a widespread contract cloning practice that preserves the cloned
+contract’s functionalities. It may be, however, not ideal from the
+decentralization perspective, as potential bugs or vulnerabilities of
+the cloned contracts are also propagated, as noted in the previous
+paragraph or in existing work [52].
+Fourth, the minimal proxy design dominates the standard proxy
+contracts while a non-negligible portion of non-standard proxy contracts exists. We present the distribution of proxy contracts’ design patterns in Table 4. Notably, most of them (89.05%) adhere to
+the minimal design standard [31], which includes only the delegate call in the fallback function and a hard-coded logic contract address in the bytecode. These minimal proxy contracts are
+not vulnerable to function and storage collisions due to the absence of variable and function declarations. We further categorize
+proxy contracts into other standards based on the locations storing their logic contracts’ addresses. In particular, 22, 789 contracts
+are categorized under the EIP-1822 standard (Universal Upgradeable Proxy Standard) as they utilize a specific storage slot derived
+6 https://etherscan.io/address/0x95a3946104132973b00ec0a2f00f7cc2b67e751f
+7 https://etherscan.io/address/0x4e488a5367daf86cfc71ea3b52ff72ca937efcf8
+8 https://etherscan.io/address/0xf17b1a1f68e1ddaa2e3285437b96ea28af2a2dc0
+9 https://etherscan.io/address/0xa471cd47769c3a788ad9c7b3d8350f195bf672bd
+10 https://etherscan.io/address/0x0de8bf93da2f7eecb3d9169422413a9bef4ef628
+
+20
+
+40
+60
+Number of upgrades
+
+80
+
+Figure 6: Number of upgrades for logic contracts in log scale.
+Most proxy contracts (99.7%) have not upgraded to a newer
+version of logic contracts.
+from the Keccak-256("PROXIABLE") hash. Similarly, 196, 688 contracts follow the EIP-1967 standard because they store logic contract addresses in a slot derived from the Keccak-256 hash of
+("eip1967.proxy.implementation"). We also note that there are
+9.83% of the proxy contracts storing their logic contract’s addresses
+in the storage without conforming to any known design patterns.
+Last, we find that most proxy contracts have not upgraded to a
+newer version of logic contracts. We show the number of contract
+upgrade events in which the logic contract’s address is updated
+in Figure 6. We find that the number of upgraded smart contracts
+is insignificant, e.g., only 51, 925 proxy contracts have upgraded
+their logic implementations throughout history. The majority of
+these contracts also upgrade only a few times (i.e., having only
+1.32 associated logic contracts on average). We also observe that
+upgrade events are infrequent; only 68, 804 upgrading events ever
+occurred, meaning, on average, an upgrade happens only once
+per 200 Ethereum blocks. From the security point of view, such
+an infrequent upgrade may render proxy contracts less prone to
+storage collisions, which often arise during contract upgrades.
+
+8
+
+DISCUSSION
+
+In this section, we discuss several key points. We first describe the
+limitations of Proxion and explain why they do not undermine
+Proxion’s contributions (§8.1). Based on the discussed limitations,
+we outline a few potential follow-up works for Proxion (§8.2). We
+finally acknowledge the ethical considerations in this paper (§8.3).
+
+8.1
+
+Limitations
+
+When analyzing proxy contracts, Proxion misses the contracts
+following the Diamonds, Multi-Facet Proxy design pattern [30], in
+which only the function signatures registered by the contract owner
+can trigger the delegate calls in the fallback function. Unfortunately,
+Proxion can currently only send randomly generated call data
+during EVM emulation and, thus, cannot detect these diamond
+contracts.
+Another limitation of the system is the occurrence of runtime
+errors, which are relatively low (e.g., at 4.9%) during the emulation
+of EVM execution of smart contracts (cf. Section 7.1). Additionally,
+
+Conference’17, July 2017, Washington, DC, USA
+
+Cheng-Kang Chen, Wen-Yi Chu, Muoi Tran, Laurent Vanbever, and Hsu-Chun Hsiao
+
+EVM emulation may inevitably yield results that differ from actual
+contract execution, although the extent of these discrepancies is
+not known.
+
+contracts’ bytecode, thus covering more contracts than USCHunt.
+Unlike Proxion, however, the analysis here involves replaying past
+transactions to the contracts under tests, thus limiting the effective
+analysis to only contracts with many transactions.
+CRUSH is a newly developed automation tool that detects storage
+collisions and generates verified exploits [41]. The CRUSH engine is
+also employed by Proxion to identify storage collisions, particularly
+for proxy contracts without source code. Like Salehi et al., CRUSH
+depends on historical transactions to locate proxy contracts, thus
+missing out on millions of hidden contracts. Additionally, unlike
+Proxion, CRUSH is not equipped to detect function collisions.
+
+8.2
+
+Future Work
+
+Future work for Proxion includes identifying proxy contracts that
+follow the diamond design pattern [30]. A potential solution involves extracting all registered functions from past transactions
+(similar to CRUSH [41]) and utilizing them to generate call data.
+To detect contracts with source code available, Proxion may employ a static analysis approach like USCHunt [5], combining with
+the information of the slot storing logic contract’s address (i.e.,
+Keccak-256("diamond.standard.diamond.storage")).
+Proxion can also be extended to analyze proxy smart contracts
+beyond Ethereum blockchain. Similar to USCHunt [5], Proxion
+may apply to several other blockchains, such as Arbitrum, Avalanche,
+Binance Smart Chain, Celo, Fantom, Optimism, and Polygon.
+
+8.3
+
+Ethical Considerations
+
+This paper does not raise any ethical issues. Our evaluation uses
+the already available datasets. Our interaction with the Ethereum
+production network is only to retrieve real-world data and does
+not affect any other parties.
+
+9
+
+9.2
+
+RELATED WORK
+9.3
+
+We consider related work that studies the same target of proxy
+smart contracts (§9.1), discusses contract upgradability (§9.2), or
+performs analysis on smart contracts (§9.3).
+
+9.1
+
+Upgradeability in Smart Contracts
+
+The upgradeability in smart contracts has been discussed extensively in several EIPs [3, 30, 31, 38], technical blog posts [34, 36],
+and numerous studies [15, 23, 40, 53]. These works focus on designing new proxy patterns to enable upgrading smart contracts at
+scale or studying the status quo of upgradable contracts. Our work
+also studies upgradable contracts in Ethereum, which is a subset of
+proxy smart contracts. We further reveal that upgrading events are
+actually rare, and functionality cloning is a more popular usage of
+proxy contracts. Our work, thus, provides an additional discussion
+to the existing literature on upgradeability in smart contracts.
+
+Finding Collisions in Proxy Smart Contracts
+
+Several tools aim to detect proxy smart contracts and their collision
+issues; see Table 1 for an overview.
+Slither, a static analysis framework, examines the source code
+of contracts to determine if they are proxy contracts [13]. However, Slither’s proxy detection relies on keyword searches, such
+as "proxy" or "delegatecall," which may lead to a high rate of false
+positives. Additionally, in contrast to Proxion, Slither does not
+automatically identify associated logic contracts for a given proxy
+contract.
+Etherscan is a widely recognized web-based explorer for the
+Ethereum blockchain, featuring an integrated proxy contract verification tool [11]. This tool identifies contracts with the DELEGATECALL
+opcode as proxy contracts, a result that Etherscan admits may lead
+to numerous false positives [12]. Proxion applies a similar initial
+filtering process for proxy contracts and then conducts dynamic
+analysis, resulting in more precise detection.
+USCHunt [5] employs static analysis based on Slither to detect proxy contracts with published source code, and their security vulnerabilities, such as collisions, on eight blockchains, including Ethereum. Proxion focuses on improving the detection of
+proxy contracts and collision issues, specifically on the Ethereum
+blockchain, which has shown to be more efficient, inclusive, and
+precise than USCHunt throughout this paper.
+Salehi et al. [42] studied the ownership of upgradability in smart
+contracts, i.e., finding out who can upgrade the proxy contracts. Similar to Proxion, this work also performs dynamic analysis on smart
+
+Smart Contracts Analyzers
+
+The security of smart contracts is a well-studied research topic,
+as smart contracts are known to have multiple vulnerabilities [1].
+Many smart contract analyzers have been proposed in recent years
+to detect these vulnerabilities. Commonly, they can be categorized
+into static analyzers and dynamic analyzers based on their overall approach. Particularly, static analyzers detect smart contract
+vulnerabilities by inspecting their source code or bytecode, using
+techniques such as information flow analysis (e.g., Slither [13], MadMax [17]) or symbolic execution (e.g., Oyente [28], MantiCore [29],
+Securify [48], teEther [25], Mythril [9], Zeus [22], Osiris [45]). On
+the other hand, dynamic analyzers execute the test smart contracts
+and observe the behaviors of vulnerable ones, using fuzzing (e.g.,
+ReGuard [27], ContractFuzzer [21], Confuzzius [44], sFuzz [32], Harvey [50]) or validation (e.g., MAIAN [33], Sereum [39], SODA [7],
+ESCORT [43]). We refer to a recent survey by Kushwaha et al. [26]
+for a more comprehensive review of such existing analysis tools.
+This paper proposes Proxion, a new hybrid contract analyzer focusing specifically on the collision issues of Ethereum smart contracts.
+
+10
+
+CONCLUSION
+
+While the proxy design pattern facilitates upgrading smart contracts in Ethereum, it also introduces potential security risks due
+to function and storage collisions. Previous efforts to detect these
+collisions have been inadequate, mainly due to the limited coverage of contracts under test, especially for the hidden ones without
+source code or transaction history. To bridge this gap, we have
+created Proxion, a novel automated tool that efficiently, effectively,
+and accurately identifies hidden proxy contracts and their associated collision vulnerabilities. Utilizing Proxion, we analyzed all
+Ethereum smart contracts and discovered that half are associated
+
+Proxion: Uncovering Hidden Proxy Smart Contracts for Finding Collision Vulnerabilities in Ethereum
+
+with the proxy pattern, and millions of them are vulnerable to collisions. Observing proxy smart contracts’ evolution suggests an
+increased adoption of the proxy pattern in the coming years. We
+thus believe our work significantly contributes to securing proxy
+contracts in this anticipated future.
+
+REFERENCES
+[1] Nicola Atzei, Massimo Bartoletti, and Tiziana Cimoli. 2017. A survey of attacks
+on Ethereum smart contracts (sok). In ETAPS.
+[2] Audius. 2022. How Attackers Stole Around $1.1M Worth of Tokens From Decentralized Music Project Audius. https://blog.audius.co/article/audius-governancetakeover-post-mortem-7-23-22.
+[3] Gabriel Barros and Patrick Gallagher. 2019. ERC-1822: Universal Upgradeable
+Proxy Standard (UUPS). https://eips.ethereum.org/EIPS/eip-1822.
+[4] Google BigQuery. 2023. Ethereum Cryptocurrency. https://console.cloud.google.
+com/marketplace/product/ethereum/crypto-ethereum-blockchain.
+[5] William E Bodell III, Sajad Meisami, and Yue Duan. 2023. Proxy hunting: Understanding and characterizing proxy-based upgradeable smart contracts in
+blockchains. In USENIX Security.
+[6] Vitalik Buterin. 2024. Viper. https://ethereum-viper.readthedocs.io/en/latest/.
+[7] Ting Chen, Rong Cao, Ting Li, Xiapu Luo, Guofei Gu, Yufei Zhang, Zhou Liao,
+Hang Zhu, Gang Chen, and Zheyuan He. 2020. SODA: A Generic Online Detection
+Framework for Smart Contracts.. In Proc. NDSS.
+[8] Compound. 2023. Compound. https://compound.finance/.
+[9] Consensys. 2023. Mythril. https://github.com/ConsenSys/mythril.
+[10] Ethereum. 2023. Ethereum Archive Node. https://ethereum.org/en/developers/
+docs/nodes-and-clients/archive-nodes.
+[11] EtherScan. 2023. EtherScan. https://etherscan.io/.
+[12] EtherScan. 2023. Proxy Contracts. https://info.etherscan.com/what-is-proxycontract/.
+[13] Josselin Feist, Gustavo Grieco, and Alex Groce. 2019. Slither: a static analysis
+framework for smart contracts. In IEEE WETSEB.
+[14] Ethereum Foundation. 2024. The Solidity Contract-Oriented Programming Language. https://github.com/ethereum/solidity.
+[15] Michael Fröwis and Rainer Böhme. 2022. Not all code are create2 equal. In WTSC.
+[16] Neville Grech, Lexi Brent, Bernhard Scholz, and Yannis Smaragdakis. 2019. Gigahorse: thorough, declarative decompilation of smart contracts. In Proc. IEEE/ACM
+ICSE.
+[17] Neville Grech, Michael Kong, Anton Jurisevic, Lexi Brent, Bernhard Scholz, and
+Yannis Smaragdakis. 2018. Madmax: Surviving out-of-gas conditions in Ethereum
+smart contracts. Proc. OOPSLA (2018).
+[18] Neville Grech, Sifis Lagouvardos, Ilias Tsatiris, and Yannis Smaragdakis. 2022.
+Elipmoc: Advanced decompilation of Ethereum smart contracts. In PACMPL.
+[19] OpenZeppelin Inc. 2020. Safemath.
+https://github.com/OpenZeppelin/
+openzeppelin-contracts/blob/master/contracts/utils/math/SafeMath.sol
+[20] Jorge Izquierdo and Manuel Araoz. 2018. ERC-897: DelegateProxy. https://eips.
+ethereum.org/EIPS/eip-897.
+[21] Bo Jiang, Ye Liu, and Wing Kwong Chan. 2018. Contractfuzzer: Fuzzing smart
+contracts for vulnerability detection. In Proc. ACM/IEEE ASE.
+[22] Sukrit Kalra, Seep Goel, Mohan Dhawan, and Subodh Sharma. 2018. Zeus:
+analyzing safety of smart contracts.. In Proc. NDSS.
+[23] Philipp Klinger, Long Nguyen, and Freimut Bodendorf. 2020. Upgradeability concept for collaborative blockchain-based business process execution framework.
+In Proc. IEEE ICBC.
+[24] Tomasz Kolinko and Palkeo. 2024. Panoramix - EVM decompiler. https://github.
+com/palkeo/panoramix.
+[25] Johannes Krupp and Christian Rossow. 2018. teEther: Gnawing at Ethereum to
+automatically exploit smart contracts. In Proc. USENIX Security.
+[26] Satpal Singh Kushwaha, Sandeep Joshi, Dilbag Singh, Manjit Kaur, and Heung-No
+Lee. 2022. Ethereum smart contract analysis tools: A systematic review. IEEE
+Access (2022).
+[27] Chao Liu, Han Liu, Zhao Cao, Zhong Chen, Bangdao Chen, and Bill Roscoe. 2018.
+Reguard: finding reentrancy bugs in smart contracts. In Proc. ACM ICSE.
+[28] Loi Luu, Duc-Hiep Chu, Hrishi Olickel, Prateek Saxena, and Aquinas Hobor. 2016.
+Making smart contracts smarter. In Proc. CCS.
+[29] Mark Mossberg, Felipe Manzano, Eric Hennenfent, Alex Groce, Gustavo Grieco,
+Josselin Feist, Trent Brunson, and Artem Dinaburg. 2019. Manticore: A userfriendly symbolic execution framework for binaries and smart contracts. In Proc.
+IEEE/ACM ASE.
+[30] Nick Mudge. 2020. ERC-2535: Diamonds, Multi-Facet Proxy. https://eips.
+ethereum.org/EIPS/eip-2535.
+[31] Peter Murray, Nate Welch, and Joe Messerman. 2018. EIP-1167: Minimal Proxy
+Contract. https://eips.ethereum.org/EIPS/eip-1167.
+[32] Tai D Nguyen, Long H Pham, Jun Sun, Yun Lin, and Quang Tran Minh. 2020.
+sfuzz: An efficient adaptive fuzzer for solidity smart contracts. In Proc. ACM/IEEE
+
+Conference’17, July 2017, Washington, DC, USA
+
+CSE.
+[33] Ivica Nikolić, Aashish Kolluri, Ilya Sergey, Prateek Saxena, and Aquinas Hobor.
+2018. Finding the greedy, prodigal, and suicidal contracts at scale. In Proc. ACSAC.
+[34] Trail of Bits. 2018. Contract upgrade anti-patterns. https://blog.trailofbits.com/
+2018/09/05/contract-upgrade-anti-patterns/.
+[35] OpenSea. 2023. OpenSea. https://opensea.io/.
+[36] OpenZeppelin. 2023. Proxy Upgrade Pattern. https://docs.openzeppelin.com/
+upgrades-plugins/1.x/proxies.
+[37] Martin Ortner and Shayan Eskandari. 2023. Smart Contract Sanctuary. https:
+//github.com/tintinweb/smart-contract-sanctuary.
+[38] Santiago Palladino, Francisco Giordano, and Hadrien Croubois. 2019. ERC-1967:
+Proxy Storage Slots. https://eips.ethereum.org/EIPS/eip-1967.
+[39] Michael Rodler, Wenting Li, Ghassan O Karame, and Lucas Davi. 2019. Sereum:
+Protecting existing smart contracts against re-entrancy attacks. In Proc. NDSS.
+[40] Michael Rodler, Wenting Li, Ghassan O Karame, and Lucas Davi. 2021. EVMPatch:
+Timely and automated patching of Ethereum smart contracts. In Proc. USENIX
+Security.
+[41] Nicola Ruaro, Fabio Gritti, Robert McLaughlin, Ilya Grishchenko, Christopher
+Kruegel, and Giovanni Vigna. 2024. Not your Type! Detecting Storage Collision
+Vulnerabilities in Ethereum Smart Contracts. In Proc. NDSS.
+[42] Mehdi Salehi, Jeremy Clark, and Mohammad Mannan. 2022. Not so immutable:
+Upgradeability of smart contracts on Ethereum. In WTSC.
+[43] Christoph Sendner, Huili Chen, Hossein Fereidooni, Lukas Petzi, Jan König, Jasper
+Stang, Alexandra Dmitrienko, Ahmad-Reza Sadeghi, and Farinaz Koushanfar.
+2023. Smarter Contracts: Detecting Vulnerabilities in Smart Contracts with Deep
+Transfer Learning.. In Proc. NDSS.
+[44] Christof Ferreira Torres, Antonio Ken Iannillo, Arthur Gervais, and Radu State.
+2021. Confuzzius: A data dependency-aware hybrid fuzzer for smart contracts.
+In Proc. IEEE EuroS&P.
+[45] Christof Ferreira Torres, Julian Schütte, and Radu State. 2018. Osiris: Hunting
+for integer bugs in Ethereum smart contracts. In Proc. ACSAC.
+[46] Christof Ferreira Torres, Mathis Steichen, and Radu State. 2019. The art of the
+scam: Demystifying honeypots in Ethereum smart contracts. In USENIX Security.
+[47] Mike Truppa. 2022. Arbitrum announces 400 ETH bug bounty payout.
+[48] Petar Tsankov, Andrei Dan, Dana Drachsler-Cohen, Arthur Gervais, Florian
+Buenzli, and Martin Vechev. 2018. Securify: Practical security analysis of smart
+contracts. In Proc. CCS.
+[49] Patrick Ventuzelo. 2023. Octopus: Security Analysis tool for WebAssembly module and Blockchain Smart Contracts. https://github.com/FuzzingLabs/octopus.
+[50] Valentin Wüstholz and Maria Christakis. 2020. Harvey: A greybox fuzzer for
+smart contracts. In Proc. ACM FSE.
+[51] Wyvern. 2023. Wyvern Protocol. https://wyvernprotocol.com/.
+[52] Kailun Yan, Jilian Zhang, Xiangyu Liu, Wenrui Diao, and Shanqing Guo. 2023. Bad
+Apples: Understanding the Centralized Security Risks in Decentralized Ecosystems. In ACM Web Conference.
+[53] Gavin Zheng, Longxiang Gao, Liqun Huang, Jian Guan, Gavin Zheng, Longxiang
+Gao, Liqun Huang, and Jian Guan. 2021. Upgradable contract. Ethereum Smart
+Contract Development in Solidity (2021).
+

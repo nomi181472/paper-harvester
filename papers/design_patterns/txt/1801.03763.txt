@@ -1,0 +1,629 @@
+To Pool or Not To Pool? Revisiting an Old Pattern
+Ioannis T. Christou
+Athens Information Technology, 15125 Marousi, Greece
+
+arXiv:1801.03763v1 [cs.SE] 10 Jan 2018
+
+Sofoklis Efremidis
+Athens Information Technology, 15125 Marousi, Greece
+January 15, 2018
+Abstract
+We revisit the well-known object-pool design pattern in Java. In the last decade, the
+pattern has attracted a lot of criticism regarding its validity when used for light-weight
+objects that are only meant to hold memory rather than any other resources (database
+connections, sockets etc.) and in fact, common opinion holds that is an “anti-pattern” in
+such cases. Nevertheless, we show through several experiments in different systems that the
+use of this pattern for extremely short-lived and light-weight memory objects can in fact
+significantly reduce the response time of high-performance multi-threaded applications, especially in memory-constrained environments. In certain multi-threaded applications where
+high performance is a requirement and/or memory constraints exist, we recommend therefore that the object pool pattern be given consideration and tested for possible run-time as
+well as memory footprint improvements.
+
+Index terms:
+design patterns
+
+1
+
+Parallel program, managed memory language, thread-local, object pool,
+
+Introduction
+
+The “Object Pool” design pattern is a well-known design pattern ([1]) that is often used with
+so-called “heavy objects” such as database connection objects or thread objects; its usefulness in
+such cases is immediately justified by the requirement to constrain the number of simultaneous
+such objects according to the underlying resources available; or by the costs associated with
+creating and/or destroying such objects. To save such costs, a pool of such objects is created
+before first use of an object, so that when client code requests an object of the type contained in
+the pool, the pool is queried for available objects, and if such an object is available it is immediately returned from the pool. When the client code no longer needs the requested object, most
+usually, the object has to be returned to the pool by invoking an appropriate method; alternatively, the object must have appropriate finalization and/or resurrection methods to guarantee
+its safe return to the pool. The debate on the usefulness of object pools in managed-memory
+languages such as Java and C# ([1], [2], [3]) was initially centered around the fact that object allocation and certainly, garbage collection was much more costly for such languages, and
+therefore object pools were worth the extra effort on the part of the programmer. As better
+technology was invented for VMs, and in particular, as strong progress was made in the fields of
+object allocation and garbage collection, object pools lost their appeal, while it remained true
+that implementing them required significant care on the part of the programmer especially in
+multi-threaded applications. In the words of J. Bloch [4]
+1
+
+“...avoiding object creation by maintaining your own object pool is a bad idea unless the
+objects in the pool are extremely heavyweight... Generally speaking, however, maintaining
+your own object pools clutters your code, increases memory footprint, and harms performance.
+Modern JVM implementations have highly optimized garbage collectors that easily outperform
+such object pools on lightweight objects.”
+Similar advice is offered by B. Goetz [5]. In the blogo-sphere, almost unanimously, everyone
+supports this claim ([6], [7], [8]). Indeed, some attempts at creating fast object pools such
+as the “furious-objectpool” [10] that claim to be faster than standard approaches such as the
+Apache Commons Object Pool library [11] unfortunately suffer from subtle synchronization
+bugs (e.g., by using the notorious Double Check-Locking idiom), further adding support to the
+notion that even when implemented correctly, object pools are “synchronization bottlenecks”.
+However, while optimizing a number of codes for scientific computing applications some of which
+currently form integral parts of heavy-load production systems, we discovered that under certain
+conditions, appropriately designed object pools with thread-local object storage for light-weight
+objects can yield very significant performance benefits. We first discuss an essentially trivial case
+for using an object pool in the form of a cache data member, then illustrate a more complicated
+case, and finally introduce our own generic library that we use as solution to the problem. We
+finally draw some conclusions from this research.
+
+2
+
+Setting the Stage: Creating Arrays in Random Search
+
+To set the stage, we first discuss an almost trivial search algorithm that is however often used
+as a benchmark against which other algorithms’ performance is compared: pure random search!
+Consider the classical box-constrained non-linear optimization problem minl≤x≤u f (x). The
+easiest attempt at solving the problem, is pure random search, also known as Monte-Carlo
+search, where we evaluate the function f on a given number of randomly selected points in the
+multi-dimensional box [l, u]. A MonteCarloSearch class in an Object-Oriented design, might
+then implement an OptimizerIntf that would declare a double optimize(FunctionIntf f)
+method signature (this is the approach taken in the popt4jlib open-source library [9]. Since
+function evaluations are presumably independent of each other, we can easily parallelize the
+random search by splitting the total number of function evaluations among a number of threads.
+The class’s implementation of the optimize() method would then create a number of threads
+that would execute a MonteCarloTask whose run() method includes a loop as shown in Listing 1.
+c l a s s MonteCarloTask implements Runnable {
+p r i v a t e ArgumentGenIntf randomVectorGenerator ;
+...
+p u b l i c v o i d run ( ) {
+...
+f o r ( i n t i =0; i < numTries ; i ++) {
+d o u b l e [ ] x i= randomVectorGenerator .
+newVector ( lowerBnd , upperBnd ) ;
+d o u b l e y i= f u n c t i o n . e v a l u a t e ( x i ) ;
+i f ( y i <l o c a l i n c u m b e n t v a l ) {
+updateLocalIncumbent ( x i , y i ) ;
+}
+}
+// update g l o b a l incumbent with l o c a l incumbent
+...
+}
+
+2
+
+}
+c l a s s DblArr1RndGenerator implements ArgumentGenIntf {
+p u b l i c d o u b l e [ ] newVector ( d o u b l e [ ] low , d o u b l e [ ] h i g h ) {
+d o u b l e [ ] x = new d o u b l e [ low . l e n g t h ] ;
+// p o p u l a t e x ’ s e l e m e n t s
+...
+return x ;
+}
+}
+
+Listing 1: Random vector generator relies too heavily on the garbage collector as it generates
+a double[] each time the newVector() method is invoked; the array will be used in a single
+function evaluation and will then be discarded, so it is extremely short-lived.
+Using this approach, a commodity laptop equipped with an Intel core i7 CPU with 4 real
+cores with hyper-threading for a total of 8 logical processors and 16GB RAM, will run 10,000,000
+evaluations of the 1000-dimensional Rastrigin multi-modal test-function [12] using 8 threads in
+approximately 202 seconds of wall-clock time. Does it matter that the method newVector()
+constructs a new double[] (and initializes its elements to zero) at every iteration? According
+to the “pools-are-bad” camp, the construction of these arrays should not be expected to hurt
+performance, and it results in a clean-looking code. Nevertheless, let’s add a private double[]
+x; simple member field that will act as a cache for a –now only once– constructed array, and
+modify the newVector() method as shown in Listing 2. As long as each thread has its own
+DblArr1RndGeneratorWCache object, there is no interference between the threads at all, and
+there is no need for sharing anything between the threads except for the final update of the
+global incumbent object when every thread will attempt to update the global incumbent with
+its own version of the best point found in its execution.
+c l a s s DblArr1RndGeneratorWCache implements ArgumentGenIntf {
+p r i v a t e double [ ] x ;
+...
+p u b l i c d o u b l e [ ] newVector ( d o u b l e [ ] low , d o u b l e [ ] h i g h ) {
+i f ( x==n u l l | | low . l e n g t h != x . l e n g t h )
+x = new d o u b l e [ low . l e n g t h ] ;
+// p o p u l a t e x e l e m e n t s
+...
+return x ;
+}
+}
+
+Listing 2: A slightly modified argument generator class that does not create new double arrays
+in each invocation of the newVector() method.
+The code above now runs on the same hardware and the same number of threads in approximately 130 seconds. In fact, Fig. 1 shows the running times when executing 1 million evaluations
+of the Rastrigin function in different number of dimensions, with and without this “thread-local
+member cache”. One might argue that creating objects with sizes of up to 3.2 MB, doesn’t
+count as “light-weight object creation”. For this reason, we investigate the difference in running
+times when running a varying number of function evaluations for the 1000-dimensional Rastrigin
+function (which results in the creation of double[] objects of size 64K each, which by today’s
+standards are usually considered quite “light-weight”) with and without the use of thread-local
+object pools. The results are shown in Fig. 2 and again, show a rather strong advantage of this
+“data-member-as-pool” approach.
+3
+
+Figure 1: Comparing the performance of
+using or not a vector cache to evaluate the
+Rastrigin function in varying dimensions.
+
+Figure 2: Comparing the performance of
+using or not a vector cache to evaluate the
+Rastrigin function in 1000 dimensions for
+various number of times. Both experiments
+conducted using 4 threads on an i7-3630QM
+CPU with 16GB RAM running Windows 10
+Pro, compiled and run in JDK7.
+
+From the above it is clear that at least in some cases, taking care not to needlessly allocate
+new objects can prove beneficial for the overall system performance, though the reasons why this
+might be so may not be clear at this point. Next, we illustrate a similar case from a production
+system.
+
+3
+
+Creating Many Small Objects In Recommender Systems
+
+Apache Mahout [13] defines the interface in Listing 3 for recommended items.
+p u b l i c i n t e r f a c e RecommendedItem {
+l o n g getItemID ( ) ;
+f l o a t getValue ( ) ;
+}
+
+Listing 3: Recommended items interface in Apache Mahout.
+This interface encapsulates a pair of values: an item-id together with its perceived value (that
+will be different for different users). Recommender engines, provide public interface methods as
+part of their public API that return a List<RecommendedItem> when asked to recommend a list
+of items to a specific user for example; when a recommender system engine follows this API style,
+it is clear that a huge number of very light-weight (and short-lived) memory objects holding such
+¡id,value¿ pairs will be needed during a batch process of computing such recommendations for
+the many thousands of users subscribing to whatever service needs recommendations for, and
+exporting them to the engine clients. AMORE [14, 15] is a hybrid parallel recommender engine
+that the first author designed and implemented for a major Greek Triple-Play service provider,
+and its only means of interaction with the provider’s systems is through a set of exposed webservices. AMORE runs periodically a batch process that computes for each of the more than
+forty thousand subscribers to the Video-Club service, the top-500 recommended content items.
+During this batch process, three different recommender algorithms (one user-based, one itembased, and one content-based) compute in parallel (using multiple concurrent threads each) the
+4
+
+relative value of each of the available content items for each user, resulting in a total need of 3
+× #users × #items <id,value> pairs, which is in the order of 2 × 109 objects created through
+multiple concurrently executing threads of control in a single iteration of the overall process. All
+these objects are very short-lived: as soon as the top-500 items for each subscriber have been
+computed, they are written to an RDBMS table, or sent through the network (XML encoded)
+to the consumer of an appropriate web-service method invoked). Such huge object generation
+requirements turn out to exercise serious stress on the JVM especially when running under strict
+memory requirements that force its garbage collector to run frequently, as is the case when a
+particular software system runs as a process on a virtual machine created by virtualization
+software hosted on server hardware that partitions the server’s physical resources among many
+several virtual machines, allocating a small fraction of the overall available RAM to each.
+The above discussion set the context in which our algorithms operate. To isolate from the
+rest of the system and study the effects of object creation and the possible benefits/trade-offs
+of using a thread-local object pool, we create a very simple benchmark program comprising of
+the two classes shown in Listings 4 and 5.
+p u b l i c c l a s s DLPair implements S e r i a l i z a b l e , RecommendedItem {
+private f l o a t v a l ; private long i d ;
+p u b l i c DLPair ( f l o a t v a l , l o n g i d ) { v a l = v a l ; i d = i d ; }
+public f l o a t getValue ( ) { return v a l ; }
+p u b l i c l o n g getItemID ( ) { r e t u r n i d ; }
+p u b l i c v o i d s e t D a t a ( l o n g id , f l o a t v ) { i d=i d ; v a l=v ; }
+p u b l i c i n t compareTo ( Ob ject o t h e r ) { . . . }
+}
+
+Listing 4: No-pools implementation of a “holder” class holding ¡item,value¿ pairs.
+p u b l i c c l a s s DLPairTest {
+p u b l i c s t a t i c v o i d main ( S t r i n g [ ] a r g s ) {
+l o n g s t a r t = System . c u r r e n t T i m e M i l l i s ( ) ;
+l o n g t o t a l n u m o b j s = Long . parseLong ( a r g s [ 0 ] ) ;
+i n t num threads = I n t e g e r . p a r s e I n t ( a r g s [ 1 ] ) ;
+long s t a r t i n d = 0;
+l o n g w o r k p e r t h r e a d = t o t a l n u m o b j s / num threads ;
+DLPThread [ ] t d s = new DLPThread [ num threads ] ;
+f o r ( i n t i =0; i <num threads −1; i ++) {
+t d s [ i ] = new DLPThread ( i , s t a r t i n d , w o r k p e r t h r e a d ) ;
+s t a r t i n d += w o r k p e r t h r e a d ;
+}
+l o n g rem = t o t a l n u m o b j s − s t a r t i n d ;
+t d s [ t d s . l e n g t h −1]=new DLPThread ( t d s . l e n g t h −1, s t a r t i n d , rem ) ;
+f o r ( i n t i =0; i <t d s . l e n g t h ; i ++) {
+tds [ i ] . s t a r t ( ) ;
+}
+double t o t a l v a l = 0 . 0 ;
+f o r ( i n t i =0; i <t d s . l e n g t h ; i ++) {
+try {
+tds [ i ] . j o i n ( ) ;
+t o t a l v a l += t d s [ i ] . getSum ( ) ;
+}
+catch ( InterruptedException e ) {
+Thread . c u r r e n t T h r e a d ( ) . i n t e r r u p t ( ) ;
+}
+
+5
+
+}
+l o n g dur = System . c u r r e n t T i m e M i l l i s ( ) − s t a r t ;
+System . out . p r i n t l n ( ” T o t a l v a l=”+ t o t a l v a l +” i n ”+dur+” msecs . ” ) ;
+}
+}
+c l a s s DLPThread e x t e n d s Thread {
+private int id ;
+p r i v a t e l o n g numObjs ;
+private long o f f s e t ;
+p r i v a t e d o u b l e sum ;
+p u b l i c DLPThread ( i n t id , l o n g o f f s e t , l o n g numobjs ) {
+numObjs = numobjs ;
+o f f s e t = o f f s e t ; id = id ;
+}
+p u b l i c v o i d run ( ) {
+DLPair [ ] p i s = new DLPair [ 1 0 0 0 0 ] ;
+sum = 0 . 0 ;
+i n t ind = 0 ;
+f i n a l l o n g u p t o = o f f s e t + numObjs ;
+f o r ( l o n g i= o f f s e t ; i <u p t o ; i ++) {
+46:
+DLPair p i = new DLPair ( 0 , 0 ) ;
+p i . s e t D a t a ( i , 2 . 0 f ∗ i ) ; // do some computation
+sum += p i . g e t V a l u e ( ) ;
+p i s [ i n d++] = p i ;
+50:
+i f ( i n d==p i s . l e n g t h ) i n d =0;
+}
+}
+p u b l i c d o u b l e getSum ( ) { r e t u r n sum ; }
+}
+
+Listing 5: Test-driver class testing the concurrent generation of many light-weight DLPair objects
+using the standard Java mechanism for new object creation (see line 46).
+DLPairTest is a bare-bones implementation of a multi-threaded application that spawns a
+number of threads, each of which in its run method has a for-loop that iterates for a number
+of times, generating a DLPair object, setting values for the object’s members, and then, adding
+its value member to a running thread-local sum. The object is stored in an array, whose only
+reference is stack-allocated, until 10,000 more such objects are allocated in the for-loop, at
+which time it is removed from this array and becomes available for garbage-collection. The
+main program waits until each of its spawned threads are joined and then exits. Notice that in
+Listing 5, creation of each object occurs via calling new DLPair(.,.) in line 46. The program,
+when executed on the same machine mentioned as above, with the JVM maximum heap option
+-Xmx100m specified, and parameters 800,000,000 8 (i.e., 800 mio objects to be created in equal
+numbers by 8 threads) runs in approximately 5.8 seconds of wall-clock time, as averaged over 10
+runs. As it turns out, we can improve substantially the performance of this program by using the
+concept of a completely lock-free thread-local object pool that essentially acts as a convenient
+cache of frequently allocated objects in thread-local storage. The important requirement is that
+the program flow must be such so that objects “requested” in one thread, essentially remain
+visible only in the same thread that requested them, and are eventually “released” back into the
+pool from the same thread that requested them in the first place.
+
+6
+
+4
+
+A Generic Thread-Local Object Pool API
+
+Consider an API for poolable objects that can be stored in a generic thread-local object cache
+(which we appropriately call, ThreadLocalObjectPool) as shown in Listing 6. Once a software designer decides that a particular class X would benefit from thread-local object pooling,
+they have to declare that X extends the PoolableObject class, and implement the method
+setData(Object... args). They also need to modify the constructors of class X to call
+super(null) first, and add a constructor taking a pool as an argument, with a body of calling
+super(pool).
+p u b l i c a b s t r a c t c l a s s P o o l a b l e O b j e c t implements S e r i a l i z a b l e {
+p r i v a t e ThreadLocalObjectPool p o o l = n u l l ;
+private boolean isUsed = f a l s e ;
+p u b l i c f i n a l s t a t i c <T e x t e n d s P o o l a b l e O b j e c t > T
+n e w I n s t a n c e ( P o o l a b l e O b j e c t F a c t o r y <T> f , Obj ect . . . a r g s ) {
+T t = T h r e a d L o c a l O b j e c t P o o l .<T>g e t O b j e c t ( f , a r g s ) ;
+t . setData ( args ) ;
+return t ;
+}
+protected PoolableObject ( ThreadLocalObjectPool pool )
+{ pool = pool ; }
+/∗∗
+∗ c a l l e d by <CODE>n e w I n s t a n c e ( f , a r g s )</CODE> method when
+∗ r e t u r n i n g a new i n s t a n c e o f t h e implementing sub−c l a s s .
+∗ @param a r g s
+∗/
+p u b l i c a b s t r a c t v o i d s e t D a t a ( Ob ject . . . a r g s ) ;
+f i n a l public void r e l e a s e ( ) {
+i f ( p o o l != n u l l ) {
+i f ( isUsed ) {
+i s U s e d=f a l s e ;
+p o o l . returnObjectToPool ( t h i s ) ;
+} e l s e throw
+new I l l e g a l S t a t e E x c e p t i o n ( ” O bjec t not c u r r e n t l y used ” ) ;
+}
+}
+f i n a l protected void setIsUsed ( ) { isUsed = true ; }
+f i n a l protected boolean isUsed ( ) { return isUsed ; }
+f i n a l p r o t e c t e d b o o l e a n isManaged ( ) { r e t u r n p o o l != n u l l ; }
+}
+
+Listing 6: The abstract PoolableObject base-class.
+Such an implementation is usually trivial: for the example of the DLPair class above, one
+would write the setData method like this:
+public void setData(Object... args) {
+if (args==null) return; // guard against null var-args
+_id = ((Long) args[0]).longValue();
+_val = ((Double) args[1]).doubleValue();
+}
+7
+
+To use the newly defined DLPair objects, we also need an appropriate factory class implementing the following interface shown in Listing 7.
+/∗∗
+∗ i n t e r f a c e f o r f a c t o r y c r e a t i n g o b j e c t s o f a c l a s s whose
+∗ i n s t a n c e s may be ”managed” o r ”unmanaged” by thread −l o c a l
+∗ o b j e c t p o o l s ; such c l a s s e s must ex tend t h e
+∗ <CODE>P o o l a b l e O b j e c t </CODE> b a s e a b s t r a c t c l a s s .
+∗/
+p u b l i c i n t e r f a c e P o o l a b l e O b j e c t F a c t o r y <T e x t e n d s P o o l a b l e O b j e c t > {
+/∗∗
+∗ compile −time c o n s t a n t s p e c i f i e s t h e maximum number o f t y p e s
+∗ t h a t w i l l need thread −l o c a l p o o l i n g i n t h e program .
+∗/
+p u b l i c s t a t i c f i n a l i n t MAX NUM POOLED TYPES = 1 0 ;
+/∗∗
+∗ c r e a t e an ”unmanaged” o b j e c t , u s i n g t h e a r g s p a s s e d i n .
+∗ @param a r g s
+∗ @return
+∗/
+T c r e a t e O b j e c t ( O bjec t . . . a r g s ) ;
+/∗∗
+∗ c r e a t e a ”managed” o b j e c t ( u s i n g a r g s p a s s e d i n ) t h a t w i l l
+∗ belong to the s p e c i f i e d pool .
+∗ @param p o o l
+∗ @param a r g s
+∗ @return
+∗/
+T createPooledObject
+( ThreadLocalObjectPool <T> pool , O bjec t . . . a r g s ) ;
+/∗∗
+∗ r e t u r n an i d t h a t i s uniq ue f o r each ” p o o l a b l e ” type T
+∗ i n t h e program .
+∗ This i d w i l l be used t o d e r e f e r e n c e t h e r i g h t p o o l
+∗ o f <CODE>P o o l a b l e O b j e c t </CODE>s e x i s t i n g i n t h e
+∗ <CODE>ThreadLocal </CODE> v a r i a b l e o f t h e c u r r e n t t h r e a d
+∗ when g e t t i n g an o b j e c t o f type T .
+∗ @return i n t must be w i t h i n { 0 , . . . MAX NUM POOLED TYPES} .
+∗/
+i n t getUniqueTypeId ( ) ;
+}
+
+Listing 7: The PoolableObjectFactory public interface.
+The ThreadLocalObjectPool generic class is illustrated in Listing 8. The factory method
+getUniqueTypeId() deserves some special mention as it might not be immediately clear what
+purpose it serves. Given that it is quite possible that in a program there may be a need for
+more than one type of object to be pooled, in order to quickly fetch from thread-local storage
+the pool for a particular type, for performance reasons, we use a thread-local array of pools
+(see Listing 9); the targeted array’s position is identified by the value the getUniqueTypeId()
+method returns. The alternative of identifying the correct pool to fetch by the name of the class
+of the objects we need incurs high performance penalties. Here is why: in such a design, an
+8
+
+associative array (a map) of a kind would be needed to store the thread-local object pool of
+each object type by name; but the get() operation of maps that would then be required in each
+invocation of the newInstance() method of any PoolableObject which is much slower than
+the simple array de-reference operation that is required in the current design.
+Returning to the example DLPairTest program, an example factory creating pooled DLPair
+objects becomes as simple as this:
+class DLPairFactory implements PoolableObjectFactory<DLPair> {
+public DLPair createObject(Object... args) {
+return new DLPair(null);
+}
+public DLPair createPooledObject
+(ThreadLocalObjectPool<DLPair> pool, Object... args) {
+return new DLPair(pool);
+}
+public int getUniqueTypeId() { return 0; }
+}
+p u b l i c f i n a l c l a s s ThreadLocalObjectPool <T e x t e n d s P o o l a b l e O b j e c t >
+implements S e r i a l i z a b l e {
+// d e f a u l t c a c h e s i z e
+p r i v a t e s t a t i c v o l a t i l e i n t NUMOBJS = 1 0 0 0 0 0 ;
+private T[ ]
+private int
+
+p o o l ; // t h e c o n t a i n e r o f t h e o b j e c t s
+t o p A v a i l P o s = −1;
+
+s t a t i c <T e x t e n d s P o o l a b l e O b j e c t > ThreadLocalObjectPool <T>
+newThreadLocalObjectPool ( P o o l a b l e O b j e c t F a c t o r y <T> f ,
+Ob ject . . . a r g s ) {
+ThreadLocalObjectPool <T> p = new ThreadLocalObjectPool < >();
+p . i n i t i a l i z e ( f , args ) ;
+return p ;
+}
+p r i v a t e ThreadLocalObjectPool ( ) {
+p o o l = (T [ ] ) new P o o l a b l e O b j e c t [ NUMOBJS ] ;
+}
+s t a t i c <T e x t e n d s P o o l a b l e O b j e c t >
+T g e t O b j e c t ( P o o l a b l e O b j e c t F a c t o r y <T> f , Obj ect . . . a r g s ) {
+ThreadLocalObjectPool <T> p o o l =
+T h r e a d L o c a l O b j e c t P o o l s .<T>g e t T h r e a d L o c a l P o o l ( f , a r g s ) ;
+T p = p o o l . getObjectFromPool ( ) ;
+i f ( p!= n u l l ) { // ok , r e t u r n managed o b j e c t
+return p ;
+} e l s e // oops , c r e a t e new unmanaged o b j e c t
+return f . createObject ( args ) ;
+}
+v o i d r e t u r n O b j e c t T o P o o l (T i n d ) {
+
+p o o l [++ t o p A v a i l P o s ] = i n d ; }
+
+private void
+i n i t i a l i z e ( P o o l a b l e O b j e c t F a c t o r y <T> f , Obj ect . . . a r g s ) {
+
+9
+
+f o r ( i n t i =0; i < NUMOBJS ; i ++) {
+pool [ i ] = f . createPooledObject ( this , args ) ;
+}
+t o p A v a i l P o s = NUMOBJS−1;
+}
+p r i v a t e T getObjectFromPool ( ) {
+i f ( t o p A v a i l P o s >=0) {
+T o b j = p o o l [ t o p A v a i l P o s −−];
+p o o l [ t o p A v a i l P o s +1] = n u l l ; // a v o i d memory l e a k s
+obj . setIsUsed ( ) ;
+return obj ;
+}
+return null ;
+}
+s t a t i c v o i d s e t P o o l S i z e ( i n t num) { . . . }
+s t a t i c i n t g e t P o o l S i z e ( ) { r e t u r n NUMOBJS ; }
+}
+
+Listing 8: The ThreadLocalObjectPool generic class that can be used to hold any
+PoolableObject.
+
+10
+
+public f i n a l c l a s s ThreadLocalObjectPools {
+private s t a t i c boolean poolSizeResetAllowed = true ;
+p r i v a t e s t a t i c ThreadLocal<T h r e a d L o c a l O b j e c t P o o l [] > poolsMap =
+new ThreadLocal ( ) ;
+p u b l i c s t a t i c <T e x t e n d s P o o l a b l e O b j e c t > v o i d
+d e l e t e T h r e a d L o c a l P o o l ( P o o l a b l e O b j e c t F a c t o r y <T> f ) { . . . }
+s t a t i c <T e x t e n d s P o o l a b l e O b j e c t > ThreadLocalObjectPool <T>
+g e t T h r e a d L o c a l P o o l ( P o o l a b l e O b j e c t F a c t o r y <T> f , Obj ect . . . a r s )
+{
+ThreadLocalObjectPool [ ] p =
+( T h r e a d L o c a l O b j e c t P o o l [ ] ) poolsMap . g e t ( ) ;
+ThreadLocalObjectPool <T> p o o l = n u l l ;
+i f ( p==n u l l ) {
+synchronized ( ThreadLocalObjectPools . c l a s s ) {
+p o o l S i z e R e s e t A l l o w e d=f a l s e ;
+}
+p = new T h r e a d L o c a l O b j e c t P o o l [ P o o l a b l e O b j e c t F a c t o r y .
+MAX NUM POOLED TYPES ] ;
+poolsMap . s e t ( p ) ;
+}
+f i n a l i n t f i d = f . getUniqueTypeId ( ) ;
+pool = p [ f i d ] ;
+i f ( p o o l==n u l l ) {
+pool =
+T h r e a d L o c a l O b j e c t P o o l .<T>newThreadLocalObjectPool ( f , a r s ) ;
+p [ f i d ] = pool ;
+}
+return pool ;
+}
+s t a t i c <T e x t e n d s P o o l a b l e O b j e c t > ThreadLocalObjectPool <T>
+g e t T h r e a d L o c a l P o o l ( P o o l a b l e O b j e c t F a c t o r y <T> f )
+throws I l l e g a l S t a t e E x c e p t i o n { . . . }
+public s t a t i c synchronized void s e t P o o l S i z e ( i n t p o o l s i z e )
+throws I l l e g a l S t a t e E x c e p t i o n , I l l e g a l A r g u m e n t E x c e p t i o n { . . . }
+public s t a t i c int getPoolSize () {
+return ThreadLocalObjectPool . g e t P o o l S i z e ( ) ;
+}
+}
+
+Listing 9: The ThreadLocalObjectPools auxiliary class.
+Finally, we modify line 50 to read as follows:
+50: if (ind == pis.length) {
+for (int j=0; j<pis.length; j++) pis[j].release();
+ind = 0;
+}
+With this set of changes, the DLPairTest sample code now runs in 2.9 seconds. This performance gain is consistent as the number of objects and/or number of threads grows, as seen in
+11
+
+Figure 3: Performance comparison of a
+sample test-driver program constructing
+large numbers of trivially small objects,
+concurrently on 8 threads, under JVM
+memory constraint “-Xmx100m”.
+
+Figure 4: Comparing the performance of
+using Thread-Local Object Pool under various degrees of concurrency and under same
+JVM memory constraint as in Figure 3.
+
+Figures 3 and 4.
+Where does the gain come from? In Figures 5 and 6 we show a profiling of running the
+same program, with and without pooling. It is clear that when pooling is not used, all the
+participating threads experience some locking, even though the program itself is lock-free. This
+locking is necessitated by the need of the threads to allocate more memory and/or by the garbage
+collector that kicks in while the program is running.
+The gain observed when constructing many lightweight short-lived objects from many concurrently executing threads still exists when running in a virtualized environment: we executed
+the same program on an Oracle VirtualBox virtual machine running OpenMandriva Linux 2014
+64-bit, hosted on the same hardware as our previous experiments, allowing the virtual machine
+to utilize 4 cores of the real CPU. The JVM running on the virtual machine was now JDK 8.
+The results shown in Figure 7 remain consistent with what we previously observed. Further,
+we also verified the trend of the thread-local object pool to out-perform the no-pool approach
+in the presence of multiple threads on different CPUs and Operating Systems; in particular, on
+an i3 dual-core CPU running Windows 8.1, and on an Apple MacBook Pro mid2014 with an i7
+quad core CPU running OS X. We also compared the performance of our proposed Thread-Local
+Object Pool with that of the so-called “FastObjectPool” [16], which is a lock-less object pool
+that has been measured to compare favorably against some other object pools available on the
+internet. Unfortunately, it appears to suffer from bugs that often cause it to loop endlessly, or
+at least to be more than 4 orders of magnitude slower, in the presence of large numbers of object
+creation requests.
+
+5
+
+Discussion and Conclusions
+
+We show that thread-local object pools acting as caches for objects that are usually not shared
+among different threads can significantly improve the performance of computationally intensive
+tasks, especially under heavy concurrency and stringent memory requirements, even though their
+performance can sometimes lag behind the no-pool-approach in single-threaded environments.
+Creating many light-weight (and usually short-lived) objects, is often an indication of suboptimal data design, or application of Object-Oriented concepts at too fine a level of granularity.
+In such cases, whenever the software designer has control over such interface choices, it would
+make much more sense to group data in more meaningful ways for performance, rather than try
+
+12
+
+Figure 5: Profile of a sample test-driver
+program constructing large numbers of
+trivially small objects, concurrently on 8
+threads, without the use of pooling, under JVM memory constraint “-Xmx100m”.
+All user threads experience blocking even
+though there is no explicit user-lock in the
+program.
+
+Figure 6: Profiling the performance of the
+same test-driver program as in Figure 5 but
+with the use of pooling. The threads never
+stall.
+
+Figure 7: Thread-local object pool performance in a virtualized environment running OpenMandriva Linux 2014 64-bit with access to 4 CPU cores, and Java8 running under -Xmx100m JVM
+option.
+
+13
+
+to alleviate the issues caused by fine granularity of objects by using object pools on top. But
+whenever such design choices cannot be altered, and one has to deal with the fact that large
+numbers of lightweight objects will have to be requested on demand from many concurrently
+executing threads, then using a small library as the one we propose can result in significant
+performance gains. The proposed code for the library we describe can be found as Open-Source
+at https://github.com/ioannischristou/ThreadLocalObjectPool.
+
+References
+[1] https://en.wikipedia.org/wiki/Object pool pattern, retrieved on Apr. 17, 2017.
+[2] K.-Y. Chen, J.-M. Chang, T.-W. Hou Multithreading in Java: Performance and Scalability
+on Multicore Systems IEEE Transactions on Computers, 60(11):1521-1534, 2011.
+[3] M. Kircher, P. Jain Pooling Technical Report, Siemens AG, 2002.
+[4] J. Bloch Effective Java, 2nd ed. Addison-Wesley, Boston, MA, 2008.
+[5] B. Goetz et al. Java Concurrency in Practice Addison-Wesley, Boston, MA, 2006.
+[6] http://softwareengineering.stackexchange.com/questions/115163/is-object-pooling-adeprecated-technique, Apr. 17, 2017.
+[7] https://dzone.com/articles/creating-object-pool-java retrieved on Apr. 17, 2017.
+[8] http://stackoverflow.com/questions/4921642/what-is-object-pooling-in-java
+Apr. 7, 2017.
+
+retrieved
+
+on
+
+[9] https://github.com/ioannischristou/popt4jlib
+[10] Furious Object Pool: https://code.google.com/archive/p/furious-objectpool/, retrieved on
+Apr. 7, 2017.
+[11] Apache Commons Object Pool: https://commons.apache.org/proper/commons-pool/, retrieved on Apr. 7, 2017.
+[12] H. Mühlenbein, D. Schomisch, J. Born The Parallel Genetic Algorithm as Function Optimizer Parallel Computing, 17:619–632, 1991.
+[13] S. Owen, R. Anil, T. Dunning, E. Friedman Mahout in action Manning, NY, 2011.
+[14] I.T. Christou, E. Amolochitis, Z.-H. Tan AMORE: Design and Implementation of a
+Commercial-Strength Parallel Hybrid Movie Recommendation Engine Knowledge and Information Systems, 47(3):671-696, 2016.
+[15] E. Amolochitis, I.T. Christou, Z.-H. Tan Implementing a Commercial-Strength Parallel
+Hybrid Movie Recommendation Engine IEEE Intelligent Systems, 29(2):92-96, 2014.
+[16] https://github.com/ashkrit/blog/blob/master/src/main/java/objectpool
+
+14
+

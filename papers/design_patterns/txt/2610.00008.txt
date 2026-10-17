@@ -1,0 +1,797 @@
+RESEARCH ARTICLE
+
+Bounded-Fidelity Sim-as-Demo-Stage: Mocap Handoff for
+Governance Benchmarks
+
+arXiv:2610.00008v1 [cs.RO] 9 Jul 2026
+
+Xue Qin1
+
+Simin Luan2
+
+1
+
+School of Software, Harbin Institute of
+Technology, Harbin, China
+
+2
+
+School of Computer Science and Technology,
+Harbin Institute of Technology, Harbin, China
+
+3
+
+School of Future Science and Engineering,
+Soochow University, Suzhou, China
+
+Correspondence
+Cong Yang, School of Future Science and
+Engineering, Soochow University, Suzhou, China.
+Email: cong.yang@suda.edu.cn
+Zhijun Li, School of Computer Science and
+Technology, Harbin Institute of Technology,
+Harbin, China.
+Email: lizhijun_os@hit.edu.cn
+
+Cong Yang3
+
+Zhijun Li2
+
+Abstract
+Sim-to-real research pursues physics fidelity as a primary objective: simulators are judged by how closely
+they reproduce real-world contact dynamics. For governance benchmarking of LLM-driven robots, where
+the simulator demonstrates that an admission/policy/contract/audit pipeline behaves correctly, contact fidelity at object handoffs (grasp, carry, place) becomes a liability: contact-force integration noise injects
+audit-chain divergence that is structurally unrelated to the governance property under test. We propose
+bounded-fidelity sim-as-demo-stage, a design pattern that suppresses contact physics within explicitly
+bracketed handoff envelopes while preserving full dynamics elsewhere. The construction uses MuJoCo’s
+mocap-body primitive driven by a 220-line Python adapter that the governance bridge invokes via structured intents. We formalise audit-chain stability as byte-equality of the hashed event log across replays and
+identify two structural envelope properties that imply it. Across N = 1000 replays per posture, the mocap
+variant produces one distinct audit-chain hash (1000/1000 byte-identical; Wilson 95% CI [0.997, 1.000]);
+the contact-force baseline produces 584 distinct hashes (993/1000 diverged; CI [0.987, 0.998]). A timestep
+sweep ({1, 2, 5, 10} ms) shows the divergence is structural, not a tuning artefact: it stays at 0.985 at every timestep. Envelope-edge timing jitter (±10 simulation steps, 1,400 replays) produces 0 divergence, and
+audit chains remain byte-equal across K ∈ {1, 2, 3} sequentially handed-off objects (1,500 replays) with
+sub-linear per-pick-and-place overhead. The pattern gives benchmark designers audit-chain reproducibility at near-zero engineering cost; we also map where it is harmful (sim-to-real validation, policy training,
+contact-rich tasks) so it is not mis-deployed.
+KEYWORDS
+
+Audit Reproducibility, Design Patterns, Governance Benchmarking, LLM-Driven Robots, MuJoCo, Simulation Fidelity
+
+1
+
+INTRODUCTION
+
+A senior engineer evaluates a startup’s robotic governance demo. The pitch: an LLM-driven Franka Panda arm picks up a red
+cup, carries it across a worktable, and places it in a drop-off tray. The governance bridge admits the natural-language command,
+runs the admission, policy, contract, and audit gates, and dispatches the resulting structured intents to the simulator. The audit
+log streams in real time alongside the 3D viewport.
+Run 1 of the demo is clean. The arm reaches the cup, grasps it, carries it, and releases it on the tray. The audit chain logs four
+skill executions: perception.locate_object, navigation.move_to, manipulation.grasp, manipulation.place.
+Every gate shows admission GRANTED, policy PASS, contract PASS, executor dispatched.
+Run 2 of the same demo, same script, same seed. The arm reaches the cup. The gripper closes. But this time the contact-force
+integrator generates a brief spurious 87 N spike from the gripper-on-cup collision, the cup slips from the gripper’s grasp, and
+a moment later the cup geom clips the table edge and triggers a runtime force-limit violation. The audit chain now records a
+recovery_action event the demo’s narration does not mention. The engineer is confused. Was that the bridge’s bug, or the
+simulator’s?
+
+Software: Practice and Experience 2026;00:1–11
+
+wileyonlinelibrary.com/journal/spe
+
+1
+
+2
+
+QIN et al.
+
+place closes
+handoff envelope (carry phase)
+
+LLM planner
+(prompted)
+
+Governance bridge
+
+Mocap adapter
+
+MuJoCo
+
+Audit chain
+
+admit / policy / contract
+
+enter / update / exit
+
+mocap-body step
+
+SHA256(canonical(H))
+
+Property (handoff envelope): within the dashed envelope, cup pose is a deterministic
+function of gripper-tip pose, and audit-chain events are keyed on structured intents, not
+contact samples. Consequence: hash(H1 ) = hash(H2 ) byte-equal across N = 1000 replays
+(mocap variant).
+
+F I G U R E 1 System overview of the bounded-fidelity sim-as-demo-stage pattern. The governance bridge admits a structured
+grasp intent, dispatches it to the mocap adapter, and opens the handoff envelope (orange dashed region) around the carry phase.
+Within the envelope, the cup pose is written as a deterministic function of the gripper pose, so the audit-chain hash is byte-equal
+across replays (Proposition 2; 1000/1000 mocap variant vs 7/1000 contact-force baseline in §4.3).
+
+This is the kernel of our argument. The senior engineer’s evaluation is about governance behaviour, not about physics fidelity.
+The contact-force noise that spoiled Run 2 was the high-fidelity contact integrator working as intended. Precisely because it
+worked as intended, it leaked into the audit chain and confused the evaluator about what they were watching.
+We propose bounded-fidelity sim-as-demo-stage as a design pattern for governance benchmarks: a simulator deliberately
+configured to be deterministic at handoff points, even at the cost of physics realism. The construction uses MuJoCo’s mocapbody primitive 1,2 to implement object handoff via Python pose-tracking, sidestepping the contact-force integrator during the
+carry phase. Across reproducible replays of the construction, the audit chain is byte-stable; under the contact-force equivalent
+it diverges.
+
+Contributions.
+(1) The design choice to build governance-benchmark simulators around handoff suppression rather than handoff fidelity, with
+an explicit problem-decomposition argument for why the sim-to-real default is the wrong default in this sub-context. (2) A concrete implementation pattern using MuJoCo mocap bodies driven by a 220-line Python adapter bracketed by governance-bridge
+structured intents, including a formal definition of the handoff envelope (Section 3.4) with two structural properties (determinism preservation and audit-chain stability under handoff) that admit lightweight Hoare-style verification. (3) An evaluation
+discipline that treats audit-chain hash stability as a first-class metric, with N = 1000-replay byte-equality measurements, a fourpoint timestep sweep (200 trials each) demonstrating that the contact-force divergence is structural in the contact solver rather
+than a tuning artefact, and two robustness ablations: envelope-edge timing jitter (±10 simulation steps over 1,400 replays) and
+compositional generalisation across K ∈ {1, 2, 3} sequentially handed-off objects (over 1,500 replays). (4) An applicability matrix (Section 5.1) identifying both the use cases the pattern serves well (governance benchmarks, investor demos, regression
+tests, tutorials) and the use cases for which it is actively harmful (sim-to-real validation, policy training, contact-rich tasks).
+Roadmap.
+Section 2 positions the work against sim-to-real, LLM-driven robotics, governance-benchmark, reproducibility, and kinematicvs-dynamic-simulation literature. Section 3 presents the bounded-fidelity construction, including the mocap-body mechanism,
+the handoff-envelope decomposition, and what the pattern is and is not. Section 3.4 provides a formal account: a state-transition
+definition of the envelope, a specification of audit-chain stability as byte-equality, and two structural properties stated in Hoarestyle pre- and post-conditions. Section 4 reports the implementation and the 1000-replay empirical study. Section 5 discusses
+the applicability boundary, including the explicit when-not-to-use cases. Section 6 concludes.
+
+Bounded-Fidelity Sim-as-Demo-Stage
+
+2
+
+3
+
+RELATED WORK
+
+Software design patterns.
+The contribution is framed as a software design pattern in the tradition of Gamma et al. 3 and Schmidt et al. 4 : a named, reusable
+solution to a recurring design problem, with explicit applicability conditions and known consequences. The Bounded Fidelity
+Pattern formalised in Section 3 differs from those classical pattern catalogues, which describe compositional building blocks
+for object-oriented or concurrent systems, by addressing a runtime-fidelity choice rather than a class-structure choice. It inherits
+the same expository style of context, problem, solution, and consequences.
+Sim-to-real.
+The mainstream sim-to-real research programme treats the simulator as a training environment for behavioural policies that must
+transfer to hardware 5,6,7,8,9,10 . Physics fidelity is a means to an end: minimise the reality gap so the trained policy generalises.
+MuJoCo 1 , PyBullet 11 , and IsaacSim 12 all invest in faithful contact dynamics, friction models, and rigid-body integrators.
+LLM-driven robotics.
+A parallel line of work has positioned large language models as planners that emit structured intents or executable code for
+downstream robotic skills 13,14,15,16 . These systems make the intent layer explicit, and it is precisely that intent layer that our
+handoff envelope brackets (Section 3).
+Governance benchmarks.
+A small but growing line of work evaluates the runtime governance of LLM-driven agents 17,18 . These benchmarks measure
+admission policies, contract enforcement, audit chains, and recovery behaviour rather than task success rates. Embodied test
+environments such as Habitat 2.0 19 and AI2-THOR 20 , alongside manipulation benchmarks such as robosuite 21 and RLBench 22 ,
+provide rich worlds for such evaluations, but their default rendering and physics pipelines are tuned for policy training rather
+than governance read-out. The simulator’s role here is different: it is a stage for the governance pipeline to demonstrate correct
+behaviour, not a training environment.
+Reproducibility in robotics and ML.
+Reproducibility has been a perennial concern in robotics and reinforcement learning 23,24,25,26 . The standard mitigation, seed
+determinism, breaks down at contact resolution under practically any non-trivial physics integrator. Our construction sidesteps
+the seed-determinism issue at exactly the most contact-sensitive moments (grasp, handoff, place).
+Kinematic vs. dynamic simulation.
+Kinematic-only simulation is a long-standing technique used in animation and motion planning; established libraries such as
+OMPL 27 and MoveIt 28 operate purely in configuration space, treating dynamics as a separable downstream concern. Posa et
+al. 29 formalise the kinematic/dynamic split as a constraint structure for contact trajectory optimisation, and modern toolkits
+like Drake 30 make the same split a first-class authoring choice. The contribution of this paper is not the kinematic primitive
+itself but the deliberate use of bounded fidelity at governance-relevant handoff points within an otherwise full-dynamics scene.
+
+3
+3.1
+
+THE BOUNDED-FIDELITY PATTERN
+Mocap-Body Handoff
+
+MuJoCo’s mocap body is a body whose pose is driven externally via data.mocap_pos and data.mocap_quat, rather than
+by the contact-force integrator. Within a single simulation step, the mocap body is treated as a kinematic constraint: it does not
+respond to applied forces, and any contact with non-mocap geoms is resolved as if the mocap body’s pose were authoritative.
+The construction is two lines of XML per handoffable body and an extra Python field per handoff event:
+<!-- scene.xml (excerpt) -->
+<body name="red_cup" mocap="true">
+<geom type="cylinder" size="0.025 0.05" rgba="0.8 0.1 0.1 1"/>
+</body>
+
+4
+
+QIN et al.
+
+grasp
+
+place
+
+Carry
+mocap
+
+Approach
+dynamic
+
+Place
+dynamic
+
+handoff envelope
+cup pose = gripper pose
+time
+F I G U R E 2 The handoff envelope. During carry the cup is pose-tracked to the gripper (mocap body, no contact physics).
+During approach and place the cup is a normal dynamic body. Boundaries are opened/closed by structured intents grasp and
+place dispatched by the governance bridge.
+
+# bridge dispatcher: handoff phase (per simulation step)
+data.mocap_pos[cup_id] = gripper_tip_pos(model, data)
+data.mocap_quat[cup_id] = gripper_tip_quat(model, data)
+
+3.2
+
+The Handoff Envelope
+
+We model the demo as a sequence of phases: ⟨approach, grasp, carry, place, release⟩. The handoff envelope is the (carry) phase,
+bracketed by grasp at the start and release at the end. Within the envelope, the cup’s pose is driven by the gripper’s pose. Outside
+the envelope (approach, place, post-release), the cup is a normal dynamic body and standard contact physics apply.
+The handoff envelope is opened by a structured intent (the governance bridge dispatches manipulation.grasp(red_cup)
+to the simulator’s bridge-side adapter, which sets the mocap flag on red_cup for the duration of the carry phase). It is closed
+by manipulation.place(red_cup) which clears the flag. The adapter is a pure-Python module in the bridge runtime; no
+MuJoCo plugin is required.
+
+3.3
+
+What the Pattern Is and Is Not
+
+The pattern is: suppress contact physics during governance-irrelevant handoff phases, while preserving full dynamics elsewhere
+in the scene. It is not: free-flight motion during carry (the cup is still kinematically tracked by the gripper); a full kinematic-only
+simulator (the floor, table, and non-handoff objects remain dynamic); or a replacement for sim-to-real validation (we discuss
+this explicitly in Section 5).
+
+3.4
+
+Formal Account
+
+To give the construction a sharper specification than prose alone affords, we provide a small formal account: a state-transition
+definition of the handoff envelope, a precise specification of audit-chain stability, and two structural properties stated in Hoarestyle pre- and post-conditions. The account is intentionally lightweight; mechanised verification (TLA+, Apalache, Coq) is
+
+Bounded-Fidelity Sim-as-Demo-Stage
+
+5
+
+out of scope here. The Hoare-style statements admit straightforward regression-test encoding, which is what the shipped
+implementation checks.
+
+3.4.1
+
+State, Phases, and the Envelope
+
+Let σ = (q, x, H) be the joint state of a demo at simulation step i, where q is the simulator’s internal state (joint positions,
+velocities, contact forces), x is the set of object poses (one SE(3) pose per dynamic body), and H is the prefix of the auditchain event sequence emitted up to and including step i. Let Φ = {approach, grasp, carry, place, release} be the demo phases,
+exposed as labels in the audit chain via the structured intent that opens and closes each phase. The handoff envelope E ⊆ Φ is
+the set of phases during which the cup is pose-tracked to the gripper; in the construction of Section 3, E = {carry}, opened by
+manipulation.grasp and closed by manipulation.place.
+
+3.4.2
+
+Audit-Chain Stability
+
+Specification.
+A simulation run produces an audit-chain event sequence H. We serialise H canonically (deterministic JSON, no wall-clock
+fields) and define the audit-chain hash as hash(H) := SHA256(canonical(H)).
+Definition 1 (Audit-chain stability). A demo configuration is audit-chain stable under a random-replay distribution D over
+seeds and simulator nondeterminism if, for all H1 , H2 sampled independently from D, hash(H1 ) = hash(H2 ). Operationally
+we report stability as the fraction of replays whose hash equals the modal hash across an N-replay cohort (Section 4.3).
+
+3.4.3
+
+Two Structural Properties
+
+Proposition 1 (Determinism preservation within the envelope). Let C denote the configuration in which the cup is a mocap
+( i)
+body driven by the adapter of Section 3. Under C , the cup’s pose xcup at any step i during the envelope is a deterministic function
+( i)
+of the gripper-tip pose xtip alone.
+{ pre: phase(i) ∈ E }
+
+update(model, data)
+
+(1)
+
+( i)
+i)
+{ post: x(cup
+= T(xtip ) }
+
+where T(·) is the fixed rigid-body transform from gripper tip to cup body, parameterised by the grasp-time offset.
+Argument. The mocap-body primitive 2 writes data.mocap_pos[cup_id] and data.mocap_quat[cup_id] on every step
+within the envelope. MuJoCo’s contact solver does not modify mocap-body poses; therefore the contact-force noise term that
+perturbs non-mocap bodies has no path to the cup’s pose during the envelope. The transform T is captured at envelope open
+(enter_handoff) and held constant until envelope close (exit_handoff); within the envelope, the cup follows the gripper
+byte-equally across replays.
+Proposition 2 (Audit-chain stability under handoff). If (i) the simulator’s contact integrator is the only source of inter-replay
+non-determinism, and (ii) the audit chain emits events indexed by structured intents (not by contact-force samples) and
+canonically excludes wall-clock fields, then C is audit-chain stable in the sense of Definition 1.
+{ pre: Source(D) = ContactSolver,
+
+(2)
+
+Events(H) ⊥ ContactSamples }
+replay_under C
+{ post: hash(H1 ) = hash(H2 ) }
+Argument. By Proposition 1, the cup’s pose during the envelope is independent of contact-force samples; therefore the phasetransition events triggered by gripper-tip motion (grasp acquisition, place release) fire at byte-equal step indices across replays.
+Outside the envelope, dynamic-phase events depend on contact, but D’s only non-determinism source is the contact integrator, so they would diverge only if the governance bridge emitted audit-chain events keyed on contact samples. The shipped
+
+6
+
+QIN et al.
+
+bridge emits events keyed on structured intents (grasp, place, recovery_action triggered by gate decisions, not by contact
+thresholds). The audit chain H is therefore byte-equal across replays.
+The arguments are not mechanised proofs. They identify the chain of structural dependencies that the implementation must respect. The regression suite of Section 4.3 discharges them empirically across N = 1000 replays; a violation of either proposition
+would manifest as audit-chain divergence and be caught by the same harness.
+
+4
+
+EXPERIMENTS
+
+4.1
+
+Implementation
+
+The construction is implemented as a ∼220-LOC MocapAdapter module in the AEROS runtime, shipped as
+src/mocap_adapter.py in the artifact repository. The reference environment is Python 3.11.7 with MuJoCo 3.1.4
+and mujoco 3.1.4 Python bindings on macOS 14.5; Section 4.7 reports a byte-equal reproduction on an independent Ubuntu host. All replays in Section 4.3–§4.6 use the fixed seed 12345 (the default for both reference harnesses, harness/envelope_precision.py and harness/multi_object.py; override via --seed). The adapter exposes three operations: enter_handoff(body, gripper), update(model, data) called once per simulation step inside the carry envelope, and exit_handoff(body) which restores dynamic behaviour. The bridge’s executor invokes
+enter_handoff when admission/policy/contract gates have all passed for a manipulation.grasp intent, and exit_handoff
+on manipulation.place.
+
+Open reference implementation.
+The three-method MocapAdapter interface, the canonical audit-chain hash function, the phase-state envelope contract, and
+the per-task summary.json files backing every claim in Section 4.3–§4.6 are released as a standalone artefact at https:
+//github.com/s20sc/bounded-fidelity-mocap-handoff. The repository ships under Apache License 2.0, depends only on the
+Python standard library for the hypothesis sign-check (scripts/sign_check.py) which verifies H1–H4 against the shipped
+seed=12345 aggregates in ∼ 1 s without MuJoCo, and pins mujoco==3.1.4 as an optional [sim] extra for re-running the
+reference harnesses. A Dockerfile ships for fully containerised inspection.
+
+4.2
+
+Audit-Chain Stability Metric
+
+We define audit-chain stability as the byte-equality of the serialised audit chain across two replays of the same script with the
+same seed. The audit chain is a sequence of event records (JSON-serialisable) emitted by the governance bridge as it admits,
+gates, and dispatches intents. Stability requires that any non-determinism in the simulator does not cause divergence in which
+events are emitted or what their structured payloads contain. (Wall-clock timestamps are excluded from the hash.)
+
+4.3
+
+Quantitative Results
+
+We run the pick-and-place demo through N = 1000 independent replays under each of two postures (mocap variant and
+contact-force variant) on a developer workstation. The results, summarised in Table 1, are stark.
+T A B L E 1 Audit-chain divergence across N = 1000 replays per posture. Divergence rate is the fraction of replays whose
+audit-chain SHA-256 differs from the most common hash across the cohort.
+Variant
+Mocap (ours)
+Contact-force baseline
+
+Distinct hashes
+
+Divergence rate
+
+CI 95%
+
+1
+584
+
+0.0%
+99.3%
+
+[0.0, 0.0]
+[98.7, 99.8]
+
+The mocap variant exhibits 1000/1000 byte-identical audit chains: a single SHA-256 hash (e4bf79b0 . . .) accounts for every
+replay. The contact-force variant produces 584 distinct audit-chain hashes across 1000 replays; only 7 replays land on the most
+common hash, giving a 99.3% divergence rate (Wilson 95% CI [0.987, 0.998]). Wall-clock medians are essentially the same
+
+Bounded-Fidelity Sim-as-Demo-Stage
+
+7
+
+(∼ 3.41 s per replay) under both postures, so the divergence is not a cost of the bounded-fidelity construction; it is a property
+of the contact integrator itself.
+The result is stronger than the construction’s headline claim required: the mocap variant produces byte-identical audit chains
+with no exceptions, while the contact baseline diverges on nearly every replay (not on ∼ 30–40% as we anticipated when the
+five-replay manual measurements were the only data point). Governance demos built on the contact-force pipeline cannot rely
+on audit-chain stability at all; the mocap pattern, in contrast, gives it for free.
+
+4.4
+
+Fidelity-Stability Trade-Off Across Timesteps
+
+To check whether the contact-force divergence is a tuning artefact of the MuJoCo timestep, we sweep option.timestep
+across {0.001, 0.002, 0.005, 0.010} s (200 trials per setting) and compare against the mocap baseline.
+The mocap variant remains at a single audit-chain hash across the entire sweep. The contact variant exhibits a divergence rate
+of 0.985 at every timestep tested, with no monotone trend in either direction. Shrinking the timestep 10× does not make the
+contact-force pipeline byte-stable; the divergence is structural in the contact solver, not a function of integration step. This is
+a stronger statement than the construction needs to make and we report it without overclaiming: an exhaustive timestep sweep
+would presumably find a regime in which contact-force becomes byte-stable, but it lies outside the range used in governance
+benchmarks of which we are aware.
+
+4.5
+
+Envelope-Precision Ablation
+
+A reviewer-friendly concern about the bounded-fidelity construction is that audit-chain stability might depend on the structured
+intent firing at a precise simulation step. If the bridge dispatcher were to schedule grasp or place with a small timing offset
+(due to scheduler jitter, asynchronous gate delay, or clock skew between the bridge and the simulator), divergence might reenter. We test this directly by sweeping a deterministic boundary-jitter parameter ∆ ∈ {–10, –5, –1, 0, +1, +5, +10} MuJoCo
+simulation steps (±20 ms at the default 0.002 s timestep) on both envelope edges (grasp completion and release completion),
+with N = 200 trials per setting and the mocap variant active.
+Across all 7 × 200 = 1,400 replays, every setting produces a single distinct audit-chain SHA-256 hash and the divergence
+rate is 0.000 at every jitter magnitude (Wilson 95% CI [0.000, 0.018]; Figure 3a). The audit-chain hash at every jitter setting
+equals the V1 baseline hash byte-for-byte (e4bf79b0 . . .). Wall-clock medians remain within 0.008% of the ∆ = 0 baseline
+(3.4048–3.4053 s p50 across all seven settings).
+T A B L E 2 Envelope-precision ablation. Audit-chain divergence under boundary jitter ∆ on grasp and release edges, N =
+200 trials per setting. All seven settings collapse to a single audit hash.
+∆ (steps)
+
+Distinct hashes
+
+Divergence
+
+Wilson 95% CI
+
+wall p50 (s)
+
+–10
+–5
+–1
+0
++1
++5
++10
+
+1
+1
+1
+1
+1
+1
+1
+
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+0.000
+
+[0.000, 0.018]
+[0.000, 0.018]
+[0.000, 0.018]
+[0.000, 0.018]
+[0.000, 0.018]
+[0.000, 0.018]
+[0.000, 0.018]
+
+3.4048
+3.4049
+3.4053
+3.4050
+3.4053
+3.4049
+3.4048
+
+The result is stronger than the construction needed: the hypothesis we wrote into the experiment brief was that ±10 might
+admit a small fraction of divergence; the data shows none. The mechanistic explanation is that the cup’s end-of-trial pose is set
+by place_held_object_at(tray) to a deterministic target, and the release-settle phase that follows holds the end effector
+approximately stationary while the gripper opens; the millimetre-quantised cup pose absorbs the small drift introduced by ±10step jitter. A scene in which the end effector moves during the release window (an arm-retreat motion concurrent with the
+gripper-open command) would exercise the envelope-precision property more aggressively; we flag that as a future ablation
+rather than a fix to the present construction. Property 2 is therefore robust to envelope-edge imprecision in the regime under test.
+
+8
+
+QIN et al.
+
+4.6
+
+Multi-Object Handoff
+
+The single-cup demo of Section 4.3 leaves an open generalisation question: does audit-chain stability survive when the envelope
+is invoked repeatedly across K > 1 objects? We extend the scene to three mocap-bound cups (identical geometry and mass,
+distinct initial positions) and dispatch K sequential pick-and-place pairs per trial, with K ∈ {1, 2, 3} and N = 500 trials per scale.
+The byte-equal rate is 1.000 at every scale (Wilson 95% CI lower bound 0.9924; Figure 3b). Each scale produces exactly
+one distinct audit-chain hash across 500 replays. The hashes differ across scales because the audit chain encodes object identity
+in the grasp and place payloads (4K events per trial), but each scale’s hash is byte-identical across all replays of that scale.
+Wall-clock scales linearly with K at the trial level (p50 = 3.405/6.810/10.216 s for K = 1, 2, 3), which is expected from the
+sequential-dispatch design. The per-pick-and-place wall ratio at K = 3 is 1.0001× of K = 1, well under the 1.2× ceiling we
+adopted as the compositional-cost threshold.
+T A B L E 3 Multi-object handoff. Byte-equality rate and wall-clock scaling for K sequentially handed-off objects (identical
+cups), N = 500 trials per scale.
+K
+
+Byte-equal
+
+Distinct hashes
+
+wall p50 (s)
+
+per-PnP wall
+
+ratio vs K = 1
+
+1
+2
+3
+
+1.000
+1.000
+1.000
+
+1
+1
+1
+
+3.405
+6.810
+10.216
+
+3.405
+3.405
+3.405
+
+1.000×
+1.000×
+1.0001×
+
+The byte-stability property is conserved under handoff composition: divergence channels do not compound across
+sequentially-handed objects, which is the load-bearing evidence that the mocap-handoff pattern is a composable primitive rather
+than a single-object trick. We ran only the homogeneous-object case (three identical cups); a heterogeneous-shape variant (cup
++ block + marker) would test whether the property holds across object types as well as object count, and is flagged as a small
+follow-up rather than a blocker.
+
+(a) Envelope-precision sweep (Table 2)
+
+(b) Multi-object scaling (Table 3)
+
+byte-equal rate
+
+1.00
+
+0.99
+
+0.98
+
+−10
+
+−5
+
+−2
+
++0
+
++2
+
++5
+
+boundary jitter Δ (MuJoCo steps)
+
++10
+
+K=1
+
+K=2
+
+K=3
+
+sequentially handed-off objects
+
+F I G U R E 3 Per-cell byte-equal rates across the two ablation sweeps. Panel (a) plots the envelope-precision sweep (Table 2,
+7 × 200 = 1,400 trials); panel (b) plots the multi-object scale sweep (Table 3, 3 × 500 = 1,500 trials). Bars are per-cell byteequal rates; the downward whisker is the Wilson 95% lower bound on byte-equal rate (equivalently, the Wilson 95% upper
+bound on divergence rate). The bound is tighter in panel (b) because each cell sees 500 trials versus 200 in panel (a).
+
+4.7
+
+Cross-Machine Reproducibility
+
+To check whether the audit chain’s structural-content property survives a platform change, we re-ran the canonical replays of
+§4.5 and §4.6 on an Ubuntu 24.04 workstation (Linux kernel 6.17, glibc 2.39, Intel Core Ultra 9 285K, 188 GiB RAM) at the
+
+Bounded-Fidelity Sim-as-Demo-Stage
+
+9
+
+same AEROS runtime version that backs the macOS results. The Linux toolchain was MuJoCo 3.1.4 with NumPy 2.4.6 under
+Python 3.11.15; the minor Python version differs from the macOS reference (Python 3.11.7), so the comparison includes a
+small upstream-runtime skew. The aggregated reproduction covers the same 1400 task-01 trials (7 jitter cells × 200) and 1500
+task-02 trials (3 scales × 500) as the macOS baseline. Table 4 reports the per-task byte-equal rates.
+T A B L E 4 Cross-machine reproduction of the canonical audit-chain hashes. A trial is byte-equal iff its serialised audit chain
+matches the macOS canonical for that cell; both platforms also produce one distinct hash within every cell.
+Platform
+
+Toolchain
+
+task 01 byte-equal
+(7×200=1400 trials)
+
+task 02 byte-equal
+(3×500=1500 trials)
+
+macOS 14.5
+Ubuntu 24.04
+
+Py 3.11.7 + MuJoCo 3.1.4
+Py 3.11.15 + MuJoCo 3.1.4
+
+1400/1400 (100%)
+1400/1400 (100%)
+
+1500/1500 (100%)
+1500/1500 (100%)
+
+All 10 cells reproduce byte-for-byte. The audit chain therefore survives both the macOS → Ubuntu OS boundary (glibc 2.39
+versus Apple libsystem) and a minor Python version skew, which is the behaviour predicted if the chain depends only on the
+structural content of admitted events and is independent of wall-clock and platform-specific scheduling.
+
+4.8
+
+Scope: What We Are and Are Not Measuring
+
+We measure audit-chain stability under handoff. We do not measure: task success rate on a held-out test set (the demo script
+is fixed); transfer to physical hardware (the construction is sim-only by design); generalisation across object shapes (the demo
+uses one cup); or pile-up scenes with many dynamic objects (the cup is the only handoffable body in the demo).
+
+5
+5.1
+
+DISCUSSION
+Applicability Matrix
+
+Table 5 consolidates the use-case envelope. We list seven candidate uses of an LLM-driven robotic demonstration platform and
+mark each with the pattern’s effect. The classification is deliberately coarse: a use is in scope (✓) when the governance pipeline
+can be exercised with audit-chain stability as a first-class signal; out of scope (×) when the pattern’s contact-suppression would
+defeat the very property the use case needs to measure; and conditional (◦) when the pattern can be retained for the non-handoff
+segments of the demo while contact phases are reverted to full dynamics.
+T A B L E 5 Applicability matrix for the bounded-fidelity pattern: ✓ in scope, × out of scope, ◦ conditional.
+Use case
+
+Status
+
+Governance benchmark
+Investor demo
+Bridge regression test
+Tutorial / classroom
+Sim-to-real validation
+Policy training
+Slip / grasp benchmark
+Multi-skill demo
+
+5.2
+
+✓
+✓
+✓
+✓
+×
+×
+×
+◦
+
+Rationale
+Audit-chain stability is the primary signal.
+Reproducibility is the deliverable; physics realism is decorative.
+Isolates bridge bugs from contact-solver noise.
+Pedagogy is pipeline-shaped, not contact-shaped.
+Suppressed contact eliminates the transfer signal.
+No contact gradient during the carry envelope.
+Pattern eliminates the phenomenon under test.
+Apply only to governance-irrelevant segments.
+
+When to Use, When Not to Use
+
+When to use this pattern.
+Governance benchmarks (admission/policy/contract/audit correctness); investor demos (where audit-chain readability is the
+deliverable); regression tests for the bridge layer; tutorial scenarios where the pedagogy is governance-pipeline-shaped, not
+manipulation-skill-shaped.
+
+10
+
+QIN et al.
+
+When not to use this pattern.
+Sim-to-real validation (mocap handoff cannot tell you whether a real gripper will keep its hold of the cup); manipulation
+policy training (the policy sees no contact-force signal during carry); contact-rich tasks (assembly, insertion, peg-in-hole); any
+benchmark that measures grasp robustness or slip resistance. The pattern is harmful for these uses and we say so explicitly.
+Bridge boundary assumption.
+The pattern assumes the simulator runs behind a bridge-side adapter that distinguishes “in handoff” from “not in handoff” based
+on structured intents. Demos where the simulator is invoked directly without a structured intent layer cannot trivially adopt the
+pattern.
+Audit-chain stability is necessary, not sufficient.
+A byte-stable audit chain is a precondition for governance benchmark reproducibility, not a proof of bridge correctness. The
+bridge can still be wrong; we just want it to be reliably wrong (so reviewers can see and discuss the bug) rather than randomly
+wrong (so the bug looks like sim noise).
+Future work.
+(i) A heterogeneous-shape variant of the multi-object scene of Section 4.6 (cup + block + marker rather than three identical cups), to confirm the byte-stability property holds across object types as well as object count. (ii) Multi-robot handoff in
+which one robot passes the cup to another, requiring an explicit handover protocol between two adapters and a composed envelope spanning two governance bridges. (iii) Mechanised verification of Propositions 1 and 2 via a lightweight TLA+ or
+Apalache model, lifting the current Hoare-style arguments from prose to a model-checkable specification. (iv) A more aggressive envelope-precision scenario in which the end effector moves during the release window (concurrent arm-retreat and
+gripper-open), which the Section 4.5 sweep does not exercise because the workshop scene holds the end effector approximately
+stationary during release-settle.
+
+6
+
+CONCLUSION
+
+The sim-to-real community’s pursuit of physics fidelity is the right goal for behavioural policy training; it is the wrong goal
+for governance benchmarking. Governance benchmarks need an audit chain that is readable, reproducible, and uncluttered by
+physics noise that is irrelevant to the property under test. The bounded-fidelity sim-as-demo-stage pattern, implemented via
+MuJoCo’s mocap-body primitive and bracketed by structured intents from a governance bridge, gives benchmark designers the
+reproducibility they need without rebuilding the simulator from scratch. The pattern is narrowly scoped; we have said where
+it helps and where it hurts. The empirical claim is concrete: mocap-bracketed handoff produces byte-identical audit chains on
+1000/1000 replays, while the contact-force baseline diverges on 993/1000 replays of the same script under the same seed.
+CONFLICT OF INTEREST
+The authors declare no potential conflict of interest.
+DATA AVAILABILITY STATEMENT
+The data that support the findings of this study (the MocapAdapter reference implementation, the canonical audit-chain hash
+function, the hypothesis sign-check scripts, and the per-task summary.json aggregates backing every empirical claim in
+Section 4) are openly available at https://github.com/s20sc/bounded-fidelity-mocap-handoff under Apache License 2.0.
+REFERENCES
+1. Todorov E, Erez T, Tassa Y. MuJoCo: A Physics Engine for Model-Based Control. In: Proceedings of the IEEE/RSJ International Conference on
+Intelligent Robots and Systems (IROS) 2012:5026–5033
+2. Google DeepMind . MuJoCo Documentation: Modeling — Mocap Bodies. https://mujoco.readthedocs.io/en/stable/modeling.html#
+mocap-bodies; 2024. Official documentation, accessed 2026-05-12.
+3. Gamma E, Helm R, Johnson R, Vlissides J. Design Patterns: Elements of Reusable Object-Oriented Software. Reading, Massachusetts: AddisonWesley, 1995. The Gang of Four. Foundational catalogue of object-oriented design patterns.
+4. Schmidt DC, Stal M, Rohnert H, Buschmann F. Pattern-Oriented Software Architecture, Volume 2: Patterns for Concurrent and Networked
+Objects. Chichester, UK: Wiley, 2000. POSA vol 2; canonical anchor for software-architecture patterns governing concurrent dispatch.
+5. Tobin J, Fong R, Ray A, Schneider J, Zaremba W, Abbeel P. Domain Randomization for Transferring Deep Neural Networks from Simulation to
+the Real World. In: IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS) 2017:23–30
+
+Bounded-Fidelity Sim-as-Demo-Stage
+
+11
+
+6. Peng XB, Andrychowicz M, Zaremba W, Abbeel P. Sim-to-Real Transfer of Robotic Control with Dynamics Randomization. In: IEEE
+International Conference on Robotics and Automation (ICRA) 2018:3803–3810
+7. Akkaya I, Andrychowicz M, Chociej M, et al. Solving Rubik’s Cube with a Robot Hand. 2019. OpenAI Rubik’s Cube paper; arXiv preprint, not
+formally venue-published.
+8. OpenAI , Andrychowicz M, Baker B, et al. Learning Dexterous In-Hand Manipulation. The International Journal of Robotics Research.
+2020;39(1):3–20. OpenAI Dactyl team; author list opens with the OpenAI collective per the IJRR title page, followed by the named
+contributors.doi: 10.1177/0278364919887447
+9. Tan J, Zhang T, Coumans E, et al. Sim-to-Real: Learning Agile Locomotion for Quadruped Robots. In: Proceedings of Robotics: Science and
+Systems (RSS) 2018
+10. Zhao W, Queralta JP, Westerlund T. Sim-to-Real Transfer in Deep Reinforcement Learning for Robotics: a Survey. In: IEEE Symposium Series
+on Computational Intelligence (SSCI) 2020:737–744. Sim-to-real survey covering domain randomisation, adaptation, and reality-gap mitigation;
+arXiv 2009.13303.
+11. Coumans E, Bai Y. PyBullet, a Python Module for Physics Simulation for Games, Robotics and Machine Learning. http://pybullet.org; 2016–2024.
+Open-source software, accessed 2026-05-12.
+12. NVIDIA Corporation . NVIDIA Isaac Sim: A Robotics Simulation Application. https://developer.nvidia.com/isaac/sim; 2024. Commercial
+software documentation, accessed 2026-05-12.
+13. Ahn M, Brohan A, Brown N, et al. Do As I Can, Not As I Say: Grounding Language in Robotic Affordances. In: Proceedings of the 6th Conference
+on Robot Learning (CoRL) 2022. arXiv:2204.01691.
+14. Liang J, Huang W, Xia F, et al. Code as Policies: Language Model Programs for Embodied Control. In: IEEE International Conference on Robotics
+and Automation (ICRA) 2023:9493–9500
+15. Huang W, Xia F, Xiao T, et al. Inner Monologue: Embodied Reasoning through Planning with Language Models. In: Proceedings of the 6th
+Conference on Robot Learning (CoRL) 2022. arXiv:2207.05608.
+16. Brohan A, Brown N, Carbajal J, et al. RT-2: Vision-Language-Action Models Transfer Web Knowledge to Robotic Control. In: Proceedings of
+the 7th Conference on Robot Learning (CoRL) 2023. arXiv:2307.15818.
+17. Anonymous Authors . EmbodiedGovBench: A Benchmark for Governance Layers in Embodied Agent Runtimes. 2026. Under review.
+18. Ruan Y, Dong H, Wang A, et al. Identifying the Risks of LM Agents with an LM-Emulated Sandbox. In: International Conference on Learning
+Representations (ICLR) 2024. arXiv:2309.15817.
+19. Szot A, Clegg A, Undersander E, et al. Habitat 2.0: Training Home Assistants to Rearrange their Habitat. In: Advances in Neural Information
+Processing Systems (NeurIPS) 2021. arXiv:2106.14405.
+20. Kolve E, Mottaghi R, Han W, et al. AI2-THOR: An Interactive 3D Environment for Visual AI. 2017.
+21. Zhu Y, Wong J, Mandlekar A, et al. robosuite: A Modular Simulation Framework and Benchmark for Robot Learning. 2020. arXiv preprint;
+widely cited as the robosuite benchmark; subsequent IROS 2022 version available.
+22. James S, Ma Z, Arrojo DR, Davison AJ. RLBench: The Robot Learning Benchmark & Learning Environment. IEEE Robotics and Automation
+Letters. 2020;5(2):3019–3026. doi: 10.1109/LRA.2020.2974707
+23. Henderson P, Islam R, Bachman P, Pineau J, Precup D, Meger D. Deep Reinforcement Learning that Matters. In: Proceedings of the AAAI
+Conference on Artificial Intelligence. 32. 2018. AAAI 2018 (volume 32, issue 1).
+24. Pineau J, Vincent-Lamarre P, Sinha K, et al. Improving Reproducibility in Machine Learning Research (A Report from the NeurIPS 2019
+Reproducibility Program). Journal of Machine Learning Research. 2021;22(164):1–20.
+25. Association for Computing Machinery . ACM Artifact Review and Badging — Version 1.1. https://www.acm.org/publications/policies/
+artifact-review-and-badging-current; 2020. Official policy, accessed 2026-05-12.
+26. Farama Foundation . Gymnasium: Reproducibility and Determinism. https://gymnasium.farama.org/api/env/; 2024. Open-source documentation,
+accessed 2026-05-12.
+27. Şucan IA, Moll M, Kavraki LE. The Open Motion Planning Library. IEEE Robotics & Automation Magazine. 2012;19(4):72–82. doi:
+10.1109/MRA.2012.2205651
+28. Coleman D, Şucan IA, Chitta S, Correll N. Reducing the Barrier to Entry of Complex Robotic Software: a MoveIt! Case Study. 2014. arXiv
+preprint; the journal-version metadata sometimes listed (Journal of Software Engineering for Robotics 5(1):3–16) could not be independently
+confirmed at audit date, so the citable form is the arXiv preprint.
+29. Posa M, Cantu C, Tedrake R. A Direct Method for Trajectory Optimization of Rigid Bodies through Contact. The International Journal of Robotics
+Research. 2014;33(1):69–81. Drake-pedigree trajectory-optimisation paper that established the kinematic/dynamic separation as a first-class
+authoring choice for contact-rich tasks.doi: 10.1177/0278364913506757
+30. Tedrake R, The Drake Development Team . Drake: Model-Based Design and Verification for Robotics. https://drake.mit.edu/; 2019. Open-source
+software, accessed 2026-05-12.
+

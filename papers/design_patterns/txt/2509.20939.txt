@@ -1,0 +1,3273 @@
+Under review as a conference paper at ICLR 2026
+
+U NLOCKING N OISE -R ESISTANT V ISION : K EY A RCHITEC TURAL S ECRETS FOR ROBUST M ODELS
+
+arXiv:2509.20939v1 [cs.CV] 25 Sep 2025
+
+Bum Jun Kim, Makoto Kawano, Yusuke Iwasawa & Yutaka Matsuo
+Department of Engineering, The University of Tokyo
+{bumjun.kim,kawano,iwasawa,matsuo}@weblab.t.u-tokyo.ac.jp
+
+A BSTRACT
+While the robustness of vision models is often measured, their dependence on specific
+architectural design choices is rarely dissected. We investigate why certain vision architectures are inherently more robust to additive Gaussian noise and convert these empirical
+insights into simple, actionable design rules. Specifically, we performed extensive evaluations on 1,174 pretrained vision models, empirically identifying four consistent design
+patterns for improved robustness against Gaussian noise: larger stem kernels, smaller input
+resolutions, average pooling, and supervised vision transformers (ViTs) rather than CLIP
+ViTs, which yield up to 506 rank improvements and 21.6%p accuracy gains. We then develop a theoretical analysis that explains these findings, converting observed correlations
+into causal mechanisms. First, we prove that low-pass stem kernels attenuate noise with
+a gain that decreases quadratically with kernel size and that anti-aliased downsampling
+reduces noise energy roughly in proportion to the square of the downsampling factor. Second, we demonstrate that average pooling is unbiased and suppresses noise in proportion
+to the pooling window area, whereas max pooling incurs a positive bias that grows slowly
+with window size and yields a relatively higher mean-squared error and greater worst-case
+sensitivity. Third, we reveal and explain the vulnerability of CLIP ViTs via a pixel-space
+Lipschitz bound: The smaller normalization standard deviations used in CLIP preprocessing amplify worst-case sensitivity by up to 1.91 times relative to the Inception-style
+preprocessing common in supervised ViTs. Our results collectively disentangle robustness into interpretable modules, provide a theory that explains the observed trends, and
+build practical, plug-and-play guidelines for designing vision models more robust against
+Gaussian noise.
+
+1
+
+I NTRODUCTION
+
+Vision models, implemented with deep neural networks, are now deployed across numerous fields, even in
+safety-critical applications ranging from medical imaging to autonomous driving. Their remarkable accuracy, however, conceals an uncomfortable fact: Performance can deteriorate when test images deviate—even
+slightly—from the training distribution (Hendrycks & Dietterich, 2019). Even light Gaussian noise can trigger misclassifications, and in autonomous vehicles, such brittleness can lead to life-threatening failures.
+Recent studies have empirically discovered that the architectural design of deep neural networks strongly
+shapes their robustness to common image transformations. Specifically, Paul & Chen (2022); Bai et al.
+(2021); Naseer et al. (2021) observed that vision transformers (ViTs) often degrade less than previous convolutional networks, such as residual networks (ResNets), under various corruptions. Although promising
+results with ViTs have been reported, such studies typically treat each architecture as a whole, leaving unanswered which specific internal choices contribute to gains in robustness.
+1
+
+Under review as a conference paper at ICLR 2026
+
+In this study, we dissect the robustness of vision models under Gaussian noise, showing that specific microarchitectural choices are key factors in determining robustness. We performed extensive experiments on
+available vision models from the timm library (Wightman, 2019), as well as controlled experiments; our
+empirical meta-analysis compares architectures pairwise within the vision models, which enables us to isolate the effect of each micro-architectural factor, thereby revealing four interesting design patterns in architectures that improve robustness against Gaussian noise:
+• Larger stem kernels, such as larger patch sizes in ViTs, rather than smaller ones,
+• Smaller input resolutions, such as 2242 , rather than larger ones, such as 3842 ,
+• Average pooling, rather than max pooling, and
+• Supervised learning ViTs, rather than CLIP ViTs.
+Extending these empirical observations, we also derive several theoretical results that account for the differences in these choices. Specifically, we prove that noise gain decays quadratically with the stem kernel
+size and that downsampling after anti-alias filtering yields analogous gains (Section 3). Then we analyze
+Gaussian-noise error formulas for both pooling operators, showing that average pooling is unbiased with
+decreased variance, whereas max pooling incurs a positive bias and a higher mean-squared error (Section 4).
+Finally, we demonstrate that the vulnerability of CLIP ViTs is primarily caused by the choice of mean-std
+normalization, whose effect is proven with Lipschitz bounds (Section 5).
+
+2
+
+R ELATED W ORK
+
+Robustness literature and positioning of this study. Robustness to common corruptions is typically evaluated using ImageNet-C (Hendrycks & Dietterich, 2019). A consistent observation across studies is that
+ViTs often degrade less than CNNs do under such corruptions (Paul & Chen, 2022; Bai et al., 2021; Naseer
+et al., 2021). However, most prior comparisons treat architectures as monolithic families or vary training
+recipes, making it hard to isolate which micro-architectural choices drive robustness. Furthermore, multiple
+corruptions, such as brightness changes and blur, are mixed in. In contrast to these complex corruptions
+and architectures, we design a systematic evaluation protocol to isolate the effect of each micro-architectural
+factor. Furthermore, we select Gaussian noise due to its approximation of aggregate perturbations by the
+central limit theorem and its prevalence in real-world imaging, such as sensor readout and thermal noise.
+To this end, our experiments disentangle four architectural choices across pretrained models and controlled
+settings, enabling clean attribution. Our findings align with prior results on robustness studies (Paul & Chen,
+2022; Boureau et al., 2010) and add causal, quantitative explanations. The parts below review related work
+that corresponds to the empirical design patterns we identified for enhancing Gaussian noise robustness.
+Anti-aliasing, kernels, and resolution. Anti-aliased downsampling is known to reduce high-frequency
+sensitivity and improve stability (Zhang, 2019; Zou et al., 2023), and analogous ideas have been explored for
+ViTs (Qian et al., 2021). Complementing these studies, we provide explicit scaling laws: The output noise
+energy decays quadratically with the stem kernel size and the anti-aliased downsampling factor, explaining
+why larger stem kernels and smaller input resolutions improve robustness.
+Pooling under additive noise. Classical analysis shows that average pooling is unbiased with variance
+reduction, whereas max pooling introduces a positive bias under Gaussian noise (Boureau et al., 2010);
+recent studies further clarify when max pooling aids invariance despite worse noise behavior (Matoba et al.,
+2023). We extend this line and empirically verify the predicted advantage of average pooling over max
+pooling across multiple datasets.
+Normalization, CLIP preprocessing, and Lipschitz sensitivity. Vision models employ specific perchannel mean-std preprocessing, which, according to Lipschitz-based robustness theory (Virmaux & Scaman, 2018; Gouk et al., 2021; Tsuzuku et al., 2018), directly rescales pixel-space sensitivity. We make this
+2
+
+Under review as a conference paper at ICLR 2026
+
+connection explicit: Smaller channel standard deviations enlarge the end-to-end Lipschitz bound, predicting
+greater worst-case and mean-squared sensitivity to additive noise.
+
+3
+
+N OISE ATTENUATION BY L OW-PASS K ERNELS
+
+ViTs have various configurations (Dosovitskiy et al., 2021), such as the size of each patch in the patch
+embedding and the input image size in pixels, which we refer to as the input resolution. Even within the
+same ViT architecture, various pretrained weights are available: They were trained with different recipes, the
+hyperparameter combinations used in training. For example, vit base patch16 224.augreg in1k
+indicates the ViT with a model size of base, a patch size of 16, a resolution of 2242 , and pretrained weights
+obtained using a training recipe of AugReg (Steiner et al., 2022) and a dataset of ImageNet-1K (Deng et al.,
+2009). Although plenty of variations in its configuration are allowed, the effect of each choice on robustness
+against Gaussian noise has not been clearly studied, making it difficult for practitioners to choose which one
+to use.
+To study the effect of each architectural factor in a ViT on robustness, we performed an extensive evaluation using pretrained ViTs with various configurations. For example, by comparing
+vit base patch16 224.augreg in1k and vit base patch32 224.augreg in1k, we can
+study the effect of the choice of patch sizes of 16 and 32 on performance because all other conditions
+remained the same. In this section, we first present empirical observations from different configurations, and
+then we examine the corresponding properties.
+3.1
+
+E MPIRICAL O BSERVATION
+
+We used the timm library, which provides 1,174 pretrained vision models. For all pretrained models, we
+evaluated the top-1 accuracy (%) on the standard ImageNet-1K dataset. Then we injected Gaussian noise into
+the images on the ImageNet-1K dataset and measured the top-1 accuracy. Although it is natural to observe a
+linear accuracy drop after applying a specific corruption (Recht et al., 2019; Hendrycks & Dietterich, 2019),
+a model with robustness would show a relatively smaller drop in top-1 accuracy. Motivated by this behavior,
+we identified robust models by observing relative ranking among the 1,174 models: When a model ranked
+50th becomes 20th after adding Gaussian noise, we say that it demonstrates relatively stronger robustness
+to Gaussian noise. To investigate the model with improved rank, we computed the rank difference before
+and after applying Gaussian noise, where more negative values indicate better robustness. Full rationale for
+rank difference and technical details are available in Appendix H and Appendix I. Full results on all models
+are in supplementary materials. Based on these rank differences, we compared pairs of ViTs with different
+configurations and investigated which architectural factors contribute to improved ranking under noise.
+Table 1 summarizes the top-1 accuracy and ranking changes before and after injecting Gaussian noise.
+We found that the rank difference was lower when a ViT had 1) a larger patch size, such as 32, and 2) a
+smaller resolution, such as 2242 . For example, comparing vit base patch16 224.augreg in1k and
+vit base patch32 224.augreg in1k, we observed that the model with a patch size of 32 yielded
+a lower rank difference than the one with a patch size of 16. We consistently observed similar behavior
+across multiple pretrained weights such as AugReg2, original ViTs, SAM, and others (Steiner et al., 2022;
+Chen et al., 2022). The same holds for resolution, where a model with a 2242 resolution exhibited a lower
+rank difference than one with 3842 . Note that this observation is contrary to the common practice of scaling
+up resolution to improve general performance (Tan & Le, 2019); our results indicate that this practice may
+increase vulnerability to Gaussian noise. These two factors were significantly more important than others,
+such as model size.
+The patch size of a ViT corresponds to the kernel size used in the patch embedding, which is referred to
+as the stem. Based on these observations, we investigated whether using a larger stem kernel and a smaller
+3
+
+Under review as a conference paper at ICLR 2026
+
+Table 1: Top-1 accuracy (%) on the ImageNet-1K dataset before and after adding Gaussian noise to images.
+For the rank difference (RankDiff), more negative values indicate better robustness under noise. Models
+with large kernels and small resolutions consistently showed improved robustness.
+Top-1 → w/ Noise
+
+Rank → w/ Noise
+
+RankDiff
+
+vit small patch16 224.augreg in1k
+vit small patch16 384.augreg in1k
+vit base patch16 224.augreg in1k
+vit base patch16 384.augreg in1k
+vit base patch32 224.augreg in1k
+vit base patch32 384.augreg in1k
+
+78.84 → 59.22
+81.12 → 56.59
+79.15 → 62.21
+81.10 → 60.23
+74.90 → 58.44
+78.75 → 59.65
+
+885 → 547
+673 → 613
+862 → 487
+676 → 524
+1075 → 569
+893 → 539
+
+-338
+-60
+-375
+-152
+-506
+-354
+
+vit tiny patch16 224.augreg in21k ft in1k
+vit tiny patch16 384.augreg in21k ft in1k
+vit small patch16 224.augreg in21k ft in1k
+vit small patch16 384.augreg in21k ft in1k
+vit small patch32 224.augreg in21k ft in1k
+vit small patch32 384.augreg in21k ft in1k
+vit base patch8 224.augreg in21k ft in1k
+vit base patch16 224.augreg in21k ft in1k
+vit base patch16 384.augreg in21k ft in1k
+vit base patch32 224.augreg in21k ft in1k
+vit base patch32 384.augreg in21k ft in1k
+vit large patch16 224.augreg in21k ft in1k
+vit large patch16 384.augreg in21k ft in1k
+
+75.46 → 40.34
+78.42 → 30.50
+81.39 → 62.43
+83.80 → 62.25
+76.00 → 57.14
+80.48 → 57.33
+85.80 → 73.50
+84.53 → 71.19
+85.99 → 70.89
+80.71 → 65.31
+83.35 → 63.72
+85.84 → 76.62
+87.08 → 76.23
+
+1060 → 949
+921 → 1078
+644 → 479
+349 → 484
+1044 → 601
+740 → 596
+145 → 118
+257 → 192
+129 → 208
+719 → 392
+412 → 437
+141 → 55
+59 → 61
+
+-111
++157
+-165
++135
+-443
+-144
+-27
+-65
++79
+-327
++25
+-86
++2
+
+vit base patch16 224.orig in21k ft in1k
+vit base patch16 384.orig in21k ft in1k
+
+81.79 → 60.91
+84.20 → 54.91
+
+603 → 513
+302 → 657
+
+-90
++355
+
+vit base patch8 224.augreg2 in21k ft in1k
+vit base patch16 224.augreg2 in21k ft in1k
+
+86.22 → 76.09
+85.10 → 74.50
+
+109 → 67
+203 → 96
+
+-42
+-107
+
+vit base patch16 224.sam in1k
+vit base patch32 224.sam in1k
+
+80.24 → 57.13
+73.69 → 51.33
+
+771 → 602
+1101 → 748
+
+-169
+-353
+
+vit medium patch16 gap 256.sw in12k ft in1k
+vit medium patch16 gap 384.sw in12k ft in1k
+
+84.45 → 73.07
+85.54 → 73.98
+
+274 → 132
+163 → 106
+
+-142
+-57
+
+vit so150m patch16 reg4 gap 256.sbb e250 in12k ft in1k
+vit so150m patch16 reg4 gap 384.sbb e250 in12k ft in1k
+
+86.68 → 77.54
+87.37 → 77.30
+
+81 → 38
+49 → 44
+
+-43
+-5
+
+Pretrained Model
+
+Figure 1: Classification accuracy (%) using ResNet-50 for different kernel sizes and resolutions. Larger
+kernels and smaller resolutions improved performance. Shaded areas represent standard deviations.
+resolution improves robustness to Gaussian noise on another architecture, performing controlled experiments
+on ResNets (He et al., 2016). Specifically, we trained ResNet-50 on five datasets, including Oxford-IIIT Pet
+4
+
+Under review as a conference paper at ICLR 2026
+
+(Parkhi et al., 2012), Caltech-101 (Fei-Fei et al., 2007), FGVC-Aircraft (Maji et al., 2013), Caltech-UCSD
+Birds-200-2011 (Wah et al., 2011), and Stanford Cars (Krause et al., 2013) datasets. Similar to the above ViT
+experiments, we trained ResNet in a standard recipe (Appendix I), obtained numerous models with different
+kernel sizes and resolutions, and measured classification accuracy after applying Gaussian noise.
+We observed that larger kernel sizes and smaller resolutions improved classification accuracy under additive
+Gaussian noise (Figure 1). The classification errors on noisy images tended to decrease quadratically with
+larger kernel sizes and smaller resolutions.
+3.2
+
+T HEORETICAL A NALYSIS
+
+Now, we prove that the noise energy decays quadratically with the stem kernel size and the resolution, or
+equivalently, the anti-aliased downsampling factor. Full proofs are available in Appendix A. Throughout,
+η ∼ N (0, σ 2 I) denotes independent and identically distributed (i.i.d.) Gaussian noise, and the per-pixel
+noise gain is the output noise energy normalized by the number of output pixels (Oppenheim, 1999).
+b k its
+Setup. For a kernel size k ≥ 3, let Kk ∈ Rk×k denote the linear, shift-invariant stem kernel, and K
+DFT (Oppenheim, 1999). We consider a single, mild assumption on the stem kernel:
+• (Aroll ) Radial low-pass envelope at scale 1/k: There exist β, δ > 0 such that, for all frequencies ω,
+b k (ω)| ≤ ϕk (∥ω∥),
+|K
+ϕk (r) := (1 + βkr)−1−δ ,
+where ϕk is nonincreasing in r. This assumption works well in practical use cases (Appendix G).
+Per-pixel noise gain for stem kernel. We define
+
+
+E ∥Kk ∗ η∥22 (Parseval) 1 X b
+γ(k) :=
+=
+|Kk (ω)|2 = ∥Kk ∥2F ,
+σ 2 HW
+HW ω
+
+(1)
+
+where H and W are the height and width. Intuitively, γ(k) is the average squared magnitude response of
+the stem kernel.
+Theorem 1 (Noise attenuation for practical low-pass stem kernel). Assume (Aroll ). Then, there exists a
+constant C > 0, independent of k, such that
+
+
+E ∥Kk ∗ η∥22
+C
+γ(k) =
+≤ 2.
+σ 2 HW
+k
+Moreover, the k −2 rate is achievable.
+Remark 1 (Practical reading of Theorem 1). Doubling the stem kernel size, such as the patch size from 16
+to 32, quarters the output noise energy (≈ −6 dB).
+Per-output-pixel noise gain for anti-aliased downsampling. For a downsampling factor s ≥ 1, we define
+Ds := (⇓s ) ◦ Kg(s) ,
+c1 s ≤ g(s) ≤ c2 s,
+(2)
+i.e., filter with Kg(s) satisfying the same assumptions at scale g(s) and then downsample by s. We normalize
+the noise gain by the number of output pixels:
+
+
+E ∥Ds η∥22
+:=
+γ↓ (s)
+.
+(3)
+σ 2 HW/s2
+Theorem 2 (Resolution-driven robustness). There exists C ′ > 0 independent of s such that
+C′
+γ↓ (s) ≤ 2 .
+s
+This s−2 rate is tight up to constants.
+Remark 2 (Practical reading of Theorem 2). Resizing 3842 to 2242 corresponds to s ≈ 1.71 and yields
+roughly s−2 ≈ 0.34 of the original noise energy per output pixel (≈ −4.7 dB).
+5
+
+Under review as a conference paper at ICLR 2026
+
+Table 2: Classification accuracy (%) with different choices of ResNet type. The numbers in the parentheses
+represent standard deviations on the five runs with different random seeds.
+Dataset
+
+Model
+
+ResNet-50-T
+
+ResNet-50-D
+
+ResNet-50-C
+
+ResNet-50-S
+
+Oxford-IIIT Pet
+
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+39.1 (11.1)
+38.1 (11.3)
+
+37.9 (9.6)
+36.1 (10.3)
+
+34.9 (11.4)
+34.0 (10.4)
+
+24.3 (3.3)
+22.9 (2.4)
+
+Caltech-101
+
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+62.3 (1.4)
+59.7 (1.1)
+
+61.2 (3.0)
+59.1 (2.8)
+
+58.8 (1.1)
+57.8 (1.0)
+
+50.9 (3.2)
+49.5 (2.7)
+
+FGVC-Aircraft
+
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+27.8 (1.6)
+29.9 (1.1)
+
+27.3 (2.4)
+30.4 (1.6)
+
+23.9 (1.9)
+26.1 (2.1)
+
+4.7 (0.9)
+5.5 (0.8)
+
+Caltech-UCSD
+Birds-200-2011
+
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+27.6 (2.0)
+26.3 (2.0)
+
+28.8 (0.8)
+27.7 (0.6)
+
+26.3 (1.3)
+25.2 (1.7)
+
+13.9 (0.6)
+13.7 (1.1)
+
+Stanford Cars
+
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+56.9 (2.3)
+55.0 (1.9)
+
+55.2 (2.8)
+53.2 (2.7)
+
+41.6 (2.3)
+40.5 (2.3)
+
+29.2 (1.9)
+28.5 (2.0)
+
+Table 3: Classification accuracy (%) comparing different poolings. The largest gain came from AvgPool.
+Dataset
+
+Model
+
+MaxPool
+
+NNPool
+
+AvgPool
+
+Oxford-IIIT Pet
+
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+42.0 (1.1)
+41.8 (0.9)
+
+44.2 (2.8)
+42.3 (3.2)
+
+50.2 (1.9)
+49.3 (1.8)
+
+Caltech-101
+
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+59.5 (1.0)
+57.2 (1.3)
+
+58.3 (1.1)
+56.7 (1.1)
+
+62.7 (1.8)
+60.8 (1.9)
+
+FGVC-Aircraft
+
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+24.2 (3.5)
+27.3 (3.6)
+
+22.8 (1.9)
+24.7 (1.8)
+
+41.0 (2.9)
+43.1 (3.1)
+
+Caltech-UCSD
+Birds-200-2011
+
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+26.9 (1.8)
+26.1 (1.7)
+
+27.5 (3.0)
+25.6 (2.6)
+
+28.8 (1.8)
+26.8 (1.2)
+
+Stanford Cars
+
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+43.3 (3.4)
+42.2 (2.8)
+
+49.1 (1.9)
+46.9 (1.3)
+
+52.1 (1.8)
+51.2 (2.1)
+
+4
+
+C HOICE ON P OOLING
+
+4.1
+
+E MPIRICAL O BSERVATION
+
+Extending the above analysis, we probed the effect of choosing specific architectural types of ResNets on
+robustness. Specifically, ResNet has several types, including ResNet-{C, D, T, S} (He et al., 2019; Wightman
+et al., 2021; Guo et al., 2020), although the effects of these choices and their underlying mechanisms on
+robustness have been rarely studied. Here, we trained the four ResNets on the five datasets mentioned above
+and compared their classification accuracy after applying Gaussian noise (Table 2).
+Overall, the T and D types of ResNet demonstrated robust results against Gaussian noise, followed by the
+C and S types of ResNet. While there are several different factors among the four ResNets (Appendix I),
+the core difference is the pooling in downsampling: the T and D types of ResNet adopt average pooling
+with convolution in downsampling, whereas the C and S types of ResNet adopt strided 1 × 1 convolution in
+downsampling, which is equivalent to nearest-neighbor pooling followed by a 1 × 1 convolution.
+We further explored the effect of pooling choice on robustness to Gaussian noise. Using ResNet-50, we
+compared the original one, which uses max pooling in the stem, and modified ResNets that adopt nearest6
+
+Under review as a conference paper at ICLR 2026
+
+neighbor pooling or average pooling in the stem (Table 3). ResNets with average pooling consistently
+yielded robust performance against Gaussian noise among the three setups in pooling. More results for other
+architectures under controlled conditions are available in Appendix C.
+4.2
+
+T HEORETICAL A NALYSIS
+
+We explain why average pooling is more robust than max pooling under i.i.d. additive Gaussian noise.
+Setup. Consider a pooling window of size k ≥ 2 in a single channel. Let the clean activations be S =
+(S1 , . . . , Sk ) ∈ Rk and the observation be S + η with i.i.d. noise η ∼ N (0, σ 2 Ik ). We define
+Xavg := k1
+
+k
+X
+
+(Si + ηi ),
+
+Xmax := max (Si + ηi ),
+1≤i≤k
+
+i=1
+
+their clean counterparts Savg := k1 i Si , Smax := maxi Si , and the errors δavg := Xavg − Savg , δmax :=
+Xmax − Smax . Let ∆ := S(1) − S(2) ≥ 0 be the gap between the largest and second-largest entries. We also
+Pk
+denote Tavg (v) := k1 i=1 vi , Tmax (v) := max1≤i≤k vi , and ∥T ∥ℓ2 →ℓ2 for ℓ2 -Lipschitz constant.
+k
+P
+
+Theorem 3 (Average and max poolings under Gaussian noise). For any S ∈ R and σ > 0, we have
+
+(i) Average pooling is unbiased and reduces variance proportionally to the window area: E[δavg ] =
+0, Var[δavg ] = σ 2 /k.
+(ii) Max pooling incurs a positive noise bias and admits the following mean-squared error (MSE) controls:
+(Bias) E[δmax ] = E[max(Si + ηi )] − max Si ≥ 0,
+i
+
+(Uniform-signal case)
+(General case)
+
+i
+
+2
+(S1 = · · · = Sk ) : δmax = σMk , E[δmax
+] = σ 2 E[Mk2 ],
+
+2
+|δmax | ≤ ∥η∥∞ ⇒ E[δmax
+] ≤ σ 2 E[A2k ],
+i.i.d.
+
+where Mk := max1≤i≤k Zi and Ak := max1≤i≤k
+|Zi | with Zi ∼ N (0, 1). In particular, E[A2k ] ≤
+
+2
+] ≤ σ 2 2 log(2k) + 2 .
+2 log(2k) + 2, so E[δmax
+√
+P
+(iii) Adversarial worst-case sensitivity. For any perturbation n ∈ Rk , | k1 i ni | ≤ ∥n∥2 / k, so
+∥Tavg ∥ℓ2 →ℓ2 = k −1/2 ; and | maxi ai − maxi bi | ≤ ∥a − b∥∞ ≤ ∥a − b∥2 , so ∥Tmax ∥ℓ2 →ℓ2 ≤ 1.
+2
+] = σ 2 ; when the top index never switches
+(iv) Large-gap regime. For z := ∆/σ, one has limz→∞ E[δmax
+under noise, max pooling is equivalent to reading a single noisy entry.
+Remark 3 (Practical reading of Theorem 3). Average pooling is unbiased and cuts Gaussian noise variance
+by a factor k (e.g., a 2 × 2 window gives −6 dB). Max pooling is positively biased, and its MSE grows at
+most logarithmically with the window size, while also having a greater worst-case Lipschitz gain, clearly
+worse than average pooling.
+Remark 4 (Average and nearest-neighbor poolings). Selecting a fixed element in the window, such as the
+nearest-neighbor pooling, is unbiased with an MSE σ 2 . Hence, average pooling is strictly more robust to
+additive Gaussian noise than nearest-neighbor pooling by a factor of k in MSE.
+
+5
+
+W HY ARE CLIP MODELS VULNERABLE ?
+
+5.1
+
+E MPIRICAL O BSERVATION
+
+Although the original ViT (Dosovitskiy et al., 2021) was trained with supervised learning, the CLIP study
+(Radford et al., 2021) trained ViTs with self-supervised learning and successfully achieved competitive per7
+
+Under review as a conference paper at ICLR 2026
+
+Table 4: ImageNet-1K results for ViT-B/16 2242 with eight different pretrained weights. CLIP ViTs tended
+to yield worse ranks under noise.
+Pretrained Model
+
+Mean-Std
+
+Top-1 → w/ Noise
+
+Rank → w/ Noise
+
+RankDiff
+
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg2 in21k ft in1k
+vit base patch16 224.orig in21k ft in1k
+vit base patch16 224.augreg in21k ft in1k
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.laion2b ft in12k in1k
+vit base patch16 clip 224.laion2b ft in1k
+vit base patch16 clip 224.openai ft in1k
+
+INCEPTION
+INCEPTION
+INCEPTION
+INCEPTION
+OPENAI
+OPENAI
+OPENAI
+OPENAI
+
+79.15 → 62.21
+85.10 → 74.50
+81.79 → 60.91
+84.53 → 71.19
+85.94 → 70.81
+86.17 → 71.24
+85.47 → 67.88
+85.29 → 67.06
+
+862 → 487
+203 → 96
+603 → 513
+257 → 192
+135 → 209
+114 → 189
+168 → 311
+182 → 340
+
+-375
+-107
+-90
+-65
++74
++75
++143
++158
+
+formance. Currently, available pretrained weights for ViTs are largely divided into CLIP ViTs and others
+trained with supervised learning; we refer to the latter as supervised ViTs. The training methods and datasets
+differ between these two sources of ViTs, yielding different pretrained weights, while they have almost the
+same architecture with only a single minor difference. Nevertheless, we observed that CLIP ViTs exhibited significant vulnerabilities when Gaussian noise was applied to images (Table 4). Similar observations
+regarding the degraded performance of CLIP ViTs due to distribution shifts have been reported in certain
+studies (Shu et al., 2023; Wortsman et al., 2022); they focused on the characteristics of CLIP pretrained
+weights due to different datasets or training schemes, but we present a different perspective on this issue.
+We performed ablation studies to identify what determined the difference in robustness (Appendix E). We
+discovered that the core factor in different robustness arose from the preprocessing pipeline. Specifically,
+CLIP ViTs apply mean-std normalization to input images using certain per-channel mean and standard
+deviation (std) constants, which we refer to as the OPENAI constants (Appendix I), whereas supervised ViTs
+apply different per-channel mean-std constants, which are often called INCEPTION constants (Szegedy
+et al., 2016). In other words, the OPENAI mean-std constants led to vulnerability to Gaussian noise, whereas
+the INCEPTION mean-std constants did not show this vulnerability.
+Indeed, when we replaced the OPENAI mean-std constants with the INCEPTION constants, the CLIP ViTs
+achieved improved robustness (Table 5). The reverse also holds, and similar vulnerability was observed when
+adopting IMAGENET mean-std constants for ViTs. Full results on other datasets are available in Appendix C,
+where we observed these improvements across various pretrained weights with different training recipes.
+5.2
+
+T HEORETICAL A NALYSIS
+
+We give an explanation for the empirical vulnerability of CLIP ViTs to additive Gaussian noise. The key
+point is that channel-wise normalization sets the pixel-space sensitivity scale: Smaller per-channel stds in
+the input normalization enlarge the worst-case response to perturbations even before the backbone acts.
+Setup. Let x ∈ [0, 1]C×H×W be an image and η an additive perturbation. Let µ ∈ RC and σ ∈ RC
+>0 be the
+per-channel means and stds, and define the normalization Nµ,σ (x) := (x − µ)/σ. Let f : RC×H×W → RK
+denote the vision backbone operating on normalized inputs, which is globally ℓ2 -Lipschitz with constant Lz
+on its domain.1 We study the end-to-end pipeline Fµ,σ := f ◦ Nµ,σ and its ℓ2 -Lipschitz constant ∥Fµ,σ ∥Lip .
+Theorem 4 (Pixel-space Lipschitz bound). For any image x and perturbation η, we obtain
+Fµ,σ (x + η) − Fµ,σ (x) 2 ≤ Lz
+
+η
+σ
+
+≤
+2
+
+Lz
+∥η∥2 ,
+σmin
+
+where σmin := minc σc . In particular, the pixel-space Lipschitz constant satisfies ∥Fµ,σ ∥Lip ≤ Lz /σmin .
+1
+This assumption holds when linear layers have bounded spectral norms and other modules are Lipschitz. ReLU:
+1-Lipschitz (Gouk et al., 2021); GELU: ≈ 1.13 (Hendrycks & Gimpel, 2016); LayerNorm: Lipschitz with a constant
+set by γ and ε (Ba et al., 2016).
+
+8
+
+Under review as a conference paper at ICLR 2026
+
+Table 5: Classification accuracy (%) for fine-tuning ViTs on the Oxford-IIIT Pet.
+Pretrained Model
+
+Mean-Std
+
+Val. Acc. w/ Noise
+
+Test Acc. w/ Noise
+
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.laion2b
+vit base patch16 clip 224.laion2b
+vit base patch16 clip 224.laion2b
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in21k
+vit base patch16 224.augreg in21k
+vit base patch16 224.augreg in21k
+vit base patch16 224.mae
+vit base patch16 224.mae
+vit base patch16 224.mae
+
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+
+94.5 (1.0) → 77.7 (3.4)
+95.5 (0.5) → 87.3 (2.1)
+94.2 (0.4) → 73.9 (2.3)
+93.6 (0.9) → 67.4 (6.0)
+94.7 (0.5) → 78.5 (4.0)
+92.8 (0.9) → 57.6 (7.4)
+95.0 (0.3) → 73.1 (1.5)
+94.8 (0.8) → 78.6 (4.9)
+95.1 (0.3) → 69.8 (2.7)
+92.8 (0.7) → 64.8 (4.4)
+94.7 (0.4) → 78.5 (2.0)
+91.6 (0.3) → 54.5 (2.5)
+92.5 (0.3) → 71.7 (1.0)
+94.0 (0.7) → 78.6 (4.6)
+91.2 (0.5) → 58.5 (4.0)
+91.8 (1.2) → 56.1 (7.7)
+93.8 (0.6) → 76.4 (1.9)
+90.2 (0.8) → 52.3 (4.4)
+95.5 (0.2) → 88.7 (0.3)
+95.5 (0.1) → 89.7 (0.5)
+95.5 (0.2) → 87.7 (0.5)
+95.6 (0.3) → 91.4 (0.3)
+95.9 (0.2) → 92.3 (0.3)
+95.7 (0.5) → 91.6 (0.5)
+93.5 (0.3) → 70.8 (2.8)
+93.7 (0.3) → 75.0 (2.1)
+93.5 (0.3) → 72.0 (2.0)
+
+93.8 (1.0) → 76.3 (4.1)
+95.2 (0.6) → 87.2 (2.2)
+93.4 (0.5) → 72.7 (2.5)
+93.2 (0.9) → 67.3 (5.9)
+93.6 (0.6) → 78.4 (3.8)
+92.6 (0.5) → 58.1 (7.4)
+94.1 (0.5) → 73.3 (1.9)
+93.6 (0.4) → 79.8 (5.0)
+94.0 (0.4) → 68.8 (3.1)
+92.0 (0.7) → 62.3 (3.9)
+93.9 (0.3) → 78.5 (1.8)
+90.8 (0.3) → 52.8 (1.6)
+91.9 (0.6) → 70.2 (1.2)
+93.2 (0.9) → 77.3 (5.1)
+90.7 (0.8) → 58.4 (4.3)
+90.5 (1.1) → 54.0 (6.6)
+92.8 (0.5) → 75.6 (1.8)
+89.5 (0.8) → 51.4 (4.1)
+94.9 (0.2) → 88.2 (0.7)
+94.4 (0.3) → 89.2 (0.8)
+94.9 (0.2) → 87.9 (0.7)
+95.2 (0.5) → 91.9 (0.6)
+95.6 (0.4) → 92.6 (0.4)
+95.6 (0.3) → 92.0 (0.5)
+93.4 (0.2) → 72.7 (2.3)
+93.3 (0.2) → 75.2 (2.5)
+92.7 (0.5) → 71.9 (2.2)
+
+Proof. Write z = Nµ,σ (x) and z̃ = Nµ,σ (x + η) = z + η/σ. By Lipschitzness of f , we have ∥f (z̃) −
+f (z)∥2 ≤ Lz ∥η/σ∥2 ≤ (Lz /σmin )∥η∥2 .
+Remark 5 (Practical reading of Theorem 4). For the standard choices
+σINCEPTION = (0.5, 0.5, 0.5),
+σCLIP = (0.26862954, 0.26130258, 0.27577711),
+the worst-case pixel-space sensitivity bound for CLIP is greater by a factor
+Lz / min(σCLIP )
+0.5
+=
+≈ 1.91,
+Lz / min(σINCEPTION )
+0.26130258
+relative to a supervised ViT using INCEPTION statistics. This ∼ 1.91× looser bound amplifies the effect of
+input perturbations before the feature extractor.
+
+6
+
+C ONCLUSION
+
+Across timm models and controlled experiments, four design patterns consistently improved robustness:
+(1) larger stem kernel sizes, (2) smaller resolutions, (3) average pooling instead of max pooling, and (4) supervised ViTs rather than CLIP ViTs. Practically, we recommend models with these design patterns such as
+vit base patch32 224.augreg in21k ft in1k for ViT-B as an example. Our analysis integrates
+these findings: Theorem 1 proves that noise attenuation is quadratic with stem kernel size; Theorem 2 yields
+an analogous gain under anti-aliased downsampling; Theorem 3 shows that average pooling is unbiased with
+error that falls as the window grows, whereas max pooling is positively biased and, for a uniform signal, its
+error grows logarithmically; and Theorem 4 explains CLIP sensitivity using pixel-space Lipschitz bounds
+scaling as 1/σmin , which leads to a ∼ 1.91× difference when comparing the OPENAI and INCEPTION
+constants. These insights provide actionable guidelines for practitioners to enhance the robustness of vision
+models against Gaussian noise in diverse applications.
+9
+
+Under review as a conference paper at ICLR 2026
+
+R EFERENCES
+Francis J Anscombe. The transformation of Poisson, binomial and negative-binomial data. Biometrika, 35
+(3/4):246–254, 1948.
+Lei Jimmy Ba, Jamie Ryan Kiros, and Geoffrey E. Hinton. Layer Normalization. CoRR, abs/1607.06450,
+2016.
+Yutong Bai, Jieru Mei, Alan L. Yuille, and Cihang Xie. Are Transformers more robust than CNNs? In
+NeurIPS, pp. 26831–26843, 2021.
+Y-Lan Boureau, Jean Ponce, and Yann LeCun. A Theoretical Analysis of Feature Pooling in Visual Recognition. In ICML, pp. 111–118, 2010.
+Alexander Buslaev, Vladimir I. Iglovikov, Eugene Khvedchenya, Alex Parinov, Mikhail Druzhinin, and
+Alexandr A. Kalinin. Albumentations: Fast and Flexible Image Augmentations. Inf., 11(2):125, 2020.
+Xiangning Chen, Cho-Jui Hsieh, and Boqing Gong. When Vision Transformers Outperform ResNets without
+Pre-training or Strong Data Augmentations. In ICLR, 2022.
+Ekin Dogus Cubuk, Barret Zoph, Jonathon Shlens, and Quoc Le. RandAugment: Practical Automated Data
+Augmentation with a Reduced Search Space. In NeurIPS, 2020.
+Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. ImageNet: A large-scale hierarchical
+image database. In CVPR, pp. 248–255, 2009.
+Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, Jakob Uszkoreit, and
+Neil Houlsby. An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale. In ICLR,
+2021.
+Li Fei-Fei, Robert Fergus, and Pietro Perona. Learning generative visual models from few training examples:
+An incremental Bayesian approach tested on 101 object categories. Comput. Vis. Image Underst., 106(1):
+59–70, 2007.
+Henry Gouk, Eibe Frank, Bernhard Pfahringer, and Michael J. Cree. Regularisation of neural networks by
+enforcing Lipschitz continuity. Mach. Learn., 110(2):393–416, 2021.
+Jian Guo, He He, Tong He, Leonard Lausen, Mu Li, Haibin Lin, Xingjian Shi, Chenguang Wang, Junyuan
+Xie, Sheng Zha, Aston Zhang, Hang Zhang, Zhi Zhang, Zhongyue Zhang, Shuai Zheng, and Yi Zhu.
+GluonCV and GluonNLP: Deep Learning in Computer Vision and Natural Language Processing. J. Mach.
+Learn. Res., 21:23:1–23:7, 2020.
+Peter Hall. On the rate of convergence of normal extremes. Journal of Applied Probability, 16(2):433–439,
+1979.
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep Residual Learning for Image Recognition.
+In CVPR, pp. 770–778, 2016.
+Tong He, Zhi Zhang, Hang Zhang, Zhongyue Zhang, Junyuan Xie, and Mu Li. Bag of Tricks for Image
+Classification with Convolutional Neural Networks. In CVPR, pp. 558–567, 2019.
+Dan Hendrycks and Thomas G. Dietterich. Benchmarking Neural Network Robustness to Common Corruptions and Perturbations. In ICLR, 2019.
+10
+
+Under review as a conference paper at ICLR 2026
+
+Dan Hendrycks and Kevin Gimpel. Bridging Nonlinearities and Stochastic Regularizers with Gaussian Error
+Linear Units. CoRR, abs/1606.08415, 2016.
+Gao Huang, Yu Sun, Zhuang Liu, Daniel Sedra, and Kilian Q. Weinberger. Deep Networks with Stochastic
+Depth. In ECCV (4), volume 9908, pp. 646–661, 2016.
+Jonathan Krause, Michael Stark, Jia Deng, and Li Fei-Fei. 3D Object Representations for Fine-Grained
+Categorization. In ICCV Workshops, pp. 554–561, 2013.
+Ilya Loshchilov and Frank Hutter. SGDR: Stochastic Gradient Descent with Warm Restarts. In ICLR, 2017.
+Ilya Loshchilov and Frank Hutter. Decoupled Weight Decay Regularization. In ICLR, 2019.
+Subhransu Maji, Esa Rahtu, Juho Kannala, Matthew B. Blaschko, and Andrea Vedaldi. Fine-Grained Visual
+Classification of Aircraft. CoRR, abs/1306.5151, 2013.
+Kyle Matoba, Nikolaos Dimitriadis, and François Fleuret. Benefits of Max Pooling in Neural Networks:
+Theoretical and Experimental Evidence. Trans. Mach. Learn. Res., 2023, 2023.
+Muzammal Naseer, Kanchana Ranasinghe, Salman Khan, Munawar Hayat, Fahad Shahbaz Khan, and MingHsuan Yang. Intriguing Properties of Vision Transformers. In NeurIPS, pp. 23296–23308, 2021.
+Alan V Oppenheim. Discrete-time signal processing. 1999.
+Omkar M. Parkhi, Andrea Vedaldi, Andrew Zisserman, and C. V. Jawahar. Cats and dogs. In CVPR, pp.
+3498–3505, 2012.
+Sayak Paul and Pin-Yu Chen. Vision Transformers Are Robust Learners. In AAAI, pp. 2071–2081, 2022.
+Shengju Qian, Hao Shao, Yi Zhu, Mu Li, and Jiaya Jia. Blending Anti-Aliasing into Vision Transformer. In
+NeurIPS, pp. 5416–5429, 2021.
+Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel Goh, Sandhini Agarwal, Girish
+Sastry, Amanda Askell, Pamela Mishkin, Jack Clark, Gretchen Krueger, and Ilya Sutskever. Learning
+Transferable Visual Models From Natural Language Supervision. In ICML, volume 139, pp. 8748–8763,
+2021.
+Benjamin Recht, Rebecca Roelofs, Ludwig Schmidt, and Vaishaal Shankar. Do ImageNet Classifiers Generalize to ImageNet? In ICML, volume 97, pp. 5389–5400, 2019.
+Yang Shu, Xingzhuo Guo, Jialong Wu, Ximei Wang, Jianmin Wang, and Mingsheng Long. CLIPood:
+Generalizing CLIP to Out-of-Distributions. In ICML, volume 202, pp. 31716–31731, 2023.
+Andreas Steiner, Alexander Kolesnikov, Xiaohua Zhai, Ross Wightman, Jakob Uszkoreit, and Lucas Beyer.
+How to train your ViT? Data, Augmentation, and Regularization in Vision Transformers. Trans. Mach.
+Learn. Res., 2022, 2022.
+Christian Szegedy, Vincent Vanhoucke, Sergey Ioffe, Jonathon Shlens, and Zbigniew Wojna. Rethinking the
+Inception Architecture for Computer Vision. In CVPR, pp. 2818–2826, 2016.
+Mingxing Tan and Quoc V. Le. EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks.
+In ICML, volume 97, pp. 6105–6114, 2019.
+Hugo Touvron, Matthieu Cord, Matthijs Douze, Francisco Massa, Alexandre Sablayrolles, and Hervé Jégou.
+Training data-efficient image transformers & distillation through attention. In ICML, volume 139, pp.
+10347–10357, 2021.
+11
+
+Under review as a conference paper at ICLR 2026
+
+Yusuke Tsuzuku, Issei Sato, and Masashi Sugiyama. Lipschitz-Margin Training: Scalable Certification of
+Perturbation Invariance for Deep Neural Networks. In NeurIPS, pp. 6542–6551, 2018.
+Roman Vershynin. High-Dimensional Probability: An Introduction with Applications in Data Science, 2018.
+Aladin Virmaux and Kevin Scaman. Lipschitz regularity of deep neural networks: analysis and efficient
+estimation. In NeurIPS, pp. 3839–3848, 2018.
+Catherine Wah, Steve Branson, Peter Welinder, Pietro Perona, and Serge Belongie. The caltech-ucsd birds200-2011 dataset. 2011.
+Ross Wightman.
+PyTorch Image
+pytorch-image-models, 2019.
+
+Models.
+
+https://github.com/rwightman/
+
+Ross Wightman, Hugo Touvron, and Hervé Jégou. ResNet strikes back: An improved training procedure in
+timm. CoRR, abs/2110.00476, 2021.
+Mitchell Wortsman, Gabriel Ilharco, Jong Wook Kim, Mike Li, Simon Kornblith, Rebecca Roelofs,
+Raphael Gontijo Lopes, Hannaneh Hajishirzi, Ali Farhadi, Hongseok Namkoong, and Ludwig Schmidt.
+Robust fine-tuning of zero-shot models. In CVPR, pp. 7949–7961, 2022.
+Sangdoo Yun, Dongyoon Han, Sanghyuk Chun, Seong Joon Oh, Youngjoon Yoo, and Junsuk Choe. CutMix:
+Regularization Strategy to Train Strong Classifiers With Localizable Features. In ICCV, pp. 6022–6031,
+2019.
+Richard Zhang. Making Convolutional Networks Shift-Invariant Again. In ICML, volume 97, pp. 7324–
+7334, 2019.
+Zhun Zhong, Liang Zheng, Guoliang Kang, Shaozi Li, and Yi Yang. Random Erasing Data Augmentation.
+In AAAI, pp. 13001–13008, 2020.
+Xueyan Zou, Fanyi Xiao, Zhiding Yu, Yuheng Li, and Yong Jae Lee. Delving Deeper into Anti-Aliasing in
+ConvNets. Int. J. Comput. Vis., 131(1):67–81, 2023.
+
+12
+
+Under review as a conference paper at ICLR 2026
+
+A PPENDIX TABLE OF C ONTENTS
+A Proofs for Theorems 1 and 2
+
+13
+
+A.1 Conventions and assumptions . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+13
+
+A.2 Proof of Theorem 1 (Quadratic decay in stem kernel size) . . . . . . . . . . . . . . . . . . .
+
+14
+
+A.3 Proof of Theorem 2 (Quadratic decay under anti-aliased downsampling) . . . . . . . . . . .
+
+15
+
+B Proof of Theorem 3 (Average and max poolings under Gaussian Noise)
+
+15
+
+C Additional Experimental Results
+
+18
+
+D Extension to Other Noise Models
+
+19
+
+E Are there other factors that cause vulnerabilities of CLIP?
+
+23
+
+F Limitations
+
+23
+
+G Empirical Simulations for Testing Assumption and Theorems
+
+25
+
+H Rank difference as a robustness proxy
+
+26
+
+I
+
+Experimental Setup
+
+28
+
+J
+
+List of Notations
+
+29
+
+A
+
+P ROOFS FOR T HEOREMS 1 AND 2
+
+Here, we provide proofs of the quadratic noise-decay results in Section 3.2.
+A.1
+
+C ONVENTIONS AND ASSUMPTIONS
+
+DFT convention and Parseval. For u ∈ RH×W with discrete Fourier transform (DFT) u
+b on the frequency
+grid Ω, we use the Parseval identity
+1 X
+2
+u
+b(ω) =
+HW
+ω∈Ω
+
+X
+
+|u(p)|2 .
+
+(4)
+
+p∈{1,...,H}×{1,...,W }
+
+We write ε := 2π/ max{H, W } for the infrared cutoff.
+bk.
+Filter family. For k ≥ 3, let Kk ∈ Rk×k denote the linear, shift-invariant stem kernel with DFT K
+We assume only the following low-pass envelope; the same assumption applies to Kg(s) when used as the
+anti-aliasing filter at scale g(s):
+13
+
+Under review as a conference paper at ICLR 2026
+
+• (Aroll ) (Radial low-pass envelope at scale 1/k) There exist β, δ > 0 such that, for all frequencies ω,
+b k (ω)| ≤ ϕk (∥ω∥),
+|K
+
+ϕk (r) := (1 + βkr)−1−δ ,
+
+where ϕk is nonincreasing in r.
+This assumption provides a monotone radial upper envelope sufficient for establishing our upper bounds:
+P b
+1
+2
+2
+b 2
+When estimating HW
+ω |Kk (ω)| , we first dominate |Kk | by ϕk and then apply the sum-integral comparison in Eq. 8.
+Noise model and gains. Let η ∼ N (0, σ 2 I) be spatially white Gaussian noise. The per-pixel noise gain
+of the stem kernel is
+
+
+E ∥Kk ∗ η∥22 Eq. 4 1 X b
+2
+(5)
+γ(k) :=
+Kk (ω) = ∥Kk ∥2F .
+=
+σ 2 HW
+HW ω
+For anti-aliased downsampling with a factor s ≥ 1, we define
+Ds := (⇓s ) ◦ Kg(s) ,
+
+c1 s ≤ g(s) ≤ c2 s,
+
+(6)
+
+and its per-output-pixel noise gain
+
+
+E ∥Ds η∥22
+γ↓ (s) := 2
+.
+σ HW/s2
+
+(7)
+
+Radial sum-integral comparison. Let Ω be the H × W DFT grid with spacing ε, and let g : [ε, π] → R≥0
+be radially nonincreasing. We partition Ω into annuli Aj := {ω : jε ≤ ∥ω∥ < (j + 1)ε}. Because each grid
+point occupies an area ≍ ε2 and the annulus area is 2πrε up to boundary effects, there exist absolute lattice
+constants c1 , c2 > 0—independent of H, W, k, s—with
+c1 HW (2πjε)ε ≤ |Aj | ≤ c2 HW (2π(j + 1)ε)ε.
+P
+By monotonicity, g((j + 1)ε)|Aj | ≤ ω∈Aj g(∥ω∥) ≤ g(jε)|Aj |. Summing over j and dividing by HW
+turns the lattice sum into upper and lower Riemann sums for r 7→ 2πrg(r) with mesh ε, yielding absolute
+constants A1 , A2 > 0 such that
+Z π
+Z π
+1 X
+g(∥ω∥) ≤ A2
+rg(r)dr.
+(8)
+A1
+rg(r)dr ≤
+HW
+ε
+ε
+ω∈Ω
+
+As ε → 0, both bounds converge to the same limit; for finite grids, A1 , A2 absorb edge discrepancies and
+remain independent of the kernel scale k or downsampling factor s.
+A.2
+
+P ROOF OF T HEOREM 1 (Q UADRATIC DECAY IN STEM KERNEL SIZE )
+
+Proof. By Eq. 5, Eq. 8, and (Aroll ), we have
+Z π
+Z π
+−2−2δ
+2
+b
+γ(k) ≲
+r Kk (r) dr ≤
+r 1 + βkr
+dr.
+ε
+
+ε
+
+Let u = 1 + βkr. Then r = (u − 1)/(βk) and dr = du/(βk), so
+Z π
+Z 1+βkπ
+Z ∞
+1
+u−1
+1
+u−1
+C
+r(1 + βkr)−2−2δ dr = 2 2
+du
+≤
+du = 2 ,
+2+2δ
+2 k2
+2+2δ
+β
+k
+u
+β
+u
+k
+ε
+1+βkε
+1
+for a finite constant C = C(β, δ). Hence γ(k) ≤ C ′ /k 2 for some C ′ independent of k.
+14
+
+Under review as a conference paper at ICLR 2026
+
+A.3
+
+P ROOF OF T HEOREM 2 (Q UADRATIC DECAY UNDER ANTI - ALIASED DOWNSAMPLING )
+
+We first state the following identity for white noise.
+Lemma 1 (Per-output-pixel gain identity). For Ds defined in Eq. 2 and white noise η ∼ N (0, σ 2 I),
+γ↓ (s) = ∥Kg(s) ∥2F .
+Proof. Stationarity of white noise and Eq. 4 give
+
+
+E ∥Kg(s) ∗ η∥22 = (HW )σ 2 ∥Kg(s) ∥2F .
+Downsampling by s keeps every s-th sample along each axis: The retained samples all have equal variance
+as the original, pre-downsampled field. Therefore,
+
+ HW
+E ∥Ds η∥22 = 2 σ 2 ∥Kg(s) ∥2F ,
+s
+and the normalization in Eq. 7 yields γ↓ (s) = ∥Kg(s) ∥2F .
+Proof of Theorem 2. By Lemma 1, γ↓ (s) = ∥Kg(s) ∥2F . Applying Theorem 1 with kernel size k = g(s)
+gives
+C
+C
+C′
+γ↓ (s) ≤
+≤
+=
+,
+g(s)2
+(c1 s)2
+s2
+with C ′ = C/c21 independent of s.
+
+B
+
+P ROOF OF T HEOREM 3 (AVERAGE AND MAX POOLINGS UNDER G AUSSIAN
+N OISE )
+
+Consider a pooling window of size k ≥ 2 in a single channel. Let the clean activations be S =
+i.i.d.
+(S1 , . . . , Sk ) ∈ Rk and let the observation be S + η, where η = (η1 , . . . , ηk ) ∼ N (0, σ 2 ). We define
+k
+
+Xavg :=
+
+1X
+(Si + ηi ),
+k i=1
+
+Xmax := max (Si + ηi ),
+1≤i≤k
+
+P
+1
+
+and their clean counterparts Savg = k i Si , Smax = maxi Si . Let the errors be δavg := Xavg − Savg ,
+δmax := Xmax −Smax . Write the order statistics S(1) ≥ · · · ≥ S(k) , define the gap ∆ := S(1) −S(2) ≥ 0, and
+i.i.d.
+
+the standardized gap z := ∆/σ. We use Zi ∼ N (0, 1), Mk := max1≤i≤k Zi , and Ak := max1≤i≤k |Zi |.
+Proof of (i). By definition, δavg = k1
+E[δavg ] =
+
+Pk
+
+i=1 ηi . Hence
+
+1X
+E[ηi ] = 0,
+k i
+
+Var[δavg ] =
+
+1 X
+σ2
+.
+Var[ηi ] =
+2
+k i
+k
+
+This part requires only i.i.d. zero-mean noise with variance σ 2 .
+Proof of (ii). (Positive bias) Let i⋆ ∈ arg maxi Si . Then Xmax ≥ Si⋆ + ηi⋆ . Taking expectations and using
+E[ηi⋆ ] = 0 yields
+E[δmax ] = E[Xmax − Smax ] ≥ 0.
+15
+
+Under review as a conference paper at ICLR 2026
+
+Pooling under N(0, 2) noise (w = 3, k = 9)
+Average pooling (MC)
+Max pooling (MC)
+Avg theory
+Max theory
+Avg mean = 0
+Max mean 1.49
+
+1.2
+1.0
+
+density
+
+0.8
+0.6
+0.4
+0.2
+0.0
+
+4
+
+2
+
+0
+2
+pooled value / (z-score)
+
+4
+
+Figure 2: Illustration of positive bias introduced by max pooling
+(Uniform-signal case) If S1 = · · · = Sk , translate so Si ≡ 0. Then δmax = maxi ηi = σMk and
+2
+E[δmax
+] = σ 2 E[Mk2 ].
+
+Classical Gaussian extreme-value asymptotics (Hall, 1979) give
+
+
+p
+log log k + log(4π)
+√
+E[Mk ] = 2 log k −
++ o (log k)−1/2 ,
+2 2 log k
+hence
+
+E[Mk2 ] = Var[Mk ] + E[Mk ]
+Because δmax = σMk , we have
+
+2
+
+Var[Mk ] =
+
+
+π2
++ o (log k)−1 ,
+12 log k
+
+= 2 log k − log log k − log(4π) + o(1),
+
+2
+E[δmax
+] = σ 2 [EMk2 ] = σ 2 (2 log k − log log k − log(4π) + o(1)) = Θ(σ 2 log k),
+
+so the MSE scales as Θ(σ 2 log k).
+(General case) For any realization,
+δmax = max(Si + ηi ) − max Si ≤ max |ηi | = σAk .
+i
+
+Hence
+
+i
+
+2
+E[δmax
+] ≤ σ 2 E[A2k ].
+
+We now bound E[A2k ] explicitly.
+16
+
+i
+
+Under review as a conference paper at ICLR 2026
+
+i.i.d.
+
+Lemma 2. For Ak = max1≤i≤k |Zi | with Zi ∼ N (0, 1), we have E[A2k ] ≤ 2 log(2k) + 2.
+Pk
+2
+Proof of Lemma 2. For t ≥ 0, Pr(Ak ≥ t) ≤ i=1 Pr(|Zi | ≥ t) ≤ 2ke−t /2 , where the last step uses
+2
+the union bound and the standard Gaussian
+tail estimate Pr(|Z| ≥ t) ≤ 2e−t /2 for Z ∼ N (0, 1); see,
+R
+∞
+e.g., Vershynin (2018). Using E[X 2 ] = 0 2t Pr(X ≥ t)dt for a nonnegative X and splitting at t0 :=
+p
+2 log(2k),
+Z t0
+Z ∞
+E[A2k ] =
+2t Pr(Ak ≥ t)dt +
+2t Pr(Ak ≥ t)dt
+0
+t0
+Z ∞
+2
+2
+≤ t20 +
+4kte−t /2 dt = 2 log(2k) + 4ke−t0 /2 .
+t0
+2
+
+Because e−t0 /2 = e− log(2k) = 1/(2k), the last term equals 2, proving the claim.
+By Lemma 2,
+
+2
+E[δmax
+] ≤ σ 2 2 log(2k) + 2 .
+
+P
+Proof of (iii). Let Tavg (n) = k1 i ni . By Cauchy–Schwarz, |Tavg (n)| ≤ ∥n∥2 ∥k −1 (1, . . . , 1)∥2 =
+√
+∥n∥2 / k, so ∥Tavg ∥ℓ2 →ℓ2 = k −1/2 , tight for constant n. For max, for any a, b, | maxi ai − maxi bi | ≤
+∥a − b∥∞ ≤ ∥a − b∥2 , hence ∥Tmax ∥ℓ2 →ℓ2 ≤ 1, tight for a one-hot n.
+Proof of (iv). Translate so S(1) = 0 and Si ≤ −∆ for i ≥ 2. Let S be the switch event that some j ≥ 2
+overtakes the top index after noise:
+S := {∃j ≥ 2 : ηj − ∆ ≥ η1 } = {∃j ≥ 2 : Zj − Z1 ≥ z}.
+Because Zj and Z1 are independent standard normals, we have Zj −Z1 ∼ N (0, 2); hence, by a union bound
+2
+Pr(S) ≤ (k − 1) Pr(N (0, 2) ≥ z) ≤ (k − 1)e−z /4 → 0 as z → ∞. On S c , Xmax = S(1) + η1 = η1 , so
+2
+2
+2
+δmax = η1 . Dominated convergence then gives E[δmax
+] → E[η12 ] = σ 2 .
+
+Figure 3: Examples of pooling outputs from a noisy image using average, max, and nearest neighbor
+17
+
+Under review as a conference paper at ICLR 2026
+
+Figure 4: The results on the validation set
+Table 6: Classification accuracy comparing different poolings, using ResNet-50-D
+
+C
+
+Dataset
+
+Model
+
+MaxPool
+
+NNPool
+
+AvgPool
+
+Oxford-IIIT Pet
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+87.7 (0.6)
+85.3 (0.8)
+48.3 (2.2)
+47.8 (1.3)
+
+87.6 (0.4)
+84.7 (0.6)
+46.3 (1.9)
+45.2 (2.3)
+
+86.7 (0.5)
+84.8 (0.9)
+54.0 (3.7)
+53.6 (2.7)
+
+Caltech-101
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+81.3 (0.7)
+80.5 (0.3)
+61.1 (1.5)
+59.8 (1.7)
+
+82.4 (1.1)
+80.7 (0.4)
+60.3 (1.4)
+58.3 (1.3)
+
+81.7 (0.5)
+81.6 (0.7)
+62.7 (1.4)
+61.6 (1.3)
+
+FGVC-Aircraft
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+68.1 (0.2)
+68.8 (1.1)
+27.7 (1.6)
+31.5 (2.1)
+
+67.7 (0.8)
+68.3 (1.5)
+24.8 (1.8)
+26.9 (0.8)
+
+69.0 (0.7)
+69.6 (0.3)
+42.9 (1.7)
+44.8 (1.1)
+
+Caltech-UCSD
+Birds-200-2011
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+69.8 (0.7)
+67.3 (0.4)
+26.8 (0.6)
+26.0 (0.7)
+
+69.8 (0.4)
+66.4 (0.6)
+28.7 (1.7)
+27.4 (1.2)
+
+69.3 (1.1)
+65.9 (0.4)
+31.8 (1.6)
+31.1 (2.1)
+
+Stanford Cars
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+86.5 (0.5)
+84.8 (0.2)
+56.0 (0.5)
+54.8 (1.5)
+
+85.7 (0.5)
+83.6 (0.3)
+53.6 (1.6)
+51.6 (1.5)
+
+84.9 (0.2)
+83.2 (0.3)
+56.8 (2.2)
+55.3 (2.0)
+
+A DDITIONAL E XPERIMENTAL R ESULTS
+
+Figure 4 shows the accuracy on the validation set for the controlled experiments on kernel size and resolution.
+We also report additional results for ResNet-50-D (Table 6) and ResNet-101-D (Table 7) for different choices
+of pooling.
+18
+
+Under review as a conference paper at ICLR 2026
+
+Table 7: Classification accuracy comparing different poolings, using ResNet-101-D
+Dataset
+
+Model
+
+MaxPool
+
+NNPool
+
+AvgPool
+
+Oxford-IIIT Pet
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+87.0 (0.5)
+84.8 (0.6)
+52.3 (1.9)
+51.0 (1.3)
+
+86.5 (0.8)
+84.4 (0.7)
+51.0 (1.5)
+49.2 (1.4)
+
+86.2 (0.3)
+84.3 (0.6)
+56.4 (2.1)
+56.3 (2.4)
+
+Caltech-101
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+82.0 (0.9)
+80.6 (0.4)
+63.4 (1.9)
+62.1 (1.5)
+
+82.9 (0.6)
+80.7 (0.9)
+63.7 (1.3)
+61.6 (1.7)
+
+82.9 (0.5)
+81.2 (0.4)
+64.8 (1.1)
+63.7 (1.4)
+
+FGVC-Aircraft
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+69.5 (0.3)
+71.0 (1.0)
+36.9 (4.0)
+39.1 (3.5)
+
+67.7 (0.6)
+67.1 (0.4)
+28.5 (2.7)
+30.5 (2.6)
+
+69.4 (0.8)
+69.6 (0.7)
+48.4 (1.5)
+49.5 (1.8)
+
+Caltech-UCSD
+Birds-200-2011
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+70.5 (0.5)
+67.4 (0.7)
+29.7 (1.7)
+29.0 (1.7)
+
+70.0 (0.7)
+66.8 (0.4)
+29.3 (2.0)
+29.2 (2.6)
+
+68.9 (0.6)
+66.0 (0.7)
+33.4 (1.8)
+32.2 (1.5)
+
+Stanford Cars
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+84.5 (0.4)
+83.3 (0.2)
+57.5 (1.2)
+56.0 (0.9)
+
+83.9 (0.4)
+81.9 (0.8)
+55.2 (0.9)
+54.5 (0.7)
+
+83.7 (0.5)
+82.1 (0.6)
+58.2 (1.2)
+56.4 (1.2)
+
+Table 8 summarizes the results for ResNet-AA, which adopts anti-aliasing average pooling architecture
+(Zhang, 2019). Specifically, ResNet-AA adopts average pooling in all downsampling layers as well as
+replacing the max pooling in the stem with average pooling. ResNet-AA was marginally more robust than
+the ResNet with average pooling only in the stem, but not as significant as the difference with the original
+ResNet. The result indicates that the core difference in robustness was caused by the use of average pooling
+in the stem.
+Table 9 summarizes ImageNet-1K results for other ViT configurations, including different patch sizes, resolutions, and training recipes.
+Table 10, Table 11, Table 12, and Table 13 summarize full results for fine-tuning ViTs on other datasets.
+When we replaced the OPENAI mean-std constants with the INCEPTION constants, the CLIP ViTs
+achieved improved robustness.
+
+D
+
+E XTENSION TO OTHER N OISE M ODELS
+
+We select Gaussian noise due to its approximation of aggregate perturbations by the central limit theorem
+and its prevalence in real-world imaging, such as sensor readout and thermal noise. Here, we explain how
+our main findings—noise attenuation by larger stem kernels and smaller input resolution (Theorems 1, 2),
+the pooling comparison (Theorem 3), and the normalization effect (Theorem 4)—extend beyond Gaussian
+noise.
+Setup. We continue to use k for a filter side length. For pooling windows, we use w for side length and
+m = w2 for the number of elements.
+19
+
+Under review as a conference paper at ICLR 2026
+
+Table 8: Results on ResNet-AA
+Dataset
+
+Model
+
+ResNet-AA-50
+
+ResNet-AA-50-D
+
+ResNet-AA-101-D
+
+Oxford-IIIT Pet
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+84.8 (0.8)
+83.1 (0.8)
+50.1 (2.7)
+49.6 (3.2)
+
+86.9 (0.4)
+84.7 (0.8)
+55.6 (2.0)
+53.9 (1.4)
+
+86.2 (0.3)
+84.3 (0.2)
+58.1 (2.7)
+58.9 (2.9)
+
+Caltech-101
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+80.2 (0.4)
+79.5 (0.6)
+61.2 (1.6)
+60.1 (1.5)
+
+81.7 (0.7)
+80.6 (0.5)
+61.7 (2.2)
+60.8 (2.8)
+
+83.0 (0.3)
+80.9 (0.5)
+65.0 (1.5)
+63.3 (1.3)
+
+FGVC-Aircraft
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+67.3 (0.5)
+67.1 (0.9)
+40.4 (3.6)
+42.3 (3.9)
+
+69.8 (1.0)
+70.7 (1.2)
+45.5 (2.5)
+48.3 (2.2)
+
+69.1 (0.6)
+70.0 (0.9)
+49.0 (2.9)
+49.5 (2.5)
+
+Caltech-UCSD
+Birds-200-2011
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+65.3 (0.6)
+62.3 (1.1)
+28.6 (0.8)
+27.5 (1.3)
+
+68.9 (0.8)
+66.1 (0.6)
+32.5 (1.0)
+31.4 (1.9)
+
+69.4 (0.6)
+66.1 (0.4)
+31.7 (2.8)
+31.0 (2.4)
+
+Stanford Cars
+
+Val. Acc.
+Test Acc.
+Val. Acc. w/ Noise
+Test Acc. w/ Noise
+
+79.9 (0.6)
+78.9 (0.6)
+51.8 (1.6)
+50.3 (1.0)
+
+85.9 (0.3)
+83.9 (0.4)
+60.3 (2.8)
+58.9 (2.0)
+
+83.5 (0.6)
+81.6 (0.8)
+57.2 (3.2)
+56.0 (3.2)
+
+Table 9: ImageNet-1K results for other ViT configurations
+Pretrained Model
+
+Mean-Std
+
+Top-1 → w/ Noise
+
+Rank → w/ Noise
+
+RankDiff
+
+vit base patch16 384.augreg in1k
+vit base patch16 384.augreg in21k ft in1k
+vit base patch16 clip 384.laion2b ft in12k in1k
+vit base patch16 clip 384.openai ft in1k
+vit base patch16 clip 384.openai ft in12k in1k
+vit base patch16 clip 384.laion2b ft in1k
+
+INCEPTION
+INCEPTION
+OPENAI
+OPENAI
+OPENAI
+OPENAI
+
+81.10 → 60.23
+85.99 → 70.89
+87.21 → 70.38
+86.20 → 68.55
+87.03 → 69.11
+86.62 → 66.63
+
+676 → 524
+129 → 208
+55 → 227
+110 → 285
+61 → 269
+83 → 348
+
+-152
++79
++172
++175
++208
++265
+
+vit base patch32 224.augreg in1k
+vit base patch32 224.sam in1k
+vit base patch32 224.augreg in21k ft in1k
+vit base patch32 clip 224.openai ft in1k
+vit base patch32 clip 224.laion2b ft in1k
+vit base patch32 clip 224.laion2b ft in12k in1k
+
+INCEPTION
+INCEPTION
+INCEPTION
+OPENAI
+OPENAI
+OPENAI
+
+74.90 → 58.44
+73.69 → 51.33
+80.71 → 65.31
+81.93 → 63.94
+82.58 → 63.09
+83.30 → 65.57
+
+1075 → 569
+1101 → 748
+719 → 392
+591 → 428
+504 → 450
+419 → 386
+
+-506
+-353
+-327
+-163
+-54
+-33
+
+vit base patch32 384.augreg in1k
+vit base patch32 384.augreg in21k ft in1k
+vit base patch32 clip 384.openai ft in12k in1k
+vit base patch32 clip 384.laion2b ft in12k in1k
+
+INCEPTION
+INCEPTION
+OPENAI
+OPENAI
+
+78.75 → 59.65
+83.35 → 63.72
+85.21 → 68.40
+85.37 → 65.58
+
+893 → 539
+412 → 437
+191 → 293
+180 → 383
+
+-354
++25
++102
++203
+
+Poisson noise. Let S be the filter support with |S| = m = k 2 . Let h = {ht }t∈S denote the linear filter
+coefficients on S, and Yt ∼ Poisson(xt ) independent. For a locally constant intensity on the filter support,
+where xt ≈ x̄ in a smooth patch, we have
+X
+X
+X
+X
+X
+Var[
+ht Yt ] =
+h2t Var[Yt ] =
+h2t xt = x̄
+h2t +
+h2t (xt − x̄) ≈ x̄∥h∥22 ,
+t
+
+t
+
+t
+
+20
+
+t
+
+t
+
+(9)
+
+Under review as a conference paper at ICLR 2026
+
+Table 10: Classification accuracy (%) for fine-tuning ViTs on the Caltech-101.
+Pretrained Model
+
+Mean-Std
+
+Val. Acc. w/ Noise
+
+Test Acc. w/ Noise
+
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.laion2b
+vit base patch16 clip 224.laion2b
+vit base patch16 clip 224.laion2b
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in21k
+vit base patch16 224.augreg in21k
+vit base patch16 224.augreg in21k
+vit base patch16 224.mae
+vit base patch16 224.mae
+vit base patch16 224.mae
+
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+
+93.1 (0.6) → 84.1 (1.1)
+95.7 (0.6) → 90.4 (0.8)
+91.6 (1.2) → 80.5 (2.4)
+95.3 (0.8) → 86.4 (2.3)
+96.2 (0.6) → 91.0 (1.3)
+94.7 (0.7) → 82.5 (1.9)
+90.2 (11.2) → 80.1 (15.0)
+96.5 (0.6) → 91.7 (1.2)
+93.7 (3.9) → 79.9 (10.5)
+94.9 (0.7) → 81.5 (2.0)
+96.0 (0.5) → 89.5 (2.1)
+93.6 (1.0) → 76.3 (3.2)
+92.8 (0.2) → 78.9 (3.1)
+95.4 (0.3) → 87.8 (0.9)
+92.3 (0.4) → 80.3 (1.8)
+92.3 (0.9) → 77.7 (2.4)
+95.3 (0.6) → 87.3 (0.3)
+90.1 (0.8) → 71.5 (2.4)
+94.4 (0.3) → 84.8 (0.9)
+94.1 (0.3) → 86.0 (0.5)
+94.3 (0.6) → 84.7 (0.6)
+97.0 (0.4) → 95.1 (0.5)
+97.1 (0.3) → 95.8 (0.5)
+97.2 (0.2) → 95.1 (0.2)
+92.0 (0.5) → 76.3 (0.7)
+91.6 (0.6) → 80.8 (1.2)
+91.7 (0.5) → 75.4 (0.6)
+
+92.0 (0.8) → 81.8 (1.4)
+94.5 (0.7) → 89.5 (1.2)
+90.5 (0.8) → 78.5 (2.4)
+94.6 (0.6) → 84.8 (2.1)
+95.7 (0.9) → 89.7 (1.4)
+93.8 (1.0) → 80.8 (2.6)
+88.9 (12.3) → 78.8 (14.8)
+95.9 (0.5) → 91.0 (1.8)
+92.4 (4.6) → 78.2 (10.7)
+94.2 (0.7) → 79.5 (2.0)
+95.0 (0.8) → 87.8 (2.8)
+92.3 (1.2) → 74.6 (2.9)
+91.7 (1.1) → 76.9 (3.6)
+95.4 (0.6) → 86.9 (0.9)
+91.8 (0.7) → 77.7 (1.9)
+91.2 (0.6) → 75.6 (1.6)
+94.3 (0.6) → 85.8 (0.5)
+89.2 (0.5) → 67.6 (2.4)
+94.1 (0.3) → 85.7 (0.4)
+93.8 (0.2) → 86.7 (0.8)
+94.0 (0.3) → 85.7 (0.7)
+96.3 (0.4) → 94.5 (0.7)
+96.6 (0.2) → 95.4 (0.3)
+96.6 (0.5) → 94.6 (0.5)
+91.6 (0.8) → 75.7 (1.2)
+91.7 (0.4) → 79.4 (0.7)
+91.6 (0.4) → 74.5 (1.2)
+
+Table 11: Classification accuracy (%) for fine-tuning ViTs on the FGVC-Aircraft.
+Pretrained Model
+
+Mean-Std
+
+Val. Acc. w/ Noise
+
+Test Acc. w/ Noise
+
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.laion2b
+vit base patch16 clip 224.laion2b
+vit base patch16 clip 224.laion2b
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in21k
+vit base patch16 224.augreg in21k
+vit base patch16 224.augreg in21k
+vit base patch16 224.mae
+vit base patch16 224.mae
+vit base patch16 224.mae
+
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+
+62.6 (1.7) → 46.6 (1.9)
+60.4 (23.6) → 50.8 (20.4)
+59.5 (1.4) → 44.0 (1.6)
+73.7 (4.9) → 50.7 (7.7)
+80.8 (1.9) → 66.3 (3.7)
+65.9 (4.1) → 40.0 (6.1)
+75.4 (4.9) → 55.7 (7.0)
+82.0 (4.1) → 70.0 (8.1)
+72.9 (6.6) → 51.3 (9.4)
+68.0 (2.7) → 48.4 (4.1)
+80.5 (1.6) → 68.4 (3.2)
+64.5 (1.3) → 40.9 (2.4)
+63.7 (4.7) → 47.4 (5.6)
+74.6 (3.5) → 65.4 (4.5)
+60.3 (1.6) → 42.6 (2.7)
+59.9 (1.9) → 37.7 (2.4)
+69.2 (4.4) → 54.3 (5.5)
+58.3 (1.8) → 36.0 (2.3)
+67.8 (0.8) → 50.7 (1.9)
+67.0 (0.5) → 52.4 (1.4)
+67.4 (0.4) → 50.1 (1.4)
+78.2 (0.3) → 69.9 (0.5)
+78.6 (0.6) → 71.6 (0.4)
+77.8 (0.6) → 68.9 (0.9)
+69.3 (0.7) → 39.9 (4.2)
+69.1 (0.7) → 43.5 (2.8)
+69.1 (0.6) → 40.0 (2.1)
+
+61.7 (1.2) → 47.4 (1.7)
+59.5 (23.7) → 50.9 (21.1)
+58.2 (1.2) → 45.2 (1.2)
+72.2 (4.0) → 52.7 (7.1)
+79.4 (2.0) → 66.3 (3.5)
+65.0 (3.4) → 41.5 (5.2)
+75.2 (5.2) → 57.3 (8.0)
+81.7 (4.3) → 70.7 (7.6)
+71.3 (7.1) → 52.5 (9.8)
+67.3 (2.5) → 49.7 (3.0)
+79.2 (2.2) → 69.5 (3.4)
+64.2 (1.4) → 43.3 (2.3)
+61.9 (4.3) → 49.1 (4.4)
+73.4 (3.8) → 66.0 (5.4)
+59.4 (1.4) → 43.4 (2.6)
+58.4 (1.7) → 38.5 (1.9)
+68.9 (5.4) → 55.0 (6.0)
+56.9 (1.3) → 37.3 (2.4)
+67.0 (1.2) → 51.2 (1.7)
+67.2 (0.9) → 53.6 (1.0)
+67.3 (0.8) → 51.0 (2.5)
+77.2 (0.6) → 69.4 (1.1)
+77.3 (0.4) → 71.0 (0.4)
+77.1 (1.0) → 68.5 (1.2)
+68.8 (1.5) → 40.3 (4.4)
+69.1 (0.9) → 44.0 (2.3)
+69.4 (1.2) → 41.8 (1.2)
+
+so the per-output-pixel variancepinherits the k −2 and s−2 scalings up to the local factor x̄. Applying the
+Anscombe transform A(y) = 2 y + 3/8 approximately stabilizes the Poisson variance to ≈ 1, after which
+Gaussian-based methods are applicable (Anscombe, 1948).
+21
+
+Under review as a conference paper at ICLR 2026
+
+Table 12: Classification accuracy (%) for fine-tuning ViTs on the Caltech-UCSD Birds-200-2011.
+Pretrained Model
+
+Mean-Std
+
+Val. Acc. w/ Noise
+
+Test Acc. w/ Noise
+
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.laion2b
+vit base patch16 clip 224.laion2b
+vit base patch16 clip 224.laion2b
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in21k
+vit base patch16 224.augreg in21k
+vit base patch16 224.augreg in21k
+vit base patch16 224.mae
+vit base patch16 224.mae
+vit base patch16 224.mae
+
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+
+84.0 (0.9) → 64.0 (1.7)
+85.3 (1.6) → 69.3 (1.7)
+82.6 (0.8) → 59.8 (1.3)
+83.4 (1.1) → 53.6 (2.3)
+84.7 (0.7) → 59.7 (4.5)
+83.6 (0.9) → 52.2 (2.8)
+84.8 (1.2) → 58.8 (2.6)
+87.3 (1.6) → 69.6 (4.7)
+81.6 (2.7) → 50.0 (2.3)
+83.3 (0.5) → 49.5 (3.5)
+85.8 (0.9) → 62.1 (2.0)
+81.3 (2.5) → 45.3 (4.5)
+83.4 (0.5) → 60.1 (2.4)
+85.5 (0.8) → 66.7 (3.4)
+75.3 (14.1) → 50.1 (13.8)
+81.4 (1.4) → 52.1 (2.2)
+84.6 (0.6) → 62.0 (2.1)
+81.0 (0.4) → 50.1 (0.7)
+83.4 (0.4) → 67.6 (0.7)
+83.9 (0.5) → 69.3 (0.7)
+83.7 (0.4) → 67.5 (1.2)
+89.6 (0.2) → 84.0 (0.5)
+89.6 (0.2) → 84.9 (0.7)
+89.5 (0.2) → 83.9 (0.1)
+76.7 (0.5) → 39.3 (4.4)
+74.0 (0.3) → 41.1 (4.2)
+76.4 (0.9) → 38.0 (1.5)
+
+81.3 (1.0) → 61.1 (1.1)
+82.7 (1.3) → 67.0 (2.5)
+79.7 (1.6) → 56.7 (1.8)
+81.4 (1.0) → 50.7 (2.6)
+82.8 (0.8) → 57.3 (3.8)
+81.5 (1.1) → 49.3 (2.6)
+83.0 (1.3) → 56.4 (2.3)
+86.0 (2.0) → 67.3 (5.2)
+79.7 (2.8) → 48.1 (2.9)
+81.1 (0.9) → 47.9 (3.2)
+83.4 (0.6) → 60.1 (1.8)
+78.7 (2.7) → 43.6 (4.2)
+81.8 (0.8) → 57.7 (2.8)
+83.3 (1.3) → 65.1 (3.7)
+72.7 (13.9) → 47.5 (12.6)
+78.5 (2.5) → 50.0 (2.0)
+82.2 (0.4) → 59.9 (2.1)
+78.7 (0.5) → 48.3 (1.1)
+81.7 (0.8) → 65.8 (0.7)
+81.8 (0.3) → 67.8 (0.5)
+81.8 (0.2) → 65.9 (0.7)
+88.9 (0.5) → 83.4 (0.4)
+88.7 (0.4) → 83.7 (0.6)
+88.9 (0.3) → 83.4 (0.7)
+74.1 (0.6) → 36.7 (3.9)
+72.5 (1.1) → 38.9 (4.4)
+74.4 (0.5) → 35.6 (1.7)
+
+Table 13: Classification accuracy (%) for fine-tuning ViTs on the Stanford-Cars.
+Pretrained Model
+
+Mean-Std
+
+Val. Acc. w/ Noise
+
+Test Acc. w/ Noise
+
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.openai ft in12k in1k
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.datacompxl
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.dfn2b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.metaclip 2pt5b
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.openai
+vit base patch16 clip 224.laion2b
+vit base patch16 clip 224.laion2b
+vit base patch16 clip 224.laion2b
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in1k
+vit base patch16 224.augreg in21k
+vit base patch16 224.augreg in21k
+vit base patch16 224.augreg in21k
+vit base patch16 224.mae
+vit base patch16 224.mae
+vit base patch16 224.mae
+
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+OPENAI
+INCEPTION
+IMAGENET
+
+83.8 (0.1) → 71.0 (1.4)
+87.3 (1.2) → 77.7 (2.1)
+81.1 (1.6) → 63.8 (2.2)
+90.1 (0.7) → 76.1 (1.7)
+91.3 (0.2) → 80.9 (0.8)
+89.8 (1.4) → 75.4 (3.8)
+91.1 (0.5) → 78.9 (2.5)
+94.2 (1.1) → 88.7 (2.2)
+91.1 (1.8) → 78.8 (5.0)
+87.7 (0.7) → 67.7 (1.7)
+91.1 (0.3) → 78.5 (1.3)
+87.1 (1.3) → 64.7 (2.0)
+85.6 (3.3) → 73.5 (4.1)
+89.8 (0.4) → 81.0 (1.1)
+85.2 (1.6) → 70.1 (3.0)
+84.8 (2.4) → 65.6 (4.2)
+89.9 (0.8) → 78.4 (2.3)
+79.9 (4.7) → 54.5 (6.6)
+82.8 (0.5) → 67.4 (1.0)
+83.2 (0.6) → 69.2 (1.1)
+83.0 (0.3) → 66.2 (1.4)
+89.7 (0.2) → 82.6 (0.5)
+89.9 (0.2) → 84.2 (0.4)
+89.9 (0.5) → 81.9 (0.5)
+80.4 (0.5) → 61.1 (1.5)
+80.3 (0.3) → 61.7 (1.0)
+80.6 (0.4) → 58.1 (2.2)
+
+83.0 (0.7) → 69.7 (0.7)
+86.2 (1.3) → 76.3 (2.2)
+80.7 (1.9) → 64.6 (2.2)
+89.2 (0.6) → 75.3 (1.5)
+90.4 (0.6) → 79.4 (1.0)
+89.1 (1.4) → 74.3 (3.8)
+90.2 (0.5) → 77.8 (2.2)
+93.2 (1.0) → 87.6 (2.8)
+90.7 (1.4) → 77.6 (5.4)
+86.9 (0.7) → 66.4 (1.7)
+90.2 (0.4) → 77.3 (1.6)
+86.1 (1.7) → 63.2 (2.3)
+85.3 (3.1) → 72.4 (3.9)
+89.5 (0.4) → 80.2 (0.7)
+84.2 (1.3) → 69.0 (3.0)
+84.1 (2.3) → 65.3 (3.7)
+88.8 (0.9) → 77.0 (2.2)
+79.5 (5.1) → 54.9 (7.6)
+81.6 (0.4) → 66.3 (0.9)
+81.6 (0.5) → 67.5 (1.3)
+81.5 (0.2) → 65.1 (1.6)
+88.5 (0.3) → 81.4 (0.5)
+88.3 (0.3) → 83.3 (0.7)
+88.6 (0.6) → 81.1 (0.3)
+78.0 (0.6) → 58.5 (0.9)
+77.6 (0.5) → 59.3 (0.8)
+78.3 (0.3) → 56.7 (2.4)
+
+22
+
+Under review as a conference paper at ICLR 2026
+
+Salt-and-pepper noise. Under the symmetric model where each pixel is replaced by either 0 or 1 with
+probability q and a locally constant patch with mean x̄, we have
+E[avg error] = q(1/2 − x̄),
+
+Var[avg error] = O(1/m).
+
+Max pooling tends to amplify these impulses. As a robust alternative, median pooling recovers the clean
+value in constant patches when contamination is lower than 50% and is 1-Lipschitz with respect to ℓ∞ ;
+trimmed means are another option.
+Normalization and Lipschitz sensitivity. The pixel-space Lipschitz bound in Theorem 4 does not depend
+on the specific noise type, so smaller per-channel normalization stds increase the worst-case sensitivity
+equally for Gaussian and non-Gaussian perturbations.
+
+E
+
+A RE THERE OTHER FACTORS THAT CAUSE VULNERABILITIES OF CLIP?
+
+We investigated other factors that might possibly address the vulnerability of CLIP. However, the vulnerability of CLIP could not be fully addressed by other factors examined below.
+How about swapping pretrained weights with supervised ViT? Answer: No. Differences in training
+datasets and losses would lead to different pretrained weights for CLIP ViTs. Assuming that certain dataset
+or loss properties, or equivalently certain properties of the pretrained weights of CLIP ViTs, lead to vulnerabilities, we performed controlled experiments to swap parts of them with those of supervised ViTs.
+Specifically, we swapped pretrained weights of each block in vit base patch16 clip 224.openai
+with those of vit base patch16 224.augreg2 in21k ft in1k to see which module weights determine the robustness against Gaussian noise (Table 14). Although swapping pretrained weights partially
+addressed the vulnerability of CLIP ViTs in certain cases near the last block such as targeting block12,
+the improvements were not as significant as the approach of replacing mean-std constants. Furthermore,
+the improvement depended on the specific weight choice in the target block; block12.mlp.fc2.weight improved robustness, whereas block12.norm1.weight did not. When we swapped multiple weights such as
+block12.{mlp.fc2, mlp.fc1, norm2}, the performance rather degraded, which indicates that improvement is
+not guaranteed.
+How about architectural differences such as norm pre? Answer: No. Although the architecture is
+almost the same for CLIP ViT and supervised ViTs, one difference is that CLIP ViTs insert additional
+LayerNorm in the patch embedding before the transformer blocks start, which we refer to as norm pre.
+Assuming that the use of norm pre causes vulnerability, we performed controlled experiments training ViTs
+with and without norm pre (Table 16). Nevertheless, the ViT with norm pre, which corresponds to the
+identical architecture of CLIP ViTs, rather exhibited improved performance against Gaussian noise, which
+indicates that norm pre does not lead to the vulnerability observed in CLIP ViTs.
+
+F
+
+L IMITATIONS
+
+Our study focuses exclusively on robustness to additive Gaussian noise, which, although common in imaging
+pipelines, does not encompass all real-world corruptions, such as adversarial perturbations, weather effects,
+or sensor-specific artifacts. Also, the empirical findings are derived from pretrained models in the timm
+library and controlled experiments on specific datasets, which may represent a limitation in their generalizability to other domains like medical imaging or video processing. Future work could extend these insights
+to broader corruptions, architectures, and datasets.
+23
+
+Under review as a conference paper at ICLR 2026
+
+Table 14: Results of swapping pretrained weights in CLIP ViT. The accuracy with Gaussian noise partially
+improved.
+Swap
+
+Val. Acc. → w/ Noise
+
+Test Acc. → w/ Noise
+
+stem
+block1
+block2
+block3
+block4
+block5
+block6
+block7
+block8
+block9
+block10
+block11
+block12
+head
+
+53.1 (1.2) → 36.3 (0.9)
+81.3 (19.1) → 48.6 (14.8)
+41.9 (3.4) → 20.1 (1.6)
+68.6 (13.6) → 29.9 (4.5)
+80.2 (6.8) → 29.6 (7.5)
+77.0 (4.0) → 30.0 (4.0)
+84.7 (0.8) → 39.9 (1.9)
+87.8 (0.4) → 45.0 (0.8)
+90.5 (0.4) → 49.9 (2.7)
+90.7 (0.2) → 56.5 (3.9)
+91.5 (0.4) → 62.3 (3.3)
+91.4 (0.4) → 59.6 (5.1)
+91.5 (0.5) → 62.3 (4.9)
+82.8 (7.6) → 48.4 (7.5)
+
+51.3 (1.5) → 35.4 (1.2)
+80.1 (19.9) → 46.2 (14.1)
+40.7 (3.9) → 18.8 (1.6)
+67.9 (13.7) → 28.7 (4.4)
+79.8 (6.4) → 28.6 (7.9)
+77.3 (3.2) → 29.0 (3.4)
+84.0 (0.5) → 37.8 (2.2)
+86.5 (0.6) → 44.9 (1.2)
+88.4 (0.6) → 48.4 (1.6)
+90.1 (0.4) → 54.8 (2.2)
+91.0 (0.4) → 60.4 (3.5)
+90.7 (0.9) → 58.1 (6.0)
+91.4 (0.6) → 60.8 (4.4)
+82.3 (6.8) → 48.2 (6.6)
+
+Baseline (IMAGENET)
+Ours (INCEPTION)
+
+91.2 (0.5) → 58.5 (4.0)
+92.5 (0.3) → 71.7 (1.0)
+
+90.7 (0.8) → 58.4 (4.3)
+91.9 (0.6) → 70.2 (1.2)
+
+Table 15: Results of swapping specific weights in block12. Swapping multiple weights did not ensure
+improved robustness.
+Swap
+
+Val. Acc. → w/ Noise
+
+Test Acc. → w/ Noise
+
+block12.norm1.weight
+block12.norm1.bias
+block12.attn.qkv.weight
+block12.attn.qkv.bias
+block12.attn.proj.weight
+block12.attn.proj.bias
+block12.norm2.weight
+block12.norm2.bias
+block12.mlp.fc1.weight
+block12.mlp.fc1.bias
+block12.mlp.fc2.weight
+block12.mlp.fc2.bias
+
+91.0 (1.3) → 56.8 (8.2)
+91.5 (0.9) → 59.5 (5.7)
+91.0 (0.5) → 60.5 (1.3)
+91.0 (0.9) → 58.7 (3.6)
+92.1 (0.6) → 59.8 (5.6)
+90.9 (1.0) → 58.3 (5.4)
+91.8 (0.7) → 62.7 (4.3)
+91.4 (0.9) → 60.8 (3.4)
+91.4 (1.0) → 61.0 (7.6)
+91.2 (1.3) → 58.3 (3.4)
+91.3 (0.4) → 65.2 (2.2)
+91.4 (0.7) → 58.8 (5.0)
+
+90.1 (1.3) → 56.6 (8.6)
+90.7 (1.4) → 58.1 (6.1)
+90.3 (0.8) → 59.0 (1.4)
+90.0 (0.9) → 58.4 (3.7)
+91.3 (0.9) → 59.8 (5.8)
+90.2 (1.2) → 57.8 (5.0)
+90.7 (0.9) → 61.1 (3.7)
+90.8 (0.7) → 59.7 (3.4)
+91.0 (1.4) → 60.3 (7.0)
+90.4 (1.5) → 57.4 (3.7)
+90.5 (0.3) → 63.8 (2.1)
+90.7 (0.7) → 58.2 (5.4)
+
+block12.mlp.fc2
+block12.mlp.fc2 & mlp.fc1
+block12.mlp.fc2 & mlp.fc1 & norm2
+
+90.8 (0.6) → 58.7 (3.2)
+91.9 (1.1) → 64.2 (4.3)
+91.0 (0.5) → 55.5 (4.3)
+
+90.0 (0.4) → 57.7 (3.1)
+91.6 (0.8) → 63.8 (5.0)
+90.0 (1.4) → 54.0 (5.2)
+
+Table 16: Results on different ViT architectures with and without norm pre. The use of norm pre did not
+bring vulnerability.
+Architecture
+
+Top-1 → w/ Noise
+
+Top-5 → w/ Noise
+
+w/o norm pre
+w/ norm pre
+
+77.76 → 47.15
+78.84 → 54.22
+
+93.84 → 68.96
+94.14 → 76.13
+
+24
+
+Under review as a conference paper at ICLR 2026
+
+Table 17: The upper block reports the results for the box kernel. The lower block reports the results for the
+Gaussian kernel.
+r (rad)
+
+b k (ω)|)
+Empirical (|K
+
+Theoretical (ϕk (∥ω∥))
+
+0.3962
+0.7886
+1.5661
+
+0.0297134
+0.0129235
+0.0040941
+
+0.0570019
+0.0167515
+0.0042482
+
+0.3962
+0.7886
+1.6031
+
+0.0226295
+0.0059380
+0.0007060
+
+0.0326660
+0.0068950
+0.0010978
+
+Table 18: Measured γ for a k × k kernel. Stds for 100 simulations are reported.
+
+G
+
+k
+
+Empirical
+
+Theoretical
+
+4
+8
+12
+16
+20
+24
+28
+32
+
+0.062535 ± 0.001019
+0.015584 ± 0.000484
+0.006911 ± 0.000296
+0.003888 ± 0.000212
+0.002487 ± 0.000169
+0.001728 ± 0.000148
+0.001271 ± 0.000129
+0.000973 ± 0.000115
+
+0.062500
+0.015625
+0.006944
+0.003906
+0.002500
+0.001736
+0.001276
+0.000977
+
+E MPIRICAL S IMULATIONS FOR T ESTING A SSUMPTION AND T HEOREMS
+
+We performed module-level simulations to compare empirical results with the expected values stated in the
+assumption and theorems. All simulation results closely matched the theoretical expectations. The used
+Python source code is available in the supplementary materials.
+b form its
+Aroll We embed each k×k kernel into a 512×512 grid, compute the normalized spectrum |K|,
+−(1+δ)
+ℓ2 -radial profile, and fit the low-pass envelope ϕk (r) = (1 + βkr)
+by weighted log-MSE (Table 17).
+For representative radii of π/8, π/4, π/2, we observed that the empirical magnitudes lie below the fitted
+envelopes, which verifies this assumption in practice.
+Theorem 1 Table 18 reports the Monte Carlo estimate of the per-pixel noise gain γ for a k × k normalized
+box filter. We convolve i.i.d. N (0, σ 2 ) noise with the filter via FFT-based circular convolution and compare
+the empirical γ̂ with the theoretical ||Kk ||2F = 1/k 2 , where Kk is the normalized k × k box stem kernel.
+Theorem 2 Table 19 reports Monte Carlo estimates of the per-output-pixel noise gain γ↓ (s) under antialiased downsampling by a factor s, using a g(s) × g(s) normalized box prefilter and decimation. We
+compare the empirical γ̂↓ with the theoretical ||Kg(s) ||2F = 1/g(s)2 , implying ∼ s−2 when g(s) ∝ s.
+Theorem 3 The results in Table 20 were obtained via Monte Carlo with 200k trials on S + η with η ∼
+N (0, 1) and k = w2 . Theoretical entries correspond to σ 2 /k for average pooling and Gauss-Hermite
+quadrature for E[Mk ] and E[Mk2 ] to compute max-pooling bias and MSE.
+Theorem 4 We construct random linear maps A with ∥A∥2 = Lz = 3.0, compose them with D =
+diag(1/σ) from INCEPTION and OPENAI, and estimate ∥AD∥2 via power iteration. Table 21 compares
+the theoretical bound Lz /σmin with the measured norm and their ratio, confirming the predicted 1/σmin
+scaling.
+25
+
+Under review as a conference paper at ICLR 2026
+
+Table 19: Measured γ↓ (s) for anti-aliased downsampling by a factor of s. Stds for 100 simulations are
+reported.
+s
+
+Empirical
+
+Theoretical
+
+1
+2
+3
+4
+6
+8
+12
+16
+
+0.999667 ± 0.006170
+0.250114 ± 0.002767
+0.110970 ± 0.001869
+0.062447 ± 0.001483
+0.027772 ± 0.000880
+0.015567 ± 0.000649
+0.006945 ± 0.000433
+0.003925 ± 0.000359
+
+1.000000
+0.250000
+0.111111
+0.062500
+0.027778
+0.015625
+0.006944
+0.003906
+
+Table 20: Comparison of empirical (Em.) and theoretical (Th.) results for average and max poolings
+w
+
+k
+
+Avg MSE (Em.)
+
+Avg MSE (Th.)
+
+Max Bias (Em.)
+
+Max Bias (Th.)
+
+Max MSE (Em.)
+
+Max MSE (Th.)
+
+2
+3
+4
+5
+6
+
+4
+9
+16
+25
+36
+
+0.25083
+0.11049
+0.06265
+0.04006
+0.02779
+
+0.25000
+0.11111
+0.06250
+0.04000
+0.02778
+
+1.02936
+1.48535
+1.76524
+1.96619
+2.11722
+
+1.02938
+1.48501
+1.76599
+1.96531
+2.11812
+
+1.55372
+2.56409
+3.41148
+4.12369
+4.71818
+
+1.55133
+2.56262
+3.41374
+4.12097
+4.72069
+
+Table 21: Measured ∥AD∥2 closely matches the bound Lz /σmin for random A under INCEPTION and
+OPENAI, confirming the 1/σmin scaling
+
+H
+
+Constants
+
+Bound Lz /σmin
+
+Measured ∥AD∥2
+
+Lz /σmin
+∥AD∥2
+
+INCEPTION
+OPENAI
+
+6.000000
+11.480943
+
+5.998213
+11.200055
+
+1.000298
+1.025079
+
+R ANK DIFFERENCE AS A ROBUSTNESS PROXY
+
+Here, we denote the rank difference (RankDiff) at severity τ > 0,
+RankDiff i (τ ) := rankτ (i) − rank0 (i),
+where rankτ orders models by accuracy at τ , so a more negative RankDiff i indicates a robustness gain. In
+this section, we show that RankDiff is a principled, scale-free proxy because it aggregates pairwise rank flips
+caused by robustness slope differences.
+Assumption (local linearity with quadratic remainder). For model i ∈ {1, . . . , M }, let Ai (τ ) be its
+accuracy at noise severity τ ≥ 0 and pi := Ai (0). For some τ0 > 0,
+Ai (τ ) = pi − ρi τ + ri (τ ),
+
+ρi ≥ 0,
+
+|ri (τ )| ≤ Li τ 2
+
+(τ ∈ [0, τ0 ]),
+
+(10)
+
+where ρi is the first-order robustness slope, and Li bounds the curvature. The linear accuracy drop after applying a specific corruption has been verified in several studies (Recht et al., 2019; Hendrycks & Dietterich,
+2019).
+Pairwise flip rule. For any i ̸= j,
+Ai (τ ) − Aj (τ ) = (pi − pj ) − (ρi − ρj )τ + εij (τ ),
+26
+
+|εij (τ )| ≤ (Li + Lj )τ 2 .
+
+(11)
+
+Under review as a conference paper at ICLR 2026
+
+If ρi ̸= ρj , the first-order flip threshold is
+⋆
+:=
+τij
+
+pi − p j
+.
+ρi − ρ j
+
+(12)
+
+⋆
+When τij
+∈ (0, τ0 ] and the margin condition
+
+|(pi − pj ) − (ρi − ρj )τ | > (Li + Lj )τ 2
+
+(13)
+
+holds at τ , the sign of Ai (τ ) − Aj (τ ) is determined by the first-order term: Model i outranks j at τ if and
+⋆
+only if τ > τij
+when ρi < ρj (Figure 5).
+1.0
+
+Ai (τ) = pi − ρi τ
+Aj (τ) = pj − ρj τ
+
+p −p
+
+τij⋆ = ρii − ρjj
+pj
+
+Accuracy
+
+0.8
+
+pi
+
+0.6
+
+0.4
+
+Condition:
+ρi < ρj ⇒ i ≻ j iff τ > τij⋆
+
+0.2
+
+j≻i
+0.0
+
+0.0
+
+i≻j
+0.2
+
+τij⋆
+
+0.4
+
+τ (noise severity)
+
+0.6
+
+0.8
+
+1.0
+
+Figure 5: Illustration of a rank flip
+RankDiff counts robustness-driven flips. Let Ai (τ ) := {j ̸= i : |(pi − pj ) − (ρi − ρj )τ | ≤ (Li + Lj )τ 2 }
+be the set of ambiguous pairs at τ . Then, we have
+X
+⋆
+|RankDiff i (τ ) +
+sgn(ρj − ρi )1{ρi ̸= ρj , 0 < τij
+≤ τ }| ≤ |Ai (τ )|.
+(14)
+j̸=i
+
+In particular, if Eq. 13 holds for all j ̸= i at τ , equality holds in Eq. 14: RankDiff i (τ ) equals the net number
+of pairwise flips caused by having a smaller slope ρi .
+Under the empirically observed near-linearity of accuracy-severity curves within the tested range, RankDiff
+is a scale-free robustness score: It ignores absolute calibration of accuracies and rewards models with smaller
+slopes ρi by counting the robustness-driven improvements in relative order.
+27
+
+Under review as a conference paper at ICLR 2026
+
+Although we wrote that a negative RankDiff indicates better robustness, we are not saying that understanding the absolute value of RankDiff would capture robustness; to clarify our approach, we rather compare
+pairwise architectures to compute their corresponding ∆RankDiff to understand the relative difference in
+robustness.
+
+I
+
+E XPERIMENTAL S ETUP
+
+Here, we present the experimental details and full hyperparameters for the implementations.
+Gaussian Noise We injected Gaussian noise into images using the GaussNoise() function
+from the Albumentations library (Buslaev et al., 2020). By default, we used the transform
+A.GaussNoise(std range=(0.1, 0.22), p=1.0) with a scale factor with range (0.1, 0.22),
+which determines the fraction of the maximum value, i.e., 255 for uint8 images or 1.0 for float images.
+For ImageNet-1K experiments, we used a scale factor with a range of (0.2, 0.44). The probability of applying Gaussian noise was set to 1. Note that Gaussian noise was applied only during evaluation, i.e., during
+the test phase, not during the training phase.
+ResNet Experiments We targeted multi-class classification tasks on the Oxford-IIIT Pet, Caltech-101,
+FGVC-Aircraft, Caltech-UCSD Birds-200-2011, and Stanford Cars datasets. The Oxford-IIIT Pet dataset
+contains 7K pet images from 37 classes; the Caltech-101 dataset includes 9K object images from 101 classes
+with a background category; the FGVC-Aircraft dataset includes 10K aircraft images from 102 classes;
+the Caltech-UCSD Birds-200-2011 dataset includes 12K bird images from 200 classes; and the Stanford
+Cars dataset includes 16K car images from 196 classes. These datasets are publicly available on their
+official websites. Each dataset was split into training, validation, and test sets with a ratio of 70:15:15.
+Unless specified otherwise, all experiments were conducted at a resolution of 2242 using standard data
+augmentation, including random resized cropping to 256 pixels, random rotations within 15 degrees, color
+jitter with a factor of 0.4, random horizontal flip with a probability of 0.5, center cropping with 224-pixel
+windows, and mean-std normalization based on ImageNet statistics.
+For training, stochastic gradient descent with a momentum of 0.9, learning rate of 0.01, cosine annealing
+schedule with 200 iterations (Loshchilov & Hutter, 2017), weight decay of 10−2 , and mini-batch size of
+128 were used. These hyperparameters were determined based on the accuracy of the validation set. One
+exception was made for experiments with larger resolutions ranging from 2242 to 8962 , where we used
+mini-batch size of 64 to adjust GPU memory, while other hyperparameters are the same. The model with
+the highest validation accuracy was obtained after 200 training epochs, and we reported accuracy on the
+validation and test sets. The ResNets were trained from scratch to solely focus on the architectural difference.
+The training was conducted on a single GPU machine. An average and standard deviation of five runs with
+different random seeds were reported for each result.
+For ResNet, we used five types with the following architectures:
+• Original ResNet: 7 × 7 stem with a width = 64 with single-layer, strided convolution in downsampling.
+• ResNet-C: 3-layer 3 × 3 stem with a width = 32 (32, 32, 64), strided convolution in downsampling.
+• ResNet-D: 3-layer 3 × 3 stem with a width = 32 (32, 32, 64), average pool in downsampling.
+• ResNet-S: 3-layer 3 × 3 stem with a width = 64 (64, 64, 128), strided convolution in downsampling.
+• ResNet-T: 3-layer 3 × 3 stem with a width = 32 (24, 48, 64), average pool in downsampling.
+CLIP Experiments For the CLIP experiments, we used pretrained weights for both supervised ViTs and
+CLIP ViTs. When performing fine-tuning experiments, we used a learning rate of 0.001 and a weight decay
+of 2 × 10−4 , while keeping all other hyperparameters the same as in the above setup in ResNet.
+28
+
+Under review as a conference paper at ICLR 2026
+
+ImageNet-1K Training The ImageNet-1K dataset contains 1.28M images for 1,000 classes. We referred
+to the hyperparameter recipe described in the official documentation and the recipe from DeiT (Touvron
+et al., 2021). For training, the AdamW optimizer (Loshchilov & Hutter, 2019) with learning rate 5 × 10−4 ,
+epochs 400, warm-up learning rate 10−6 , cosine annealing schedule (Loshchilov & Hutter, 2017), weight
+decay 0.05, label smoothing (Szegedy et al., 2016) 0.1, RandAugment (Cubuk et al., 2020) of magnitude
+9 and noise-std 0.5 with increased severity (rand-m9-mstd0.5-inc1), random erasing (Zhong et al., 2020)
+with probability 0.25, Cutmix (Yun et al., 2019) 1.0, stochastic depth (Huang et al., 2016) 0.1, mini-batch
+size 128 per GPU, Exponential Moving Average of model weights with decay factor 0.99996, and image
+resolution 2242 were used. The training was performed on a 4×A100 GPU machine, which required two to
+three days per training.
+Mean-Std Constants Note that pretrained models may have been trained by any of the normalization
+constants; our choice of mean-std constants was applied on evaluation or fine-tuning of pretrained models.
+For training our own models, mean-std constants were applied during both the training and test phases. The
+exact values are as follows:
+OPENAI_CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+OPENAI_CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+IMAGENET_INCEPTION_MEAN = (0.5, 0.5, 0.5)
+IMAGENET_INCEPTION_STD = (0.5, 0.5, 0.5)
+IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
+
+J
+
+L IST OF N OTATIONS
+Table 22: Kernel and resolution-related notations.
+Symbol
+
+Description
+C×H×W
+
+x ∈ [0, 1]
+η ∼ N (0, σ 2 I)
+I, In
+∗
+u
+b
+Ω
+ε
+Kk ∈ Rk×k
+ϕk (r) = (1 + βkr)−1−δ
+β, δ
+E∥Kk ∗ η∥22
+γ(k) =
+σ 2 HW
+s≥1
+g(s)
+c1 , c 2
+Ds = (⇓s ) ◦ Kg(s)
+⇓s
+E∥Ds η∥22
+γ↓ (s) = 2
+σ HW/s2
+E[·], Var[·]
+C, C ′
+∥ · ∥2 , ∥ · ∥∞ , ∥ · ∥F
+
+Input image with C channels, height H, width W .
+Additive i.i.d. Gaussian noise with per-pixel std σ.
+Identity matrix of appropriate size; In ∈ Rn×n .
+2D discrete convolution.
+DFT of u on the grid Ω.
+DFT grid.
+Infrared cutoff ε = 2π/ max{H, W }.
+b k denotes its DFT.
+Stem kernel of side length k; K
+b k (ω)|.
+Radial low-pass envelope upper-bounding |K
+Positive envelope constants.
+Per-pixel noise gain of the stem; equals ∥Kk ∥2F .
+Downsampling factor.
+Anti-alias filter size before downsampling; c1 s ≤ g(s) ≤ c2 s.
+Absolute positive constants, independent of s.
+Anti-aliased downsampling: Filter then downsample by s.
+Downsampling by a factor s along height and width.
+Per-output-pixel noise gain after downsampling.
+Expectation and variance.
+Absolute constants independent of k and s in the bounds.
+Euclidean, sup, and Frobenius norms.
+
+29
+
+Under review as a conference paper at ICLR 2026
+
+Table 23: Pooling and CLIP-related notations.
+Symbol
+
+Description
+2
+
+w, m = w
+S = (S1 , . .P
+. , Sm )
+m
+1
+Xavg = m
+i=1 (Si + ηi )
+Xmax = max
+(Si + ηi )
+1≤i≤m
+P
+1
+Savg = m
+i Si , Smax = maxi Si
+δavg = Xavg − Savg
+δmax = Xmax − Smax
+Tavg , Tmax
+∥T ∥ℓ2 →ℓ2
+∆ = S(1) − S(2)
+i.i.d.
+Zi ∼ N (0, 1)
+µ ∈ RC , σ ∈ RC
+>0
+Nµ,σ (x) = (x − µ)/σ
+f
+z = Nµ,σ (x)
+Lz
+Fµ,σ = f ◦ Nµ,σ
+σmin = minc σc
+
+Pooling window side length and number of elements.
+Clean activations in one pooling window; S(j) denotes the j-th order statistic.
+Average-pooled noisy activation.
+Max-pooled noisy activation.
+Clean pooled activations.
+Avg-pool error; E[δavg ] = 0, Var[δavg ] = σ 2 /m.
+Max-pool error.
+Pooling maps on a window for average and max.
+Lipschitz constant in ℓ2 ; ∥Tavg ∥ = m−1/2 , ∥Tmax ∥ ≤ 1.
+Gap between the largest and second-largest clean entries.
+Standard normals; Mm = maxi Zi , Am = maxi |Zi |.
+Per-channel mean and std for input normalization.
+Channel-wise normalization.
+Vision backbone operating on normalized inputs.
+Normalized input.
+Global ℓ2 -Lipschitz constant of f on its domain.
+End-to-end map; ∥Fµ,σ ∥Lip ≤ Lz /σmin .
+Smallest channel std in normalization.
+
+Table 24: Rank difference-related notations.
+Symbol
+
+Description
+
+τ ≥0
+Ai (τ )
+ρi
+Li , τ0
+rankτ (i)
+RankDiff i (τ ) = rankτ (i) − rank0 (i)
+pi − p j
+⋆
+τij
+=
+ρi − ρ j
+Ai (τ )
+sgn(·), 1{·}
+
+Noise severity level.
+Accuracy of model i at severity τ ; pi = Ai (0) denotes clean accuracy.
+First-order accuracy slope with respect to severity.
+Curvature bound and validity radius for the local model.
+Rank of model i by accuracy at severity τ .
+Rank change.
+First-order crossing severity of models i and j.
+Set of j whose ordering with i is ambiguous at τ .
+Sign and indicator functions.
+
+30
+

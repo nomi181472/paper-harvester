@@ -1,0 +1,789 @@
+Toward Sustainable Distributed LLM Inference:
+A Systems Synthesis and Research Agenda for an Energy-, Carbon-,
+and Cache-Aware llm-d Control Plane
+
+arXiv:2609.05565v1 [cs.DC] 3 Sep 2026
+
+Twinkll Sisodia
+twinklls@bu.edu
+September 2026
+Abstract
+Large language model (LLM) sustainability is increasingly a serving-systems problem, not only a training
+problem. In production, energy and carbon impact depend on more than model size: workload shape, batching,
+key–value (KV) cache reuse, prefill/decode placement, model and accelerator choice, power state, geographic
+carbon intensity, and service-level objectives (SLOs) all matter. Recent systems papers study many of these
+factors separately. This paper connects those results and asks a practical engineering question: what do they
+imply when the decision point is a distributed inference control plane such as llm-d?
+The contribution here is synthesis, not a new set of benchmark results. Reported performance, energy,
+carbon, and cost improvements remain the results of the cited papers and systems. I group the literature
+into recurring design patterns and use those patterns to sketch a Sustainable Inference Control Plane (SICP)
+for llm-d. The proposed control plane would consider latency, energy, carbon, cache reuse, serving cost,
+and quality when routing and scaling, while keeping TTFT/TPOT SLOs as hard constraints. I also outline
+an evaluation framework based on SLO-satisfied goodput per joule and per gram CO2 e, together with a
+reproducible experimental plan. The main observation from connecting the literature is that sustainable LLM
+inference is unlikely to come from one “green” model or one accelerator; it is more naturally treated as a
+control problem across model, phase, cache, hardware, replica, region, and time.
+
+Keywords: sustainable AI, LLM inference, distributed inference, llm-d, vLLM, energy efficiency, carbon-aware
+computing, KV cache, disaggregated serving, inference routing, GPU scheduling.
+
+1
+
+Introduction
+
+The sustainability discussion around modern AI has historically emphasized the large, visible cost of frontiermodel training. That framing is becoming incomplete. Production LLMs execute continuously, often across
+millions or billions of requests, and inference workloads are increasingly lengthened by reasoning, retrieval, tool
+use, agents, and multimodal generation. Recent empirical work shows that inference energy depends strongly on
+workload geometry, software stack, accelerator, batching, decoding strategy, and parallelism; naive estimates
+based on FLOPs or theoretical utilization can substantially mischaracterize real consumption [Fernandez et al.,
+2025]. Industrial systems research similarly shows that energy, power, carbon, and cost can be reduced while
+meeting latency SLOs when serving infrastructure dynamically reconfigures itself [Stojkovic et al., 2025b, Li
+et al., 2025b, Stojkovic et al., 2025a].
+In parallel, LLM serving has undergone a systems transition. PagedAttention and vLLM reframed KV
+cache as a virtual-memory problem [Kwon et al., 2023]; Splitwise and DistServe separated prefill from decode
+because the phases stress hardware differently [Patel et al., 2024, Zhong et al., 2024]; QServe demonstrated
+model–system co-design through aggressive weight, activation, and KV quantization [Lin et al., 2024]; Mooncake
+made distributed KV state a first-class architectural resource [Qin et al., 2024]; and newer work extends serving to
+1
+
+agentic continuity and composite multimodal graphs [Li et al., 2025a, Jha et al., 2026]. The practical implication
+is important: inference is no longer a homogeneous function call behind a round-robin load balancer.
+The open-source llm-d project makes that transition explicit. It has evolved from a Kubernetes-native
+distributed serving stack into an inference control plane that performs cache-aware and load-aware routing,
+prefill/decode disaggregation, multi-tier KV management, autoscaling, heterogeneous-engine orchestration,
+predicted-latency scheduling, and request-level tracing [llm-d Maintainers, 2026a, Mitra et al., 2026, Guy et al.,
+2026, Liu and Kumar, 2026, llm-d Maintainers, 2026b]. These capabilities expose a natural insertion point for
+sustainability: the same control plane that asks “which endpoint will be fastest?” can also ask “which feasible
+endpoint will satisfy the SLO with the least incremental energy, carbon, power pressure, and recomputation?”
+The goal of this paper is narrower than designing a new serving engine. I am connecting results that are often
+discussed separately and asking what they imply at the control-plane level. No experimental gain reported in this
+paper is an original measurement. Whenever a numerical result or an existing system capability is discussed, it is
+attributed to the cited work. The SICP architecture, taxonomy, and evaluation plan are the synthesis developed in
+this paper.
+What this paper adds.
+1. A common taxonomy that places recent LLM inference and sustainable-computing work across request,
+model, phase, cache, hardware, cluster, datacenter, and lifecycle layers.
+2. A set of recurring engineering patterns—phase asymmetry, workload sensitivity, state reuse, heterogeneity,
+SLO-constrained adaptation, and telemetry-driven control—that appear across otherwise separate research
+lines.
+3. A concrete SICP design sketch for llm-d that connects those patterns to routing, KV placement, power
+management, model selection, autoscaling, and regional placement.
+4. A measurement and evaluation plan for testing the proposal without treating cost, average power, or a single
+workload as a proxy for sustainability.
+
+2
+
+Scope and Evidence Selection
+
+I used a structured but pragmatic literature selection covering work published or publicly released from 2023
+through September 3, 2026. The review emphasizes peer-reviewed papers and arXiv preprints from university
+systems/AI groups and major industrial research organizations, supplemented by official llm-d architecture and
+release material only when describing current llm-d capabilities.
+The selection focuses on work that directly studies at least one of the following: inference energy or
+carbon; power/thermal management; prefill/decode disaggregation; KV cache management; scheduling/routing;
+quantization; speculative decoding; model cascades; heterogeneous accelerators; agentic/multimodal serving; or
+geographically/temporally carbon-aware inference. Training-only sustainability work is used only as background
+and is not treated as evidence for serving-system behavior.
+This is not a PRISMA-style systematic review and does not claim exhaustive coverage of every paper released
+during the period. The intent is to collect directly relevant systems results, compare the control variables they
+expose, and look for patterns that can be connected at the inference-control-plane layer.
+Claim and attribution boundary. The paper separates prior results from synthesis in three ways. First,
+empirical findings and numerical improvements are stated with citations to the original papers or project material.
+Second, descriptions of existing llm-d behavior are limited to cited project documentation. Third, the SICP
+equations, taxonomy, design choices, research questions, and experimental roadmap are proposals derived from
+connecting those sources; they are not presented as implemented or experimentally validated results.
+
+2
+
+3
+
+What the Recent Literature Converges On
+
+3.1
+
+Inference energy is workload-dependent, not a model constant
+
+A central finding in recent empirical work is that “energy per query” is not a stable property of a model.
+Fernandez et al. [2025] measure energy across frameworks, decoding strategies, GPU architectures, sequence
+lengths, batching modes, and parallelism, finding that optimized serving can reduce energy substantially relative
+to unoptimized baselines, while the best optimization changes with workload geometry. Their measurements
+also show that decode often dominates energy for generation-heavy workloads, speculative decoding can save
+energy at small batches but increase it at high batches, and adding tensor-parallel GPUs can reduce latency while
+increasing total energy.
+Taken together, these measurements make static rules—for example, always selecting the newest GPU, always
+maximizing parallelism, or always enabling speculative decoding—hard to justify. The engineering implication I
+draw is that a sustainability-aware scheduler should condition its decision on prompt length, expected output
+length, batch state, accelerator, cache hit, and SLO.
+
+3.2
+
+Prefill and decode should be treated as different resources
+
+Splitwise established that prompt computation is compute-intensive while token generation is more memoryintensive and can underutilize the compute capability of high-end GPUs [Patel et al., 2024]. DistServe showed that
+separating the phases can improve SLO-constrained goodput by eliminating phase interference and independently
+choosing resource allocation and parallelism [Zhong et al., 2024]. Sarathi-Serve explored the complementary path
+of chunked prefill and stall-free scheduling to reduce the throughput–latency conflict without full disaggregation
+[Agrawal et al., 2024]. Later work such as TaiChi argues that aggregation and disaggregation are not universally
+superior; the optimal mode depends on TTFT and TPOT SLO geometry [Wang et al., 2025].
+Taken together, these papers suggest a sustainability implication beyond performance: phases with different
+compute and memory behavior can also have different energy-efficient operating points. PowerSlider explicitly
+studies this asymmetry under time-varying power caps [Li et al., 2026]. This motivates testing phase-specific
+power control rather than assuming one power state is best for an entire model replica.
+
+3.3
+
+KV state is both a performance asset and an energy asset
+
+PagedAttention showed that improved KV memory management can unlock much larger effective batches and
+throughput [Kwon et al., 2023]. Mooncake extended the idea to a distributed KVCache-centric architecture
+with CPU, DRAM, and SSD resources participating in cache storage and movement [Qin et al., 2024]. For
+agentic applications, Continuum shows that interleaved tool calls create a new decision: retain KV state during a
+pause or evict and later recompute/reload it [Li et al., 2025a]. Current llm-d work further adds cross-endpoint
+peer-to-peer KV sharing so an idle endpoint can pull cached state instead of recomputing a long prefix [Guy et al.,
+2026].
+Recomputation is therefore not only a latency penalty; it is avoidable energy. But cache retention and transfer
+are not free. A sustainable system needs an explicit transfer-versus-recompute model that prices network energy,
+CPU/DRAM/storage occupancy, HBM pressure, and the probability of reuse.
+
+3.4
+
+Efficiency is a model–software–hardware co-design problem
+
+QServe demonstrates that lower precision alone is insufficient; performance depends on how quantization maps
+to GPU kernels and memory behavior [Lin et al., 2024]. CMU’s energy study similarly finds that framework and
+kernel choices can materially change real energy use [Fernandez et al., 2025]. Heterogeneous serving work such
+as Splitwise shows that a cheaper/lower-power device can be preferable for decode even if it is not the fastest
+
+3
+
+general-purpose accelerator [Patel et al., 2024]. This motivates a sustainability policy that chooses hardware by
+phase and workload, not by a single benchmark score.
+
+3.5
+
+Quality-aware model routing is a sustainability lever
+
+FrugalGPT, Hybrid LLM, and RouteLLM show that queries can be routed between models of different capability/cost while maintaining a target quality level [Chen et al., 2023, Ding et al., 2024, Ong et al., 2024]. Google
+Research’s speculative-cascade direction combines smaller and larger models to reduce unnecessary expensive
+inference [Narasimhan and Menon, 2025]. These works primarily optimize cost or latency, but their structure is
+directly applicable to sustainability: if a smaller model can satisfy the quality target, running a larger model is
+often wasted computation. However, cost is not a perfect proxy for energy or carbon, so future routers should
+learn quality and sustainability jointly.
+
+3.6
+
+Carbon, power, and embodied impact require control above the model server
+
+DynamoLLM dynamically adjusts cluster configuration under latency SLOs and reports substantial reductions in
+energy, operational carbon, and cost [Stojkovic et al., 2025b]. EcoServe broadens the accounting boundary to
+embodied carbon and proposes “Reduce, Reuse, Rightsize, Recycle” as design pillars [Li et al., 2025b]. TAPAS
+incorporates power and thermal constraints into placement, routing, and reconfiguration [Stojkovic et al., 2025a].
+XWind explores cross-site inference near renewable generation [Reddy et al., 2026], while recent live work shows
+that real-time grid carbon signals can be used as an overlay on production routing [Bernhard and Yardimci, 2026].
+Viewed together, these systems suggest that some sustainability decisions necessarily sit above a CUDA
+kernel or a single model-server process. Replica-, cluster-, and region-level choices need a higher-level control
+point.
+
+4
+
+Table 1: Representative evidence and the control-plane implication derived from it. Reported numerical gains
+belong to the cited systems and are not results of this paper.
+Work
+
+Primary lever
+
+Representative finding
+
+Implication for sustainable distributed inference
+
+vLLM / PagedAttention [Kwon et al.,
+2023]
+
+KV memory
+
+2–4× throughput over prior serving
+baselines at similar latency in reported experiments
+
+Splitwise
+[Patel
+et al., 2024]
+
+P/D phase split
+
+Memory fragmentation and cache duplication are sustainability issues because they reduce useful work per
+accelerator-hour.
+Match accelerator class and power
+state to phase behavior.
+
+DistServe [Zhong
+et al., 2024]
+
+P/D disaggregation
+
+QServe [Lin et al.,
+2024]
+
+W4A8KV4 codesign
+
+Energy Considerations [Fernandez
+et al., 2025]
+DynamoLLM [Stojkovic et al., 2025b]
+
+Workloadaware optimization
+Dynamic cluster
+management
+
+EcoServe [Li et al.,
+2025b]
+
+Carbon lifecycle
+
+Continuum [Li et al.,
+2025a]
+
+Agentic
+TTL
+
+M* [Jha et al., 2026]
+
+Composite multimodal serving
+
+PowerSlider
+et al., 2026]
+
+Phase-aware
+power control
+
+Up to 1.4× throughput at 20%
+lower cost; alternative design points
+increase throughput under fixed
+power/cost
+Large
+goodput
+gains
+under Optimize sustainability subject to
+TTFT/TPOT constraints in re- phase-specific SLOs, not average laported workloads
+tency.
+Higher serving throughput and lower Precision must be selected with harddollar cost than compared baselines
+ware/kernel awareness; KV precision
+is a first-class lever.
+Up to 73% lower energy than an un- Sustainability policies must be condioptimized baseline; optimization effi- tional and learned from telemetry.
+cacy varies by workload/hardware
+Reports 53% energy and 38% Energy/carbon belong in the cluster
+operational-carbon reduction while controller’s objective.
+meeting SLOs
+Reports up to 47% carbon reduction Include lifecycle-aware rightsizing,
+and highlights embodied-carbon role reuse, and batch deferral.
+of host infrastructure
+Large job-completion gains by retain- Predict future reuse; price reing KV across tool calls when benefi- tain/offload/reload/recompute
+cial
+actions.
+Dataflow-graph serving improves Sustainability control must generalize
+throughput/latency across composite beyond text autoregressive loops.
+models
+Maintains substantially more goodput Couple routing/disaggregation with
+under changing power caps than re- per-phase DVFS and grid demand reported baselines
+sponse.
+Online model uses prompt length, Extend
+the
+predictor
+from
+cache hit, queue depth, KV pressure, latency-only to multi-objective
+etc. to predict TTFT/TPOT
+latency+energy+carbon.
+
+[Li
+
+llm-d
+predictedlatency
+routing
+[Mitra et al., 2026]
+
+4
+
+KV
+
+Learned routing
+
+A Taxonomy of Sustainable Inference Levers
+
+For this synthesis, I use eight control layers. The boundaries are not strict; the point is to make the interactions
+visible, because optimizing one layer in isolation can worsen another.
+1. Request layer: prompt length, output budget, reasoning mode, deadlines, priority, batchability, and expected
+reuse.
+2. Model layer: model size, dense versus MoE, quantization, speculative-draft configuration, LoRA/adapters,
+and model cascade choice.
+3. Phase/operator layer: prefill, reasoning/thinking, answer decode, encoders, diffusion heads, experts, and
+other composite operators.
+5
+
+4. State layer: KV cache locality, precision, TTL, offload tier, replication, peer transfer, and recomputation.
+5. Hardware layer: accelerator family, memory capacity/bandwidth, frequency/power state, tensor/expert/pipeline
+parallelism, and interconnect.
+6. Replica/cluster layer: queue depth, batch formation, routing, flow control, autoscaling, consolidation, and
+failure recovery.
+7. Datacenter/region layer: PUE, thermal headroom, power caps, electricity price, carbon intensity, water
+stress, and renewable availability.
+8. Lifecycle layer: embodied carbon, hardware lifetime, host overprovisioning, reuse, and recycling.
+A sustainable control plane should not necessarily optimize all eight layers on every request. Instead, it
+should expose a hierarchy: fast millisecond-scale routing decisions, slower seconds/minutes autoscaling and
+power control, and still slower regional capacity/lifecycle decisions.
+
+5
+
+Why llm-d Is a Natural Sustainability Control Point
+
+llm-d is designed above the model-serving engine, allowing vLLM, SGLang, and other backends to focus
+on efficient execution while the control plane manages distributed placement and orchestration. By v0.8, the
+project explicitly described itself as an inference control plane and expanded beyond a single engine and a
+single text-serving pattern [llm-d Maintainers, 2026a]. By v0.9, high availability, GPU-utilization-aware routing,
+hardened flow control, broader autoscaling foundations, and support for additional workload classes had moved
+the architecture further toward a general production control layer [llm-d Maintainers, 2026b].
+Three current capabilities are especially relevant.
+Learned request routing. The predicted-latency scheduler trains an online regression model from prompt
+length, prefix cache hit rate, running requests, queue depth, and KV utilization to estimate TTFT and TPOT on
+each endpoint [Mitra et al., 2026]. Those features overlap with the inputs an energy predictor would likely need.
+A natural experiment is to add GPU power/frequency/energy counters and hardware identity and test whether the
+same routing architecture can estimate incremental joules well enough to influence endpoint selection.
+Portable KV reuse. Peer-to-peer cache sharing explicitly evaluates whether copying KV state to a better-loaded
+endpoint beats recomputation [Guy et al., 2026]. The synthesis proposed here is to make that crossover function
+richer: compare not only latency, but also transfer energy, recompute energy, memory pressure, and future reuse
+probability.
+Request-level observability. End-to-end OpenTelemetry tracing now spans Gateway, Endpoint Picker, KVcache, prefill/decode proxy, and model server, exposing the causal path of a request [Liu and Kumar, 2026]. That
+tracing path provides a practical place to test request-level attribution by attaching measured or estimated energy
+and carbon to the same trace that already explains cache score, phase placement, and queue time.
+These properties make llm-d more suitable for sustainability orchestration than a model-server-only solution.
+The sustainability controller needs visibility across replicas and freedom to choose among them; it should not be
+embedded so deeply in a single engine that it cannot compare heterogeneous endpoints or regions.
+
+6
+
+Proposed Architecture: Sustainable Inference Control Plane
+
+Based on the patterns above, I sketch an extension of the llm-d decision loop that I call the Sustainable Inference
+Control Plane (SICP). This section is a design proposal derived from the cited literature, not a description of
+functionality that is already implemented in llm-d. The design is intentionally incremental: existing performance
+signals remain useful, while sustainability signals become additional scorers, constraints, and autoscaling inputs.
+
+6
+
+Prefill pool
+compute-optimized
+Request
+tokens, SLO, quality
+deadline, modality
+
+KV hierarchy
+HBM/DRAM/storage/P2P
+
+Sustainable Router / EPP
+latency + energy + carbon
+cache + quality prediction
+
+Cluster / Region Controller
+autoscale, DVFS, carbon,
+power, thermal, batch deferral
+Decode pool
+bandwidth-optimized
+
+Model/accelerator
+variants
+
+Telemetry + Predictor Training
+OTel traces, DCGM/NVML, queue/KV metrics,
+grid carbon, power, temperature, quality
+
+Figure 1: Proposed Sustainable Inference Control Plane. Fast request routing predicts SLO feasibility, cache
+reuse, energy, and carbon; slower controllers change replica counts, phase allocation, power states, model variants,
+and regional placement. Telemetry closes the loop.
+
+6.1
+
+Fast-path request decision
+
+For each request r and feasible endpoint/plan e, the controller estimates:
+L̂r,e = fL (xr , se ),
+
+(1)
+
+Êr,e = fE (xr , se ),
+
+(2)
+
+emb
+Ĉr,e = Êr,e · CIg(e) (t) + Cr,e
+,
+
+(3)
+
+Q̂r,e = fQ (xr , me ),
+
+(4)
+
+K̂r,e = fK (xr , se , me ),
+
+(5)
+
+where xr includes request properties (input tokens, expected output tokens, modality, reasoning budget, deadline,
+reusable-prefix fingerprint), se includes endpoint state (queue, cache hit, KV pressure, GPU utilization, frequency,
+emb is an
+hardware, batch state), CIg(e) (t) is time-varying grid carbon intensity for the endpoint region, Cr,e
+amortized embodied-carbon term when lifecycle-aware accounting is enabled, and K̂r,e is the predicted monetary
+serving cost of assigning request r to endpoint or execution plan e.
+The route is selected from the feasible set F that satisfies quality and SLO constraints:
+h
+i
+e∗ = arg min αL̂r,e + β Êr,e + γ Ĉr,e + δ K̂r,e + ηRr,e ,
+(6)
+e∈F
+
+subject to
+T TˆF T r,e ≤ SLOT T F T ,
+
+T PˆOT r,e ≤ SLOT P OT ,
+
+Q̂r,e ≥ Qmin .
+
+(7)
+
+Rr,e captures reliability or recomputation risk. The weights need not be static: a datacenter under a demandresponse event can increase the power/carbon term, while a latency-critical interactive request can emphasize
+SLO headroom.
+A practical implementation should avoid hiding every trade-off inside one opaque scalar. A simpler starting
+policy is lexicographic: (1) reject infeasible quality/SLO plans; (2) satisfy reliability and capacity constraints; (3)
+select from the remaining Pareto frontier using the operator’s sustainability policy. This prevents a low-carbon
+route from silently violating user-visible performance.
+
+6.2
+
+Cache action as an explicit decision
+
+When a useful prefix exists elsewhere, the router chooses among four actions: local hit, route-to-owner, peer
+transfer, or recompute. For a candidate transfer from endpoint i to j, transfer is sustainability-preferred when
+net
+Ei→j
++ Ejload + λMjpressure < Ejrecompute ,
+
+7
+
+(8)
+
+subject to the latency crossover and expected reuse. For agentic workloads, a fifth action—retain for TTL—
+competes with eviction/offload, following the insight of Continuum [Li et al., 2025a]. This makes cache policy a
+measurable energy optimization instead of an implicit side effect of routing.
+
+6.3
+
+Phase-aware power and hardware control
+
+The phase controller assigns prefill and decode to hardware classes and power states based on phase sensitivity.
+Splitwise motivates heterogeneous phase placement [Patel et al., 2024]; PowerSlider shows why power caps
+should be allocated differently across phases [Li et al., 2026]. In SICP, the autoscaler therefore reasons in units
+of workload variants: e.g., long-context prefill on compute-dense accelerators, decode on memory-bandwidthefficient devices, or mixed/aggregated execution when network transfer cost outweighs disaggregation benefit.
+
+6.4
+
+Model and reasoning routing
+
+The request classifier can additionally choose a model or reasoning mode. Model-routing research shows that
+many requests do not require the most expensive model [Chen et al., 2023, Ding et al., 2024, Ong et al., 2024].
+The proposal here is to extend that idea to an explicit quality-constrained sustainability decision. Importantly, the
+controller should measure the energy of both the router and the selected model; a complex routing model that
+saves few large-model calls can erase its own benefit.
+
+6.5
+
+Regional and temporal scheduling
+
+Interactive traffic has limited geographic and temporal flexibility, but batch/offline traffic may have substantial
+slack. EcoServe identifies the importance of batch inference [Li et al., 2025b]; XWind and carbon-aware routing
+show that location and real-time electricity mix can be useful control signals [Reddy et al., 2026, Bernhard
+and Yardimci, 2026]. Therefore, the slow path can defer or shift eligible work under a deadline while keeping
+latency-sensitive sessions pinned for cache locality and user experience.
+
+7
+
+Metrics: From Tokens per Second to Sustainable Goodput
+
+Performance-only metrics can reward waste. Conversely, energy-only metrics can reward unacceptable latency or
+low-quality models. For evaluation, it is more informative to report a vector of SLO- and quality-constrained
+metrics.
+Let GSLO be useful output tokens (or completed requests) that meet all required latency and quality constraints
+over interval T . Then report:
+GSLO
+Etotal
+GSLO
+GC =
+Cop + Cemb
+GSLO
+GW =
+Wtotal
+GSLO
+G$ =
+Costtotal
+GE =
+
+SLO-goodput per joule,
+
+(9)
+
+SLO-goodput per gCO2 e,
+
+(10)
+
+SLO-goodput per liter water,
+
+(11)
+
+SLO-goodput per dollar.
+
+(12)
+
+These metrics should be accompanied by TTFT, TPOT/inter-token latency, P50/P95/P99 end-to-end latency,
+request success rate, model quality, cache hit rate, input/output token throughput, GPU/accelerator utilization,
+and power. The Stanford “intelligence per watt” direction similarly argues for relating capability to energy rather
+than energy alone [Stanford Hazy Research, 2025].
+
+8
+
+Why a vector rather than one green score? Operational carbon, embodied carbon, water, cost, and latency
+are not interchangeable. A single weighted score embeds value judgments and can hide regressions. A Pareto
+frontier makes trade-offs explicit and allows the same benchmark to support different operator policies.
+
+8
+
+Experimental Roadmap
+
+A later implementation study would need to validate SICP with controlled, reproducible experiments rather than
+treating the design sketch itself as evidence. The following test plan is intended as a practical starting point.
+
+8.1
+
+Testbed
+
+At minimum, use two accelerator classes with different compute/memory/power characteristics and 8–16 serving
+endpoints. A stronger evaluation includes NVIDIA H100/H200/B200-class hardware plus one alternative
+accelerator family supported by the serving stack. Deploy vLLM and SGLang variants through llm-d, with
+Prometheus/OpenTelemetry plus DCGM/NVML-equivalent energy telemetry.
+
+8.2
+
+Workloads
+
+Use a workload matrix rather than one synthetic trace:
+• short-chat: small prompts and moderate decode;
+• long-context/RAG: long shared prefixes and medium decode;
+• code: long prompts with short-to-medium output;
+• reasoning: variable, potentially long generation;
+• agentic: repeated multi-turn prefixes with tool-call pauses;
+• batch/offline: deadline-flexible inference;
+• multimodal: encoder + LLM + generation path where supported.
+Each workload should sweep offered load from underutilized to saturation and vary prefix sharing.
+
+8.3
+
+Baselines
+
+Compare against: round-robin; least-loaded; cache-aware routing; predicted-latency routing; energy-only routing;
+carbon-only routing; and the proposed joint SICP policy. For phase management, compare aggregated serving,
+fixed P/D disaggregation, and adaptive aggregation/disaggregation. For KV, compare recompute, owner-affinity,
+offload, and P2P transfer.
+
+8.4
+
+Ablations
+
+Ablate each sustainability signal: remove energy prediction, carbon intensity, cache energy, model routing,
+DVFS, and embodied-carbon term. This is necessary to distinguish true sustainability gains from a generic
+load-balancing improvement.
+
+8.5
+
+Measurement discipline
+
+Energy should be measured at sufficiently high temporal resolution and attributed to requests or batches, not
+inferred solely from device TDP. Host energy and network/storage energy should be included where material.
+Carbon calculations should clearly separate measured energy from modeled grid intensity. Report PUE assumptions, carbon-data source, and whether carbon values are average or marginal. Embodied-carbon accounting
+should state lifetime and utilization amortization assumptions.
+
+9
+
+9
+
+Research Questions and Testable Hypotheses
+
+The proposed architecture yields concrete systems questions.
+RQ1: Can latency prediction be extended to energy prediction without expensive profiling? Hypothesis:
+features already used for predicted-latency routing—prompt length, cache hit, queue depth, running requests, KV
+utilization—plus hardware/power state are sufficient for useful short-horizon incremental-energy prediction.
+RQ2: When is cache transfer greener than recomputation? Hypothesis: for long shared prefixes on a
+high-bandwidth fabric, P2P transfer reduces both TTFT and energy, but the crossover shifts with prefix length,
+network type, source/destination memory tier, and endpoint utilization.
+RQ3: Is adaptive P/D disaggregation more energy-efficient than fixed disaggregation? Hypothesis: fixed
+disaggregation wastes energy under some SLO/load regimes, while an adaptive controller can choose aggregation,
+chunked prefill, or disaggregation based on TTFT/TPOT headroom and transfer cost.
+RQ4: Does carbon-aware routing conflict with cache locality? Hypothesis: region shifting can reduce
+operational carbon for batch and stateless traffic, but aggressive shifting of multi-turn sessions can increase
+recomputation enough to offset carbon gains. Session pinning plus carbon-aware placement of new sessions
+should dominate naive global routing.
+RQ5: How much sustainability gain comes from model routing versus infrastructure routing? Hypothesis:
+task-aware model selection yields the largest savings on heterogeneous query difficulty, while infrastructure
+routing dominates when a fixed model must be used for quality/compliance reasons. The best system composes
+both.
+RQ6: Can the same control plane manage agentic and multimodal workloads? Hypothesis: a graph/phase
+representation inspired by composite serving systems such as M* [Jha et al., 2026] can generalize sustainability
+decisions beyond the two-stage text P/D abstraction.
+
+10
+
+Future of llm-d: Toward a Resource-Intelligence Control Plane
+
+Recent llm-d evolution suggests that its long-term value is not a specific optimization but a common decision
+layer above rapidly changing inference engines. The project has already expanded cache management, heterogeneous engine support, multimodal serving, batch flow control, agentic/RL workflows, GPU-aware routing,
+and deep tracing [llm-d Maintainers, 2026a,b, Liu and Kumar, 2026]. The next logical step is to make resource
+intelligence first-class.
+I see seven concrete engineering directions that follow from the synthesis. These are proposed extensions
+or experiments; unless explicitly cited as an existing capability, they should not be read as current extttllm-d
+features.
+1. Energy-aware Endpoint Picker plugins. Add predicted incremental joules and power headroom alongside
+cache and latency scores.
+2. Carbon-aware WorkloadVariantAutoscaling. Autoscale not only on saturation/SLOs but on carbon intensity
+and demand-response signals, with hard guardrails for availability.
+3. Phase-specific DVFS and accelerator selection. Map compute-heavy prefill and memory-heavy decode to
+their energy-efficient hardware/power points.
+4. Energy-priced KV orchestration. Make local hit, owner routing, P2P copy, DRAM/storage offload, and
+recompute explicit alternatives in one cost model.
+10
+
+5. Quality-aware model/adapter routing. Integrate small/large model cascades and reasoning-budget selection
+while preserving a declared minimum quality.
+6. Sustainability traces. Attach estimated/measured joules, grid intensity, cache-reuse avoided compute, and
+phase placement to the same OpenTelemetry request trace.
+7. Cross-cluster federation for flexible work. Route deadline-tolerant batch inference across regions or
+renewable-powered sites while protecting cache-local interactive sessions.
+If implemented carefully, this would shift the optimization target from “tokens/second per GPU” to “qualityand SLO-satisfied useful work per constrained resource.” That is a more durable abstraction because accelerators,
+model architectures, and energy systems will continue to change.
+
+11
+
+Limitations and Responsible Claims
+
+The claim boundary in this paper is intentionally conservative. Numerical improvements and measured behaviors
+cited throughout belong to the original systems and authors, under their hardware, workloads, and measurement
+assumptions. This paper does not re-measure those results, does not claim that SICP has been implemented, and
+does not claim that the reported gains would carry over unchanged to an llm-d-based implementation. The
+contribution is the comparison and connection of those findings into a control-plane design hypothesis. The cited
+improvements should not be combined arithmetically or treated as additive. For example, a 50% energy reduction
+from one optimization and a 40% carbon reduction from another do not imply a 70%+ combined reduction.
+Interactions can be antagonistic: speculative decoding may improve latency but increase energy at high batch;
+more GPUs can reduce latency while increasing total energy; cache retention can avoid recompute but increase
+memory pressure; and geographic carbon routing can degrade cache locality.
+Carbon accounting also depends on location, time, PUE, and whether average or marginal grid emissions
+are used. Water impact is even more site-specific and may be dominated by cooling or electricity-generation
+assumptions. Embodied-carbon accounting depends on hardware lifetime and utilization. These uncertainties
+argue for reporting raw energy and system behavior alongside modeled environmental metrics.
+Finally, sustainability must not become a pretext for quality degradation that is invisible to users. Model
+routing and reasoning-budget control should be bounded by explicit quality requirements and evaluated on
+application-relevant tasks.
+
+12
+
+Conclusion
+
+The papers reviewed here attack different parts of the LLM serving stack, but they repeatedly expose the same
+kinds of control variables: workload shape, phase behavior, cache locality, hardware choice, power state, SLO
+headroom, and placement. My reading of that common pattern is that sustainability is not only a model- or
+kernel-level optimization problem; it is also an orchestration problem.
+That is why llm-d is an interesting place to connect these ideas. A sustainability-aware experiment can
+build on existing serving engines rather than replace them, and can test whether energy, carbon, cache-recompute
+cost, and power headroom are useful signals alongside TTFT, TPOT, queue depth, and cache locality.
+The paper’s main proposal is deliberately testable: treat the path of an inference request as an optimization
+target, while holding quality and SLOs constant. The next step is implementation and measurement. Until that
+work is done, the SICP architecture should be read as an engineering hypothesis derived from prior research, not
+as a claim of measured improvement.
+
+Acknowledgments
+This manuscript is a research synthesis and systems proposal. All empirical results, numerical improvements,
+and existing system capabilities discussed in the paper are credited to the cited authors and projects; no new
+11
+
+experimental measurements are claimed here. I am grateful to the research and open-source communities whose
+papers, systems, benchmarks, and technical documentation make this kind of cross-layer comparison possible.
+
+References
+Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S. Gulavani, Alexey
+Tumanov, and Ramachandran Ramjee. Taming throughput-latency tradeoff in llm inference with sarathi-serve.
+arXiv preprint arXiv:2403.02310, 2024.
+Aleks Bernhard and Arif Baran Yardimci. Routing llm inference to the cleanest grid in real time. arXiv preprint
+arXiv:2608.06188, 2026.
+Lingjiao Chen, Matei Zaharia, and James Zou. Frugalgpt: How to use large language models while reducing cost
+and improving performance. arXiv preprint arXiv:2305.05176, 2023.
+Dujian Ding, Ankur Mallick, Chi Wang, Robert Sim, Subhabrata Mukherjee, Victor Ruhle, Laks V. S. Lakshmanan, and Ahmed Hassan Awadallah. Hybrid llm: Cost-efficient and quality-aware query routing. arXiv
+preprint arXiv:2404.14618, 2024.
+Jared Fernandez, Clara Na, Vashisth Tiwari, Yonatan Bisk, Sasha Luccioni, and Emma Strubell. Energy considerations of large language model inference and efficiency optimizations. arXiv preprint arXiv:2504.17674,
+2025.
+Nili Guy, Liran Schour, and Maroon Ayoub. Pull, don’t recompute: Peer-to-peer kv cache sharing in llm-d. llm-d
+Project Blog, August 2026. URL https://llm-d.ai/blog/p2p-kv-cache-sharing-llm-d.
+Atindra Jha, Naomi Sagan, Keisuke Kamahori, Irmak Sivgin, Rohan Sanda, Steven Gao, Mark Horowitz, Luke
+Zettlemoyer, Olivia Hsu, Jure Leskovec, Baris Kasikci, and Stephanie Wang. M*: A modular, extensible,
+serving system for multimodal models. arXiv preprint arXiv:2606.12688, 2026.
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao
+Zhang, and Ion Stoica. Efficient memory management for large language model serving with pagedattention.
+arXiv preprint arXiv:2309.06180, 2023.
+Hanchen Li, Runyuan He, Qiuyang Mang, Qizheng Zhang, Huanzhi Mao, Xiaokun Chen, Hangrui Zhou, Alvin
+Cheung, Joseph Gonzalez, and Ion Stoica. Continuum: Efficient and robust multi-turn llm agent scheduling
+with kv cache time-to-live. arXiv preprint arXiv:2511.02230, 2025a. Revised 2026.
+Yueying Li, Zhanqiu Hu, Esha Choukse, Rodrigo Fonseca, G. Edward Suh, and Udit Gupta. Ecoserve: Designing
+carbon-aware ai inference systems. arXiv preprint arXiv:2502.05043, 2025b.
+Yueying Li, Jiayang Chen, Yuanfan Chen, Leo Han, Haoran Qiu, Esha Choukse, Rodrigo Fonseca, and Udit
+Gupta. Powerslider: Exploiting phase asymmetry for llm serving under demand response. arXiv preprint
+arXiv:2608.21719, 2026.
+Yujun Lin, Haotian Tang, Shang Yang, Zhekai Zhang, Guangxuan Xiao, Chuang Gan, and Song Han. Qserve:
+W4a8kv4 quantization and system co-design for efficient llm serving. arXiv preprint arXiv:2405.04532, 2024.
+Guangya Liu and Prateek Kumar.
+Seeing through the stack: End-to-end and fine-grained
+tracing in llm-d.
+llm-d Project Blog, August 2026.
+URL https://llm-d.ai/blog/
+end-to-end-and-fine-grained-tracing-in-llm-d.
+llm-d Maintainers. llm-d v0.8: From platform to control plane. llm-d Project Blog, June 2026a. URL
+https://llm-d.ai/blog/llm-d-v0.8-from-platform-to-control-plane.
+12
+
+llm-d Maintainers. llm-d v0.9: Hardened for scale. llm-d Project Blog, August 2026b. URL https://llm-d.
+ai/blog/llm-d-v0.9-hardened-for-scale.
+Kaushik Mitra, Benjamin Braun, Abdullah Gharaibeh, and Clayton Coleman. Predicted-latency based
+scheduling for llms.
+llm-d Project Blog, March 2026.
+URL https://llm-d.ai/blog/
+predicted-latency-based-scheduling-for-llms.
+Hari Narasimhan and Aditya Menon. Speculative cascades: A hybrid approach for smarter, faster
+llm inference. Google Research Blog, September 2025. URL https://research.google/blog/
+speculative-cascades-a-hybrid-approach-for-smarter-faster-llm-inference/.
+Isaac Ong, Amjad Almahairi, Vincent Wu, Wei-Lin Chiang, Tianhao Wu, Joseph E. Gonzalez, M. Waleed Kadous,
+and Ion Stoica. Routellm: Learning to route llms with preference data. arXiv preprint arXiv:2406.18665,
+2024.
+Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Inigo Goiri, Saeed Maleki, and Ricardo Bianchini.
+Splitwise: Efficient generative llm inference using phase splitting. In Proceedings of the 51st Annual
+International Symposium on Computer Architecture (ISCA), 2024.
+Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu. Mooncake:
+A kvcache-centric disaggregated architecture for llm serving. arXiv preprint arXiv:2407.00079, 2024.
+Tella Rajashekhar Reddy, Atharva Deshmukh, Liangcheng Yu, Chaojie Zhang, Mike Shepperd, Rohan Gandhi,
+Anjaly Parayil, Srinivasan Iyengar, Ajay Manchepalli, and Debopam Bhattacherjee. Xwind: A cross-site router
+for large language model inference serving at renewable energy farms. arXiv preprint arXiv:2605.23348, 2026.
+Stanford Hazy Research. Intelligence per watt: A study of local intelligence efficiency. Stanford University,
+November 2025. URL https://hazyresearch.stanford.edu/blog/2025-11-11-ipw.
+Jovan Stojkovic, Chaojie Zhang, Inigo Goiri, Esha Choukse, Haoran Qiu, Rodrigo Fonseca, Josep Torrellas, and
+Ricardo Bianchini. Tapas: Thermal- and power-aware scheduling for llm inference in cloud platforms. In
+Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages
+and Operating Systems (ASPLOS), pages 1266–1281, 2025a. doi: 10.1145/3676641.3716025.
+Jovan Stojkovic, Chaojie Zhang, Inigo Goiri, Josep Torrellas, and Esha Choukse. Dynamollm: Designing llm
+inference clusters for performance and energy efficiency. Proceedings of the IEEE International Symposium
+on High-Performance Computer Architecture (HPCA), 2025b.
+Chao Wang, Pengfei Zuo, Zhangyu Chen, Yunkai Liang, Zhou Yu, and Ming-Chang Yang. Prefill-decode aggregation or disaggregation? unifying both for goodput-optimized llm serving. arXiv preprint arXiv:2508.01989,
+2025.
+Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu, Xin Jin, and Hao Zhang. Distserve:
+Disaggregating prefill and decoding for goodput-optimized large language model serving. In 18th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI), 2024.
+
+13
+

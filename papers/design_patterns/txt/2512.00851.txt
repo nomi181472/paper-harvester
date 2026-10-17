@@ -1,0 +1,798 @@
+City-Conditioned Memory for Multi-City Traffic and Mobility
+Forecasting
+Du Wenzhang1
+
+arXiv:2512.00851v1 [cs.LG] 30 Nov 2025
+
+1
+
+Department of Computer Engineering, Mahanakorn University of Technology, International
+College (MUTIC), Bangkok, Thailand, dqswordman@gmail.com
+December 2, 2025
+Abstract
+Deploying spatio-temporal forecasting models across many cities is challenging: traffic networks differ
+in size and topology, data volume per city can vary by orders of magnitude, and new cities often arrive
+with only a few weeks of logs. Existing deep traffic models are typically trained per city and backbone,
+making it costly to maintain separate predictors for each deployment. In this work we ask: can we design
+a single, backbone-agnostic layer that conditions on “which city this sequence comes from”, improves
+accuracy in both full- and low-data regimes, and yields better cross-city adaptation, while requiring
+minimal changes to existing models?
+We propose CityCond, a light-weight city-conditioned memory layer that can be attached to a broad
+family of spatio-temporal backbones. CityCond combines a city-ID encoder with an optional shared
+memory bank (CityMem). Given a city index and backbone hidden states, it produces city-conditioned
+features that modulate the backbone through residual connections. We instantiate this design with five
+representative backbones—GRU, temporal convolution networks (TCN), Transformers, graph neural
+networks (GNN), and spatial-temporal GCNs (STGCN)—and evaluate across three realistic regimes: (i)
+full-data training on METR-LA and PEMS-BAY, (ii) low-data training with only 5–50
+Across 14+ model variants and three random seeds, CityCond yields consistent gains on traffic
+forecasting, with the largest improvements for high-capacity backbones. On full-data traffic, CityMemTransformer reduces error by roughly one third compared to a shared Transformer baseline, and CityMemSTGCN improves over STGCN by 30–35
+
+Keywords: traffic forecasting, spatio-temporal modeling, graph neural networks, transfer learning,
+multi-city learning, trajectory prediction
+
+1
+
+Introduction
+
+Urban traffic and mobility forecasting are core building blocks of AI-powered smart cities. Accurate predictions
+of road speed, volume, or pedestrian trajectories enable congestion mitigation, dynamic routing, and safer
+planning for shared spaces. Over the past decade, deep spatio-temporal models—diffusion convolutional
+RNNs (DCRNN) [1], STGCN [2], Graph WaveNet [3], MTGNN [4], adaptive graph RNNs [5], among many
+others—have significantly advanced single-city traffic forecasting. However, large operators rarely serve a
+single urban system: they must deploy models across dozens of cities, each with different topology, sensor
+layouts, and data volumes.
+A straightforward approach is to train a separate model per city and per backbone. This siloed paradigm
+does not scale. It duplicates training and maintenance cost, and it fails when a new city has only a short
+history of logs. Meanwhile, an emerging line of work explores cross-city transfer learning and meta-learning:
+MetaST learns a pattern-based spatio-temporal memory from multiple cities [6]; RegionTrans (Wang et al.)
+aligns similar regions across cities for transfer [7]; ST-MetaNet (Pan et al.) uses deep meta learning for traffic
+prediction [8]; and Selective Cross-City Transfer (CrossTReS) re-weights source regions for transfer [9]. These
+
+1
+
+methods demonstrate that city-level knowledge can be shared, but they often require complex training loops
+or tightly coupled architectures that are hard to drop into existing systems.
+In this work we explore a complementary question: Can we build a single, backbone-agnostic layer that
+conditions on city identity, can be plugged into existing spatio-temporal models with minimal code changes,
+and consistently improves performance across full-data, low-data, and cross-city regimes?
+We answer this by proposing CityCond, a city-conditioned memory layer. CityCond takes as input a
+city index, backbone hidden states, and (optionally) raw node features; it outputs a city-conditioned feature
+vector that is fused back into the backbone. Concretely, CityCond has two components: (i) a CityID encoder
+that maps a discrete city index to a learnable embedding; and (ii) CityMem, an optional shared memory bank
+with K slots, queried by the city embedding and current hidden states via attention to produce a city-specific
+context vector. Because CityCond only depends on a city id and the backbone’s feature tensors, it can be
+attached to a wide range of models without modifying their recurrence, convolution, or attention patterns.
+We instantiate CityCond on three representative traffic backbones—GRU, TCN, Transformer—and two
+graph-based backbones—GNN-based speed prediction and STGCN [2]. For each backbone we study three
+variants: Base (a multi-city shared model), CityID (Base plus a city embedding), and CityMem (CityID
+plus the memory bank). Our experiments cover: (i) full-data training on METR-LA and PEMS-BAY; (ii)
+low-data training where each city provides only 5–50
+Figure 1 gives an overview of the architecture. Figure 2 and Figure 3 summarize the main empirical
+trends. Tables 1–4 report detailed numbers.
+Contributions.
+
+Our main contributions are:
+
+• City-conditioned memory as a design pattern. We formalize CityCond as a general-purpose
+layer that augments existing spatio-temporal backbones with city-aware conditioning. CityCond can be
+implemented as a small module with a clear input–output interface, without altering backbone internals.
+• A unified multi-backbone, multi-regime benchmark. We provide a systematic evaluation of
+city conditioning across four families of backbones (sequence-only RNN/TCN/Transformer, graphbased GNN/STGCN), three data regimes (full-data, low-data, cross-city few-shot), and three datasets
+(METR-LA, PEMS-BAY, SIND). All experiments use common training protocols and multi-seed
+evaluation.
+• Empirical characterization of when city conditioning helps. We show that CityID and CityMem
+bring the largest gains for high-capacity backbones (Transformer, STGCN) in low-data and crosscity regimes, while simple LSTM backbones on human trajectories see more modest improvements.
+Our analysis highlights the interaction between backbone capacity, data budget, and city-conditioned
+memory.
+
+2
+
+Problem Setup
+
+We consider a set of cities (or scenes) C = {c1 , . . . , c|C| }. For each city c we observe multivariate time series
+indexed by discrete time steps t = 1, . . . , Tc .
+
+2.1
+
+Multi-city traffic forecasting
+
+For road traffic, each city c has a fixed set of sensors (nodes) Vc with |Vc | = Nc . At time t we observe
+node-level features xct,i ∈ Rdx (e.g., speed) for node i ∈ Vc . The graph structure may be given by an adjacency
+matrix Ac (GNN/STGCN) or implicitly handled in fully-connected backbones (Transformer).
+Given a history window of length Lh , we write the past observations as
+c
+Xt−L
+= {xcτ,i }tτ =t−Lh +1 ,
+h +1:t
+
+i ∈ Vc .
+
+Our goal is to predict the next Lf steps:
+
+c
+c
+X̂t+1:t+L
+= fθ Xt−L
+,c ,
+f
+h +1:t
+2
+
+Figure 1: Overview of CityCond. A city index is embedded and optionally used to query a shared memory
+bank (CityMem). The resulting city-conditioned context is fused back into backbone hidden states through
+gated residual connections, enabling backbone-agnostic integration.
+
+3
+
+where fθ is a spatio-temporal forecasting model that may optionally depend on a city index c through
+CityCond. We train fθ to minimize mean squared error (MSE) or mean absolute error (MAE) over all cities
+and time steps.
+
+2.2
+
+Multi-agent trajectory forecasting on SIND
+
+For intersection-level multi-agent trajectories, we use the SIND drone dataset [13], collected at a signalized
+intersection in Tianjin. It contains multi-agent tracks with 2D positions pct,j ∈ R2 for agent j, covering several
+traffic participant types. We subsample fixed-length windows of length Lh + Lf . Given history positions
+pct−Lh +1:t , we predict future positions pct+1:t+Lf for each agent using an LSTM-based encoder–decoder.
+Unlike traffic, SIND does not involve a static road graph; agents move in continuous 2D space with
+complex interactions. We therefore treat SIND primarily as a sanity check for city conditioning in a different
+mobility domain, rather than as the primary target of CityMem.
+
+2.3
+
+Backbone variants and regimes
+
+For each backbone we consider three variants:
+• Base: a single model trained jointly on all cities, without explicit city conditioning.
+• CityID: Base plus a city embedding; the embedding is concatenated to input features or hidden states.
+• CityMem: CityID plus a shared memory bank; CityMem is the full CityCond layer.
+We evaluate in three regimes:
+• Full-data: use all available training data from each city.
+• Low-data: uniformly subsample a fraction frac ∈ {0.05, 0.10, 0.20, 0.50} of training windows per city.
+• Cross-city few-shot: pre-train a model on a source city, then fine-tune on a target city using a short
+adaptation window, evaluating both pre- and post-adaptation performance.
+
+3
+
+City-Conditioned Memory Layer
+
+We now describe CityCond, focusing on its interface and how it integrates with different backbones.
+
+3.1
+
+CityID conditioning
+
+We first introduce a simple city-ID conditioning baseline. Let c ∈ C be a city index and ec ∈ Rdc a learnable
+embedding vector. For each time step t and node i, we form augmented inputs by concatenating ec :
+x̃ct,i = [xct,i ; ec ].
+For sequence-only backbones (GRU/TCN/Transformer), we concatenate ec to each time step’s feature vector.
+For graph-based backbones, we either concatenate ec to node features or to pooled graph features, depending
+on the architecture. This CityID variant is parameter-efficient (only |C| × dc extra parameters) and serves as
+a strong baseline for “hard” city conditioning without memory.
+
+3.2
+
+CityMem: city-conditioned memory bank
+
+CityMem extends CityID with a shared memory bank that captures reusable patterns across cities.
+Memory structure. CityMem maintains a learnable parameter matrix M ∈ RK×dm , where each row mk
+is a memory slot. Memory slots are shared across all cities and backbones using CityCond.
+
+4
+
+Query construction. Given backbone hidden states hct,i for node i at time t, we first compute a city-pooled
+hidden state hct . For sequence-only models, we use mean pooling over nodes (or directly use the sequence
+hidden state if there is no node dimension). For graph-based models, we apply mean or max pooling over
+nodes in the graph. We then form a query vector by combining city embedding and pooled hidden state:
+
+qtc = ϕq [ec ; hct ] ,
+where ϕq is a small MLP.
+Attention readout.
+
+We compute attention weights over memory slots:
+exp(⟨qtc , mk ⟩)
+c
+αt,k
+= PK
+.
+c
+′
+k′ =1 exp(⟨qt , mk ⟩)
+
+The memory readout is
+mct =
+
+K
+X
+
+c
+αt,k
+mk .
+
+k=1
+
+Fusion with backbone states.
+
+We fuse memory readout into backbone states via a gated residual:
+
+c
+c
+gt,i
+= σ Wg [hct,i ; mct ] ,
+h̃ct,i = hct,i + gt,i
+⊙ Wm mct ,
+
+where σ is a sigmoid, Wg and Wm are learnable matrices, and ⊙ is elementwise multiplication. The augmented
+states h̃ct,i are then passed to subsequent backbone layers. If we remove the dependence on ec in qtc , CityMem
+reduces to a global pattern memory shared across all cities; we treat this as an ablation in the appendix.
+
+3.3
+
+Backbone-agnostic integration
+
+A key design goal is that CityCond should be backbone-agnostic: it should require minimal changes to
+existing models. We use a simple contract. Inputs to CityCond include the city index c, node-level features
+or hidden states {hct,i }, and optional raw inputs {xct,i }. Outputs are augmented features h̃ct,i with the same
+shape as hct,i . This enables us to wrap existing backbone layers without modifying their internal recurrence
+or convolution.
+For Transformer-based traffic models, we consider an encoder-only architecture operating on flattened
+node–time tokens. CityID concatenates ec to each token’s input. CityMem is inserted after the first encoder
+block: we pool hidden states to form hct , compute mct , and fuse it back into all tokens at step t using the
+gated residual above. For sequence-only GRU and TCN backbones, node features are aggregated into a single
+per-time-step vector. CityID is concatenated to each time-step input. CityMem again operates after an early
+block, pooling across time or channels to form hct and fusing mct into time-step states. For graph-based traffic
+backbones (our GNN and STGCN implementations), hidden states hct,i live on nodes. We pool across nodes
+to obtain hct for querying memory, then broadcast the result back to nodes and apply gated fusion. This
+preserves the original spatial message-passing structure [2, 3, 14].
+
+3.4
+
+Complexity
+
+CityCond adds O(|C|dc + Kdm ) parameters and a small number of linear layers. In our experiments, this
+increases parameter count by less than 5% and training time by under 10% for all backbones. Compared
+to meta-learning schemes that require additional inner-loop optimization [6, 8, 9], CityCond retains the
+simplicity of standard supervised training.
+
+4
+
+Experimental Setup
+
+4.1
+
+Datasets
+
+METR-LA and PEMS-BAY are standard traffic benchmarks consisting of sensor networks in Los Angeles and
+the Bay Area, respectively, with 5-minute aggregated speed readings [1, 2, 3]. We follow common practice
+5
+
+and use 12-step histories to predict 12-step (METR-LA) or 6-step (PEMS-BAY) horizons, applying per-node
+z-score normalization. SIND is a drone dataset from a signalized intersection in Tianjin [13], providing tracked
+2D positions for multiple road-user types at roughly 10 Hz. We subsample to a constant frame rate and
+construct windows of 20 observed and 10 future steps. Table 1 summarizes dataset statistics, history/horizon
+lengths, and the number of cities/scenes.
+Table 1: Datasets and forecasting setups. History length Lh and horizon Lf follow Section 4.3. Traffic
+datasets use 5-minute aggregated speeds on fixed road graphs; SIND uses multi-agent trajectories from a
+drone view without a static graph.
+Dataset
+
+Domain
+
+Cities/Scenes
+
+Sampling
+
+Lh
+
+Lf
+
+METR-LA
+PEMS-BAY
+SIND
+
+Traffic speed
+Traffic speed
+Multi-agent trajectories (intersection)
+
+Los Angeles (1 city)
+Bay Area (1 city)
+1 signalized intersection (Tianjin)
+
+5-minute aggregation
+5-minute aggregation
+≈10 Hz (drone, subsampled)
+
+12
+12
+20
+
+12
+6
+10
+
+4.2
+
+Backbones and CityCond variants
+
+We instantiate five backbones: GRU (a two-layer gated recurrent unit network over flattened sensor features),
+TCN (a temporal convolutional network with dilated convolutions), Transformer (a 4-layer encoder with
+multi-head self-attention), GNN (a graph neural network with message passing over the sensor graph), and
+STGCN (a spatial-temporal graph convolutional network similar to [2]). For each backbone we train three
+variants: Base, CityID, CityMem. For SIND, we use an LSTM encoder–decoder with Base and CityID
+variants.
+
+4.3
+
+Data regimes and training protocol
+
+For each city and backbone, we consider: (i) full-data using all training windows; (ii) low-data by randomly
+sampling 5%, 10%, 20%, or 50% of training windows while holding out a fixed validation set; and (iii)
+cross-city transfer, where Transformer variants are pre-trained on one city (e.g., METR-LA) then fine-tuned
+for a fixed number of steps on the other (PEMS-BAY) using a small labeled set, evaluating both pre- and
+post-adaptation performance. We train all models with Adam, using early stopping on validation error. We
+run three random seeds (13, 21, 42) per configuration and report mean and standard deviation.
+
+4.4
+
+Evaluation metrics
+
+For traffic we report MSE and MAE averaged over all nodes and forecast horizons. For SIND we use finaldisplacement error (FDE) and average-displacement error (ADE) in meters, following standard practice [10,
+11, 12].
+
+5
+
+Results
+
+5.1
+
+Full-data traffic forecasting
+
+Table 2 summarizes full-data results on METR-LA+PEMS-BAY. We highlight three main observations. First,
+Transformers benefit most from CityMem: the city-agnostic Transformer baseline has the highest error among
+backbones (e.g., validation MSE ≈ 97.6). Adding CityID slightly improves MAE but leaves MSE similar,
+whereas CityMem-Transformer reduces validation MSE to ≈ 64.7 and MAE from ≈ 5.7 to ≈ 4.2, a relative
+improvement of roughly 30–35% in MSE and 25% in MAE. Second, graph backbones also see consistent gains.
+For the GNN backbone, CityID and CityMem both outperform the city-agnostic version, reducing MSE by
+about 8–9%. For STGCN (Table 2 and the supplemental STGCN aggregation), CityMem-STGCN achieves
+normalized error around 0.58 versus ≈ 0.86 for the base model, a reduction of about one third. Third, effects
+on lower-capacity sequence models are smaller: GRU and TCN baselines already perform competitively and
+6
+
+Table 2: Full-data traffic forecasting on METR-LA + PEMS-BAY. Means ± std over three seeds.
+backbone model
+MSE
+MAE
+gnn
+gnn
+gnn
+tf
+tf
+tf
+stgcn
+stgcn
+stgcn
+
+gnn base
+gnn cityid
+gnn citymem
+tf base
+tf cityid
+tf citymem
+base
+cityid
+citymem
+
+135.599 ± 2.398
+123.187 ± 4.423
+123.867 ± 2.899
+97.577 ± 3.621
+96.462 ± 3.109
+62.883 ± 5.159
+0.855 ± 0.229
+0.862 ± 0.234
+0.581 ± 0.006
+
+7.107 ± 0.176
+6.454 ± 0.145
+6.610 ± 0.086
+5.718 ± 0.121
+5.658 ± 0.025
+4.231 ± 0.169
+–
+–
+–
+
+Table 3: Low-data traffic forecasting on METR-LA + PEMS-BAY. Columns show the fraction of training
+data used. Means ± std over three seeds.
+backbone model
+0.10
+0.20
+gnn
+gnn
+gnn
+tf
+tf
+tf
+stgcn
+stgcn
+stgcn
+
+gnn base
+gnn cityid
+gnn citymem
+tf base
+tf cityid
+tf citymem
+base
+cityid
+citymem
+
+133.0 ± 8.5
+131.3 ± 9.4
+120.9 ± 7.1
+2305.7 ± 13.5
+2304.8 ± 17.3
+530.1 ± 254.9
+0.9 ± 0.1
+0.9 ± 0.1
+0.6 ± 0.0
+
+138.3 ± 8.9
+129.1 ± 11.7
+124.9 ± 8.9
+861.5 ± 43.7
+864.1 ± 38.1
+127.7 ± 14.9
+0.9 ± 0.1
+0.9 ± 0.2
+0.6 ± 0.0
+
+CityID/CityMem bring modest or no improvements. This supports our hypothesis that city-conditioned
+memory is most useful when the backbone has enough capacity to exploit the extra context.
+
+5.2
+
+Low-data traffic regimes
+
+Table 3 and Figure 2 show how error changes as we reduce the training data per city. Under severe data
+scarcity (5–10%), all models degrade substantially, but city-conditioned versions degrade less. For example,
+at 10% data, CityMem-Transformer’s validation MSE is around 530–540, compared to over 2300 for the
+base Transformer, yielding a large relative improvement. CityMem-STGCN similarly reduces error by over
+30% across fractions. Under moderate scarcity (20–50%), GRU and TCN gradually recover as more data is
+added, but still trail their full-data performance. CityMem-Transformer continues to outperform its baselines
+at all fractions, with especially strong gains at 20% (roughly 4–5× lower MSE than base). For GNN and
+STGCN, CityID and CityMem consistently improve low-data performance, although the margin shrinks as
+data increases. Standard deviations across seeds remain small for most CityMem variants, suggesting that
+conditioning does not introduce optimization instability.
+
+5.3
+
+Cross-city few-shot transfer
+
+We focus on Transformer-based models for cross-city transfer, as they benefit the most from CityMem. Table 4
+reports pre- and post-adaptation test MSE/MAE for METR-LA → PEMS-BAY and PEMS-BAY → METRLA. When trained on METR-LA and evaluated on PEMS-BAY without fine-tuning, CityMem-Transformer’s
+error is already substantially lower than the city-agnostic and CityID baselines. After a short fine-tuning
+phase on the target city, all models improve, but CityMem-Transformer achieves the largest relative gains.
+Figure 3 plots adaptation trajectories over gradient steps: CityMem-Transformer not only converges to a
+lower final error but also learns faster in the initial phase.
+
+7
+
+Validation MSE
+
+Low-data Transformer
+3000
+2500
+2000
+1500
+1000
+500
+0
+
+Transformer variant
+tf_base
+tf_cityid
+tf_citymem
+
+0.1
+
+0.2 0.3 0.4
+Training fraction
+
+0.5
+
+Low-data STGCN
+
+1.1
+Validation MSE
+
+1.0
+0.9
+0.8
+
+STGCN variant
+base
+cityid
+citymem
+
+0.7
+0.6
+0.1
+
+0.2 0.3 0.4
+Training fraction
+
+0.5
+
+Figure 2: Low-data traffic forecasting performance. (a) Transformer variants as the available training fraction
+decreases. (b) STGCN variants under the same low-data settings.
+
+METR-LA -> PEMS-BAY
+Pre-adapt
+Post-adapt
+
+Test MSE
+
+500
+400
+300
+200
+100
+0
+400
+
+base
+
+cityid
+
+citymem
+
+PEMS-BAY -> METR-LA
+Pre-adapt
+Post-adapt
+
+Test MSE
+
+300
+200
+100
+0
+
+base
+
+cityid
+
+citymem
+
+Figure 3: Cross-city few-shot transfer for Transformer backbones. Adaptation curves illustrate that CityMem
+improves both convergence speed and final error in both transfer directions.
+
+8
+
+Table 4: Cross-city few-shot transfer for Transformer backbones. “Pre” and “Post” denote error before and
+after adaptation on the target city. Means ± std over three seeds.
+train city
+test city
+model
+Pre MSE
+Post MSE
+METR-LA
+METR-LA
+METR-LA
+PEMS-BAY
+PEMS-BAY
+PEMS-BAY
+
+5.4
+
+PEMS-BAY
+PEMS-BAY
+PEMS-BAY
+METR-LA
+METR-LA
+METR-LA
+
+base
+cityid
+citymem
+base
+cityid
+citymem
+
+566.0 ± 2.3
+564.3 ± 2.2
+150.3 ± 3.4
+299.9 ± 11.7
+303.7 ± 1.7
+396.8 ± 15.0
+
+214.7 ± 1.3
+213.8 ± 0.7
+55.0 ± 0.3
+209.2 ± 1.1
+207.9 ± 3.9
+186.9 ± 1.5
+
+SIND multi-agent trajectories
+
+On SIND, we compare LSTM-Base and LSTM-CityID across full and low-data regimes. On the singleintersection dataset, CityID and Base achieve similar validation MSE and ADE/FDE, with differences under
+2%. CityID does not harm performance. When restricting training data to 5–50%, CityID consistently
+yields slightly lower validation MSE and ADE/FDE than Base, especially at 10–20% fractions (e.g., ∼5–8%
+relative reductions). This indicates that even simple city embeddings can help sequence models disambiguate
+heterogeneous trajectories in low-data settings. We did not deploy CityMem on SIND in this work, both to
+keep the experimental matrix manageable and because pedestrian motion lacks an explicit graph structure;
+we leave memory designs tailored to such settings as future work.
+
+6
+
+Analysis and Discussion
+
+6.1
+
+When does city conditioning help?
+
+Combining results across datasets, backbones, and regimes, a consistent picture emerges. For high-capacity
+sequence models (Transformer) and graph-based models such as GNNs and STGCNs, city conditioning—
+especially CityMem—substantially improves both full-data and low-data performance. It also yields strong
+benefits in cross-city transfer. For medium-capacity RNN/TCN backbones, the benefits are smaller and
+sometimes negligible, particularly in full-data regimes where the base model already fits well. For pedestrian
+trajectories, city-ID features help in low-data regimes but do not yet show the same magnitude of gains as in
+traffic, possibly due to task differences and the absence of graph structure. This suggests that city-conditioned
+memory is most valuable when the backbone has enough capacity to utilize additional context and when
+data per city is limited or heterogeneous.
+
+6.2
+
+CityID vs CityMem vs Base
+
+Our experiments also shed light on the relative roles of CityID and CityMem. CityID is a strong baseline:
+for GNN and STGCN, CityID alone often provides most of the gains over Base by allowing the model to
+shift biases and scales per city. On SIND, CityID offers consistent small improvements at low data fractions.
+CityMem provides structured sharing: for Transformer and STGCN, CityMem significantly outperforms both
+Base and CityID, particularly in low-data and cross-city regimes. This indicates that a shared memory bank
+allows the model to distill and reuse global patterns that are not captured by city-specific embeddings alone.
+In a few configurations (e.g., GRU with very small data), CityMem does not help or is slightly worse than
+CityID, consistent with the intuition that adding memory increases model capacity and can overfit without
+enough data.
+
+6.3
+
+Backbone capacity and data budget
+
+An interesting interaction emerges between backbone capacity and data budget. With large data, high-capacity
+models may already extract most of the useful structure from each city independently; city conditioning then
+offers moderate gains. With limited data, high-capacity models are more prone to overfitting, but CityMem
+
+9
+
+acts as a form of cross-city regularization: memory slots aggregated from multiple cities encourage sharing of
+reusable patterns (e.g., morning/evening rush-hour profiles). For low-capacity models (e.g., two-layer GRUs),
+the bottleneck remains the backbone itself; adding city conditioning brings smaller marginal improvements.
+These findings complement prior work on graph-based and meta-learning approaches [1, 2, 3, 4, 5, 6, 8, 9, 14],
+suggesting that even simple conditioning layers can meaningfully reshape the bias–variance trade-off in
+multi-city forecasting.
+
+6.4
+
+Qualitative behavior of CityMem
+
+We perform a preliminary qualitative analysis of learned memory slots for CityMem-Transformer and CityMemSTGCN (visualizations in the appendix). We observe that certain slots are consistently activated during
+rush-hour periods across both METR-LA and PEMS-BAY, suggesting they capture global traffic patterns
+such as “morning commuting into downtown”. Other slots show city-specific preferences—for example, slots
+that are more active in PEMS-BAY’s evening rush hour than in METR-LA—indicating that the attention
+mechanism naturally balances global reuse and city-specific specialization. During cross-city adaptation,
+attention shifts gradually from source-dominated to target-dominated slots, providing an interpretable view of
+how the model reuses and reweights shared patterns. While these observations are preliminary, they support
+our interpretation of CityMem as a shared pool of reusable spatio-temporal motifs.
+
+7
+
+Related Work
+
+7.1
+
+Spatio-temporal forecasting and graph neural networks
+
+Deep spatio-temporal models have become the de facto standard for traffic forecasting. DCRNN introduces
+diffusion convolution within an RNN to capture directed graph dynamics [1]. STGCN uses localized graph
+convolutions combined with temporal convolutions [2]. Graph WaveNet augments graph learning with dilated
+temporal convolutions [3], and MTGNN further unifies multivariate time-series forecasting with learned
+graphs [4]. Adaptive graph RNNs extend these ideas by learning dynamic adjacency matrices [5]. Surveys on
+spatial-temporal GNNs provide broader context for these architectures [14]. Our work is orthogonal to these
+backbones: CityCond neither changes their core message-passing mechanisms nor their loss functions, but
+sits on top as a city-conditioned adapter.
+
+7.2
+
+Cross-city transfer and meta-learning
+
+RegionTrans (Wang et al.) proposed regional transfer learning for deep spatio-temporal prediction by aligning
+similar regions across cities [7]. MetaST introduced a global pattern-based spatio-temporal memory and a
+meta-learning framework for transferring to data-scarce target cities [6]. ST-MetaNet (Pan et al.) used deep
+meta learning for urban traffic prediction [8]. Selective Cross-City Transfer (CrossTReS) further studied
+which cities to transfer from and how much to transfer via region re-weighting [9]. These methods highlight
+the importance of cross-city sharing but typically require complex training procedures (e.g., inner-loop
+optimization, region alignment). By contrast, CityCond is a single layer that can be attached to existing
+backbones and trained with standard supervised learning, while still capturing useful cross-city structure via
+shared memory.
+
+7.3
+
+Trajectory forecasting at signalized intersections and SIND
+
+Pedestrian trajectory prediction has seen rapid progress with RNNs and generative models. Social GAN
+uses a GAN framework to generate socially plausible trajectories [11]. Trajectron++ models multi-agent
+interactions and dynamic feasibility with conditional variational auto-encoders [10]. Social-STGCNN applies
+spatio-temporal GCNs to human trajectories [12]. The SIND drone dataset provides multi-agent trajectories
+from a signalized intersection in Tianjin [13]. We use SIND primarily as a complementary mobility task to
+test the generality of CityID-style conditioning in a non-graph setting. Designing memory mechanisms that
+explicitly account for human–human interactions remains an interesting direction.
+
+10
+
+8
+
+Conclusion and Future Directions
+
+We introduced CityCond, a light-weight city-conditioned memory layer that can be attached to a variety of
+spatio-temporal backbones. Through a unified experimental study on METR-LA, PEMS-BAY, and SIND, we
+showed that CityCond—especially its CityMem variant—consistently improves multi-city traffic forecasting
+in full-data, low-data, and cross-city few-shot regimes, with the largest gains for high-capacity backbones
+such as Transformers and STGCNs. Simple city-ID embeddings also help in pedestrian trajectory forecasting,
+particularly when data per scene is limited. Rather than proposing a monolithic new architecture, we advocate
+viewing city-conditioned memory as a reusable design pattern for scaling forecasting models across many
+urban systems under realistic resource constraints. In practice, CityCond can be implemented as a small
+module that wraps existing models, making it easy to integrate into production systems. Future work includes:
+extending CityCond to more cities and modalities (e.g., ride-hailing demand, bike sharing); incorporating
+richer city descriptors (POIs, demographics, policies) into the city encoder; exploring finer-grained memories
+at the region or sensor level; and deploying CityCond in online or continual-learning settings where cities
+evolve over time.
+
+References
+[1] Yaguang Li, Rose Yu, Cyrus Shahabi, and Yan Liu. Diffusion Convolutional Recurrent Neural Network:
+Data-Driven Traffic Forecasting. International Conference on Learning Representations (ICLR), 2018.
+[2] Bing Yu, Haoteng Yin, and Zhanxing Zhu. Spatio-Temporal Graph Convolutional Networks: A Deep
+Learning Framework for Traffic Forecasting. International Joint Conference on Artificial Intelligence
+(IJCAI), 2018.
+[3] Zonghan Wu, Shirui Pan, Guodong Long, Jing Jiang, and Chengqi Zhang. Graph WaveNet for Deep
+Spatial-Temporal Graph Modeling. IJCAI, 2019.
+[4] Zonghan Wu, Shirui Pan, Guodong Long, Jing Jiang, Xiaojun Chang, and Chengqi Zhang. Connecting
+the Dots: Multivariate Time Series Forecasting with Graph Neural Networks. ACM SIGKDD Conference
+on Knowledge Discovery and Data Mining (KDD), 2020.
+[5] Lei Bai, Lina Yao, Can Li, Xianzhi Wang, and Can Wang. Adaptive Graph Convolutional Recurrent
+Network for Traffic Forecasting. Advances in Neural Information Processing Systems (NeurIPS), 2020.
+[6] Huaxiu Yao, Yiding Liu, Ying Wei, Xianfeng Tang, and Zhenhui Li. Learning from Multiple Cities: A
+Meta-Learning Approach for Spatial-Temporal Prediction. World Wide Web Conference (WWW), 2019.
+[7] Leye Wang, Xu Geng, Xiaojuan Ma, Feng Liu, and Qiang Yang. Cross-City Transfer Learning for Deep
+Spatio-Temporal Prediction (RegionTrans). IJCAI, 2019.
+[8] Zheyi Pan, Yuxuan Liang, Weifeng Wang, Yong Yu, Yu Zheng, and Junbo Zhang. Urban Traffic Prediction
+from Spatio-Temporal Data Using Deep Meta Learning (ST-MetaNet). ACM SIGKDD Conference on
+Knowledge Discovery and Data Mining, 2019.
+[9] Yilun Jin, Kai Chen, and Qiang Yang. Selective Cross-City Transfer Learning for Traffic Prediction
+via Source City Region Re-Weighting (CrossTReS). Proceedings of the ACM SIGKDD Conference on
+Knowledge Discovery and Data Mining (KDD), 2022.
+[10] Tim Salzmann, Boris Ivanovic, Punarjay Chakravarty, and Marco Pavone. Trajectron++: DynamicallyFeasible Trajectory Forecasting with Heterogeneous Data. European Conference on Computer Vision
+(ECCV), 2020.
+[11] Agrim Gupta, Justin Johnson, Li Fei-Fei, Silvio Savarese, and Alexandre Alahi. Social GAN: Socially
+Acceptable Trajectories with Generative Adversarial Networks. Conference on Computer Vision and
+Pattern Recognition (CVPR), 2018.
+
+11
+
+[12] Abduallah Mohamed, Kun Qian, Mohamed Elhoseiny, and Christian Claudel. Social-STGCNN: A Social
+Spatio-Temporal Graph Convolutional Neural Network for Human Trajectory Prediction. CVPR, 2020.
+[13] Yanchao Xu, Wenbo Shao, Jun Li, Kai Yang, Weida Wang, Hua Huang, Chen Lv, and Hong Wang.
+SIND: A Drone Dataset at Signalized Intersection in China. arXiv preprint arXiv:2209.02297, 2022.
+[14] Zonghan Wu, Shirui Pan, Fengwen Chen, Guodong Long, Chengqi Zhang, and Philip S. Yu. A Comprehensive Survey on Graph Neural Networks. IEEE Transactions on Neural Networks and Learning
+Systems, 2021.
+[15] Wei Zhao, Shiqi Zhang, Bing Zhou, and Bei Wang. STCGAT: A Spatio-Temporal Causal Graph Attention
+Network for Traffic Flow Prediction in Intelligent Transportation Systems. PeerJ Computer Science,
+2023.
+[16] Silke K. Kaiser, Filipe Rodrigues, Carlos Lima Azevedo, and Lynn H. Kaack. Spatio-Temporal Graph
+Neural Network for Urban Spaces: Interpolating Citywide Traffic Volume (GNNUI). arXiv preprint
+arXiv:2505.06292, 2025.
+
+12
+

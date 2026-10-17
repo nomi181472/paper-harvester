@@ -1,0 +1,1559 @@
+Structured State Reconciliation for Human–AI Task Handover
+KAYLEIGH BISHOP, University of Colorado Boulder, USA
+MARIA P. STULL, University of Colorado Boulder, USA
+BREANNE CROCKETT, University of Colorado Boulder, USA
+BRADLEY HAYES, University of Colorado Boulder, USA
+Task handover requires communicating enough current state for a successor to resume work, yet the relevant information is often
+
+arXiv:2608.28907v1 [cs.HC] 28 Aug 2026
+
+divided between system records and human observations. System records can be precise and timestamped but only partially observe
+the task, while human reports capture intent and task knowledge that no log contains but are vulnerable to omission and memory
+error. We present a provenance-aware pipeline that converts task telemetry and human-authored reports into a shared typed task-state
+representation, aligns and reconciles their facts, detects conflicts, and generates structured handover reports. We evaluate the approach
+on 13 paired task states collected in a controlled spatial multitask environment, using task-grounded metrics that estimate the
+state-reconstruction cost a report would spare a hypothetical recipient and the misinformation burden it would impose. Reconciling
+both sources preserved greater estimated task-state utility than either the user report or telemetry alone. Relative to a direct end-to-end
+LLM given the same inputs, structured reconciliation maintained comparable estimated utility while incurring substantially less
+misinformation, and task-aware rendering retained utility more efficiently (per token) than exhaustive rendering. An exploratory
+content analysis further shows that human reports contain substantial strategic knowledge that lies outside state-focused metrics.
+These results support provenance-aware state reconciliation as a design pattern for safer AI-assisted handover; recipient-side task
+performance is not directly measured and remains an important validation step.
+CCS Concepts: • Human-centered computing → Empirical studies in HCI; Collaborative and social computing; • Computing
+methodologies → Natural language generation.
+Additional Key Words and Phrases: task handover, provenance, large language models, knowledge graphs, information reconciliation,
+situation awareness, human–AI collaboration, misinformation
+ACM Reference Format:
+Kayleigh Bishop, Maria P. Stull, Breanne Crockett, and Bradley Hayes. 2026. Structured State Reconciliation for Human–AI Task
+Handover. In Proceedings of Make sure to enter the correct conference title from your rights confirmation email (Conference acronym ’XX).
+ACM, New York, NY, USA, 33 pages. https://doi.org/XXXXXXX.XXXXXXX
+
+Authors’ Contact Information: Kayleigh Bishop, kayleigh.bishop@colorado.edu, University of Colorado Boulder, Boulder, Colorado, USA; Maria P. Stull,
+University of Colorado Boulder, Boulder, Colorado, USA; Breanne Crockett, University of Colorado Boulder, Boulder, Colorado, USA; Bradley Hayes,
+University of Colorado Boulder, Boulder, Colorado, USA.
+Permission to make digital or hard copies of all or part of this work for personal or classroom use is granted without fee provided that copies are not
+made or distributed for profit or commercial advantage and that copies bear this notice and the full citation on the first page. Copyrights for components
+of this work owned by others than the author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or republish, to post on
+servers or to redistribute to lists, requires prior specific permission and/or a fee. Request permissions from permissions@acm.org.
+© 2026 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+Manuscript submitted to ACM
+Manuscript submitted to ACM
+
+1
+
+2
+1
+
+Bishop et al.
+Introduction
+
+Task handover, the transfer of responsibility for an ongoing task from one agent to another, is among the most frequent
+sites of critical error in high-stakes domains. In medical settings, communication failures at care transition are a leading
+contributor to preventable adverse medical events; incomplete or inaccurate transfer of patient state information leads
+to missed treatments, duplicated interventions, and delayed responses to deterioration [24, 39]. Analogous cascading
+failures resulting from handover miscommunication have been documented in aviation, chemical processing, and
+emergency response [25, 27, 36]. Standardization tools and mnemonics like I-PASS or SBAR (both utilized in the
+healthcare domain) aim to reduce the cognitive burden of handover by imposing a consistent structure to handover
+reports, reducing reliance on ad hoc recall. While these interventions have shown measurable reductions in reported
+errors [26, 39], the onus remains on the outgoing agent to identify, retain, and articulate task-relevant information, all
+while managing high workloads, frequent interruptions, and the natural decay of contextual detail over time. Researchers
+have highlighted the ongoing challenges of addressing the dynamic needs and complex decision support demanded
+by fast-paced or unpredictable environments, and the outstanding need for effective information support systems
+in handover [1]. Recent work has begun to apply natural language processing and large language models (LLMs) to
+handover documentation itself: benchmarking speech recognition and information extraction over nursing handover
+[41], generating and evaluating emergency-medicine handoff notes [16, 17], and deploying LLM-assisted nursing
+handover documentation across hospitals [7]. These studies establish that LLMs can draft handover documentation and
+reduce documentation burden, but they generally synthesize a single record stream and evaluate the quality of the
+resulting draft. A different and comparatively underexplored problem motivates the present work: at handover time,
+the information a successor needs is typically divided between two partial and potentially conflicting accounts (system
+records and the outgoing worker’s own report), and an effective support system must reconcile them, preserve where
+each piece of information came from, and control the misinformation it passes on.
+The difficulty of handover lies in the inherent challenge of situation awareness (SA) transfer across an agent boundary.
+During a task, a worker’s SA is continuously updated as they perceive relevant state information, integrate it into a
+coherent model of the situation, and project it forward [12]. This awareness is inherently dynamic and perishable;
+interruptions and multitasking cause memory traces for lower-salience goals to decay, requiring active recovery through
+re-engagement with environmental cues [15]. At handover time, however, the incoming agent must acquire SA from
+the outgoing agent’s report, or risk losing valuable time to manually re-acquiring key state information. Thus the
+handover report (typically a written artifact, though often accompanied by supplementary verbal exchange [2, 29])
+must often serve as the sole external scaffold for SA reconstruction. This framing highlights one necessary component
+of handover quality: whatever else a report conveys, the incoming agent must be able to reconstruct a sufficiently
+accurate model of the current task state from an incomplete externalization of the outgoing agent’s awareness. We
+focus on this recoverable-state component throughout, while recognizing that interactive communication, strategic
+guidance, and common-ground negotiation also contribute to successful handover [8, 29].
+In instrumented workplaces, the raw material for reconstructing task state is divided between two sources with
+complementary strengths and failure modes. System records (telemetry, event logs, electronic documentation) are
+precise and timestamped but capture only what has been instrumented, omitting dialogue, intent, and contextual
+observations. Human accounts capture exactly this uninstrumented content, including strategy and anticipated next
+steps [1, 45], but are vulnerable to omission and memory error [11, 49]. Effective handover assistance must therefore
+reconcile two partial accounts of the same underlying state, not merely summarize whichever one is available.
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+
+3
+
+An obvious approach is to place both sources in an LLM’s context window and request a summary. Direct synthesis
+of this kind, however, leaves several hard problems implicit: the sources differ in reliability; they can contradict each
+other; event records mix stale and current facts; and generation can introduce content supported by neither source [19].
+Providing source material does not by itself guarantee grounded output [40], and clinician-reviewed evaluations of LLMdrafted handoff summaries continue to report omissions and mischaracterizations that require human review [16, 17].
+A free-form summary also carries no explicit provenance: the recipient cannot distinguish statements corroborated by
+system records from statements resting solely on the outgoing worker’s memory, or from statements the two sources
+actively dispute [13, 14].
+We present a provenance-aware pipeline that treats handover report generation as structured state reconciliation.
+The pipeline converts system telemetry and the outgoing worker’s free-text report into a shared typed knowledge
+representation, aligns entities and facts across the two sources, detects conflicts, reconciles temporal state so that
+the representation reflects current rather than historical conditions, and preserves the provenance of every fact. A
+constrained LLM rendering step then realizes the reconciled state as a report. Because not all facts are equally costly to
+rediscover, a task-aware rendering variant foregrounds outstanding needs and the locations required to satisfy them,
+while an exhaustive variant reports all available state [35, 48].
+We evaluate the approach on 13 paired task states collected in a controlled spatial multitask handover environment
+inspired by information-work challenges in healthcare [29, 33, 34], in which participants made partial task progress
+under time pressure and interruption before writing a handover report. Our evaluation is deliberately artifact-level:
+we score each report’s content against the ground-truth task state under an explicit search-cost model, estimating (i)
+the state-reconstruction effort the report would spare a hypothetical recipient and (ii) the misinformation burden it
+would impose. We do not observe a recipient resuming the task; downstream recipient performance is the motivating
+application of this work, not its measured outcome.
+Our study is organized around three research questions and one exploratory question:
+• RQ1 (Source complementarity). Does reconciling human-authored reports with system telemetry improve
+estimated recoverable task-state utility relative to either source alone?
+• RQ2 (Value of explicit reconciliation). Does explicit structured state reconciliation reduce the misinformation
+burden of generated reports relative to direct end-to-end LLM synthesis over the same source inputs?
+• RQ3 (Task-aware rendering). Does task-aware rendering improve task-value density (estimated utility per
+token) relative to exhaustive rendering while preserving comparable estimated task-state utility?
+• Exploratory. What information do human-authored reports contribute that is not represented by state-recovery
+metrics?
+This work makes three contributions:
+• A provenance-aware state reconciliation pipeline for task handover that converts system telemetry and a
+human-authored report into a shared typed representation, aligns entities and facts, detects and preserves
+conflicts, reconciles temporal state, and constrains LLM generation to the reconciled result. Unlike prior handover
+documentation systems that synthesize a single record stream, the pipeline treats the two accounts as jointly
+partial and mutually correcting.
+• A task-grounded, artifact-level evaluation framework that scores handover reports against ground-truth task
+state in cost-denominated units, separating estimated task-state utility from misinformation burden rather than
+Manuscript submitted to ACM
+
+4
+
+Bishop et al.
+treating all extracted facts as equally valuable. The framework is task-specific by design; its purpose is to make
+report quality objectively measurable for controlled comparison.
+• Empirical evidence from 13 paired task states that (i) reconciling both sources preserves more estimated task-state
+utility than either source alone, (ii) explicit reconciliation substantially reduces misinformation relative to an
+end-to-end LLM given identical inputs, at comparable estimated utility, and (iii) task-aware rendering achieves a
+better utility–length tradeoff than exhaustive rendering. An exploratory content analysis additionally documents
+substantial strategic knowledge in human reports that state-focused metrics do not credit, informing how such
+systems should divide labor between human and machine.
+
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+2
+
+5
+
+Background and Related Work
+
+To design and evaluate an intervention for handover support, we drew on existing research across human factors,
+computing for collaborative work, and explainable AI.
+2.1
+
+Handover as collaborative knowledge transfer and information work
+
+Prior research characterizes handover as a collaborative and context-dependent process in which responsibility must be
+transferred under severe temporal and cognitive constraints. Bosua and Venkitachalam [2] collected case studies of
+handover practices from multiple industries, including manufacturing and customer service, and examine them through
+the lens of their use of "boundary objects": artifacts, such as notes or written reports, that bridge the communicative
+boundary between collaborators [31]. In their work, the authors identified the most common boundary object as the
+handover sheet. This is typically a standard form that workers use to document relevant information that collaborators
+should be aware of to ensure continuity of progress. Handover sheets provide a much-needed infrastructure to scaffold
+knowledge transfer. Workplaces that lacked such an artifact reported lost productivity due to both repeated work and a
+lack of shared procedural knowledge; one CEO complained that "...[employees] keep solving the problems over and
+over again during shifts" [2, 32].
+Further work, particularly in the healthcare domain, has investigated the role of information work in ensuring task
+continuity. Information work refers to the process of seeking, receiving, and sharing information, and thus encompasses
+both handover itself and the myriad steps of information gathering, synthesis, and interpretation that it requires
+[46]. Recent work has identified the fragmented nature of information support tools in settings such as emergency
+departments, and highlighted the necessity of integrating, retaining, and processing patient information dynamically
+[1, 47]. Yang et al. identified information access cost (IAC) as a key determinant of junior doctors’ pre-handover
+information work; clinicians were more likely to rely on memory alone for patient information that took more time
+to verify, resulting in more errors during handover preparation [48]. This manual burden, in which synthesis and
+integration must be performed anew by a time-constrained sender or recipient at significant risk of information loss, is
+where automated assistance offers leverage. It further motivates our decision to operationalize the value of handover
+content via the information work it saves the recipient, while exploring how automated synthesis of system- and
+human-authored information can reduce that burden.
+2.2
+
+Situation awareness and distributed cognition at handover
+
+Endsley’s three-level model characterizes situation awareness (SA) as the perception of elements in the environment,
+the comprehension of their meaning in relation to current goals, and the projection of their future states [12]. Applied
+to handover, this framing clarifies that a complete report is not simply an inventory of observed facts (perception) but
+must also convey their task-relevant significance (comprehension) and their likely trajectory (projection); for instance,
+not only that a door is locked, but it blocks progress towards a current goal, and the recipient should expect to need a
+specific key soon. This distinction between raw state and its interpreted significance has two consequences for our own
+framework. First, it points to why conveying significance efficiently, and not merely completely, matters at handover: a
+report that lists every perceived fact without signaling which are comprehension- or projection-relevant imposes its
+own cost on the recipient, who must then perform that interpretive work themselves. This motivates our task-value
+density measure (see Evaluation), which evaluates reports not just on the estimated task-state utility they preserve, but
+also on how economically that utility is conveyed per unit of report length. Second, it makes clear the need to parse
+Manuscript submitted to ACM
+
+6
+
+Bishop et al.
+
+strictly state-related information (perception) from procedural knowledge (projection) information, which we address
+via our taxonomy of content in handover reports.
+In practice, however, SA is rarely held exclusively by a single person; in team settings it must be distributed and
+reconciled across individuals with different access to information. Clark et al. reviewed handover tools and techniques
+through this distributed SA lens across healthcare, aviation, energy, and other high-risk industries, cataloguing nineteen
+distinct techniques in use [9]. Their comparison of domain-specific mnemonics is instructive: healthcare’s SBAR is
+built around a holistic, interpretive account of patient status, while air traffic control mnemonics such as PRAWNS
+convey discrete, descriptive facts (e.g., runway in use, barometric pressure) and rely on the operator’s own schemata to
+interpret their significance [9]. This split between content meant to convey interpreted significance and content meant
+to convey state data recurs informally across the domains they survey.
+Individual studies within this space have gone further, formally modeling which information matters most to
+distributed SA at handover. Rosario et al. used Bayesian belief networks to identify which process variables most affect
+a recipient’s distributed SA in shift changeovers, and should therefore be prioritized in verbal handover updates [35].
+Their approach demonstrated that not all information is equally consequential to reconstruct SA after a handover, and
+that principled prioritization is possible. This finding directly motivates our information access cost metric, which
+likewise treats facts as differentially costly to omit rather than uniformly weighted. Their method’s reliance on a finite,
+hand-specified set of process variables and hand-analyzed example reports, however, limits its applicability to less
+structured or more open-ended task domains; our pipeline’s use of an LLM-derived fact ontology is intended to relax
+this constraint.
+A complementary line of work addresses the process by which two parties come to a shared situational understanding.
+Clark and Brennan’s theory of common ground describes communication as a joint process of establishing and updating
+mutually known information, with participants continuously inferring what can safely be assumed shared versus
+what must be made explicit [8]. This offers a useful lens on why knowledge-transfer content is so pervasive in the
+user-generated reports we collect. Senders are not simply reporting state, but making implicit judgments about what
+a recipient with full state visibility would still lack (i.e., what cannot be inferred from telemetry alone). Where SA
+theory describes what a mental model must contain, common ground theory explains why some of that content resists
+formalization into discrete, verifiable facts describing task state, and is instead conveyed as heuristic or experiential
+guidance.
+
+2.3
+
+Standardization interventions and evaluation
+
+Efforts to improve handover in high-stakes domains have largely centered on standardizing what gets communicated,
+rather than on measuring communication quality directly. In healthcare, the now widely-adopted I-PASS handoff
+program introduced a structured mnemonic and standardized verbal and written format for shift-change reporting
+across multiple pediatric residency programs [20], and similar benefits have been reported for other standardization
+protocols such as SBAR [39]. Implementation of these programs was associated with significant reductions in medical
+errors and preventable adverse events, demonstrating that structuring what a sender is prompted to include can
+meaningfully improve handover outcomes in practice. Notably, evaluation of these protocols has been largely indirect:
+standardized, reliable measurement tools for handoff quality itself have remained elusive [30], so effectiveness has
+typically been measured downstream, via the rate of medical errors following implementation, rather than via any
+property of the reports or the receiving clinician’s resulting task state. This leaves open a methodological question
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+
+7
+
+that standardization efforts do not by themselves answer: given two handover reports of the same task state, which
+preserves more of the information a recipient would otherwise have to reconstruct at a cost?
+This absence of a direct evaluation method has not gone entirely unaddressed. O’Connel et al. developed and
+psychometrically validated the Handover Evaluation Scale, a 14-item self-report instrument spanning quality of
+information, interaction and support, and efficiency subscales, intended to monitor handover practices across healthcare
+organizations [28]. This instrument is valuable for organizational quality assurance, but it measures participants’
+subjective perception of handover effectiveness at the level of an overall process, rather than providing an objective,
+artifact-level measure of how much task-relevant information a specific report preserves or omits; nor is it designed for
+comparison between individual reports or reporting strategies, which our task-aware and baseline conditions require.
+The methodological need therefore persists at the level our study operates on: an artifact-level, task-grounded way
+to compare candidate reports of the same underlying state. Consistent with Patterson and Wears’s observation that
+general-purpose handoff measurement remains elusive [30], we position our evaluation framework as a task-specific
+instrument for controlled comparison, not a resolution of the general measurement problem.
+Similar dynamics appear outside healthcare. Industrial and manufacturing settings have adopted a range of AI-assisted
+handover tools (documented largely in industry materials rather than peer-reviewed evaluations, so we describe them
+here as practice context rather than as validated evidence), which fall broadly into two categories. The first automates
+system-side information work to improve situation awareness: digital shift logs auto-populate from PLC/SCADA data,
+dashboards flag deviations and route exceptions to responsible teams, and scheduling tools optimize shift staffing
+to smooth transitions [21, 42]. The second targets the human side, echoing the aims of standardization protocols in
+healthcare: voice-to-text logbooks, multimedia entries, and generative drafting tools aim to capture a worker’s account
+of a shift more consistently and richly [18, 44]. Both categories aim to improve on unaided manual handover, but neither
+treats the system-derived account and the human-authored account as two partial, potentially conflicting models of
+task state to be reconciled with one another; each instead automates or enriches one side of the handover in isolation,
+and, as in the clinical case, reports benefits in terms of speed and completeness of capture rather than any measure of
+what the recipient still needs to reconstruct after reading the result.
+Across clinical standardization, self-report instruments, and industrial tooling alike, a common pattern recurs:
+interventions standardize or enrich one account of the shift in isolation, and report their benefits in terms of capture
+speed and completeness. The relationship between the system-derived account and the human-authored account,
+two partial and potentially conflicting descriptions of the same task state, is generally left implicit. Our evaluation
+framework instead scores handover artifacts directly against ground-truth task state in a controlled environment, and
+our pipeline treats telemetry and user report as complementary inputs to a single reconciled, provenance-preserving
+representation.
+2.4
+
+AI and NLP for handover documentation
+
+Applying language technology to handover documentation is not itself new. Suominen et al. established benchmark data
+and methods for clinical speech recognition and information extraction over nursing shift-change handover, framing
+the conversion of verbal handover into structured, filterable documentation as an NLP task [41]. More recently, LLMs
+have been applied to drafting handoff documents directly. Hartman et al. developed and evaluated LLM-generated
+emergency-medicine handoff notes against physician-written notes, coupling automated completeness metrics with a
+clinical evaluation of usefulness and patient-safety implications, and found that automated notes could be useful but
+required careful safety evaluation before deployment [17]. Genes et al. had emergency-department providers review
+Manuscript submitted to ACM
+
+8
+
+Bishop et al.
+
+generative-AI handoff summaries, documenting omissions and mischaracterizations that underscore the continued
+need for human review [16]. Chen et al. reported a multi-hospital deployment of LLM-assisted nursing handover
+documentation, achieving documentation-time savings under constrained prompts and mandatory nurse verification of
+generated content [7]. In HCI, Solano-Kamaiko et al. investigated how conversational AI might facilitate coordination
+and shift-style information sharing among home care workers and family caregivers, highlighting design tensions
+around trust and information asymmetry in care networks [37].
+Collectively, these studies establish the feasibility and documentation benefits of AI-drafted handover artifacts.
+However, they generally synthesize a single record stream (e.g., the electronic record) or evaluate the quality of a
+drafted note against clinician judgment. The present work examines a complementary problem that these systems leave
+implicit: explicitly reconciling a system-derived account and a human-authored account that differ in observability and
+reliability, preserving the provenance of each fact through generation, and evaluating the resulting artifact against
+ground-truth task state rather than against reviewer impressions alone.
+2.5
+
+Grounded generation, provenance, and structured intermediate representations
+
+Our pipeline design is also informed by work on factual reliability in language generation. Surveys of hallucination in
+natural language generation distinguish output that is unfaithful to its source material from output that is factually
+incorrect about the world [19], a distinction our misinformation analysis inherits. Merely providing source material
+does not guarantee grounded output: even retrieval-augmented long-form generation frequently produces statements
+unsupported by the retrieved context [22, 40]. One mitigation strategy is attribution: enabling models to generate text
+with citations to supporting evidence [14], and attributing even erroneous sentences to their most likely source so
+that errors can be located and repaired [13]. In clinical summarization specifically, logic-controlled generation systems
+constrain discharge-summary content by explicit rules and retain source attribution [50]. Our approach applies these
+ideas to handover: a typed, provenance-preserving intermediate representation with explicit conflict detection serves as
+a reliability mechanism that reduces the generation step to constrained realization of already-reconciled state, consistent
+with broader evidence that structured intermediate representations improve LLM performance on complex tasks [10].
+We treat the graph structure itself as incidental; what matters are the properties it enforces: typed facts, provenance,
+temporal status, and inspectable conflicts.
+2.6
+
+Relationship to model reconciliation
+
+Prior work in explainable AI has formulated explanation generation as a problem of reconciling the mental task models
+of agents and humans [5]. Under this formulation, an explanation system maintains a second-order model of the
+recipient’s current understanding of task state, and produces explanations as targeted "model updates" that optimize
+the recipient’s expected task performance against the cost of communicating the update [38, 43]. A limiting assumption
+in this line of work is that both the recipient’s policy and the true, static state of the world are known in advance. This
+assumption does not hold in handover: the dynamic nature of real-world workplaces means it is often impossible to
+determine a priori which information will prove relevant to the recipient [1]. Clinical practice reflects a similar tension:
+the SBAR and I-PASS handover mnemonics, among the most widely used in healthcare, explicitly separate factual
+"Situation/Background" reporting from forward-looking "Recommendations" and "Contingency planning" [26, 39],
+echoing the state/knowledge distinction we formalize in our own taxonomy. For this reason, we deliberately formulate
+handover support as provenance-aware state reconciliation rather than model reconciliation, and we regard this as the
+correct formulation for the setting rather than a simplification of it. At handover time the recipient’s belief state is
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+
+9
+
+unavailable in principle: the incoming worker may not yet be identified, brings unknown prior knowledge, and cannot
+be queried before the report must exist. A system built around a second-order model of that recipient would rest on an
+unverifiable estimate, and its outputs could only be judged against further assumptions. Reconciling the two evidence
+sources that demonstrably exist (telemetry and the outgoing worker’s report) instead anchors every retained fact to
+concrete, checkable evidence, which is what makes our approach objectively measurable: each reconciled fact and each
+rendered claim can be scored against ground-truth task state, and our evaluation does exactly this. We retain classical
+model reconciliation as motivation for treating reports as targeted updates rather than transcripts, but the implemented
+and evaluated object is the reconciled state estimate.
+The comparisons in our evaluation map directly onto the research questions introduced in Section 1. RQ1 (source
+complementarity) contrasts the fused pipeline against user-report-only and telemetry-only inputs. RQ2 (value of explicit
+reconciliation) contrasts the structured pipeline against a direct end-to-end LLM given identical source inputs. RQ3 (taskaware rendering) contrasts task-aware against exhaustive realization of the same reconciled state. The accompanying
+content analysis of what human reports contribute beyond task state is exploratory: we state no directional hypothesis
+about whether participants emphasize strategic knowledge over state.
+
+Manuscript submitted to ACM
+
+10
+
+Bishop et al.
+
+Fig. 1. Provenance-aware state reconciliation pipeline. From left to right: (1) Raw input: source evidence (timestamped telemetry
+events and sentences from the human-authored report); (2) Structured graphs: source-specific typed facts extracted from each
+source; (3) Reconciled graph: alignment and conflict detection, classifying each fact as corroborated, telemetry-only, human-only,
+or conflicting; (4) Narrative view: temporal reconciliation, which prunes superseded facts to yield a current-state estimate with
+provenance retained, and conversion to top-down entity-centric view; and (5) Natural language report: constrained report realization.
+The pipeline’s contribution is not conversion of text into a graph per se, but preservation of where each fact came from, explicit
+detection of disagreement, computation of current (rather than historical) state, and constrained generation over the result.
+
+3
+
+Provenance-Aware Task-State Reconciliation
+
+We characterize handover support as a provenance-aware state reconciliation problem. Let 𝑂𝑠 denote the timestamped
+observations logged by the task environment (the system trace), and let 𝑅ℎ denote the free-text report written by
+the outgoing worker (the “sender”). Each source induces a set of candidate task-state facts; for each fact 𝑓 we track
+its provenance 𝑃 (𝑓 ) (which source(s) support it), its temporal position where available, and its support status after
+cross-source comparison (corroborated, single-source, or conflicting). The system’s objective is deliberately modest:
+construct a current task-state estimate that (i) retains supported, task-relevant facts from both sources, (ii) distinguishes
+source and uncertainty for every retained fact, and (iii) minimizes unsupported content in the realized report 𝑌 . Facts
+differ in how costly they are for a recipient to re-acquire (e.g., re-discovering the location of a person or item requires
+physical search), and this asymmetry motivates both our task-aware rendering condition and our evaluation metric
+(Section 5). We emphasize the boundary of this formulation, and that it is drawn deliberately: we do not model the
+recipient’s beliefs or policy, because at handover time these are unobservable and often the recipient is not yet known,
+and any formulation anchored to them would make the system’s correctness unverifiable. Anchoring the formulation
+to world state instead keeps every output claim objectively checkable, and the realized report is evaluated accordingly,
+against ground-truth task state under an explicit search-cost model.
+Our system generates structured handover reports by combining two complementary information sources (a system
+trace logged by the task environment and a free-text verbal report written by the outgoing worker) into a unified
+knowledge representation. The system trace is objective and verifiable, but intentionally limited to capture discrete,
+instrumentable events (such as state transitions and agent-environment interactions) while excluding information that
+resists structured logging, such as dialogue content, agent intent, or contextual reasoning. An LLM then renders this
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+
+11
+
+representation into a natural-language report for the incoming worker. We describe each stage of this pipeline below
+and then present the ablation conditions used to isolate the contribution of each component.
+3.1
+
+Knowledge graph schema
+
+We represent task state as a typed knowledge graph whose nodes are entities (people, items, locations) and whose edges
+are structured facts. Our schema, defined using Pydantic models, supports three fact types:
+(1) Location facts: anchor an entity to a named room (e.g., "Lily is in Room 1").
+(2) Relation facts: capture task-relevant predicates using a controlled set of relation types (e.g. needs-medication,
+received-medication, awaiting-message)
+(3) Spatial facts: encode directional references that cannot yet be resolved to a specific room or entity (e.g., "someone
+in the west hall is waiting on a message").
+Entity arguments can be named (a specific person or item) or existential (an underspecified reference such as
+"someone" or "a message"), with an optional spatial constraint. This distinction allows the schema to faithfully represent
+the varying specificity typical of verbal reports.
+3.2
+
+Semantic graph construction
+
+Both inputs are converted to semantic graphs in a shared format for the purposes of later comparison. For our task,
+system telemetry uses a consistent text template for world events that can be deterministically converted into the graph
+format.
+The task environment logs timestamped events (room transitions, character interactions, medication pickups) to a
+text file (the system trace). A rule-based parser extracts facts from these events using pattern matching, maintaining
+a running state tracker for player location and most recently interacted patients to resolve implicit references. This
+transform is fully deterministic and produces a complete record of every observable (to the system) action the outgoing
+player performed.
+User written notes are first converted via LLM to a templated domain-specific language (DSL), extracting state-related
+facts to simple text strings (e.g. "Oliver is in room 2"). The DSL is constrained by a set of fixed templates and few-shot
+examples that enforce consistent formatting. Second, a deterministic parser converts each DSL line into a typed fact,
+handling entity normalization, directional parsing, and existential argument detection.
+This two-stage extraction design (LLM for surface-form normalization followed by deterministic parsing) confines
+the language model’s role to information extraction. We note the precise reproducibility boundary: all transformations
+after each LLM-produced structured output are deterministic, but the pipeline is not LLM-free end to end, since both
+this normalization step and the existential-reference resolution during entity alignment (below) invoke a model. Model
+identifiers, prompts, and decoding settings for every LLM call are reported in Section 5 and the supplementary material.
+3.3
+
+Graph alignment and merging
+
+The resulting graphs from the previous step (referred to as the "system graph" and "user graph" respectively) are able to
+be directly compared to identify novel facts, omissions, and potential contradictions via two alignment steps.
+Entity alignment maps named entities across the two graphs using string normalization and an alias table, then resolves
+existential arguments (e.g., "someone to the north") against the telemetry entity set using an LLM call, classifying each as
+resolved, ambiguous, or unresolvable. Entities in a given graph described with partial and/or existential descriptors (e.g.
+Manuscript submitted to ACM
+
+12
+
+Bishop et al.
+
+"the patient in room 1" or "someone in the west wing") are resolved to their matching exact referent in the corresponding
+graph, if such a match can be found and there is sufficient information to resolve it.
+Fact alignment matches facts on identity (same entity and predicate) and compares them field-by-field. The result
+classifies each report fact as confirmed (matching between the two graphs), novel (present only in the report), or
+conflicting (matching entity/predicate but differing on a value). Contradictions are flagged only in cases where two
+facts are incompatible (e.g. a person cannot be in multiple rooms at once).
+Facts from both graphs are added to a final graph with a flag to indicate their origin and classification, including a
+record of detected conflicts.
+
+3.4
+
+Provenance and conflict representation
+
+Every fact admitted to the merged graph carries an explicit provenance record: whether it is supported by telemetry, by
+the user report, or corroborated by both, together with its alignment classification (confirmed, novel, or conflicting) and
+a record of any detected conflict. Disagreement is not silently collapsed at merge time: when the two sources assert
+incompatible values, both facts are retained and flagged, so that downstream stages can reason about the conflict as a
+first-class artifact rather than receiving a single silently-chosen value. Facts supported only by the user report are, by
+the observability design of our environment, unverifiable from telemetry; they are retained but remain distinguishable
+from corroborated facts throughout the pipeline. In the current implementation, provenance and conflict records are
+available to the report generator through the narrative view (below), but are not rendered as explicit source labels in
+the final report prose; we return to the implications of this design choice in the Discussion and Limitations.
+
+3.5
+
+State reconciliation
+
+A reconciliation pass replays the logical consequences of event-type facts over the declarative state. For example, (lily,
+needs, medication 1) is pruned if a later-timestamped (lily, received, medication 1) was added. This ensures the graph
+reflects the current outstanding task state rather than a cumulative event log, a critical distinction for generating
+actionable handover reports. The predicate vocabulary of these rules is domain-specific (e.g., needs → received, awaitingmessage → delivered, location superseded by later movement), but the underlying pattern of later-timestamped event
+facts superseding earlier declarative state is general, and porting the pipeline to a new domain requires specifying the
+analogous supersession rules for that domain’s predicates.
+
+3.6
+
+Narrative view construction for top-down view
+
+The reconciled final graph from the previous step is restructured to a top-down view, where state facts are listed by
+location and relevant entity. It also collects any unanchored or miscellaneous facts that could not be resolved to a
+particular entity. Facts are converted back from graph triples to natural language strings. The resulting "narrative view"
+preserves the context, provenance and confidence data from previous steps while converting key semantic data into a
+format more suitable for LLM input.
+While earlier versions of the pipeline omitted this step and used the reconciled graph directly in the LLM prompt,
+we found that restructuring the graph around rooms and task requirements helped performance by providing the LLM
+with information that is already organized for spatial reasoning and task prioritization, rather than requiring the model
+to navigate a flat list of heterogeneous facts.
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+Condition
+User report (baseline)
+Task-aware (TA)
+Full-realization (FR)
+End-to-end (end2end)
+Telemetry-only (TA -user)
+
+Human report
+x
+x
+x
+x
+-
+
+Telemetry
+x
+x
+x
+x
+
+Structured repr.
+x
+x
+x
+
+13
+Reconciliation
+x
+x
+x
+
+Renderer
+Human (verbatim)
+Task-aware LLM prompt
+Exhaustive LLM prompt
+Task-aware LLM prompt
+Task-aware LLM prompt
+
+Table 1. Experimental conditions, decomposed by source input, intermediate representation, explicit state reconciliation, and renderer.
+All generated conditions are paired transformations of the same 13 participant task states.
+
+3.7
+
+Report generation
+
+While our system’s task modeling and reconciliation provide an organized view of task history and information, these
+steps do not address the problem of selecting key information to include in the report, or conveying that information in
+a human-readable way. To this end we leverage an LLM to make inferences over the available task information and
+written context. The LLM prompt contains the JSON-serialized narrative view from the previous step, along with a
+structured system prompt that specifies the report format. We define two prompt variants
+• Full realization prompt: An exhaustive structured report covering all known information (player status, active
+and completed patient needs, all entity and item locations, and any unresolved directional facts). This variant is
+designed to maximize information completeness.
+• Task-aware prompt: A compressed report that foregrounds only outstanding task requirements, entity locations
+relevant to those needs, and directional facts, while omitting completed actions. This variant is designed to
+maximize task-relevant information density.
+Both prompts enforce a rigid bulleted template to facilitate consistent downstream evaluation (i.e., ensuring that
+generated reports are amenable to the same structured extraction used for human reports).
+3.8
+
+Experimental conditions
+
+To answer our research questions and isolate the contribution of each pipeline component, we evaluate five report
+conditions, outlined in Table 1, decomposed by source input, intermediate representation, reconciliation, and renderer.
+The user report condition uses the outgoing participant’s original free-text report as-is, serving as the unaided human
+baseline. The task-aware and full-realization conditions run the full reconciliation pipeline and differ only in the
+rendering prompt; their contrast addresses RQ3. The end-to-end ablation bypasses graph construction, alignment,
+reconciliation, and narrative view entirely, providing the raw system trace and participant report directly to the same
+LLM with equivalent task-aware prompting; its contrast with the task-aware condition holds the source inputs and
+generation instructions fixed and isolates the value of explicit structured reconciliation (RQ2). The telemetry-only
+ablation omits the participant’s written report, running the full pipeline on telemetry alone; together with the user-report
+baseline it addresses source complementarity (RQ1).
+
+Manuscript submitted to ACM
+
+14
+
+Bishop et al.
+
+4
+
+Data and Controlled Task
+
+4.1
+
+A controlled multitask handover environment
+
+In order to examine how users prioritize and report task-relevant information while controlling for prior experience level
+and system state observability, we designed a controlled spatial multitask environment (inspired by information-work
+challenges documented in healthcare handover, but making no claim to clinical realism) that instantiates the information
+problems characteristic of handover: incomplete task progress at a deadline, multiple concurrent obligations, spatially
+distributed resources with non-trivial search costs, interruption, partial system observability, information available only
+through human observation, opportunity for memory error, and a required transfer to a successor. It deliberately does
+not instantiate other properties of real handover settings: domain expertise, clinical risk, shared professional schemas,
+interactive verbal clarification between sender and recipient, or longitudinal shifts. In this environment, participants
+control a player character in a top-down 2D world. The player can move around inside the map using arrow keys and
+interact with items or non-player characters (NPCs) using the spacebar. The player must complete tasks with several
+sequential steps by interacting with NPCs and items, and navigating through the game environment, with the goal to
+complete as many of these tasks as possible within the time limit.
+The player was tasked with interacting with 5 “patients," each in a different room. The tasks for each patient required
+several sequential steps, some of which needed to be repeated by each player. First, the player needed to fetch a specific
+item for each patient from one of two central storeroom locations. After receiving this item, the patient would request
+information from a named NPC (representing another medical care professional working with the patient). The player
+needed to locate the correct NPC and interact with them, then bring the information back to the patient. Some patients
+then required information from a different NPC, or gave instructions for a step the next player needed to complete. Any
+tasks that were not completed by the first player would be handed off to the second. The game was designed so it was
+not possible for the player to finish all possible tasks, so there were always outstanding tasks (one per patient) that
+needed to be handed off to a potential next player.
+The map layout was loosely based on a hospital floor and the movement patterns required of nurses during a typical
+shift [33], with patient rooms, storerooms for items needed for patients, and lounges where non-patient characters were
+located. Because it took a non-trivial amount of time to travel down hallways from one room to another, completing
+the tasks efficiently required clarity of which tasks needed to be completed next and where they were located. Task
+information was structured in such a way that the player needed to keep track of at least one outstanding need per
+patient at any given time.
+4.2
+
+User data collection
+
+To evaluate our system and with approval from our institution’s Institutional Review Board, we gathered sample task
+observation sets and handover reports from N = 13 participants recruited from the student population of our university.
+Participants first played a tutorial round of the game to familiarize them with the controls, which took approximately
+1-3 minutes. When they finished the tutorial they were given 10 minutes to make as much progress in the game as
+possible. Halfway through their time, they performed a memory-matching distractor task for an additional 2 minutes.
+After 10 minutes of play, they were interrupted by a notification that their time had ended. At this point the task state
+was saved and they could not continue.
+Participants were then given 5 minutes to write a report that would allow another person, or themselves in the
+future, to complete the game from where they left off. They were told to assume the person continuing the task had no
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+
+15
+
+Fig. 2. Walk-through of the data collection, showing the task interface and map. Participants controlled the player character with
+keyboard controls detailed in a short tutorial. Left: the interface includes a display of the current room, the player character (blue), and
+non-player characters within, along with the room name, their score (number of tasks complete), and their time progress in the task.
+Right: tasks required participants to navigate a map consisting of several rooms, interacting with non-player characters (indicated
+in purple) and item resources (indicated in pink). Participants did not have access to the map during the task. The environment
+creates concurrent, spatially distributed task threads and a controlled information asymmetry between system telemetry and human
+observation (Table 2). The task was also interrupted with a distractor task designed to further challenge participants’ working memory
+of their task threads and progress. After 10 minutes of in-game time had elapsed, participants were asked to write a handover report
+detailing their task state and progress to a hypothetical successor.
+
+prior knowledge about the game environment. Otherwise they were not instructed what the report should contain or
+its format and style. Note that no matter how much progress someone had made in the game, 5 incomplete tasks needed
+to be handed off to the next participants (though participants might also include information about the environment
+layout, and their prediction of future tasks based on their experience).
+The system trace from each user session was also recorded. This trace consisted of timestamped plain-text telemetry
+logging events like room transitions, initiation of NPC interactions, and item pickups and deliveries. Visual information
+(such as the positions or appearances of NPCs or items) and dialogue content (where player instructions, including
+NPC requests and directional hints, were communicated) were not logged and were thus only visible if included in
+user-written reports.
+Each participant session yields one independent task state. All generated report conditions are paired transformations
+of these 13 states; the resulting 65 reports are therefore not 65 independent participant observations, and our sample
+supports controlled within-state comparison of report-generation strategies rather than population-level behavioral
+claims.
+4.3
+
+Observability design
+
+Table 2 summarizes which information each source can, in principle, capture in our environment. This asymmetry is
+a deliberate design choice: it creates a controlled test of source complementarity in which neither telemetry nor the
+Manuscript submitted to ACM
+
+16
+
+Bishop et al.
+Information type
+Room transitions
+Item pickup/delivery
+Dialogue content (requests, hints)
+Outstanding need inferred from dialogue
+User intent and strategy
+Exact event timestamps
+Completed action history
+Memory error
+
+Telemetry can observe
+Yes
+Yes
+No
+Partial
+No
+Yes
+Yes
+Not applicable
+
+Human can observe/report
+Yes
+Yes
+Yes
+Yes
+Yes
+Usually no
+Partial (memory-limited)
+Possible
+
+Table 2. Observability matrix for the controlled environment: which information types are available to system telemetry versus to the
+outgoing human. The engineered asymmetry makes the two sources complementary by design.
+
+human report is sufficient on its own. We note the corresponding interpretive boundary explicitly: because dialogue
+content was engineered to be invisible to telemetry, the benefit of fusing human input observed in our results may be
+larger than in domains where instrumentation is more complete (see Limitations).
+5
+5.1
+
+Artifact-Level Evaluation of Estimated Task-Resumption Utility
+Evaluation scope and estimand
+
+We state the boundary of our evaluation up front: we evaluate whether a report contains task-state information
+expected to reduce reconstruction effort; we do not observe a receiver. Concretely, our metrics estimate the task-state
+information available to a hypothetical recipient under an explicit search-cost model derived from the controlled
+environment’s topology and task rules. The resulting quantities are artifact-level proxies for task-resumption readiness
+(not measurements of recipient behavior, time to resumption, error rate, or task completion), and we use “task-resumption
+potential” only in this estimated, model-relative sense. This artifact-level scope is chosen deliberately: it is what allows
+fully objective scoring, since every claim in a report is verified against a known ground-truth state rather than against
+rater judgment. Downstream recipient performance is the motivating application, not the measured outcome.
+5.2
+
+Estimating task-state utility via information access cost
+
+The constrained nature of the simulated task allowed us to directly assess the value of state-related information that
+could be reconstructed from the reports across conditions. This was done by repeating the same fact-extraction process
+used in the generation pipeline (extracting facts into a domain-specific language and then converting to a semantic
+graph) on all the reports. DSL conversion was performed by LLM, with human co-annotation on 30 percent to verify
+annotation reliability (Cohen’s 𝜅 = .72). We considered the structural risk that an LLM-based evaluator could favor
+machine-generated reports, whose regular formatting may be easier to parse than free-form prose, and designed the
+evaluation to contain it. Because LLM judges are subject to known biases [6], the model’s evaluative role is confined to
+surface-form fact extraction; all scoring of extracted facts is performed deterministically against ground-truth state,
+so no model judgment enters the utility or misinformation calculations. Extraction itself is validated against human
+co-annotation, following recommended practice for justifying LLM-assisted annotation [3], and identical extraction
+and scoring machinery is applied to every condition. Finally, our central contrasts (RQ2 and RQ3) compare machinegenerated conditions that share the same rigid output template, so differential parseability cannot account for those
+results; only the comparison against free-form user reports inherits any residual extraction asymmetry, and the margins
+observed there substantially exceed what extraction error could plausibly produce given the validated agreement.
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+
+17
+
+We then analyzed the content of these reconstructions for their informational value, quantified in terms of relative
+Information Access Cost (IAC), a key factor in real-world handover preparation behavior [48].
+IAC is a task-grounded evaluation framework that estimates the operational value of a handover report by quantifying
+how much search effort a downstream agent would be spared, or would waste, if it acted on the reported knowledge
+graph G𝑝𝑟𝑒𝑑 in our spatial, multi-task environment. Unlike precision/recall metrics that treat all facts uniformly, IAC
+weights each fact by the expected search cost (including both physical movement and interaction time) an agent would
+face in the absence of that information, producing a score denominated in task-derived search-cost units. Because these
+units arise partly from search-space cardinality and fixed interaction constants rather than literal simulated walking
+distances, we refer to them as cost units rather than “steps” throughout.
+We report two constructs separately, and deliberately name both as estimates:
+(1) Estimated task-state utility (cost saved, 𝐶𝑠𝑎𝑣𝑒𝑑 ): the reduction in modeled reconstruction cost attributable to
+information in the report, i.e., cost that would otherwise be incurred by a recipient with no prior information. Its
+complement, 𝐶𝑚𝑎𝑥 − 𝐶𝑠𝑎𝑣𝑒𝑑 , is the estimated residual reconstruction cost left to the recipient.
+(2) Misinformation burden (𝐶𝑚𝑖𝑠𝑖𝑛𝑓 𝑜 ): the modeled penalty incurred by an agent acting on incorrect information,
+which can force wasted actions or searches of wrong areas.
+𝐶𝑠𝑎𝑣𝑒𝑑 is assessed on a per-patient basis, while 𝐶𝑚𝑖𝑠𝑖𝑛𝑓 𝑜 is assessed globally.
+5.2.1 Component types. For each target patient 𝑒 ∈ E, the required information is decomposed into three orthogonal
+components:
+(1) Location (𝐶𝑙𝑜𝑐 ): Where is the patient located?
+(2) Need (𝐶𝑛𝑒𝑒𝑑 ): What specific medication or message-routing task does the patient require?
+(3) Resource (𝐶𝑟𝑒𝑠 ): Where is the resource (e.g., medication or delivery target) needed to resolve the patient’s need?
+Each component is scored independently by comparing the predicted facts in G𝑝𝑟𝑒𝑑 against the ground-truth game
+state S𝑔𝑡 and the environment topology T𝑚𝑎𝑝 .
+5.2.2 Baseline information costs. For spatial information (𝐶𝑙𝑜𝑐 , 𝐶𝑟𝑒𝑠 ), baseline search costs represent the expected
+search cost (in search-cost units) of searching the environment for a target category, depending on the target entity
+type (i.e. searching all patient rooms for a patient, or all storage rooms for a medication). If the entity type is unknown,
+𝐶𝑚𝑎𝑥 =
+
+| R𝑎𝑙𝑙 |
+2.0 , where R𝑎𝑙𝑙 is the set of all rooms in the environment.
+
+For diagnosis information (𝐶𝑛𝑒𝑒𝑑 ): A fixed baseline cost of 30.0 representing the diagnosis interaction time. This
+constant was derived from the expected steps needed to navigate to a known patient’s room and complete the dialogue
+interaction needed to find the patient’s needs. Like all parameters of the cost model, it is an explicit, fixed modeling
+choice applied identically to every condition and report, so paired comparisons between conditions are made under the
+same assumptions.
+5.2.3 Formulation & Scoring Matrix. Let 𝐶𝑚𝑎𝑥 (𝑒, 𝑐) be the baseline search cost for a given entity 𝑒 and component 𝑐 if
+the agent had no report and had to search the environment blindly.
+For each component, the predicted facts are mapped to a Credit Type 𝜅 ∈ {FULL, PARTIAL, NONE}, and a partial
+credit factor 𝑃 ∈ [0, 1], which determine 𝐶𝑠𝑎𝑣𝑒𝑑 , the portion of baseline search effort the recipient agent avoids thanks to
+the reported information, per the schema in Table 3. We define a correct omission as referring to a component for which
+the ground-truth state contains no outstanding information to convey (for example, a need that the outgoing player
+Manuscript submitted to ACM
+
+18
+
+Bishop et al.
+Credit Type (𝜅)
+FULL
+PARTIAL
+NONE
+
+Condition
+Perfect match or correct omission
+Correct but vague or under-specified information
+No correct relevant information provided
+
+𝐶𝑠𝑎𝑣𝑒𝑑
+𝐶𝑚𝑎𝑥
+𝑃 · 𝐶𝑚𝑎𝑥
+0
+
+Table 3. Cost breakdown by classification of information extracted from handover reports.
+
+already resolved): a report that says nothing about such a component has left nothing for the recipient to rediscover,
+so the component’s full baseline value is credited. Facts about entities or components outside this task-defined target
+universe are not scored as omissions; they are simply out of scope for 𝐶𝑠𝑎𝑣𝑒𝑑 (though they remain subject to the
+misinformation check below).
+5.2.4 Location Scoring (𝐶𝑙𝑜𝑐 and 𝐶𝑟𝑒𝑠 ). Both the patient NPC location and the resource location components use
+identical spatial verification logic. When exact location information was not provided in handover reports, users
+frequently employed referring expressions that could be used to completely or partially constrain the search space
+for the recipient, a typical occurrence in natural language communication [4]. Both definite and relative location
+information was evaluated as follows.
+Fact selection. All facts in G𝑝𝑟𝑒𝑑 that reference NPC 𝑒 are collected, including direct room assignments (e.g., "Lily
+is in Room 1"), directional constraints (e.g., "Lily is north of the hallway"), and embedded location constraints on
+subject/target arguments (e.g. "someone in room 1 who needs..."). When multiple facts reference the same NPC, the
+system selects the single most specific fact.
+Entity resolution. Arguments in facts may be named (e.g., "lily") or existential (e.g., "a patient in room 1"). An
+existential argument resolves to NPC 𝑒 if (1) any type-filtering heuristic is satisfied (medication names match items;
+person references match NPCs), and (2) either no spatial constraint is attached (unconstrained existential), or 𝑒’s true
+room satisfies the spatial constraint given T𝑚𝑎𝑝 .
+Spatial constraint verification and score assignment. Let 𝑐𝑜𝑛𝑠𝑡𝑟𝑎𝑖𝑛𝑡 (𝑓 ) be the spatial condition asserted by the selected
+fact 𝑓 . The set of rooms satisfying this constraint in the map graph is defined as R𝑠𝑎𝑡 ⊆ R𝑎𝑙𝑙 . Let R𝑏𝑎𝑠𝑒𝑙𝑖𝑛𝑒 be the
+canonical search rooms for that entity type, and let 𝑟𝑡𝑟𝑢𝑒 be the true room of the entity in S𝑔𝑡 .
+
+
+
+FULL
+if 𝑟𝑡𝑟𝑢𝑒 ∈ R𝑠𝑎𝑡 and |R𝑠𝑎𝑡 ∩ R𝑏𝑎𝑠𝑒 | = 1
+
+
+
+
+𝜅 = PARTIAL if 𝑟𝑡𝑟𝑢𝑒 ∈ R𝑠𝑎𝑡 and |R𝑠𝑎𝑡 ∩ R𝑏𝑎𝑠𝑒 | > 1
+
+
+
+
+ NONE
+if no correct matching fact exists
+
+
+For partial matches, the credit factor is computed as the search-space reduction ratio:
+|R𝑠𝑎𝑡 ∩ R𝑏𝑎𝑠𝑒 |
+|R𝑏𝑎𝑠𝑒 |
+This rewards facts that narrow the search space without pinpointing a unique room.
+𝑃 =1−
+
+5.2.5 Entity Need Score (𝐶𝑛𝑒𝑒𝑑 ). The system evaluates whether the report accurately details the outstanding need (e.g.,
+patient needs a specific medication, has a message to be delivered elsewhere, or is awaiting a response). Because both
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+
+19
+
+human- and LLM-written reports often use pronouns or generic descriptions, the pipeline maps predicted arguments to
+the target entity 𝑒 using a three-tier strength model and scored accordingly:
+(1) Definite: Direct named match (e.g., "lily" matches Lily), or a spatially constrained existential argument (e.g.,
+"someone in room 1") resolving exclusively to 𝑒.
+• FULL: Predicate matches (e.g., needs-medicine or has-message-for) and the associated resource/partner is an
+exact match.
+• PARTIAL: Predicate matches, but a generic category is used instead of the specific resource (e.g. "medicine"
+instead of "gold medicine"), earning a static 𝑃 = 0.5 credit.
+(2) Possible: An unconstrained existential (e.g., "someone") or a constrained existential resolving to multiple candidates including 𝑒.
+• Capped at PARTIAL credit (𝑃 = 0.5) only when the resource is an exact match. It cannot trigger a contradiction
+penalty, which prevents general statements (e.g., "someone needs the red medicine") from penalizing other
+patients.
+(3) None: Explicitly matches a different entity, or an existential that excludes 𝑒.
+5.2.6 Additional misinformation penalty. While the scoring algorithm thus far has focused on strictly necessary facts
+for task continuation, inaccurate information (such as invented patients or inaccurate supplementary details) can also
+incur a significant burden on a handover recipient’s ability to efficiently continue the task. For that reason, in addition
+to the per-entity component scores, a global misinformation cost 𝑀𝑔𝑙𝑜𝑏𝑎𝑙 is computed by independently verifying every
+predicted fact in G𝑝𝑟𝑒𝑑 against S𝑔𝑡 . For spatial and location facts, the system checks whether any NPC or item matching
+the argument (by name or by existential type+constraint) actually occupies a room satisfying the stated constraint. If
+no match exists, the fact is flagged as misinformation. For facts relating to outstanding patient needs, the system checks
+whether the asserted relation matches any patient NPC’s current ground-truth need. If no match is found, the fact is
+flagged.
+Each flagged fact incurs a cost equal to the baseline search cost for its category:
+∑︁
+
+𝑀𝑔𝑙𝑜𝑏𝑎𝑙 =
+
+𝐶𝑏𝑎𝑠𝑒𝑙𝑖𝑛𝑒 (type(𝑓 ))
+
+𝑓 ∈ F𝑚𝑖𝑠𝑖𝑛𝑓 𝑜
+
+where 𝐹𝑚𝑖𝑠𝑖𝑛𝑓 𝑜 is the set of all flagged facts and 𝐶𝑏𝑎𝑠𝑒𝑙𝑖𝑛𝑒 is the NPC/item-type-specific search cost for location facts,
+or the constant diagnosis cost for need facts.
+5.2.7
+
+Metric Aggregation. The total cost saved is summed across all patient NPCs and their components:
+𝑆𝑡𝑜𝑡𝑎𝑙 =
+
+∑︁
+
+∑︁
+
+𝐶𝑠𝑎𝑣𝑒𝑑 (𝑒, 𝑐)
+
+𝑒 ∈ E 𝑐 ∈𝑙𝑜𝑐,𝑛𝑒𝑒𝑑,𝑟𝑒𝑠
+
+The theoretical maximum (i.e., the total cost saved by a perfect report) is the sum of all baseline search costs:
+𝑡𝑜𝑡𝑎𝑙
+𝐶𝑚𝑎𝑥
+=
+
+∑︁
+
+∑︁
+
+𝐶𝑚𝑎𝑥 (𝑒, 𝑐)
+
+𝑒 ∈ E 𝑐 ∈𝑙𝑜𝑐,𝑛𝑒𝑒𝑑,𝑟𝑒𝑠
+
+which is a fixed constant for a given environment configuration and degree of task progress. Because task progress
+𝑡𝑜𝑡𝑎𝑙 can differ across participants; a normalized estimated task-state utility can accordingly be
+differs across sessions, 𝐶𝑚𝑎𝑥
+
+Manuscript submitted to ACM
+
+20
+
+Bishop et al.
+
+𝑡𝑜𝑡𝑎𝑙 . Within a given task state the denominator is constant across conditions,
+defined per task state as 𝑇 𝑆𝑈 = 𝑆𝑡𝑜𝑡𝑎𝑙 /𝐶𝑚𝑎𝑥
+
+so the within-state ordering of conditions, the basis of our paired analyses, is unaffected by this normalization.
+For the purposes of summarization, we also define an aggregate combined cost to express the total operational
+penalty an agent combining the residual search effort (what the report failed to eliminate) with the misinformation
+penalty:
+
+
+𝑡𝑜𝑡𝑎𝑙
+𝐶𝑐𝑜𝑚𝑏 = 𝐶𝑚𝑎𝑥
+− 𝑆𝑡𝑜𝑡𝑎𝑙 + 𝛼 · 𝑀𝑔𝑙𝑜𝑏𝑎𝑙
+The first term is the unsaved baseline cost, the search effort that remains because the report was incomplete or
+incorrect. The second term scales the global misinformation cost by 𝛼 = 3, reflecting that acting on false information in
+this task domain is approximately three times as costly as lacking information entirely (the agent must travel to the
+wrong location and then resume an uninformed search). The value of 𝛼 is a manually selected modeling choice; we
+therefore treat the combined index as descriptive only and draw all inferential conclusions from the separately reported
+components (𝑆𝑡𝑜𝑡𝑎𝑙 and 𝑀𝑔𝑙𝑜𝑏𝑎𝑙 ), which makes those conclusions independent of the choice of 𝛼 by construction.
+5.3
+
+Task-value density and report length
+
+To address RQ3, we assessed the task-value density of reports: the estimated task-state utility conveyed per token of
+output,
+𝐶𝑠𝑎𝑣𝑒𝑑
+𝑡𝑜𝑘𝑒𝑛𝑠
+Token counts were calculated with the o200k_base tokenizer used by the GPT-4.1 model family. We emphasize that
+𝐶𝑑𝑒𝑛𝑠𝑖𝑡 𝑦 =
+
+this is a density measure over task-derived cost units, not information-theoretic compression, and that a ratio alone can
+reward degenerately short outputs; we therefore interpret it only alongside the absolute utility and misinformation
+results, and report raw report lengths with the results.
+5.4
+
+Characterizing information content of user reports
+
+To address our exploratory question about what human reports contribute beyond task state, user-generated reports
+were annotated using a simple schema to assign a category label to each clause according to the nature of information
+contained within:
+• S - State Transfer: A factual, falsifiable claim about the current world state at handover time.
+• K - Knowledge Transfer: Something the user learned or believes from experience that a fresh agent with full
+state visibility would not automatically know. Includes strategy, priorities, causal knowledge ("you need X to do
+Y"), dead ends already ruled out, warnings, and predictions.
+• M - Meta/Other: About the report or the user’s experience rather than the task. Includes confidence hedges,
+apologies, comments about the task framework, and filler.
+• A - Ambiguous/Mixed: Has features of multiple of the above with unclear distinction.
+Annotations were performed via LLM (GPT 4.1-mini) with human co-annotation on 30 percent of reports to ensure
+reliability (Cohen’s 𝜅 = .64 overall, .84/.74 on state and knowledge categorization). Consistent with recommended
+practice for validating LLM-assisted annotation against human annotators [3, 6], we report agreement for the categories
+on which our observations rest; this analysis is exploratory and descriptive, and none of the paper’s primary claims
+depend on it.
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+5.5
+
+21
+
+LLM configuration and reproducibility
+
+Four pipeline or evaluation stages invoke an LLM: (1) normalization of user reports into the DSL, (2) existential-reference
+resolution during entity alignment, (3) report generation, and (4) evaluation-time fact extraction and content annotation
+(GPT-4.1-mini for annotation, as noted above). All other transformations are deterministic given the LLM outputs.
+Prompts, few-shot examples, output schemas, alias tables, and parsing rules for each stage are released as supplementary
+material, consistent with calls for transparent, multi-metric evaluation of LLM-based systems [23]. LLM calls were
+made via the OpenAI API ChatCompletions endpoint "gpt-4.1-mini" with knowledge cutoff of 01-Jun-2024, accessed
+18-Jul-2026, with 0 temperature; outputs were processed as-is with no retry policy or manual repair of outputs.
+
+Manuscript submitted to ACM
+
+22
+
+Bishop et al.
+
+Table 4. Descriptive cost metrics by condition. Combined cost is computed at 𝛼 = 3 and reported for descriptive purposes only;
+estimated cost saved and misinformation cost are reported separately as primary inferential metrics (see 6). Values are median [range]
+across 𝑛 = 13 participants. Units are task-derived search-cost units, not literal movement steps.
+Condition
+Baseline (user-only)
+Task-aware
+Telemetry-only
+Full-realization
+End-to-end
+
+6
+
+Combined cost (search-cost units)
+
+Omission share (%)
+
+Misinformation share (%)
+
+1150.51 [22.50, 2023.93]
+370.21 [150.00, 965.94]
+274.70 [150.00, 551.50]
+361.20 [191.50, 789.24]
+773.20 [370.21, 1345.51]
+
+64.6 [34.7, 100.0]
+63.0 [17.6, 100.0]
+100.0 [34.7, 100.0]
+44.6 [18.2, 100.0]
+32.5 [14.2, 50.4]
+
+35.4 [0.0, 65.3]
+37.0 [0.0, 82.4]
+0.0 [0.0, 65.3]
+55.4 [0.0, 81.8]
+67.5 [49.6, 85.8]
+
+Results
+
+We organize the results by research question. Friedman tests were used to evaluate omnibus differences across the five
+report conditions for each outcome, with post-hoc pairwise analysis performed using Wilcoxon signed-rank tests with
+Holm correction applied within each outcome’s family of pairwise comparisons. Omnibus differences were significant
+for estimated cost saved, 𝜒 2 (4, 𝑁 = 13) = 33.60, 𝑝 < .001, Kendall’s W = 0.65, for weighted misinformation cost,
+𝜒 2 (4, 𝑁 = 13) = 31.95, 𝑝 < .001, Kendall’s W = 0.61, and for task-value density, 𝜒 2 (4, 𝑁 = 13) = 29.46, 𝑝 < .001,
+Kendall’s W = 0.57. Because our combined cost index depends on the manually selected misinformation weighting (𝛼),
+we report it for descriptive purposes only (Table 4) and reserve statistical analysis for the component-level outcomes.
+6.1
+
+RQ1: Source complementarity
+
+Reconciling the two sources preserved more estimated task-state utility than either source alone. Estimated cost saved
+was significantly higher for reports generated by the fused task-aware pipeline (Mdn = 548.64 cost units) than for
+participants’ own reports (Mdn = 158.87, 𝑝𝑎𝑑 𝑗 < .001, 𝑟 = 1.0), and significantly higher than for reports generated from
+telemetry alone (𝑝𝑎𝑑 𝑗 = 0.01, 𝑟 = 1.0). Under this task and metric, the two sources therefore contributed complementary
+state information: neither the human report nor the telemetry alone recovered the estimated utility available from their
+reconciliation. We emphasize that this is a claim about the state information recoverable from the report artifacts under
+our cost model, not a claim about recipient performance.
+Complementarity came with a measurable tradeoff. Total weighted misinformation costs differed significantly across
+report types, and the ablation that omitted human input entirely (telemetry-only) incurred the lowest misinformation
+cost of any condition (Mdn = 0.0); task-aware reports, which incorporate the user report, incurred significantly more
+(Mdn = 45.67, 𝑝𝑎𝑑 𝑗 = .039, 𝑟 = 1.0). Because trace-only reports consistently contained little to no misinformation, most of
+the incorrect information in the task-aware condition was inherited from the user reports, which frequently contained
+misremembered names, locations, and task details. While the state reconciliation pipeline was able to address some of
+these mistakes, the task as designed contained some information that was only available to the user and not observable
+from system telemetry. As a result, the task-aware pipeline could not verify the correctness of some user input, and
+would preserve this incorrect information in its output. Reconciliation nevertheless reduced the inherited burden
+substantially relative to the unaided baseline: task-aware reports accrued significantly lower misinformation cost (Mdn
+= 45.67) than participants’ own reports (Mdn = 135.67, 𝑝𝑎𝑑 𝑗 < .001, 𝑟 = .86), reflecting cases where telemetry could
+contradict misremembered content. Adding human-only information thus increased estimated utility but also introduced
+unverifiable error, a value–risk tradeoff rather than a strict improvement, which we return to in the Discussion.
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+
+23
+
+Fig. 3. Estimated information access cost saved (positive axis) and misinformation cost incurred (negative axis) by report condition.
+TA = task-aware (ours); end2end = end-to-end (LLM-only ablation); TA -user = telemetry-only ablation; n.s. = not significant; * =
+𝑝 < .05; ** = 𝑝 < .01; *** = 𝑝 < .001. Task-aware reports saved significantly more estimated cost than the user-only baseline
+and the telemetry-only ablation, and incurred significantly less misinformation than the user-only baseline and the end-to-end
+ablation. Estimated cost saved did not differ significantly between the task-aware, full-realization, and end-to-end conditions, and the
+telemetry-only ablation incurred the least misinformation of all conditions.
+
+6.2
+
+RQ2: Structured reconciliation versus direct synthesis
+
+Given identical source inputs and equivalent task-aware prompting, the structured pipeline and the end-to-end LLM
+produced reports with statistically comparable estimated cost saved (𝑝𝑎𝑑 𝑗 = .33). The two conditions differed sharply
+on misinformation: task-aware reports accrued significantly lower weighted misinformation cost (Mdn = 45.67) than
+end-to-end reports (Mdn = 180.0, 𝑝𝑎𝑑 𝑗 = .004, 𝑟 = .93); the structured condition’s median was roughly one quarter of
+the end-to-end median. Structured reports were also significantly denser in estimated utility per token (Mdn = 2.64 vs.
+2.30, 𝑝𝑎𝑑 𝑗 = .01, 𝑟 = .87). In other words, on these data explicit reconciliation did not significantly change how much
+estimated task-state utility the model could produce from the same inputs; it changed the failure profile of the synthesis.
+The end-to-end ablation, which had access to the same input data but contained no explicit reconstruction, reconciliation, or consolidation of model state, preserved mistakes introduced by the user while also generating many
+new hallucinated facts absent from both inputs. This behavior indicates the value of explicit identification and reconciliation of contradictory facts, as well as the importance of providing structured input to avoid hallucinations.
+The misinformation-source observations reported here (user-inherited versus generation-added) are based on manual
+inspection of the facts flagged in each condition.
+Manuscript submitted to ACM
+
+24
+
+Bishop et al.
+
+6.3
+
+RQ3: Task-aware versus exhaustive realization
+
+As a manipulation check that the differing prompt types did result in differing content selection (rather than simply
+condensing a similar fact set), we calculated precision/recall on extractable state facts against those included in the
+LLM prompt. A Wilcoxon signed-rank test indicated that recall was significantly lower for reports generated by the
+task-aware prompt (Mdn = 0.52) set compared to those generated by the full-realization prompt set (Mdn = 0.68, 𝑊 = 1.0,
+𝑝𝑎𝑑 𝑗 < .001, 𝑟𝑟𝑏 = .96). Precision did not differ significantly (𝑝 = .98). These results confirm that the task-aware prompt
+selectively omitted available facts as instructed, without introducing additional unsupported content. We note that
+recall against the prompt’s own fact set is a check on the rendering manipulation, not a measure of ground-truth
+handover quality; lower recall here reflects intended selectivity, not a deficiency.
+Despite including fewer of the available facts, task-aware reports preserved estimated utility that was statistically
+comparable to the much longer full-realization reports (𝑝𝑎𝑑 𝑗 = .96), and conveyed that utility more efficiently: estimated
+cost saved per token was significantly higher for the task-aware prompt (Mdn = 2.64) than for the full-realization
+prompt (Mdn = 1.56, 𝑝𝑎𝑑 𝑗 < .001, 𝑟 = 1.0). Task-aware density did not significantly exceed the telemetry-only condition
+(Mdn = 2.77, 𝑝𝑎𝑑 𝑗 = .52), as expected given that telemetry-only reports draw on strictly less source information and
+are correspondingly short. Task-aware rendering therefore achieved a better utility–length tradeoff than exhaustive
+rendering of the same reconciled state; whether such filtering benefits an actual recipient’s comprehension remains
+untested.
+6.4
+
+Comparison with frontier reasoning model
+Table 5. Comparison with frontier model, combined cost and omission/misinformation shares by condition
+
+Condition
+Task-aware (GPT 4.1-mini)
+Task-aware (GPT 5.6-terra)
+End-to-end (GPT 5.6-terra)
+
+Combined Cost
+
+Omission Share (%)
+
+Misinformation Share (%)
+
+370.21 [150.00, 965.94]
+233.20 [101.50, 485.90]
+203.20 [116.50, 444.40]
+
+63.0 [17.6, 100.0]
+100.0 [36.8, 100.0]
+100.0 [36.5, 100.0]
+
+37.0 [0.0, 82.4]
+0.0 [0.0, 63.2]
+0.0 [0.0, 63.5]
+
+In order to compare model behavior and the performance profile of the pipeline on a frontier reasoning model,
+we re-generated reports for the task-aware and end-to-end conditions using GPT 5.6-terra (accessed via OpenAI’s
+Responses API endpoint "gpt-5.6-terra" 18-Jul-2026, with knowledge cutoff 16-Feb-2026 at time of writing) with medium
+reasoning. Evaluation DSL extraction was performed with GPT 4.1-mini for consistency. The frontier model performed
+better on cost saved and misinformation metrics on both conditions. Most notably, the end-to-end single-prompt
+approach (which resulted in increased misinformation with GPT 4.1-mini) now outperforms all other conditions on
+cost saved, with no increased misinformation. When examining the reports generated in this condition, the frontier
+model was consistently able to draw inferences across report and telemetry data, indicating that the benefit offered by
+the pipeline was sufficiently replicated by the reasoning capabilities of the frontier model (and vice versa).
+To evaluate whether GPT 4.1-mini with our task-aware pipeline achieves performance comparable to the frontier
+end-to-end condition on estimated utility, we report the Hodges-Lehmann estimate of the paired difference alongside
+its 95% CI, interpreted against a pre-specified margin of practical equivalence (25 percent of the Hodges-Lehmann
+estimate of the paired user-only vs. task-aware, GPT 4.1-mini difference on the corresponding metric), in the interest
+of anchoring the equivalence data to an effect size already established as meaningful within our own data. Given the
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+
+25
+
+Fig. 4. Breakdown of content types of user reports across all participants, by token count. Human-authored reports contained both
+task-state content and strategic-knowledge content. State was the largest category on average, while the proportion of strategic
+content varied substantially across participants. The value of this strategic knowledge is more difficult to evaluate objectively, and it
+is not captured by our state-focused pipeline or metrics.
+
+modest sample size, we treat this as a descriptive comparison rather than a formal equivalence test (e.g., TOST), which
+would be underpowered at this n to support a confirmatory claim. For cost saved, the margin was ±88.4, with the
+calculated paired difference between frontier end-to-end and task-aware GPT 4.1-mini at -7.5 (95% CI [-30.0, 7.5]),
+n=13 pairs, falling comfortably within the margin. For misinformation cost, the paired difference between the two was
+inconclusive due to the heavily zero-weighted distribution for both conditions (HL estimate 0.0, but with a large CI as 6
+out of 13 participants had 0 misinformation in any reports).
+These results suggest that our pipeline architecture allows a smaller, non-reasoning model (GPT-4.1-mini) to approach
+the cost-saving performance of a larger, frontier-tier reasoning model operating end-to-end — though we treat this as a
+descriptive indication of comparability rather than a confirmed equivalence claim, given the sample size. These results
+position architectural structure as a partial substitute for model scale on this metric.
+6.5
+
+Exploratory analysis: information content of user handover reports
+
+When faced with time pressure and the inherent ambiguity of the task, participants did not restrict themselves to solely
+conveying state information. Rather, many devoted a substantial portion of their report to strategic knowledge gained
+from their experience with the task. On average, knowledge-transfer content made up 35 percent of each report’s
+clauses (range: 0-66 percent), compared to 56 percent for state-transfer content (range: 18-78 percent). Content labeled
+as "ambiguous" or "meta" was minimal, averaging under 7 percent and 4 percent respectively. As indicated by the wide
+range in percent values, the split was not uniform across participants: several reports were dominated by a single
+Manuscript submitted to ACM
+
+26
+
+Bishop et al.
+
+category, while others showed a more even mix, suggesting individual variation in reporting strategy under time
+pressure rather than a single dominant style.
+Content labeled as "knowledge-transfer" most often included recommendations for approaching the task ("Focus on
+one patient at a time, but remember all of the [medications] as you’ll need them again later") as well as observations of
+tendencies in the map layout ("The patient rooms are all off the main room, but you’ll often need to check waiting
+rooms") or patient needs ("Most patients need you to deliver a message to someone and then return with the response").
+We interpret these data descriptively: state content was the largest category on average, while strategic knowledge
+constituted a substantial minority with strong individual variation. The data do not support a claim that participants
+reported strategy in place of state; what they do show is that human reports contain a class of contribution (strategy,
+priorities, causal knowledge, and warnings) that our state-focused pipeline currently sidelines and our state-recovery
+metrics do not credit. We return to this distinction in the Discussion, where we consider its implications for interpreting
+the precision/recall and cost results reported above.
+
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+7
+
+27
+
+Discussion
+
+7.1
+
+Structured state reconciliation as a reliability pattern
+
+Task handover has long been understood as a problem of distributed situation awareness: the challenge of ensuring that
+an incoming agent has sufficient knowledge of the world state to continue a task effectively. Prior work has approached
+this challenge primarily through standardization, using structured forms, recall mnemonics, and training protocols
+that aim to make human reporting more complete and consistent [9]. These interventions treat handover failure as a
+problem of individual recall and communication discipline. Our results suggest a complementary framing: part of the
+difficulty of handover is a state reconciliation problem, in which partial, differently reliable accounts of the same task
+must be integrated into a single defensible description of current state before anything is communicated at all.
+In our system, the goal of communicating a single, reconstructable model state is made explicit, as is the necessary
+prerequisite of integrating information from multiple sources into a single representation. Both the system trace and
+the user-written report consist of partial views of the task state; the former can be assumed to be accurate, but has
+only partial observability into the world (reflecting the limitations of analogous real-world electronic records and
+information support systems), while the latter captures more nuanced information of intent and learned heuristics but
+is subject to memory error and omission, as we saw in the reports we collected. Neither source alone recovered the
+estimated task-state utility available from their reconciliation, and the fused output partially controlled, though it did
+not eliminate, the misinformation that human input introduced.
+Our comparison with the end-to-end ablation locates where this structure matters. While it is superficially true
+that LLMs, especially when given access to system records, can improve the completeness of handover reports, our
+analysis demonstrates the value of using structured input and explicitly reconciling partial world models: given identical
+inputs and equivalent prompting, the structured pipeline matched the end-to-end condition’s estimated state utility
+while incurring significantly less misinformation and conveying utility more densely. The benefit of structure on these
+data was thus primarily error control, not coverage. We attribute this to two properties of the pipeline that cannot be
+replicated by a single LLM call. First, by explicitly identifying conflicts between the user and system records, the pipeline
+surfaces contradictions as specific artifacts that the generation step can reason about directly. A single-call approach
+has no analogous mechanism; contradictory information simply arrives in the context window, and the model must
+either implicitly resolve or silently propagate the conflict. Our inspection of flagged facts suggests it frequently does
+the latter, preserving user-introduced errors while also generating new hallucinated facts not present in either input.
+Secondly, the narrative view representation passed to the LLM is a consolidated and state-reconciled version of the
+input information, rather than raw telemetry logs and freeform text. This reduces the generation step to a well-scoped
+summarization task, limiting the surface area for hallucination. We do not claim that a knowledge graph is uniquely
+suited to this role; what matters are the properties the intermediate representation enforces (typed facts, provenance,
+temporal status, and inspectable conflicts), which other structured representations could provide equally well.
+These findings have practical implications for designers of AI-assisted handover tools, and more broadly for LLMbased systems that must synthesize information from multiple sources of varying reliability. The temptation to treat LLM
+generation as a general-purpose solution capable of handling input heterogeneity, conflict resolution, and summarization
+in a single pass may be counterproductive when input sources are known to conflict. Decomposing the task into explicit
+reconciliation and generation stages, even at the cost of increased pipeline complexity, appears to produce meaningfully
+safer outputs. This is consistent with broader findings in the LLM literature on the benefits of structured intermediate
+representations for complex reasoning tasks [10], and with work on grounded and attributed generation [14, 50], and
+Manuscript submitted to ACM
+
+28
+
+Bishop et al.
+
+suggests that handover is a domain where that decomposition is particularly valuable given the real-world costs of
+misinformation to the recipient.
+7.2
+
+Source complementarity is a value–risk tradeoff
+
+Our results caution against reading either input source as simply “better.” Telemetry-only reports incurred essentially
+no misinformation but recovered less estimated utility, because parts of the task state were unobservable to the system
+by design. Incorporating the human report expanded what the output could cover (including content available in no
+log), but it was also the dominant source of the misinformation that survived reconciliation. Human input, in other
+words, expands observability while adding uncertainty. The system’s role is therefore not to replace either source but to
+make their relationship explicit: corroborating what it can, flagging what it cannot, and carrying provenance forward
+so that downstream consumers can weigh unverified content appropriately.
+This framing has implications beyond the specific pipeline and test environment we investigate. Our results suggest
+that the design of AI-assisted handover tools (and information support tools more broadly) should foreground the
+relationship between human-provided and system-observed information, rather than treating LLM generation as
+post-hoc summarization over a single input. This is particularly true in real-world settings where electronic records
+may not be as accurate or up-to-date as human users. Where inputs conflict, the system’s behavior (whether to flag,
+resolve, or silently prefer one source) becomes a consequential design choice with direct effects on recipient trust and
+task outcomes. Future systems might adopt a more human-in-the-loop approach and make this reconciliation visible
+to the outgoing agent, allowing them to identify and correct discrepancies before the report is finalized, rather than
+delegating resolution entirely to the model. Our current implementation preserves provenance and conflict records
+internally but does not render them for the reader; surfacing them (e.g., separating corroborated state from unverified
+human-only content and listing unresolved conflicts explicitly) is a natural extension that our representation already
+supports.
+7.3
+
+State transfer, knowledge transfer, and the division of labor
+
+While user-written reports frequently omitted or misremembered state information, resulting in low scores on our
+evaluation of actionable state data, our content analysis suggests that these reports were not predominantly empty or
+uninformative. Instead, user-written reports often devoted a substantial share of their content to what we categorized
+as strategic knowledge transfer content: strategic priorities, learned heuristics, and general summaries that a receiving
+agent could still benefit from. Because our pipeline schema and evaluation focused so heavily on state reconstruction,
+this kind of abstracted information was not captured by either. This is a real cost of the current design: the system
+extracts state-related content and therefore discards or sidelines part of what humans contribute. While this behavior
+was almost certainly influenced by the nature of our evaluation task - which, by design, participants had no prior
+experience with, leading them to highly value experiential guidance - it is also generally consistent with handover
+behavior in real-world contexts, where recommendations and strategic guidance are also considered valuable even
+among highly experienced professionals [29].
+This distinction in user behavior is useful for understanding the potential support role of handover support tools
+that focus on state reconciliation. The design implication we draw is a division of labor: the system reconstructs
+and verifies current task state, an activity where telemetry and cross-source checking outperform fallible recall; the
+human supplies intent, strategy, causal knowledge, and warnings, which no log contains; and the interface preserves
+human-only contributions verbatim while marking them as unverified rather than silently discarding or homogenizing
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+
+29
+
+them. This also has implications for how such systems should be evaluated, as metrics grounded purely in state fact
+recovery will systematically undervalue user contributions. Future work should develop evaluation frameworks
+that treat the two content types separately, allowing for a fuller accounting of what human contributors bring to
+handover reporting. A concrete next step, achievable with our existing data, is a two-part output that renders verified or
+corroborated current state alongside a clearly-labeled section of human-provided strategy and observations not verifiable
+from telemetry; such an output can be evaluated for retention of human knowledge clauses and for unsupported state
+claims, though not, absent a recipient study, for downstream performance benefit.
+7.4
+
+Implications of model progress
+
+Our end-to-end comparison used a specific commercial model at a specific point in time, and base-model capability has
+advanced since these data were generated. It is plausible that a current frontier model, given the same raw inputs, would
+close some or all of the estimated-utility gap and reduce hallucination rates; whether it would match the structured
+pipeline’s misinformation profile is an empirical question we have not yet tested, and we are careful not to claim
+otherwise. We note, however, that several benefits of explicit reconciliation are independent of generator strength: the
+intermediate representation is auditable, conflicts are inspectable artifacts rather than silent resolutions, provenance
+survives into the output stage, and behavior is substantially reproducible because everything after each structured
+LLM output is deterministic. For high-stakes handover, these properties matter even if a stronger model narrows the
+headline metric differences. Any deployment atop hosted, silently-updated models must also re-validate per model
+snapshot rather than relying on results obtained under an earlier one.
+7.5
+
+What the evaluation metric can and cannot establish
+
+Our information access cost framework is useful for controlled, artifact-level comparison of reports describing the
+same underlying task state: it is grounded in the task’s actual topology and rules, it distinguishes omission from
+misinformation, and it weights facts by modeled rediscovery cost rather than treating all facts as equally valuable. It
+is equally important to state what it cannot establish. It does not measure recipient behavior, comprehension, trust,
+or time-to-resumption; it is task-specific, and its constants (baseline search costs, the need-discovery constant, the
+misinformation weight) are modeling choices that would require domain-specific re-derivation before use elsewhere;
+and it credits only state content, so it systematically undervalues strategic guidance. We see its appropriate roles as
+experimental triage, system debugging, and controlled comparison, not as a substitute for recipient-side validation,
+particularly in any clinical application.
+7.6
+
+Limitations and future work
+
+This study provides a controlled investigation into the use of explicit state reconciliation techniques alongside LLMs to
+support task handover; as such, several limitations should be acknowledged. We enumerate them explicitly, each tied to
+the claim boundary it imposes:
+(1) Controlled and simplified domain. The task was simulated, short, and novel to all participants, lacking
+professional expertise, real stakes, shared schemas, interactive clarification, and longitudinal shifts. Task novelty
+likely inflated the value participants placed on experiential guidance; a more experienced worker may report
+more state, or better calibrate to what the recipient already knows.
+Manuscript submitted to ACM
+
+30
+
+Bishop et al.
+(2) Designed observability boundary. Dialogue content was intentionally excluded from telemetry to create a
+controlled test of source complementarity. This design choice may overstate the benefit of fusing human input
+relative to richly instrumented domains where less information is human-only.
+(3) Telemetry treated as authoritative. Our environment guarantees that logged events are correct; real-world
+records can be stale, missing, or wrong, which would complicate the conflict-resolution policies that our results
+support.
+(4) Task-specific metric assumptions. Baseline search costs partly reflect search-space cardinality and fixed
+interaction constants rather than literal path costs, and the need-discovery constant and misinformation weight 𝛼
+are modeling choices. These parameters are applied identically to every condition, and all inferential conclusions
+rest on the separately reported components rather than the 𝛼-weighted index; applying the metric in another
+domain would require re-deriving its parameters for that domain.
+(5) LLM-dependent extraction and alignment. Report normalization, existential resolution, and evaluation-time
+fact extraction all invoke LLMs, so model errors can enter both before generation and during scoring. As described
+in Section 5, we contain this risk by confining the LLM’s evaluative role to surface-form extraction validated
+against human co-annotation, scoring deterministically against ground truth, and drawing the central contrasts
+between machine-generated conditions that share the same output template [3, 6].
+(6) Strategic knowledge is identified but not valued. The content analysis shows that human reports carry
+substantial strategic knowledge, but we do not evaluate its downstream utility; our metrics credit state content
+only.
+These limitations scope, rather than undermine, the contribution: within a controlled environment with known
+
+ground truth, provenance-aware reconciliation measurably changed what generated handover reports contain and
+what errors they carry. Future work includes surfacing provenance and conflict records in the rendered report and
+evaluating their effect on sender and recipient trust and verification behavior; producing a two-part output that preserves
+human-only strategy alongside verified state; and extending the evaluation to recipients resuming the task from these
+reports.
+8
+
+Conclusion
+
+Handover support systems must combine information sources that differ in observability and reliability. In a controlled
+multitask handover environment with known ground truth, reconciling outgoing workers’ reports with system telemetry
+produced handover reports with greater estimated task-state utility than either source alone. Compared with direct
+end-to-end LLM synthesis over the same inputs, explicit structured reconciliation maintained comparable estimated
+utility while incurring substantially less misinformation, and task-aware realization improved the utility–length tradeoff
+relative to exhaustive reporting. Human-authored reports additionally contained substantial strategic knowledge
+that state-focused pipelines and metrics do not capture, pointing toward a division of labor in which AI reconstructs
+and verifies current state while people contribute strategy, intent, and warnings. Together, these findings support
+provenance-aware state reconciliation as an auditable design pattern for safer AI-assisted handover. They establish
+artifact-level, estimated task-state benefits; validating those benefits with task-resuming recipients is the natural next
+step for this line of work.
+
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+
+31
+
+References
+[1] Aloha Hufana Ambe, Isaac Salisbury, Tobias Grundgeiger, Daniel Bodnar, Sean Rothwell, Nathan Brown, Penelope Sanderson, and Ben Matthews.
+2025. Patient Handover in the Emergency Department Is Not Just a Point Event: Insights for Designing Information Support Tools. In Proceedings of
+the 2025 CHI Conference on Human Factors in Computing Systems. ACM, Yokohama Japan, 1–16. doi:10.1145/3706598.3713756
+[2] Rachelle Bosua and Krishna Venkitachalam. 2015. Fostering Knowledge Transfer and Learning in Shift Work Environments. Knowledge and Process
+Management 22, 1 (2015), 22–33. doi:10.1002/kpm.1456
+[3] Nitay Calderon, Roi Reichart, and Rotem Dror. 2025. The Alternative Annotator Test for LLM-as-a-Judge: How to Statistically Justify Replacing Human
+Annotators with LLMs. In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics. Association for Computational
+Linguistics.
+[4] E. Campana, M. K. Tanenhaus, J. F. Allen, and R. Remington. 2011. Natural discourse reference generation reduces cognitive load in spoken systems.
+Natural Language Engineering 17, 3 (July 2011), 311–329. doi:10.1017/S1351324910000227
+[5] Tathagata Chakraborti, Sarath Sreedharan, Yu Zhang, and Subbarao Kambhampati. 2017. Plan Explanations as Model Reconciliation: Moving
+Beyond Explanation as Soliloquy. arXiv:1701.08317 [cs] doi:10.48550/arXiv.1701.08317
+[6] Guiming Hardy Chen, Shunian Chen, Ziche Liu, Feng Jiang, and Benyou Wang. 2024. Humans or LLMs as the Judge? A Study on Judgement Biases.
+In Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing. Association for Computational Linguistics.
+[7] R. J. Chen et al. 2026. Integrating a Large Language Model to Streamline Nursing Handover Documentation Across Multiple Hospitals in Taiwan:
+Development and Implementation Study. Journal of Medical Internet Research 28 (2026), e81604. doi:10.2196/81604
+[8] Herbert H. Clark and Susan E. Brennan. 1991. Grounding in communication. In Perspectives on socially shared cognition., Lauren B. Resnick, John M.
+Levine, and Stephanie D. Teasley (Eds.). American Psychological Association, Washington, 127–149. doi:10.1037/10096-006
+[9] Jediah R. Clark, Neville A. Stanton, and Kirsten M.A. Revell. 2019. Identified handover tools and techniques in high-risk domains: Using distributed
+situation awareness theory to inform current practices. Safety Science 118 (Oct. 2019), 915–924. doi:10.1016/j.ssci.2019.06.033
+[10] Matthew DeLorenzo, Kevin Tieu, Prithwish Jana, Piyush Jha, Dileep Kalathil, Vijay Ganesh, and Jeyavijayan Rajendran. 2025. Abstractions-ofThought: Intermediate Representations for LLM Reasoning in Hardware Design. doi:10.48550/arXiv.2505.15873 arXiv:2505.15873 [cs.PL].
+[11] Melissa Desmedt, Dorien Ulenaers, Joep Grosemans, Johan Hellings, and Jochen Bergs. 2021. Clinical handover and handoff in healthcare: a
+systematic review of systematic reviews. International Journal for Quality in Health Care 33, 1 (2021), mzaa170. doi:10.1093/intqhc/mzaa170
+[12] Mica R Endsley. 1995. Toward a Theory of Situation Awareness in Dynamic Systems. Human Factors: The Journal of the Human Factors and
+Ergonomics Society 37, 1 (1995), 32–64.
+[13] Ori Ernst, Aviv Slobodkin, Meng Cao, Sihui Wei, and Jackie Chi Kit Cheung. 2025. Where Did That Come From? Sentence-Level Error-Tolerant
+Attribution. In Findings of the Association for Computational Linguistics: EMNLP 2025. Association for Computational Linguistics, 6400–6417.
+[14] Tianyu Gao, Howard Yen, Jiatong Yu, and Danqi Chen. 2023. Enabling Large Language Models to Generate Text with Citations. In Proceedings of the
+2023 Conference on Empirical Methods in Natural Language Processing. Association for Computational Linguistics, 6465–6488.
+[15] Daniel Gartenberg, Leonard Breslow, J. Malcolm McCurry, and J. Greg Trafton. 2014. Situation Awareness Recovery. Human Factors: The Journal of
+the Human Factors and Ergonomics Society 56, 4 (June 2014), 710–727. doi:10.1177/0018720813506223
+[16] Nicholas Genes, Gregory W. Simon, Christian Koziatek, et al. 2025. Generative Artificial Intelligence Summaries to Facilitate Emergency Department
+Handoff. Applied Clinical Informatics 16, 4 (2025), 1185–1191. doi:10.1055/a-2681-5008
+[17] Vince Hartman, Xinyuan Zhang, Ritika Poddar, et al. 2024. Developing and Evaluating Large Language Model–Generated Emergency Medicine
+Handoff Notes. JAMA Network Open 7, 12 (2024), e2448723. doi:10.1001/jamanetworkopen.2024.48723
+[18] iFactory AI CMMS Solution @JRS Innovation. [n. d.]. Shift Handover Best Practices for Manufacturing Plants — ifactory.jrsinnovation.com.
+https://ifactory.jrsinnovation.com/greenfield-consulting/manufacturing-shift-handover-system-ai-logbook. [Accessed 07-07-2026].
+[19] Ziwei Ji, Nayeon Lee, Rita Frieske, Tiezheng Yu, Dan Su, Yan Xu, Etsuko Ishii, Ye Jin Bang, Andrea Madotto, and Pascale Fung. 2023. Survey of
+Hallucination in Natural Language Generation. Comput. Surveys 55, 12 (2023), 1–38. doi:10.1145/3571730
+[20] Maree Johnson, Paula Sanchez, and Catherine Zheng. 2016. The impact of an integrated nursing handover system on nurses’ satisfaction and work
+practices. Journal of Clinical Nursing 25, 1 (2016), 257–268. doi:10.1111/jocn.13080
+[21] Justas. [n. d.]. AI assistant for manufacturing | Generative AI — virtualworkforce.ai. https://virtualworkforce.ai/ai-assistant-for-manufacturing/.
+[Accessed 07-07-2026].
+[22] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim
+Rocktäschel, Sebastian Riedel, and Douwe Kiela. 2020. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. In Advances in Neural
+Information Processing Systems, Vol. 33.
+[23] Percy Liang, Rishi Bommasani, Tony Lee, et al. 2022. Holistic Evaluation of Language Models. arXiv:2211.09110.
+[24] Svend Lyhne, Andrew Georgiou, Anne Marks, Amina Tariq, and Johanna I. Westbrook. 2012. Towards an understanding of the information dynamics
+of the handover process in aged care settings—A prerequisite for the safe and effective use of ICT. International Journal of Medical Informatics 81, 7
+(July 2012), 452–460. doi:10.1016/j.ijmedinf.2012.01.013
+[25] Elizabeth Manias, Fiona Geddes, Bernadette Watson, Dorothy Jones, and Phillip Della. 2015. Communication failures during clinical handovers lead to
+a poor patient outcome: Lessons from a case report. SAGE Open Medical Case Reports 3 (Jan. 2015), 2050313X15584859. doi:10.1177/2050313X15584859
+
+Manuscript submitted to ACM
+
+32
+
+Bishop et al.
+
+[26] Martin Müller, Jonas Jürgens, Marcus Redaèlli, Karsten Klingberg, Wolf E Hautz, and Stephanie Stock. 2018. Impact of the communication and
+patient hand-off tool SBAR on patient safety: a systematic review. BMJ Open 8, 8 (2018), e022202. doi:10.1136/bmjopen-2018-022202
+[27] Michael Newman and Steve Scott. 2023. It Was This Wing Wasn’t It? Identifying the Importance of Verbal Communication in Aviation Maintenance.
+The International Journal of Aerospace Psychology 33, 2 (April 2023), 139–152. doi:10.1080/24721840.2023.2169146
+[28] Beverly O’Connell, Cherene Ockerby, and Mary Hawkins. 2014. Construct validity and reliability of the Handover Evaluation Scale. Journal of
+Clinical Nursing 23, 3-4 (Feb. 2014), 560–570. doi:10.1111/jocn.12189
+[29] E. S. Patterson. 2004. Handoff strategies in settings with high consequences for failure: lessons for health care operations. International Journal for
+Quality in Health Care 16, 2 (2004), 125–132. doi:10.1093/intqhc/mzh026
+[30] Emily S. Patterson and Robert L. Wears. 2010. Patient Handoffs: Standardized and Reliable Measurement Tools Remain Elusive. The Joint Commission
+Journal on Quality and Patient Safety 36, 2 (2010), 52–61. doi:10.1016/S1553-7250(10)36011-9
+[31] Suzanne Pawlowski and Arjan Raven. 2000. Supporting Shared Information Systems: Boundary Objects, Communities, and Brokering. In International
+Conference on Information Systems (ICIS). AIS, 329–338. https://aisel.aisnet.org/icis2000/30/
+[32] David Pothier, Pedro Monteiro, Mutuzua Mooktiar, and Alison Shaw. 2005. Pilot study to show the loss of important data in nursing handover.
+British Journal of Nursing 14, 20 (2005), 1090–1093. doi:10.12968/bjon.2005.14.20.20053
+[33] Patricia Potter, Laurie Wolf, Stuart Boxerman, Deborah Grayson, Jennifer Sledge, Clay Dunagan, and Bradley Evanoff. 2005. An Analysis of Nurses’
+Cognitive Work: A New Perspective for Understanding Medical Errors. Advances in Patient Safety: From Research to Implementation 1 (2005).
+doi:10.1037/e442012005-001 Institution: American Psychological Association.
+[34] Rebecca Randell, Stephanie Wilson, and Peter Woodward. 2011. The importance of the verbal shift handover report: A multi-site case study.
+International Journal of Medical Informatics 80, 11 (Nov. 2011), 803–812. doi:10.1016/j.ijmedinf.2011.08.006
+[35] Cláudio Roberto Rosário, Fernando Gonçalves Amaral, Fernando Jose Malmann Kuffel, Liane Mahlmann Kipper, and Rejane Frozza. 2022. Using
+Bayesian belief networks to improve distributed situation awareness in shift changeovers: A case study. Expert Systems with Applications 188 (2022),
+116039. doi:10.1016/j.eswa.2021.116039
+[36] United States Chemical Safety and Hazard Investigation Board. 2019. Investigation report: Toxic Chemical Release at the DuPont La Porte Chemical
+Facility. https://www.csb.gov/assets/1/6/dupont_laporte_final_report.pdf
+[37] Ian René Solano-Kamaiko, Ariel C. Avgar, Madeline R. Sterling, and Nicola Dell. 2026. Sharing the Care: Investigating How Conversational AI
+Might Facilitate Coordination Among Home Care Workers and Family Caregivers. In Proceedings of the 2026 CHI Conference on Human Factors in
+Computing Systems. ACM. doi:10.1145/3772318.3791116
+[38] Sarath Sreedharan, Tathagata Chakraborti, and Subbarao Kambhampati. 2021. Foundations of explanations as model reconciliation. Artificial
+Intelligence 301 (Dec. 2021), 103558. doi:10.1016/j.artint.2021.103558
+[39] Amy J. Starmer, Nancy D. Spector, Rajendu Srivastava, Daniel C. West, Glenn Rosenbluth, April D. Allen, Elizabeth L. Noble, Lisa L. Tse, Anuj K.
+Dalal, Carol A. Keohane, Stuart R. Lipsitz, Jeffrey M. Rothschild, Matthew F. Wien, Catherine S. Yoon, Katherine R. Zigmont, Karen M. Wilson,
+Jennifer K. O’Toole, Lauren G. Solan, Megan Aylor, Zia Bismilla, Maitreya Coffey, Sanjay Mahant, Rebecca L. Blankenburg, Lauren A. Destino,
+Jennifer L. Everhart, Shilpa J. Patel, James F. Bale, Jaime B. Spackman, Adam T. Stevenson, Sharon Calaman, F. Sessions Cole, Dorene F. Balmer,
+Jennifer H. Hepps, Joseph O. Lopreiato, Clifton E. Yu, Theodore C. Sectish, and Christopher P. Landrigan. 2014. Changes in Medical Errors after
+Implementation of a Handoff Program. New England Journal of Medicine 371, 19 (2014), 1803–1812. doi:10.1056/NEJMsa1405556
+[40] Alessandro Stolfo. 2024. Groundedness in Retrieval-Augmented Long-Form Generation: An Empirical Study. In Findings of the Association for
+Computational Linguistics: NAACL 2024. Association for Computational Linguistics, 1537–1552.
+[41] Hanna Suominen, Liyuan Zhou, Leif Hanlen, and Gabriela Ferraro. 2015. Benchmarking Clinical Speech Recognition and Information Extraction:
+New Data, Methods, and Evaluations. JMIR Medical Informatics 3, 2 (2015), e19. doi:10.2196/medinform.4321
+[42] SysGenPro. [n. d.]. Manufacturing AI Automation for Reducing Manual Handoffs Across Plant Systems — sysgenpro.com. https://sysgenpro.com/
+manufacturing-ai-automation-for-reducing-manual-handoffs-across-plant-systems. [Accessed 07-07-2026].
+[43] Aaquib Tabrez, Ryan Leonard, and Bradley Hayes. 2021. One-shot Policy Elicitation via Semantic Reward Manipulation. arXiv:2101.01860 [cs]
+http://arxiv.org/abs/2101.01860 Number: arXiv:2101.01860.
+[44] Akash Takyar. [n. d.]. AI Use Cases in Manufacturing — leewayhertz.com. https://www.leewayhertz.com/ai-use-cases-in-manufacturing/. [Accessed
+07-07-2026].
+[45] Giulio Toccafondi, Sara Albolino, Riccardo Tartaglia, Stefano Guidi, Antonio Molisso, Francesco Venneri, Adriano Peris, Filippo Pieralli, Elisabetta
+Magnelli, Marco Librenti, Marco Morelli, and Paul Barach. 2012. The collaborative communication model for patient handover at the interface
+between high-acuity and low-acuity care. BMJ Quality & Safety 21, Suppl 1 (Dec. 2012), i58–i66. doi:10.1136/bmjqs-2012-001178
+[46] T D Wilson. 2000. Human Information Behavior. Informing Science 3, 2 (2000).
+[47] X. Yang, R. Y. Ing Koh, B. T. Chee Tay, K. T. Ho Siah, Y. Donchin, and T. Park. 2011. Clinical shift handoffs in Singapore: A three-phase prospective.
+Proceedings of the Human Factors and Ergonomics Society Annual Meeting 55, 1 (Sept. 2011), 778–782. doi:10.1177/1071181311551161
+[48] Xi Yang, Taezoon Park, Christopher D. Wickens, Kewin Tien Ho Siah, Liesel Fong, and Shan Qing Yin. 2013. The effect of information access cost
+and overconfidence bias on junior doctors’ pre-handover performance. Proceedings of the Human Factors and Ergonomics Society Annual Meeting 57,
+1 (2013), 1755–1759. doi:10.1177/1541931213571391
+[49] Ken Ye, David McD Taylor, Jonathan C Knott, Andrew Dent, and Catherine E MacBean. 2007. Handover in the emergency department: Deficiencies
+and adverse effects. Emergency Medicine Australasia 19, 5 (2007), 433–441. doi:10.1111/j.1742-6723.2007.00984.x
+Manuscript submitted to ACM
+
+Structured State Reconciliation for Human–AI Task Handover
+
+33
+
+[50] Cheng Yuan et al. 2025. LCDS: A Logic-Controlled Discharge Summary Generation System Supporting Source Attribution and Faithful Clinical
+Summarization. In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics: System Demonstrations. Association for
+Computational Linguistics.
+
+Manuscript submitted to ACM
+

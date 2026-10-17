@@ -1,0 +1,1530 @@
+1
+
+KineticSim: A Lightweight, High-Performance
+Execution Engine for Real-Time Market Simulators
+
+arXiv:2606.21784v2 [cs.DC] 29 Jun 2026
+
+Shakya Jayakody and Prarthinie Jayakody
+
+frequent batch auctions) requires detailed computational simulations [1], [2]. Agent-Based Models (ABMs) have emerged as
+the standard paradigm for modeling financial markets, as they
+allow researchers to simulate macroscopic market phenomena
+(e.g., price volatility, bid-ask spreads, and flash crashes) from
+microscopic agent decision rules [3]–[5]. These simulators aim
+to replicate empirical stylized facts observed in real-world asset
+returns [6] and price dynamics [7].
+However, simulating large ensembles of financial markets
+populated by thousands of agents represents a massive computational challenge. Traditional CPU-based simulators, such
+as ABIDES [8], [9], process markets and agents sequentially,
+which restricts the scale and speed of experiments, even when
+evaluating simulation realism [10]. While GPU acceleration has
+been proposed to overcome this bottleneck, typical vectorized
+GPU implementations (e.g., JAX or PyTorch [11]–[13]) suffer
+from two critical limitations. First, Global Memory Bandwidth
+Bottlenecks. The market order books must be transferred to
+and from the GPU’s global memory at every simulation step,
+consuming significant memory bandwidth and materializing
+large intermediate tensors. Second, Kernel Launch Overhead.
+Executing a loop over S steps from the host CPU launches
+Θ(S) separate GPU kernels, introducing scheduling overhead
+that dominates the execution time for small-to-medium step
+sizes.
+To address these challenges, we introduce KineticSim, a
+lightweight, custom CUDA execution engine designed for highperformance financial simulations. The core contribution of
+this work is the formalization, analysis, and evaluation of
+a reusable parallel systems design pattern: persistent, statecarrying clearing for iterative multi-agent reductions. This
+Index Terms—GPU Acceleration, Market Simulation, Agentpattern maps a stateful, iterative multi-agent matching or
+Based Modeling, CUDA, Call Auction, Parallel Scan, Persistent
+clearing process onto GPU hardware by keeping the state
+Kernels
+resident in thread-block shared memory across arbitrary step
+boundaries, aggregating agent actions via shared-memory
+atomic reductions, and resolving the clearing function coI. I NTRODUCTION
+operatively. We analyze KineticSim under the work–depth
+ODERN financial markets are complex, adaptive sys- complexity model, demonstrating a major improvement over
+tems driven by the interactions of heterogeneous par- prior architectures. Specifically, KineticSim reduces the perticipants, ranging from institutional market-makers to high- step critical path depth from Θ(L + A) for a naive serial
+frequency trading (HFT) algorithms. Studying these dynamics clearing pass (where L is the price grid ticks and A is the
+under stress or designing new market mechanisms (such as agent count) to Θ (log L + ⌈A/L⌉). Furthermore, by keeping
+the state resident on-chip, KineticSim’s global-memory traffic
+S. Jayakody is an Independent Researcher, Orlando, FL USA (e-mail:
+is collapsed from Θ(S · M · L) for a launch-per-step framework
+shakyajayakody.phd@gmail.com). He was with the University of Central
+Florida, Orlando, FL 32816 USA.
+to a constant: Θ(M · L), which is completely independent of
+P. Jayakody is an Independent Researcher, Colombo, Sri Lanka.
+the simulation step count S.
+(Project lead and corresponding author: Shakya Jayakody.)
+Crucially, this design pattern generalizes beyond uniformThe source code, CUDA kernels, and benchmark suite will be publicly
+available at https://github.com/KineticSim/Project-KineticSim.
+price call auctions to any iterative multi-agent simulation work-
+
+Abstract—Simulating financial markets at scale using multiagent computational systems (Agent-Based Models) is a critical
+tool for market design, regulatory stress-testing, and reinforcement learning. However, traditional CPU-based simulators
+are bottlenecked by sequential processing, while vectorized
+GPU frameworks suffer from high kernel launch overheads
+and redundant global memory round-trips. In this work, we
+formalize, analyze, and evaluate a reusable parallel systems design
+pattern: persistent, state-carrying clearing for iterative multiagent reductions. By caching mutable simulation states directly in
+thread-block shared memory across step boundaries, aggregating
+agent actions via shared-memory atomic operations, and resolving
+clearing functions cooperatively, this pattern achieves a major
+complexity reduction. Specifically, it reduces the per-step critical
+path depth from Θ(L + A) for sequential clearing (where L is the
+price grid ticks and A is the agent count) to Θ(log L + ⌈A/L⌉)
+and collapses global-memory traffic to be independent of the step
+count.
+We implement this design in KineticSim, a lightweight, highperformance GPU execution engine designed to simulate massive
+ensembles of limit-order books in parallel. Evaluated on a modern
+GPU and CPU, KineticSim reaches a peak simulation throughput
+of over 54.7 billion agent events per second. Across the full
+sweep, the maximum observed speedups are 3695× over the
+CPU (NumPy) baseline (at the largest market count), 243× over
+PyTorch GPU and 315× over JAX GPU (at small market counts,
+where framework launch overheads dominate), and 69.2× over
+the Naive Custom CUDA baseline. On a standard fixed workload,
+KineticSim delivers speedups of 3406× over CPU (NumPy), 27.8×
+over PyTorch GPU, 42.8× over JAX GPU, and 8.4× over Naive
+Custom CUDA, while using roughly an order of magnitude
+less GPU memory than PyTorch GPU and maintaining exact
+semantic equivalence. Across all 53 benchmark configurations
+the two custom CUDA engines produce bitwise-identical order
+books, and aggregate market statistics match the CPU (NumPy)
+reference to within 0.1%.
+
+M
+
+2
+
+load that requires state-persistent, block-localized reductions
+and aggregate updates, including continuous double auctions
+utilizing parallel heap structures in shared memory, localized
+multi-agent reinforcement learning environments, traffic and
+grid routing models, and parallel Monte Carlo market tree
+searches.
+This paper makes the following contributions:
+• We design a block-per-market, shared-memory-resident
+execution model for uniform-price call-auction markets
+that keeps the entire LOB on-chip for the full duration of
+the simulation (Section III).
+• We give a work–depth complexity analysis (Section III-F)
+showing that KineticSim replaces the Θ(L) sequential
+clearing pass of a naive kernel with an Θ(log L)-depth
+cooperative scan, and that its global-memory traffic is
+independent of the step count S.
+• We conduct an extensive empirical evaluation (Section IV)
+over the complete symmetric sweeps (no omitted configurations) against four baselines, reporting throughput,
+latency, memory footprint, and amortized per-event cost.
+• We demonstrate exact semantic equivalence: both custom
+CUDA engines produce bitwise-identical books, and all
+backends agree on aggregate statistics to within 0.1% and
+match an analytical ground truth (Section IV-B).
+Our evaluation shows that KineticSim achieves throughputs
+exceeding 5.47 × 1010 events/second, delivering peak speedups
+of up to 3695× over CPU (NumPy), 243× over PyTorch GPU,
+315× over JAX GPU, and 69.2× over Naive Custom CUDA,
+while maintaining exact semantic correctness.
+II. BACKGROUND AND R ELATED W ORK
+A. Uniform-Price Call Auctions
+A uniform-price call auction is a market clearing mechanism
+where orders are accumulated over a discrete time interval and
+cleared at a single price that maximizes the total transacted
+volume [1]. Call auctions and continuous double auctions
+have been studied extensively in the market microstructure
+literature, ranging from classical analytical models [14]–[17]
+to simulations with zero-intelligence and minimal-intelligence
+agents [18], [19]. This is formally defined as follows. Given a
+combined limit-order book at tick price grid p ∈ {0, . . . , L−1},
+let BU Y [p] and SELL[p] denote the aggregate buy and sell
+quantities submitted at price p. The cumulative demand Dcum [p]
+(buyers willing to buy at or above price p) and cumulative
+supply Scum [p] (sellers willing to sell at or below price p) are
+defined as:
+X
+X
+Dcum [p] =
+BU Y [q], Scum [p] =
+SELL[q].
+(1)
+q≥p
+
+q≤p
+∗
+
+The clearing price p is the price level that maximizes the
+executable volume V (p) = min(Dcum [p], Scum [p]):
+p∗ = arg max min (Dcum [p], Scum [p]) .
+p
+
+(2)
+
+The total executed volume is V = V (p∗ ). Unmatched interest
+below p∗ for bids and above p∗ for asks persists as the resting
+limit-order book for the next clearing cycle. This formulation
+is mathematically clean and maps directly to parallel prefix
+
+scans and reductions, making it an ideal candidate for custom
+GPU acceleration.
+B. GPU Memory Hierarchies and Persistent Kernels
+Standard CUDA execution models involve launching separate kernels for each logical step of an algorithm, storing
+intermediate states in GPU global memory [20]. While simple,
+this approach is highly inefficient for iterative simulations
+like financial markets. These trade-offs in GPU architecture,
+general-purpose programming paradigms, and latency profiles
+are thoroughly documented in literature [21]–[23] and benchmarked across various workloads [24], [25]:
+Global Memory Latency. Global memory access on GPUs
+has high latency (hundreds of clock cycles) compared to shared
+memory (a few clock cycles).
+Launch Latency. Each kernel launch incurs an overhead of
+5–10 µs on the CPU host. For fine-grained simulations where
+a step takes less than a microsecond, the launch overhead
+becomes the primary bottleneck.
+To bypass these limitations, KineticSim utilizes persistent
+kernels and shared-memory caching. A single kernel is launched
+for the entire duration of the simulation (S steps). The thread
+blocks remain active on the GPU, caching the order book
+in shared memory, avoiding CPU–GPU synchronization and
+global memory round-trips.
+C. Parallel Agent-Based Simulation Architectures
+Beyond financial markets, parallelizing Agent-Based Models
+(ABMs) on high-performance compute architectures is a major
+area of research. In epidemic spread models, cellular automata,
+traffic flow simulators, and swarm robotics, agent-based systems
+involve heterogeneous populations interacting dynamically
+on a shared spatial grid or network [26], [27]. Traditional
+implementations partition the agent population or space across
+distinct cluster nodes or CPU threads, but suffer from significant
+synchronization and message-passing overheads due to dynamic
+agent migration.
+With the emergence of GPU computing, researchers have
+mapped spatial grids directly to GPU thread grids. For instance,
+in parallel cellular automata, each cell maps to a GPU thread,
+and neighborhood state transitions are executed via globalmemory reads. In spatial ABMs, sorting agents into uniform
+spatial grids (e.g., via prefix scans and radix sorting) allows
+threads to quickly scan adjacent cells. However, financial
+limit-order books differ fundamentally from spatial ABMs
+in three ways. First, Global Interconnectivity. Agents are not
+localized to physical neighborhoods; any agent’s decision
+can impact the global market price and cross quotes with
+any other participant. Second, High Reduction Density. Order
+books require aggregating thousands of discrete orders into a
+highly compact price tick grid, followed by prefix sums and
+reductions over the entire grid. Third, State Persistence across
+Loops. The resting book remains the stateful boundary across
+arbitrary step counts. Unlike spatial grids that can be updated
+in double-buffered global memory, market simulations involve
+a tight iterative loop where price updates feed back into agent
+
+3
+
+logic immediately. KineticSim addresses these constraints by
+localizing each entire market to a single thread block, allowing
+the global interconnectivity and reduction density to be resolved
+entirely within fast shared-memory barriers.
+D. GPU-Accelerated Market Simulation
+The need to scale ABMs has motivated several GPUaccelerated simulators. ABIDES [8] and its reinforcementlearning interface ABIDES-Gym [9] provide high-fidelity,
+event-driven CPU simulation but do not exploit data-parallel
+hardware. More recently, vectorized GPU frameworks such
+as JaxMARL [12] and JAX-LOB [13] batch many environments onto the GPU using array programming, achieving substantial speedups for reinforcement-learning rollouts.
+This is particularly valuable for training deep reinforcement
+learning agents [28], [29] for complex tasks like market
+making [30]–[32], algorithmic trading [33], and multi-agent
+double auctions [34]. These frameworks, however, express the
+simulation as a sequence of tensor operations: each logical
+step materializes intermediate tensors in global memory and
+is dispatched as one or more kernel launches, leaving both
+the memory-bandwidth and launch-overhead bottlenecks in
+place. KineticSim is complementary to this line of work: rather
+than expressing the auction as array operations, it implements
+the clearing mechanism as a hand-written cooperative kernel,
+trading the generality of array programming for an order-ofmagnitude reduction in memory traffic and launch overhead.
+Our parallel clearing builds on classical data-parallel scan
+primitives [35], [36].
+E. Limitations of Compiler-Based Auto-Optimization
+A central question is whether high-level JIT compilers
+and compile-graph frameworks can close the performance
+gap without custom CUDA kernels. In PyTorch and JAX,
+compilers like PyTorch Inductor (via torch.compile) and
+XLA compile tensor operations into fused kernels. For static
+loops, compilers perform operator fusion (combining vector
+additions, multiplications, and clips into a single memory pass)
+and host-dispatch reduction (using CUDA Graphs to bundle
+kernels). However, high-level JIT compilers hit two structural
+limitations in multi-agent market simulations:
+Lack of Stateful Block Caching. High-level compilers trace
+tensor expressions statically. They lack compile-time semantics
+to register a block-localized, shared-memory variable that
+persists across arbitrary loop iterations. As a result, the state
+of the resting order book must be written back to global GPU
+memory at the end of each logical step’s kernel and reloaded
+in the next step, incurring massive global memory traffic.
+Launch Trees and dynamic shape guards. Even when
+compiler graph optimization (like CUDA Graphs) compiles a
+loop, it captures execution pointers statically. For simulations
+where agent counts or market counts change (e.g., parameter
+sweeps), shape mismatches trigger compiler guard failures.
+This forces Dynamo or XLA to recompile and re-graph the
+entire execution tree, leading to significant runtime compilation
+stalls.
+
+Host CPU
+Kernel Launch
+
+Host-GPU Boundary
+
+GPU
+
+Grid of Blocks
+
+CUDA Block 1
+
+CUDA Block N
+
+CUDA Block (Magnified) : Market i
+Simulation Steps (Persistent Loop):
+
+Independent
+Markets
+
+Independent
+Markets
+
+Independent Markets
+CUDA Block 2
+
+Fetch Orders
+Process
+Trades
+
+Threads
+Update
+Order Book
+
+CUDA Block N
+
+GPU Shared Memory
+Independent
+Markets
+
+Independent
+Markets
+
+CUDA Block M
+
+CUDA Block N
+
+Independent
+Markets
+
+Independent
+Markets
+
+Limit-Order Book:
+
+Buy Grid / Bids Sell Grid / Asks
+
+Global Memory
+
+Fig. 1. KineticSim block-level persistent shared-memory execution architecture.
+Each market maps to a CUDA block. The limit-order book (LOB) is stored in
+shared memory, and a persistent loop simulates steps 0 . . . S − 1 internally.
+
+KineticSim’s persistent kernel execution model completely
+avoids these issues by managing threads, block scheduling, and
+shared-memory lifetimes manually.
+F. Real-World Applications and Prior Simulators
+While we quantitatively benchmark KineticSim against
+NumPy, PyTorch GPU, and Naive CUDA backends that
+implement the identical call-auction model (allowing rigorous
+verification in Section IV-B), we do not directly compare
+our execution times against popular prior simulators like
+ABIDES [8] or JAX-LOB [13]. In addition to the structural
+and systems constraints detailed below, these systems are
+designed for fundamentally different real-world applications
+and use cases. We summarize these distinct application domains
+in Table I. Both ABIDES and JAX-LOB simulate CDAs
+with sequential price–time-priority matching. KineticSim, by
+contrast, simulates a discrete-time uniform-price call auction.
+Because the pricing and clearing dynamics differ fundamentally,
+they cannot be verified against each other for correctness.
+III. M ETHODOLOGY
+The KineticSim execution architecture is structured around a
+block-per-market mapping that exploits cooperative, intra-block
+parallelism. Fig. 1 outlines this design.
+A. Thread and Block Mapping
+We simulate M independent markets in parallel. In KineticSim, we configure the GPU execution grid such that:
+• Each market m ∈ {0, . . . , M − 1} is mapped to a single
+CUDA thread block.
+
+4
+
+TABLE I
+R EAL -W ORLD A PPLICATIONS AND U SE C ASES OF S TATE - OF -T HE -A RT S IMULATORS .
+
+Dimension
+
+ABIDES [8]
+
+JAX-LOB [13]
+
+KineticSim (Ours)
+
+Target Market Mechanism
+
+Continuous Double Auctions
+(CDAs) (e.g., NASDAQ, NYSE
+equities, LOB crypto exchanges).
+
+CDAs with continuous order-byorder matching (e.g., electronic
+market-making).
+
+Discrete-Time Call Auctions and
+Frequent Batch Auctions (FBAs).
+
+Primary User Persona
+
+Regulators (SEC/FINRA), exchange operators, market design
+researchers.
+
+Quantitative traders, HFT firms,
+RL researchers training trading
+agents.
+
+Portfolio managers, execution algorithm designers, risk analysts.
+
+Core Use Cases
+
+Simulating policy changes, order
+routing, flash crashes, and market
+manipulation detection.
+
+Training
+and
+validating
+continuous-time
+algorithmic
+trading and market-making
+strategies via deep RL.
+
+Massive ensemble backtesting,
+block trade execution optimization, and clearing interval parameter tuning.
+
+Typical Simulation
+Scenario
+
+Evaluating how a new exchange
+fee structure affects liquidity provision and spread sizes.
+
+Training a neural network agent
+to place limit orders and manage inventory risk on a crypto
+exchange.
+
+Simulating 10,000 parameter
+sweeps to optimize the clearing
+interval and bidding strategies
+for a large fund executing block
+orders.
+
+Within each block, the number of threads T is set equal to decisions using the shared device function decide().
+the number of price grid levels L (T = L). Thus, thread State Retrieval. Threads t = 0 and t = L − 1 cooperate to
+t directly corresponds to price tick p = t.
+find the highest bid (bb) and lowest ask (ba) using shared• The price grid size L is restricted to a power of two
+memory atomic operations (atomicMax and atomicMin),
+(typically L ≤ 1024) to facilitate fast warp-level and block- computing the mid price:
+level reductions and scans, matching hardware scheduling
+(
+0.5 × (bb + ba) if bb ≥ 0 and ba < L
+and warp alignment principles [21].
+mid =
+(3)
+Although real-world financial instruments can trade across
+last price
+otherwise.
+thousands of ticks, price formation and order book liquidity are
+heavily concentrated in a local band surrounding the current Agent Strategy Classes. We model three distinct classes of
+mid-price. Thus, in KineticSim, the price grid L does not agents whose strategic interactions drive the limit order book dyspan the entire price space of an asset; rather, it represents a namics. First, zero-intelligence / noise agents (atype = NOISE).
+dynamic local window (or sliding window) of L ticks centered These agents represent noise traders. They submit buy or
+on the active trading zone. Bids and asks that migrate far sell orders with equal probability (50%). The limit price
+beyond these bounds are pruned or executed as marketable, is set by adding a random offset to the current mid-price:
+which maps cleanly to real-world exchange order routing while p = round(mid + η), where η ∼ U[−∆noise , ∆noise ]. With a
+keeping the working set compact enough to reside entirely in probability Pmkt , a noise trader submits a marketable order,
+forcing the limit price to the grid boundary (L − 1 for buys, 0
+shared memory.
+for sells) to guarantee execution. Second, trend-following / moB. Shared Memory Residency
+mentum agents (atype = MOMENTUM). These agents execute
+The limit-order book (resting quantities for bids and asks) is momentum trading strategies, buying when prices are rising and
+declared as dynamic shared memory (__shared__) within selling when prices are falling. Let rett = sgn(midt −midt−1 )
+the kernel. At the start of the kernel, thread t initializes denote the sign of the mid-price change. The agent submits
+bid[t] = 0.0 and ask[t] = 0.0 and seeds the opening quotes. an order with side = rett (if rett = 0, they fall back
+During the main loop of S steps, the arrays never leave to a random side) and limit price p = round(mid + side).
+shared memory. The shared memory requirement per block Like noise agents, with probability Pmkt the order is made
+is seven L-element float arrays (s_bid, s_ask, s_BUY, marketable. Third, market maker agents (atype = MAKER).
+s_SELL, s_Dcum, s_Scum, s_match) and one L-element These liquidity providers submit limit orders to capture the
+int array (s_idx), totalling 32×L bytes. For the benchmarked bid-ask spread. To avoid complex state tracking on-chip, each
+configuration L = 128 this is only 4 KB, fitting comfortably maker alternates between buying and selling based on the
+within the 100 KB shared-memory budget per Streaming parity of its agent index a and step index s: the agent buys
+Multiprocessor (SM) of modern GPUs and leaving ample if (a + s) mod 2 = 0, and sells otherwise. The limit price is
+headroom for many resident blocks per SM (high occupancy). posted at a fixed offset: p = round(mid − ∆maker half spread ) for
+bids, and p = round(mid + ∆maker half spread ) for asks. Market
+Even at L = 1024 the footprint is only 32 KB per block.
+makers never submit marketable orders.
+C. Agent Decision and Order Aggregation
+Order Quantity and RNG. All agents submit integer order
+Each market contains A agents. In each step, the agents quantities generated on-the-fly as q ∈ {1, . . . , qmax }, where
+retrieve the current mid price and order book spread to generate q = 1+⌊u×qmax ⌋ and u ∼ U [0, 1). To avoid the CPU memory
+•
+
+5
+
+Algorithm 1 KineticSim Block-level Persistent Scheduler
+Require: M markets, S steps, A agents, L price levels
+Ensure: Final LOB and clearing statistics in global memory
+1: {Launched
+as kernel simulate_kernel<<<M,
+L>>>}
+2: Initialize shared memory arrays: s_bid[t] ← 0,
+s_ask[t] ← 0
+3: Seed opening LOB quotes for level t
+4: for step = 0 to S − 1 do
+5:
+syncthreads()
+Thread t cooperatively finds best bid/ask and computes
+6:
+mid price
+syncthreads()
+7:
+8:
+Reset trade/order buffers: s_BUY[t] ←
+0,
+s_SELL[t] ← 0
+9:
+syncthreads()
+10:
+for a = t to A − 1 step L do
+11:
+Execute agent a strategy to produce order type, price
+p, and quantity q
+or
+12:
+atomicAdd(s_BUY[p], q)
+atomicAdd(s_SELL[p], q)
+13:
+end for
+14:
+syncthreads()
+15:
+Compute scans: s_Dcum ← parallel suffix scan of
+s_BUY
+16:
+Compute scans: s_Scum ← parallel prefix scan of
+s_SELL
+17:
+syncthreads()
+18:
+Compute
+executable
+volume:
+s_match[t]
+← min(s_Dcum[t], s_Scum[t])
+syncthreads()
+19:
+20:
+Find clearing price p∗ via block parallel argmax tournament reduction over s_match
+21:
+syncthreads()
+Update residual LOB resting quantities in s_bid[t]
+22:
+and s_ask[t]
+23: end for
+24: Write final LOB state from shared memory to global
+memory
+
+footprint and thread synchronization of GPU state storage, we
+implement a stateless, counter-based SplitMix64 generator [37]
+keyed on (seed, gid, step, channel), where gid = market ×
+A + a is the global agent ID.
+
+memory. Parallel prefix sums, or scans, are standard algorithmic
+primitives for data-parallel computing [38]–[40]:
+• Thread t initializes s_Scum[t] = s_SELL[t] and
+s_Dcum[t] = s_BUY[t].
+• For strides of f = 1, 2, 4, . . . , L/2:
+– Read from s_Scum[t - off] (prefix) and
+s_Dcum[t + off] (suffix).
+– Accumulate into current values, synchronizing threads
+(__syncthreads()) at each stride.
+After computing the scans, the executable volume
+at price level t is calculated as s_match[t] =
+fminf(s_Dcum[t], s_Scum[t]). We then find
+the clearing price p∗ (the index that maximizes s_match)
+using a parallel argmax reduction over the block. The threads
+cooperatively perform a tournament reduction where indices
+are compared and propagated, resolving ties by choosing the
+lowest price index.
+Finally, the residual book is updated. Thread t calculates
+the executed trades at price t and updates s_bid[t] and
+s_ask[t] as the remaining quantities. This residual book
+serves as the input to the next simulation step.
+E. Execution Scheduler Algorithm
+Algorithm 1 formalizes the block-level persistent execution
+scheduling pipeline of KineticSim. The scheduler operates
+entirely on-device: after a single host kernel launch, each market
+block independently drives its multi-step simulation inside
+GPU shared memory. To ensure high hardware occupancy and
+avoid CPU-GPU round-trip latencies, the execution pipeline is
+partitioned into distinct phases coordinated by explicit barrier
+synchronizations:
+Phase 1: Shared Memory Initialization (Lines 2–3): At
+kernel startup, the L threads of each block cooperatively
+initialize the resting order book arrays in shared memory
+(s_bid[t] and s_ask[t] set to zero) and write the opening
+market quotes.
+Phase 2: Microstructure State Estimation (Lines 5–7): At the
+beginning of each simulation step, threads t = 0 and t = L − 1
+find the best bid and ask quotes using shared atomic operations
+to compute the current mid price. A barrier synchronization
+ensures this mid price is visible to all threads before agent
+decision logic runs.
+
+Phase 3: Parallel Agent Order Aggregation (Lines 8–
+10): The agent population is mapped to the thread block.
+Aggregation. Each thread t handles the strategy execution for a To support arbitrary agent densities A, threads execute a
+subset of the agents. If A > L, threads loop serially over agents cooperative grid-stride loop (stepping by L), invoking the RNG
+(e.g., agent a = t, t+L, t+2L, . . . ). Once an agent’s order (side, and decision functions. Orders are aggregated into sharedprice p, quantity q) is generated, its quantity is accumulated memory buffers (s_BUY and s_SELL) using fast sharedinto the shared arrays s_BUY and s_SELL at level p using memory atomic additions (atomicAdd) to prevent writefast shared-memory atomic additions (atomicAdd).
+conflict race conditions.
+D. Cooperative Parallel Clearing
+To clear the auction at each step, we must compute the
+cumulative profiles Dcum and Scum . Instead of a serial pass, we
+implement a parallel Hillis–Steele prefix/suffix scan in shared
+
+Phase 4: Cooperative Parallel Clearing (Lines 11–19): After
+a barrier ensures all orders are accumulated, threads execute
+parallel Hillis–Steele scans to construct the cumulative demand
+(s_Dcum) and supply (s_Scum) curves in Θ(log L) steps. The
+minimum of demand and supply at each price tick determines
+the executable volume (s_match). A parallel tournament
+
+6
+
+reduction (cooperative argmax) is executed over the block
+to find the clearing price p∗ that maximizes volume, resolving
+ties in favor of lower price ticks.
+Phase 5: LOB State Persistence and Final Writeback (Lines
+20–21): Thread t calculates the executed trade volume at price
+level t, updating the residual resting bid and ask quantities
+directly in shared memory. This state persists across the loop
+boundary, serving as the input for the subsequent step without
+hitting global memory. Once the persistent loop completes all
+S steps, a final copy writes the final order book state and
+clearing statistics from shared memory back to the GPU’s
+global memory.
+
+Θ(A) due to serial aggregation, but the depth is collapsed
+to Θ(⌈A/L⌉).
+• Auction Clearing: The block computes cumulative profiles using parallel Hillis–Steele scans in shared memory.
+The work is Θ(L log L) operations, but the critical path
+depth is only Θ(log L). Similarly, the argmax tournament
+reduction to select p∗ requires Θ(L) total work but only
+Θ(log L) depth.
+• Memory Footprint and Traffic: The resting book resides
+in block shared memory. Global memory is only accessed
+once at startup (initializing quotes) and once at shutdown
+(writing final states).
+Under this cooperative model, the per-step work is Wstep =
+Θ(M (L log L + A)) and the critical path depth is:
+
+F. Work–Depth Complexity Analysis
+
+Dstep = Θ (log L + ⌈A/L⌉) .
+(4)
+To formally analyze the parallel scalability of KineticSim, we
+evaluate its execution complexity using the work–depth model Over S steps, the total depth scales as:
+of parallel computing [41]. We contrast KineticSim against
+Dtotal = Θ (S · (log L + ⌈A/L⌉)) .
+(5)
+a naive one-thread-per-market CUDA kernel (where a single
+GPU thread drives each market’s clearing loop sequentially). Because the LOB remains cached on-chip, the global memory
+Let M represent the number of parallel markets, A the number traffic is completely independent of the simulation duration S:
+of agents per market, L the number of price ticks on the grid,
+Gtotal = Θ(M · L).
+(6)
+and S the number of simulation steps. We define Work (W ) as
+the total number of operations executed across all processors, This logarithmic factor reduction in clearing depth, coupled
+and Depth (D) as the length of the critical path (the longest with the elimination of the Θ(S) global memory traffic multichain of sequential dependencies).
+plier, is the mathematical basis for KineticSim’s performance
+The Naive Kernel. In a naive GPU implementation, each scaling.
+market maps to a single thread that executes all operations
+sequentially.
+G. Stateless RNG and Counter-Based Generation
+Order Aggregation: The thread loops sequentially over
+all A agents. For each agent, it generates decisions and
+writes quotes. The work and depth are both Θ(A).
+• Auction Clearing: To compute the cumulative demand
+Dcum and supply Scum , the single thread performs serial
+prefix and suffix scans over the price ticks. The tournament
+selection for the clearing price p∗ requires a sequential
+argmax sweep. Thus, clearing work and depth are both
+Θ(L).
+• Memory Footprint and Traffic: Because the LOB lives
+in global memory, every step requires the thread to load
+resting books and write back residuals. Over S steps,
+this incurs Θ(S · L) global memory loads and stores per
+market.
+•
+
+Thus, the per-step work is Wstep = Θ(M (L + A)) and the
+critical path depth is Dstep = Θ(L + A). Over the entire
+simulation, the total work is Wtotal = Θ(S · M (L + A)) and
+the depth is Dtotal = Θ(S(L + A)). Global memory traffic
+scales linearly with step count: Gtotal = Θ(S · M · L).
+KineticSim. KineticSim utilizes cooperative, intra-block parallelism where each market is driven by a thread block of size
+T = L.
+•
+
+Order Aggregation: The L threads of the block execute
+agent logic in parallel using a grid-stride loop. Threads
+loop serially ⌈A/L⌉ times. In each iteration, threads
+generate quotes and aggregate quantities into shared
+memory via atomic additions (atomicAdd). The work is
+
+A primary systems challenge in keeping agent simulations
+entirely on-chip is random number generation. Standard pseudorandom number generators (PRNGs), such as XORSHIFT
+or L’Ecuyer’s MRG32k3a, maintain a state vector (ranging
+from 16 to 128 bytes) per active sequence. In an ensemble
+simulation with M = 16384 markets and A = 256 agents,
+storing individual state vectors for all N = M ×A ≈ 4.19×106
+agents in global memory would require 67 MB to 536 MB of
+state storage. This not only consumes precious global memory
+bandwidth but also requires high-latency global memory
+transactions to load and save states at every step.
+To solve this, KineticSim implements a stateless, counterbased PRNG based on the SplitMix64 algorithm [37]. SplitMix64 is a fast, splittable generator that produces a pseudorandom 64-bit integer from a single 64-bit counter value. In our
+persistent scheduler, we define a unique deterministic counter
+coordinate for agent a in market m at step s for random channel
+c as:
+coord(m, a, s, c) = hash (m · A + a, s, c, seed) .
+
+(7)
+
+To evaluate the coordinate, we apply a mixing function that
+hashes the coordinate using two prime multiplication constants
+and bitwise rotations:
+z = (coord ⊕ (coord ≫ 30)) × 0xbf58476d1ce4e5b9,
+
+(8)
+
+z = (z ⊕ (z ≫ 27)) × 0x94d049bb133111eb,
+
+(9)
+
+u = z ⊕ (z ≫ 31).
+
+(10)
+
+7
+
+TABLE II
+C ROSS - BACKEND SEMANTIC EQUIVALENCE AT M = 4096, A = 256. T HE
+TWO CUSTOM CUDA ENGINES ARE BITWISE - IDENTICAL ; ALL BACKENDS
+AGREE TO WITHIN 0.1%.
+
+Backend
+
+Clearing px Volume/mkt Rel. err (px)
+
+CPU (NumPy)
+PyTorch GPU
+Naive Custom CUDA
+KineticSim
+
+63.937
+63.987
+63.941
+63.941
+
+96392.1
+96438.2
+96381.2
+96381.2
+
+—
++0.08%
++0.006%
++0.006%
+
+The resulting value u is converted to a uniform floating-point
+number in [0, 1) or scaled to integer ranges on-the-fly. By
+generating random variables as a pure mathematical function
+of (seed, market, agent, step, channel), KineticSim avoids
+storing and updating PRNG state vectors altogether. This
+stateless design eliminates all global memory traffic associated
+with agent random streams and enables bitwise reproducibility
+across runs.
+IV. E VALUATION
+
+Fig. 2. Cross-backend Semantic Equivalence (Correctness): Mean clearing
+price (left) and mean transacted volume per market (right) across the market
+sweep. All four backends overlap, and the two custom CUDA engines are
+exactly coincident.
+
+agent-event in nanoseconds. Results are averaged over 5 trials
+(11 for the latency experiment), reporting the median. In total
+we report 53 backend–configuration measurements spanning a
+market sweep (M ∈ {64, 256, 1024, 4096, 16384}), an agent
+sweep (A ∈ {16, 64, 256, 1024}), a fixed reference workload,
+and a dedicated latency sweep.
+
+We evaluate KineticSim against four comparison backends:
+B. Correctness Validation
+• CPU (NumPy): Sequential CPU execution utilizing
+We validate correctness in two ways. First, the Naive Custom
+NumPy vectorization across markets, representing stanCUDA
+and KineticSim CUDA engines share the exact same
+dard quantitative backtesting frameworks [42].
+device-side
+decision functions and SplitMix64 RNG streams.
+• PyTorch GPU: A highly optimized, vectorized PyTorch
+We
+verify
+that
+for all sweeps both custom CUDA engines
+implementation executing directly on the GPU. Rather
+produce
+bitwise-identical
+order books and clearing statistics;
+than a naive framework competitor, this baseline is engithis
+is
+visible
+in
+Table
+II,
+where
+their mean clearing price and
+neered for maximum performance: it runs fully vectorized
+volume
+coincide
+to
+every
+reported
+digit.
+without Python loops, executes in a torch.no_grad()
+Defending
+the
+Bitwise-Identity
+Claim.
+Floating-point atomic
+context, uses optimized in-place tensor operations (e.g.,
+scatter_add_ for order aggregation), and is timed operations (atomicAdd) are generally non-deterministic in
+using asynchronous CUDA events to exclude host-side dis- accumulation order, which can cause rounding differences
+patch overhead [11]. This represents the peak framework- between shared-memory and global-memory aggregations.
+level performance a developer gets without custom CUDA However, KineticSim achieves bitwise identity because all
+order quantities are generated as exact integers. In singleengineering.
+precision floating-point arithmetic, addition of integers is exact
+• JAX GPU: A framework-native baseline implementing
+the identical uniform-price call-auction model. Written in and associative, provided the cumulative sum does not exceed
+24
+functional JAX, it utilizes jax.jit compilation and the mantissa’s exact representation limit of 2 ≈ 16.7 million
+executes the entire multi-step simulation loop inside units. Since our maximum accumulated volume per tick in any
+24
+a single compiled XLA kernel via jax.lax.scan. clearing window is on the order of thousands (far below 2 ),
+This represents the most competitive, compile-fused, floating-point operations behave identically to integer arithmetic
+and are immune to order-dependent rounding discrepancies.
+framework-native baseline possible on the GPU.
+Thus, the different memory reduction pathways (shared vs.
+• Naive Custom CUDA: Custom CUDA kernel executing
+with one thread per market, storing the LOB in global global) produce mathematically and bitwise identical order
+memory and running serial loops for scans and clearing. books.
+Second, we compare the CUDA engines statistically against
+the CPU (NumPy) reference (which uses standard NumPy
+A. Experimental Setup
+RNG). As summarized in Table II and Fig. 2, the aggregate
+The experiments are conducted on an AMD Ryzen 9 market statistics (mean clearing price, total transacted volume,
+9950X3D CPU (16 cores, 32 threads) and an NVIDIA GeForce and trade count) match within a relative error below 0.1%,
+RTX 5090 GPU (Blackwell architecture, 32 GB VRAM, demonstrating semantic equivalence despite the different RNG
+sm 120) with CUDA Toolkit 13.2, PyTorch 2.10.0, and MSVC implementations.
+19.51. For all runs the price grid size is set to L = 128,
+and each simulation runs for S = 500 steps. We measure
+throughput in terms of agent-events per second (defined as C. Analytical Clearing Ground Truth
+M × A × S/wall time), step latency in microseconds (µs),
+To establish a mathematically rigorous, configurationpeak GPU global-memory footprint, and the amortized cost per independent baseline for correctness, we define a concrete
+
+8
+
+TABLE III
+T HROUGHPUT ( AGENT- EVENTS / S ) FOR ALL BACKENDS ACROSS THE MARKET AND AGENT SWEEPS , WITH K INETIC S IM SPEEDUPS (5 TRIALS ). T HE PEAK
+K INETIC S IM THROUGHPUT IS 5.47 × 1010 EVENTS / S .
+Sweep
+
+Param.
+
+CPU (NumPy)
+
+PyTorch
+
+JAX
+
+Naive CUDA
+
+KineticSim
+
+vs. CPU
+
+vs. PyTorch
+
+vs. JAX
+
+Markets (A=256)
+
+M =64
+M =256
+M =1024
+M =4096
+M =16384
+
+(2.04 ± 0.00) × 107
+(2.10 ± 0.00) × 107
+(2.11 ± 0.00) × 107
+(1.60 ± 0.00) × 107
+(1.46 ± 0.00) × 107
+
+(1.48 ± 0.02) × 107
+(5.94 ± 0.05) × 107
+(2.24 ± 0.02) × 108
+(9.10 ± 0.15) × 108
+(3.54 ± 0.03) × 109
+
+(1.15 ± 0.03) × 107
+(4.47 ± 0.05) × 107
+(1.54 ± 0.04) × 108
+(6.13 ± 0.07) × 108
+(2.35 ± 0.19) × 109
+
+(6.39 ± 0.00) × 107
+(1.95 ± 0.00) × 108
+(7.56 ± 0.04) × 108
+(3.09 ± 0.00) × 109
+(1.14 ± 0.00) × 1010
+
+(3.61 ± 0.00) × 109
+(1.35 ± 0.04) × 1010
+(3.69 ± 0.08) × 1010
+(4.73 ± 0.04) × 1010
+(5.39 ± 0.00) × 1010
+
+177×
+641×
+1749×
+2960×
+3695×
+
+243×
+226×
+165×
+52×
+15×
+
+315×
+301×
+240×
+77×
+23×
+
+Agents (M =8192)
+
+A=16
+A=64
+A=256
+A=1024
+
+(6.13 ± 0.00) × 106
+(1.40 ± 0.00) × 107
+(1.54 ± 0.00) × 107
+(1.55 ± 0.00) × 107
+
+(1.13 ± 0.03) × 108
+(4.50 ± 0.09) × 108
+(1.87 ± 0.05) × 109
+(4.97 ± 0.05) × 109
+
+(8.27 ± 0.11) × 107
+(3.27 ± 0.10) × 108
+(1.17 ± 0.04) × 109
+(4.46 ± 0.17) × 109
+
+(8.01 ± 0.00) × 108
+(2.58 ± 0.00) × 109
+(6.13 ± 0.03) × 109
+(8.89 ± 0.00) × 109
+
+(8.41 ± 0.11) × 109
+(2.84 ± 0.02) × 1010
+(5.16 ± 0.03) × 1010
+(5.47 ± 0.02) × 1010
+
+1373×
+2024×
+3363×
+3525×
+
+74×
+63×
+28×
+11×
+
+102×
+87×
+44×
+12×
+
+call-auction clearing case on a price grid of size L = 5
+(p ∈ {0, 1, 2, 3, 4}). Suppose the resting limit-order book has
+been cleared, and the incoming buy orders (BU Y ) and sell
+orders (SELL) submitted during the step are:
+BU Y = [10.0, 5.0, 8.0, 0.0, 2.0],
+
+(11)
+
+SELL = [0.0, 4.0, 7.0, 6.0, 3.0].
+
+(12)
+
+The clearing engine executes the uniform-price call auction
+steps as follows:
+Cumulative Demand and Supply Profiles. Suffix summing
+BU Y and prefix summing
+SELL yields the cumulative
+P
+demand
+D
+[p]
+=
+BU
+Y [q] and supply Scum [p] =
+cum
+q≥p
+P
+SELL[q]
+profiles:
+q≤p
+Dcum = [25.0, 15.0, 10.0, 2.0, 2.0],
+
+(13)
+
+Scum = [0.0, 4.0, 11.0, 17.0, 20.0].
+
+(14)
+
+Executable Volume Maximization. The executable volume
+V (p) = min (Dcum [p], Scum [p]) at each price level is:
+V (p) = [0.0, 4.0, 10.0, 2.0, 2.0].
+
+(15)
+
+The clearing price p∗ is the price level that maximizes the
+volume:
+p∗ = arg max V (p) = 2.
+(16)
+p
+
+The total executed volume is V = V (p∗ ) = 10.0 units.
+Priority-Based Trade Allocation and Residual Update. All
+executed trades occur at p∗ = 2.
+∗
+• Buy Side: Buyers with limits above p (p ≥ 3, quantity
+2.0) are filled first. The remaining 8.0 units are allocated
+to buyers at p∗ = 2, filling them completely (BU Y [2] =
+8.0).
+∗
+• Sell Side: Sellers with limits below p (p ≤ 1, quantity
+4.0) are filled first. The remaining 6.0 units are allocated
+to sellers at p∗ = 2. Since SELL[2] = 7.0, they are
+rationed, leaving 1.0 unit unmatched.
+The residual book quantities new bid = BU Y − traded buy
+and new ask = SELL − traded sell are:
+new bid = [10.0, 5.0, 0.0, 0.0, 0.0],
+
+(17)
+
+new ask = [0.0, 0.0, 1.0, 6.0, 3.0].
+
+(18)
+
+We run this exact clearing test case on the CPU (NumPy),
+PyTorch GPU, JAX GPU, Naive CUDA, and KineticSim
+backends. All five engines produce identical clearing prices
+
+(p∗ = 2), transacted volumes (V = 10.0), and residual books
+(new bid, new ask), proving that all five implementations
+are mathematically correct and semantically unified on the
+call-auction clearing model.
+D. Alternative PyTorch Optimization Strategies
+To provide a rigorous and fair comparison, we implement two
+compiler-optimized PyTorch GPU baselines that represent stateof-the-art framework techniques for bypassing CPU dispatch
+bottlenecks:
+PyTorch CUDA Graphs. In the standard PyTorch engine, each
+step dispatches a sequence of separate CUDA kernels from
+the CPU host, incurring CPU scheduling overhead. We write a
+custom subclass where all tensor state variables (such as resting
+books, mid-prices, and aggregate statistics) are mutated in-place
+(e.g., using copy_() and add_()). This guarantees that the
+memory addresses of these tensors remain static. We then
+use PyTorch’s native torch.cuda.CUDAGraph() class to
+capture the entire loop of S steps within a single stream. During
+evaluation, the captured graph is replayed on the GPU with a
+single CPU launch, eliminating all host-side dispatch latencies.
+PyTorch compiler. We compile the step execution function
+using PyTorch’s compilation engine via torch.compile(.,
+backend="cudagraphs"). This automatically performs
+operator fusion and invokes cudagraphs optimization. Because
+the market simulation sweep runs over varying market sizes M ,
+the shapes of the state tensors change across runs. In PyTorch,
+the compiler’s cudagraphs backend uses a global graph caching
+tree (cudagraph_trees) that specializes compiled graphs
+for specific shapes. To prevent size mismatch failures when
+shapes change, we invoke torch._dynamo.reset() at
+the start of each benchmark sweep config, forcing Dynamo to
+clear its specialized cache and compile a fresh graph for the
+new dimensions.
+E. NumPy CPU Single-Core Execution
+We clarify the execution mechanics of our CPU (NumPy)
+reference. The CPU engine is written using vectorized NumPy
+array operations (e.g., np.cumsum, np.add.at) to avoid
+slow Python-level loops over markets. Although NumPy is
+internally linked with multi-threaded linear algebra libraries
+(such as OpenBLAS or Intel MKL), these libraries only spawn
+threads for large-scale matrix operations. For our limit-order
+book price grids (L = 128) and market arrays, vector sizes are
+
+9
+
+TABLE IV
+F IXED W ORKLOAD P ERFORMANCE (M = 8192, A = 256, S = 500, 5
+TRIALS ).
+Backend
+
+Throughput (ev/s)
+
+Time (ms)
+
+ns/event
+
+7
+
+CPU (NumPy)
+(1.528 ± 0.000) × 10
+68643.6 ± 0.0 65.464
+PyTorch GPU
+(1.871 ± 0.077) × 109
+560.3 ± 23.0 0.534
+PyTorch CUDA Graphs (3.852 ± 0.090) × 109
+272.2 ± 6.4
+0.260
+PyTorch Compile
+(4.984 ± 0.011) × 109
+210.4 ± 0.4
+0.201
+JAX GPU
+(1.216 ± 0.029) × 109
+862.6 ± 20.7 0.823
+9
+Naive CUDA
+(6.189 ± 0.003) × 10
+169.4 ± 0.1
+0.162
+KineticSim
+(5.203 ± 0.026) × 1010 20.2 ± 0.1
+0.019
+
+Fig. 3. KineticSim Throughput Scaling: Throughput scaling (agentevents/sec) across parallel markets M (left, holding A = 256) and agent
+counts A per market (right, holding M = 8192), showing that KineticSim
+(red) scales to dominate the baselines.
+
+too small to justify the synchronization and scheduling overhead
+of a thread pool. Run-time thread profiling confirms that the
+NumPy CPU baseline runs sequentially on a single CPU core. It
+represents a highly optimized single-core vectorized reference.
+While multi-threading a CPU loop (e.g., via multiprocessing or
+C++ threads) would scale performance, the CPU would remain Fig. 4. Speedup and Scaling Performance: (Left) Speedup of each GPU
+bound by global memory latency and memory bus bandwidth, backend over the CPU (NumPy) and PyTorch GPU baselines on the fixed
+workload (M =8192, A=256, S=500). (Right) Speedup of the custom CUDA
+failing to close the orders-of-magnitude performance gap shown backends over CPU (NumPy) (solid), PyTorch GPU (dashed), and JAX GPU
+(dash-dotted) as a function of market count M (holding A = 256).
+below.
+F. Performance Scaling Results
+
+workload. Crucially, it is 8.4× faster than the Naive Custom
+CUDA baseline, validating our design choices of sharedmemory residency and parallel clearing. In amortized terms,
+KineticSim spends only 0.019 ns per agent-event, an 8.4×
+improvement over the naive kernel and a 3406× improvement
+over CPU (NumPy).
+
+Throughput Scaling in Parallel Markets. We vary
+the number of independent parallel markets M ∈
+{64, 256, 1024, 4096, 16384} while fixing A = 256. As shown
+in Fig. 3 (left) and the upper block of Table III, KineticSim’s
+throughput scales steeply with the number of markets until
+it saturates the parallel processing capacity of the GPU. At How the Advantage Scales. Fig. 4 (right) plots how the
+M = 16384, KineticSim reaches 5.39 ×1010 events/second, speedup itself evolves with the market count. Two regimes
+completing the entire 500-step simulation in only 38.9 ms. are visible. KineticSim’s advantage over CPU (NumPy) grows
+The CPU (NumPy), PyTorch GPU, and JAX GPU baselines monotonically (from 177× at M = 64 to 2960× at M = 4096)
+scale far more weakly: CPU (NumPy) is essentially flat (it as more markets expose more parallelism for the GPU to exploit.
+is compute-bound on a single sequential pass), while the In contrast, its advantage over the vectorized frameworks
+vectorized framework baselines (PyTorch and JAX) only begin (PyTorch and JAX) shrinks as M increases specifically, from
+to amortize kernel-launch overheads at the largest market 243× (vs. PyTorch) and 315× (vs. JAX) at M = 64 down
+counts.
+to 15× (vs. PyTorch) and 23× (vs. JAX) at M = 16384.
+Scaling in Agent Density. We vary the number of agents This is because at small batch sizes, PyTorch and JAX are
+per market A ∈ {16, 64, 256, 1024} while fixing M = 8192. heavily dominated by kernel-launch overheads (the regime
+Fig. 3 (right) and the lower block of Table III illustrate the KineticSim’s persistent block-level kernel eliminates entirely),
+throughput scaling. KineticSim maintains high performance whereas at large scales, they finally amortize host launch latency
+even at A = 1024 agents, achieving its peak throughput of 5.47 and become memory bandwidth-bound. Even in this most
+×1010 events/second (wall-clock time of 76.7 ms). Because competitive regime, KineticSim remains over a magnitude
+each thread amortizes its fixed clearing cost over more agents faster due to its on-chip shared-memory caching.
+as A grows, throughput increases with agent density until the
+per-step aggregation work dominates.
+G. Memory Efficiency
+Head-to-Head Comparison. Table IV summarizes the perforBecause the order book is resident in shared memory and
+mance metrics on a fixed workload of M = 8192, A = 256, only the final state is written back, KineticSim’s global-memory
+and S = 500. KineticSim executes the entire simulation in just footprint is minimal. Fig. 5 (Left) and Table V report the peak
+20.2 ms, compared to 560.3 ms for PyTorch GPU, 862.6 ms for GPU global memory across the market sweep. KineticSim
+JAX GPU, and 68.69 seconds for CPU (NumPy). Fig. 4 (left) consistently uses roughly 10× less memory than PyTorch GPU
+visualizes the corresponding speedups. KineticSim provides a and about 2× less than the Naive Custom CUDA kernel, a gap
+3406× speedup over CPU (NumPy), a 27.8× speedup over that holds at every scale. At M = 16384, KineticSim’s entire
+PyTorch GPU, and a 42.8× speedup over JAX GPU on this working set is 34.6 MB versus 340.4 MB for PyTorch GPU.
+
+10
+
+TABLE V
+P EAK GPU GLOBAL - MEMORY FOOTPRINT (MB) ACROSS THE MARKET
+SWEEP (A = 256). K INETIC S IM ’ S SHARED - MEMORY RESIDENCY YIELDS
+THE SMALLEST FOOTPRINT AT EVERY SCALE .
+
+M
+
+PyTorch
+GPU
+
+Naive
+CUDA
+
+KineticSim
+
+Reduction
+
+64
+256
+1024
+4096
+16384
+
+1.34
+5.32
+21.28
+85.09
+340.40
+
+0.27
+1.08
+4.32
+17.26
+69.06
+
+0.14
+0.54
+2.16
+8.66
+34.63
+
+9.9×
+9.8×
+9.8×
+9.8×
+9.8×
+Fig. 6. Per-step Latency (M =4096, A=256, 11 trials): Per-step latency
+comparison (log scale) showing median and min–max range over 11 trials.
+
+Fig. 5. Resource and Efficiency Scaling: (Left) GPU global-memory footprint
+vs. market count, showing KineticSim’s 10× footprint reduction. (Right)
+Amortized execution cost per agent-event (ns, log scale) showing KineticSim’s
+hardware efficiency across parallel markets M .
+
+This compact footprint is what allows the engine to scale to
+very large market ensembles on a single GPU and leaves the
+bulk of the VRAM free for downstream reinforcement-learning
+buffers.
+
+at M = 16384 up to a peak of 69.2× at M = 256 (56.5×
+at M = 64), where the persistent kernel’s elimination of perstep launch/global-memory cost matters most relative to the
+small amount of useful work. This confirms that the benefit is
+not merely “writing CUDA” the Naive Custom CUDA kernel
+already removes Python overhead but specifically the on-chip
+residency and logarithmic-depth clearing.
+We evaluate the step latency distribution for a configuration
+of M = 4096, A = 256. Fig. 6 shows the results. KineticSim
+achieves a median per-step latency of only 22.1 µs, which is
+52× faster than PyTorch GPU (1150.7 µs), 77× faster than
+JAX GPU (1704.1 µs), 15× faster than the Naive Custom
+CUDA kernel (339.3 µs), and 2874× faster than CPU (NumPy)
+(63468.5 µs). The extremely tight error bars (min–max spread)
+demonstrate the timing consistency of KineticSim, which stems
+from the absence of per-step CPU–GPU scheduling delays.
+J. Emergent Market Dynamics and Parameter Sweeps
+
+H. Amortized Cost per Agent-Event
+Fig. 5 (Right) reports the amortized time per agent-event
+(ns/event) across the market sweep. This normalizes away the
+workload size and exposes raw hardware efficiency: lower
+is better. KineticSim drops to roughly 0.02 ns/event at scale,
+more than three orders of magnitude below CPU (NumPy)
+(50–65 ns/event) and about an order of magnitude below
+PyTorch GPU in the launch-bound regime. The Naive Custom
+CUDA kernel sits between PyTorch GPU and KineticSim,
+reflecting that it removes Python and framework overhead but
+retains the global-memory and sequential-clearing penalties
+that KineticSim eliminates.
+I. Ablation: Isolating the Design Choices
+The Naive Custom CUDA backend is, by construction, an
+ablation of KineticSim: it shares the identical device-side
+decide() logic and RNG but removes the two central
+optimizations, namely (i) shared-memory residency of the LOB
+and (ii) cooperative parallel clearing, reverting instead to a
+global-memory book and a single-threaded serial scan/argmax
+per market. The two engines are therefore numerically identical
+(Table II) but differ only in execution strategy, making their
+performance gap a clean attribution of the speedup to those
+choices. On the fixed workload, KineticSim is 8.4× faster
+(Table IV); across the market sweep the gap ranges from 4.7×
+
+To address whether KineticSim produces realistic market
+micro-dynamics and to demonstrate its utility for financial experiments that would otherwise be computationally prohibitive,
+we perform a parameter sweep over the agent population mix.
+Specifically, we sweep the fraction of momentum agents αmom
+from 0.0 to 0.70 in increments of 0.05. We fix the market maker
+fraction at αmaker = 0.15 and allocate the remaining agents as
+zero-intelligence noise traders (αnoise = 1.0 − αmaker − αmom ).
+For each configuration, we run M = 64 independent markets
+for S = 1000 steps and record the price returns. The results
+are illustrated in Fig. 7.
+Financial Realism and Stylized Facts. We observe four distinct stylized facts of financial markets emerging endogenously
+from the agent interactions:
+• Positive Feedback Volatility Escalation (Top-Left): As
+shown in Fig. 7 (Top-Left), when the market is dominated
+by noise traders (αmom = 0.0), price volatility is low
+(0.95). As the trend-following momentum agent fraction
+increases, price volatility scales exponentially, reaching
+25.19 at αmom = 0.70 (peaking at 26.90 at αmom = 0.65).
+This replicates the classical positive feedback loop where
+momentum traders amplify price trends, leading to bubbles
+and sudden price crashes.
+• Fat-Tailed Returns (Top-Right): Empirical returns display leptokurtic distributions (fat tails). As shown in
+
+11
+
+parameter sweeps and reinforcement learning in multi-agent
+environments.
+V. D ISCUSSION AND L IMITATIONS
+
+Fig. 7. Emergent Dynamics in Market Composition Sweep: (Top-Left)
+Price volatility (std dev) vs. momentum agent fraction. (Top-Right) Excess
+kurtosis of returns showing fat-tailed distributions. (Bottom-Left) Mean trading
+volume per step. (Bottom-Right) Autocorrelation Function (ACF) of returns
+rt and absolute returns |rt | for the standard configuration (αmom = 0.15),
+demonstrating volatility clustering.
+
+Generality of the Systems Design Pattern. The primary
+systems contribution of this work is the formalization and evaluation of a reusable parallel pattern: persistent, state-carrying
+clearing for iterative multi-agent reductions. While persistent
+thread blocks, shared-memory residency, and parallel scans are
+standard GPU primitives, their co-design for state-persistent
+financial ABMs is new. Any iterative multi-agent simulation
+requiring state-persistent, block-localized reductions can map
+directly to this pattern, including continuous double auctions
+with parallel heaps, MARL environments, traffic routing, and
+Monte Carlo searches. Caching mutable simulation state in
+block shared memory across step boundaries bypasses the
+global-memory bandwidth and CPU launch limits of standard
+array frameworks, achieving near-hardware-limit throughput.
+
+Generality and Datacenter GPU Scaling. Our thread block
+mapping and shared-memory execution design generalize
+directly to datacenter GPUs like the NVIDIA A100 (108 SMs)
+and H100 (132 SMs). Modern NVIDIA architectures restrict
+each SM to 2048 resident threads. Since KineticSim maps each
+price grid to a thread block of size T = L = 128 threads,
+Fig. 7 (Top-Right), the excess kurtosis of returns is strictly the physical hardware limit is exactly 2048/128 = 16 blocks
+positive. At lower momentum fractions, excess kurtosis per SM. Nsight Compute profiles confirm that KineticSim
+remains around 2.24 to 2.92. However, as the momentum achieves 100% theoretical occupancy (16 active blocks, 2048
+fraction exceeds 0.60 and destabilizes the market, the resident threads per SM). With a shared-memory footprint of
+return distribution exhibits extreme tail risk, with the 4 KB per block (well below the 100–228 KB hardware budget)
+excess kurtosis peaking at 26.34, indicating abrupt, flash- and register usage restricted to 32–40 registers per thread, the
+crash-like price transitions.
+kernel is arithmetic-bound, scaling performance linearly with
+• Trading Volume Stimulation (Bottom-Left): In Fig. 7
+SM count and clock frequency.
+(Bottom-Left), the transacted volume per clearing step Limits of Compilation Frameworks (JAX / PyTorch comrises from 169.0 units at αmom = 0.0 to 263.3 units at pile). High-level compilation frameworks using JAX’s jit or
+scale. Momentum traders, seeking to cross the spread PyTorch with CUDA graphs cannot close the performance gap.
+to chase price trends, drive higher liquidity demand and While compiling tensor expressions fuses pointwise operators
+transactional velocity.
+and reduces host dispatch, compilers are structurally limited
+• Volatility Clustering (Bottom-Right): In the standard
+in two ways: first, they lack primitives to declare block-level
+configuration (αmom = 0.15), the autocorrelation of returns shared-memory variables that persist across loop steps, forcing
+rt is negative at lag 1 (−0.34, representing standard the order book state to round-trip to global memory at every
+market-microstructure bid-ask bounce / return reversal) step; second, CUDA graphs still launch a sequence of distinct
+and quickly decays to zero, indicating no linear return kernels to global memory. In contrast, KineticSim caches the
+predictability. In contrast, the autocorrelation of absolute entire book in shared memory for the full S steps, reducing
+returns |rt | is positive (0.18 at lag 1) and decays very memory traffic from Θ(S · M · L) to Θ(M · L).
+slowly across 20 lags. This difference confirms the
+presence of volatility clustering (emergent ARCH/GARCH Limitations. Several limitations apply: first, KineticSim cureffects), where high-volatility steps tend to follow high- rently models a uniform-price call auction rather than a convolatility steps, mirroring the primary empirical stylized tinuous double auction (CDA), as the scan/reduction structure
+is specific to batch clearing. Second, we assume the price
+fact of financial assets [6].
+grid L is a power of two fitting in shared memory; grids
+Enabling Infeasible Experiments. Performing a parameter exceeding 1024 require tiling. Third, validation against the CPU
+sweep of this scale (simulating 12.8 × 106 agent events) is reference is statistical rather than bitwise due to differing RNG
+trivial with KineticSim, taking less than 0.25 seconds on a streams (SplitMix64 vs. NumPy RNG), though distributions
+single GPU. Scaling this sweep to larger populations or running agree within 0.1%. Finally, our evaluation is restricted to a
+it sequentially on traditional CPU simulators like ABIDES single GPU. None of these caveats affects the central finding
+would take hours or days, which has historically restricted that shared-memory caching and cooperative clearing yield
+researchers to narrow parameter regimes. By keeping the limit- massive performance gains, but they define where the present
+order book resident on-chip, KineticSim enables real-time engine is most applicable.
+
+12
+
+VI. C ONCLUSION AND F UTURE W ORK
+In this paper we presented KineticSim, an optimized GPU
+execution engine for agent-based financial simulators. KineticSim caches limit-order books in fast shared memory and uses
+intra-block thread cooperation for aggregation and clearing,
+replacing the Θ(L)-depth serial clearing of a naive kernel
+with an Θ(log L)-depth cooperative scan and making globalmemory traffic independent of the step count. Our evaluation
+across 53 configurations demonstrates peak speedups of up
+to 3695× over CPU (NumPy) and 243× over PyTorch GPU,
+achieving throughputs exceeding 54.7 billion events/second,
+sub-23 microsecond step latencies, and a 10× smaller memory
+footprint than PyTorch GPU. Future work will extend KineticSim to continuous double auctions using shared-memory
+heaps, support tiled price grids, scale across multiple GPUs,
+and integrate multi-agent reinforcement learning interfaces.
+R EFERENCES
+[1] E. Budish, P. Cramton, and J. Shim, “The high-frequency trading arms
+race: Frequent batch auctions as a market design response,” The Quarterly
+Journal of Economics, vol. 130, no. 4, pp. 1547–1621, 2015.
+[2] J. D. Farmer and D. Foley, “The economy needs agent-based modelling,”
+Nature, vol. 460, no. 7256, pp. 685–686, 2009.
+[3] B. LeBaron, “Agent-based computational finance.” Elsevier, 2006, vol. 2,
+pp. 1187–1233.
+[4] P. Vytelingum, D. Cliff, and N. R. Jennings, “Strategic bidding in
+continuous double auctions,” Artificial Intelligence, vol. 172, no. 14,
+pp. 1700–1729, 2008.
+[5] L. Tesfatsion, “Agent-based computational economics: A constructive
+approach to economic theory.” Elsevier, 2006, vol. 2, pp. 831–880.
+[6] R. Cont, “Empirical properties of asset returns: stylized facts and
+statistical issues,” Quantitative finance, vol. 1, no. 2, p. 223, 2001.
+[7] R. Cont and A. De Larrard, “Price dynamics in a markovian limit order
+market,” SIAM Journal on Financial Mathematics, vol. 4, no. 1, pp. 1–25,
+2013.
+[8] D. Byrd, M. Hybinette, and T. H. Balch, “Abides: Towards high-fidelity
+multi-agent market simulation,” pp. 11–22, 2020.
+[9] S. Amrouni, A. Moulin, J. Vann, S. Vyetrenko, T. Balch, and M. Veloso,
+“Abides-gym: gym environments for multi-agent discrete event simulation
+and application to financial markets,” in Proceedings of the Second ACM
+International Conference on AI in Finance, 2021, pp. 1–9.
+[10] S. Vyetrenko, D. Byrd, N. Petosa, M. Mahfouz, D. Dervovic, M. Veloso,
+and T. Balch, “Get real: Realism metrics for robust limit order book
+market simulations,” in Proceedings of the First ACM International
+Conference on AI in Finance, 2020, pp. 1–8.
+[11] A. Paszke, S. Gross, F. Massa, A. Lerer, J. Bradbury, G. Chanan,
+T. Killeen, Z. Lin, N. Gimelshein, L. Antiga et al., “Pytorch: An
+imperative style, high-performance deep learning library,” vol. 32, 2019.
+[12] A. Rutherford, B. Ellis, M. Gallici, J. Cook, A. Lupu, G. Ingvarsson,
+T. Willi, A. Khan, C. S. de Witt, A. Souly et al., “Jaxmarl: Multi-agent
+rl environments in jax,” 2023.
+[13] S. Y. Frey, K. Li, P. Nagy, S. Sapora, C. Lu, S. Zohren, J. Foerster, and
+A. Calinescu, “Jax-lob: A gpu-accelerated limit order book simulator to
+unlock large scale reinforcement learning for trading,” in Proceedings of
+the Fourth ACM International Conference on AI in Finance, 2023, pp.
+583–591.
+[14] M. B. Garman, “Market microstructure,” Journal of financial Economics,
+vol. 3, no. 3, pp. 257–275, 1976.
+[15] R. Roll, “A simple implicit measure of the effective bid-ask spread in an
+efficient market,” The Journal of finance, vol. 39, no. 4, pp. 1127–1139,
+1984.
+[16] A. S. Kyle, “Continuous auctions and insider trading,” Econometrica:
+Journal of the Econometric Society, pp. 1315–1335, 1985.
+[17] L. R. Glosten and P. R. Milgrom, “Bid, ask and transaction prices in
+a specialist market with heterogeneously informed traders,” Journal of
+financial economics, vol. 14, no. 1, pp. 71–100, 1985.
+[18] D. K. Gode and S. Sunder, “Allocative efficiency of markets with
+zero-intelligence traders: Market as a partial substitute for individual
+rationality,” Journal of political economy, vol. 101, no. 1, pp. 119–137,
+1993.
+
+[19] D. Cli, “Minimal-intelligence agents for bargaining behaviors in marketbased environments,” Hewlett-Packard Labs Technical Reports, 1997.
+[20] D. Guide, “Cuda c++ programming guide,” Tech. Rep., 2020.
+[21] J. Nickolls, I. Buck, M. Garland, and K. Skadron, “Scalable parallel
+programming with cuda: Is cuda the parallel programming model that
+application developers have been waiting for?” Queue, vol. 6, no. 2, pp.
+40–53, 2008.
+[22] J. D. Owens, D. Luebke, N. Govindaraju, M. Harris, J. Krüger, A. E.
+Lefohn, and T. J. Purcell, “A survey of general-purpose computation on
+graphics hardware,” vol. 26, no. 1, pp. 80–113, 2007.
+[23] R. Farber, CUDA application design and development. Elsevier, 2011.
+[24] V. Volkov and J. W. Demmel, “Benchmarking gpus to tune dense linear
+algebra,” in SC’08: Proceedings of the 2008 ACM/IEEE conference on
+Supercomputing. IEEE, 2008, pp. 1–11.
+[25] A. Bakhoda, G. L. Yuan, W. W. Fung, H. Wong, and T. M. Aamodt,
+“Analyzing cuda workloads using a detailed gpu simulator,” in 2009
+IEEE international symposium on performance analysis of systems and
+software. IEEE, 2009, pp. 163–174.
+[26] N. Collier and M. North, “Parallel agent-based simulation with repast for
+high performance computing,” Simulation, vol. 89, no. 10, pp. 1215–1235,
+2013.
+[27] M. Lysenko and R. M. D’Souza, “A framework for megascale agent based
+model simulations on graphics processing units,” Journal of Artificial
+Societies and Social Simulation, vol. 11, no. 4, p. 10, 2008.
+[28] V. Mnih, K. Kavukcuoglu, D. Silver, A. A. Rusu, J. Veness, M. G.
+Bellemare, A. Graves, M. Riedmiller, A. K. Fidjeland, G. Ostrovski et al.,
+“Human-level control through deep reinforcement learning,” nature, vol.
+518, no. 7540, pp. 529–533, 2015.
+[29] R. S. Sutton, A. G. Barto et al., Reinforcement learning: An introduction.
+MIT press Cambridge, 1998, vol. 1, no. 1.
+[30] T. Beysolow II, “Market making via reinforcement learning,” in Applied
+Reinforcement Learning with Python: With OpenAI Gym, Tensorflow,
+and Keras. Springer, 2019, pp. 77–94.
+[31] B. Gašperov and Z. Kostanjčar, “Deep reinforcement learning for market
+making under a hawkes process-based limit order book model,” IEEE
+control systems letters, vol. 6, pp. 2485–2490, 2022.
+[32] H. Wei, Y. Wang, L. Mangu, and K. Decker, “Model-based reinforcement
+learning for predictions and control for limit order books,” arXiv preprint
+arXiv:1910.03743, 2019.
+[33] Á. Cartea, S. Jaimungal, and L. Sánchez-Betancourt, “Deep reinforcement
+learning for algorithmic trading,” Available at SSRN 3812473, 2021.
+[34] J. Zheng, Z.-T. Liang, Y. Li, Z. Li, and Q.-H. Wu, “Multi-agent
+reinforcement learning with privacy preservation for continuous double
+auction-based p2p energy trading,” vol. 20, no. 4. IEEE, 2024, pp.
+6582–6590.
+[35] W. D. Hillis and G. L. Steele Jr, “Data parallel algorithms,” Communications of the ACM, vol. 29, no. 12, pp. 1170–1183, 1986.
+[36] S. Sengupta, M. Harris, Y. Zhang, and J. D. Owens, “Scan primitives
+for gpu computing,” 2007.
+[37] G. L. Steele Jr, D. Lea, and C. H. Flood, “Fast splittable pseudorandom
+number generators,” vol. 49, no. 10. ACM New York, NY, USA, 2014,
+pp. 453–472.
+[38] G. E. Blelloch, “Prefix sums and their applications,” Tech. Rep., 1990.
+[39] M. Harris, S. Sengupta, and J. D. Owens, “Parallel prefix sum (scan)
+with cuda,” 2007, vol. 3, no. 39, pp. 851–876.
+[40] M. Torquati, “Harnessing parallelism in multi/many-cores with streams
+and parallel patterns,” 2019.
+[41] G. E. Blelloch, “Programming parallel algorithms,” Communications of
+the ACM, vol. 39, no. 3, pp. 85–97, 1996.
+[42] R. Polakovič, “vectorbt: A python library for quantitative analysis and
+backtesting,” https://github.com/polakowo/vectorbt, 2020.
+Shakya Jayakody received the B.S. and M.S. degrees in electrical engineering
+from Louisiana Tech University, Ruston, LA, USA, in 2016 and 2020,
+respectively, and the M.S. degree in computer engineering and the Ph.D.
+degree in electrical engineering from the University of Central Florida (UCF),
+Orlando, FL, USA, in 2024 and 2025, respectively. He recently served as a
+Postdoctoral Researcher at UCF. His research focuses on the hardware–software
+co-design of machine learning systems.
+Prarthinie Jayakody received the bachelor’s degree in electronic engineering
+in 2009 and the master’s degree in economics from the University of Colombo,
+Colombo, Sri Lanka, in 2017. She is a Passed Finalist of the Chartered Institute
+of Management Accountants (CIMA), UK, and has completed Chartered
+Financial Analyst (CFA) Level 1. She is currently an independent researcher.
+

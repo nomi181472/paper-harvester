@@ -1,0 +1,1928 @@
+Preprint. Under review.
+
+Planner Matters! An Efficient and Unbalanced Multi-agent
+Collaboration Framework for Long-horizon Planning
+Wenyi Wu∗
+
+Sibo Zhu∗
+
+Kun Zhou†
+
+Biwei Huang
+
+University of California, San Diego
+
+Language model (LM)–based agents have demonstrated promising capabilities in automating complex tasks from natural language instructions,
+yet they continue to struggle with long-horizon planning and reasoning.
+To address this, we propose an enhanced multi-agent framework that
+decomposes automation into three roles: a planner for high-level decisionmaking, an actor for task execution, and a memory manager for contextual
+reasoning. While this modular decomposition aligns with established design patterns, our core contribution lies in a systematic compute-allocation
+analysis, revealing that planning is the dominant factor influencing task
+performance. Execution and memory management require significantly
+less compute and model capacity to achieve competitive results. Building
+on these insights, we introduce a planner-centric reinforcement learning
+approach, which exclusively optimizes the planner using trajectory-level
+rewards from a VLM-as-judge, while freezing the other components. Extensive experiments on benchmarks spanning web navigation, OS control,
+and tool use demonstrate that concentrating model capacity and learning
+on high-level planning yields robust and compute-efficient improvements
+in long-horizon agent automation. Our code is publicly released.
+ Code
+
+1
+
+ Website
+
+Introduction
+
+Driven by scaling laws, large vision–language models (VLMs) (BorSingle Model
++3B Actor +3B Memory
+des et al., 2024; Zhang et al., 2024)
++3B Actor
++3B Actor +3B Memory +RL
+50
++8%
+have achieved remarkable perfor+28%
++4%
+40
++17%
++22%
++14%
+mance across a wide range of multi+18%
+modal reasoning and planning tasks. 30
+Building on this capability, agents pow- 20
+ered by these models have demon- 10
+0
+strated strong, human-like abilities in
+Qwen2.5-7B
+GPT-4o
+Gemini-2.5Pro
+operating complex systems, enabling
+them to autonomously perform tasks Figure 1: Performance on WebVoyager with
+such as web navigation, software con- planner-centered multi-agent setup across model
+trol, and API-based tool use from nat- scales. Using a strong planner with smaller actor
+ural language instructions (Zhou et al., and memory manager yields significant gains.
+2024b). Typically, an agent interacts
+with a digital environment over multiple turns, jointly performing state interpretation, task
+planning, and action prediction to complete complex user-specified goals.
+Success Rate (%)
+
+arXiv:2605.02168v1 [cs.AI] 4 May 2026
+
+Abstract
+
+∗ Equal contribution.
+† Corresponding author: franciskunzhou@gmail.com.
+
+1
+
+Preprint. Under review.
+
+Despite these successes, existing agents still struggle with tasks that require long-horizon
+planning and reasoning, such as searching for complex compositional intents or conducting
+tasks that involve multi-source comparison and constrained filtering. A core difficulty is that
+it is hard for a single agent to simultaneously do well at both high-level goal management
+and low-level action execution. These tasks are challenging even for humans, because
+success requires maintaining the overall objective over time while also making accurate stepby-step decisions in a dynamic environment (Cheng et al., 2025). When an agent focuses too
+much on low-level details, it may do the local steps right but still miss the overall goal, e.g.,
+click correctly, yet fail to compare options or apply constraints (Erdogan et al., 2025; Liang
+et al., 2026). Conversely, when an agent focuses more on the high-level objective, it may
+keep the overall right direction, but fails at execution through small mistakes, e.g., missing a
+state change or skipping a check (Tan et al., 2026; Aghzal et al., 2026).
+To address the challenges of long-horizon planning, decomposing an agent’s responsibilities into distinct yet cooperative components enables more structured and reliable decision-making (Zhao et al., 2025). While prior work has explored planner–actor
+decompositions (Erdogan et al., 2025; Li et al., 2025), a systematic understanding of
+how to allocate compute across components remains lacking. We adopt a multi-agent framework consisting of a planner, an actor, and a memory manager: the planner handles highlevel goal decomposition; the memory manager maintains and updates relevant information;
+and the actor executes concrete actions. As shown in Figure 1, this framework greatly improves performance, enabling Qwen2.5-VL-7B 1 to outperform GPT-4o and Gemini.
+Based on the effective multi-agent framework, we conduct a systematic compute-allocation
+analysis to study how individual components contribute to task success. Through controlled
+scaling experiments, we identify that the planner is the primary bottleneck, whereas actor
+and memory components require significantly reduced computational capacity to achieve
+comparable performance. Our key findings reveal that planning capacity dominates overall
+performance. Scaling coefficients suggest that upgrading the planner alone achieves a
+performance gain comparable to scaling all components simultaneously, while the actor and
+memory manager have substantially lower contributions. This insight aligns with principles
+in cognitive neuroscience, where high-level executive control is recognized as a critical
+bottleneck in complex real-world tasks (Miller & Cohen, 2001; Szczepanski & Knight, 2014).
+Building on this insight, we propose a planner-centric reinforcement learning (RL) approach. It exclusively optimizes the planner using trajectory-level rewards derived from
+VLM-as-judge, while keeping the actor and memory manager frozen. This targeted optimization strategy significantly improves agent performance. For example, with an unbalanced
+7B+3B+3B configuration, our framework increases performance by 28%, while achieving results comparable to closed-source baselines including GPT-4o, Gemini-2.5-Pro and Claude-4.
+These findings highlight the importance of disentangling and prioritizing planning capacity
+to efficiently achieve state-of-the-art performance in long-horizon agents.
+
+2
+
+Preliminary
+
+Long-horizon agent task. We address the problem of long-horizon task automation, where
+an agent interacts with a digital environment to execute complex user-specified tasks. Each
+episode initializes with a natural-language task description Q (e.g., “book a flight” or “find
+a recipe and save it”). At each time step t, the environment yields an observation Ot ,
+typically comprising a high-resolution screenshot and structured UI signals (e.g., a DOM or
+accessibility tree). The agent generates an action At ∈ A for execution.
+Action space. The action space A consists of parameterized interaction primitives. Each action is a tuple (type, params) where type ∈ {Click, Type, Scroll, Select, Stop, ToolInvoke}.
+1All references to Qwen2.5-VL-7B indicate the Qwen2.5-VL-7B-Instruct model throughout this
+paper. The same applies to Qwen2.5-VL-32B, Qwen3-VL-4B, and Qwen3-VL-8B.
+
+2
+
+Preprint. Under review.
+
+Planner
+
+Actor
+
+Memory Manager
+Multi-source
+
+RL
+Retrieve & Update
+
+…
+Trajectory 1
+
+Trajectory n
+
+Relevant Experience
+
+Initial plan
+Step1
+
+DONE
+
+•
+
+Step2
+
+STUCK
+
+•
+
+Step n
+
+PENDING
+
+•
+
+New plan
+
+Execution
+•
+
+Step3:
+Adjust...
+
+•
+
+Step4
+
+•
+
+Step n
+
+Subgaol completion
+
+GUI
+Code
+execution Operation
+
+Tool
+use
+
+Figure 2: Overview of the planner-centric multi-agent framework. The system decomposes
+tasks into three agents: a central Planner that reasons over long-horizon goals; a Memory
+Manager that retrieves relevant discrete and continuous memories; and an Actor that
+executes precise actions. The pipeline supports optimization via reinforcement learning.
+Actions for GUI tasks are executed using Playwright2 or PyAutoGUI3 , depending on the
+nature of the task. It enables the agent to interact with digital environments efficiently, while
+actions for tool-use tasks involve invoking specific tool APIs with corresponding parameters.
+The episode concludes upon task success, failure, or when a maximum step limit is reached.
+A formal definition of each action type and its parameters is provided in Appendix A.3.
+Multi-agent systems. Unlike a monolithic agent that uses a single policy π (At | Ot , Q),
+a multi-agent system decomposes decision-making into specialized modules. Each agent
+handles a distinct sub-capability, such as reasoning, memory retrieval, or action execution,
+and operates within its own local context. The global action At is produced through
+structured message passing where agents exchange intermediate outputs zt (e.g., natural
+language plans, subgoals, or memory queries). This effectively separates high-level cognitive
+processes (planning) from low-level control (execution).
+
+3
+
+Multi-agent framework
+
+3.1
+
+Multi-agent collaboration
+
+We propose a planner-centric multi-agent system consisting of three components: a Planner
+as the central decision-maker, an Actor that executes commands, and a Memory Manager that
+provides dynamic context. These interact in an iterative loop throughout the task.
+Planner. The Planner serves as the central decision-maker. At each step, it receives the task
+description Q, the current observation Ot , and the memory Mt from the Memory Manager.
+It generates an initial plan at the beginning and incrementally updates it in subsequent steps
+based on the latest observations, the Actor’s execution history, and updated memory. At
+each turn, it communicates the plan and focused subgoal to the Actor:
+
+Pt = Planner(Q, Ot , Mt )
+
+(1)
+
+where Pt denotes the current plan and focused subgoal to be executed.
+Actor. The Actor translates the Planner’s subgoal into a concrete, executable action At . It
+takes as input the task description Q, the Planner’s plan Pt , the current observation Ot , and
+2 https://playwright.dev/
+
+3 https://pyautogui.readthedocs.io/
+
+3
+
+Preprint. Under review.
+
+Table 1: Performance comparison of multi-agent configurations across different VLMs on
+four WebVoyager domains.
+Model
+
+Setting
+
+Amazon Google Map Coursera Allrecipes Overall
+
+Single Model
+Qwen2.5-VL-7B +Planner+Actor
++Planner+Actor+Memory
+
+14.6%
+53.7%
+56.1%
+
+16.7%
+43.9%
+53.7%
+
+2.4%
+38.1%
+33.3%
+
+15.6%
+26.7%
+35.6%
+
+12.3%
+40.6%
+44.7%
+
+Single Model
++Planner+Actor
++Planner+Actor+Memory
+
+24.4%
+53.7%
+55.6%
+
+36.6%
+51.7%
+51.7%
+
+7.1%
+35.7%
+47.6%
+
+13.3%
+35.7%
+34.1%
+
+20.4%
+44.2%
+47.3%
+
+Single Model
+Gemini-2.5-Pro +Planner+Actor
++Planner+Actor+Memory
+
+41.7%
+51.2%
+51.2%
+
+53.7%
+56.1%
+58.5%
+
+28.6%
+31.0%
+35.7%
+
+20.0%
+24.4%
+28.9%
+
+36.0%
+40.7%
+43.6%
+
+GPT-4o
+
+the available action space A:
+
+At = Actor(Q, Pt , Ot , A)
+
+(2)
+
+After execution, the Actor returns the updated observation Ot+1 to the system.
+Memory manager. The Memory Manager retrieves and manages relevant memory to
+support the Planner. It processes the task description Q, recent observations Ot−k:t , and
+execution history At−k:t to provide the Planner with hybrid memory (Zhu et al., 2026) Mt ,
+which includes explicit discrete memory Mdt and implicit continuous memory Mct . The
+discrete memory Mdt consists of structured, text-based summaries of critical steps from past
+successful trajectories. The continuous memory Mct consists of latent representations that
+encode long-term, multimodal trajectory information into compact embeddings (Wu et al.,
+2025b).
+Mt = MemoryManager(Q, Ot−k:t , At−k:t )
+(3)
+The Memory Manager also decides when to update memory. Let δt ∈ {0, 1} denote the
+update decision. The next memory state is:
+
+Mt+1 = (1 − δt ) · Mt + δt · M′t ; where M′t = UpdateMemory(Mt , Ot+1 , At ).
+
+(4)
+
+Details about memory construction can be found in Appendix A.4.3.
+3.2
+
+Empirical analysis
+
+Effectiveness of multi-agent decomposition. To assess the necessity and effectiveness
+of our multi-agent design, we compare a monolithic model baseline with two variants:
+one using Planner and Actor agents, and another further adding a Memory Manager.
+Experiments are conducted with Qwen2.5-VL-7B-Instruct (Bai et al., 2025), GPT-4o (OpenAI,
+2024), and Gemini-2.5-Pro (Google, 2023) on four WebVoyager (He et al., 2024) domains.
+All closed-source baselines use a single-model, screenshot-only setup with ReAct-style
+prompting and no external tool access. As shown in Table 1, introducing multi-agent
+decomposition significantly improves performance across all models: GPT-4o improves
+from 20.4% to 44.2%, and Qwen2.5-VL-7B from 12.3% to 40.6%. Adding memory further
+boosts results: GPT-4o’s Coursera score rises from 35.7% to 47.6%. These gains confirm that
+decomposition is effective and generalizable.
+Scaling analysis: the planner matters most. To understand where model capacity should
+be allocated, we conduct a controlled ablation that selectively scales one component at a
+time while keeping others fixed. We evaluate across three domains (Amazon, Google Maps,
+Allrecipes) using Qwen2.5-VL-3B/7B/32B and Gemini-2.5-Pro as backbones. As shown in
+Figure 3, scaling the Planner yields the largest marginal performance gains compared to
+scaling either the Actor or Memory Manager individually. While the Actor also benefits
+from scaling, the Planner consistently captures most of the improvement achievable by
+4
+
+Preprint. Under review.
+
+All Modules
+
+Actor
+
+Planner
+
+Memory Manager
+
+Success Rate (%)
+
+60
+50
+40
+30
+20
+10
+0
+
+3B
+
+7B
+
+32B
+
+(a) Amazon
+
+Max
+
+3B
+
+7B
+
+32B
+
+(b) Google Map
+
+Max
+
+3B
+
+7B
+
+32B
+
+(c) Allrecipes
+
+Max
+
+3B
+
+7B
+
+32B
+
+(d) Overall
+
+Max
+
+Figure 3: Performance when scaling individual agents (Actor, Planner, Memory Manager),
+with “Max” denoting Gemini-2.5-Pro. Scaling the Planner yields the largest marginal gains.
+scaling all modules simultaneously. The Memory Manager shows the smallest sensitivity
+to scale, suggesting that memory retrieval and management can be effectively handled by
+smaller models. This trend holds across models and domains.
+Scaling law for parameter allocation. To quantify scaling behavior, we fit a linear regression Table 2: Fitted scaling law coefficients.
+y = α log( x ) + β where x is model size (in billions of parameters)4 and y is the overall success
+Component
+α
+β
+R2
+rate (%). Fitted lines are plotted in Figure 3(d),
+All Modules
+15.6 18.1 0.58
+and Table 2 summarizes the coefficients. The
+Planner
+16.0
+12.7 0.82
+Planner achieves α = 16.0, nearly matching the
+Actor
+12.0 13.0 0.76
+all-modules coefficient (α = 15.6), confirming
+Memory Manager
+5.6
+12.7 0.89
+that most performance gains come from increasing Planner capacity. The Actor (α = 12.0) also
+benefits from scale but contributes less, while the Memory Manager (α = 5.6) shows
+the weakest scaling response. This quantitative analysis provides practical guidance for
+compute allocation under constrained budgets.
+
+4
+
+RL for improving multi-agent collaboration
+
+Despite the improvements from decomposition, the Planner can still make critical mistakes:
+suboptimal goal setting, overly aggressive decisions, or premature termination (illustrated in
+Appendix A.10.1). Long-horizon decision-making and subgoal decomposition are difficult
+to optimize through supervised learning alone, especially in dynamic, partially observable
+environments (Luo et al., 2025). We therefore turn to reinforcement learning to improve the
+Planner’s ability to learn from sequential feedback, optimize for long-term rewards, and
+adapt strategies through exploration. We note that this is best understood as modular singlepolicy RL, we only optimize one module within a frozen pipeline, rather than multi-agent
+RL in the traditional cooperative/competitive sense.
+4.1
+
+RL with trajectory-level rewards
+
+We apply Group Relative Policy Optimization (GRPO) (Shao et al., 2024) to fine-tune the
+Planner in an online, interactive setting.
+Trajectory-level reward via VLM evaluation. To provide stable feedback for long-horizon
+planning and avoid brittle credit assignment to intermediate steps, we adopt a final-outcomebased reward. After execution, a VLM evaluator (Qwen2.5-VL-32B) assesses the full episode:
+plans, screenshots, and final answer, and assigns a score ri ∈ {1, 3, 5} based on criteria including task correctness, reasoning coherence, and interaction efficiency. The full evaluation
+prompt and criteria are provided in Appendix A.6. To mitigate noise,
+we use a voting
+
+mechanism across K independent evaluations: r = mode {ri }iK=1 . This trajectory-level
+reward is broadcast to all planning actions.
+4We estimate the parameter size of GPT-4o as 200B.
+
+5
+
+Preprint. Under review.
+
+Algorithm. We optimize the Planner using GRPO with on-policy rollouts.
+(Q, Ot , Mt , Pt ) ∼ E as experiences sampled from rollouts E , the objective is:
+J (θ ) = E(Q,Ot ,Mt ,Pt )∼E [ρt At − βDKL [πθ ∥πref ]] ; where ρt =
+
+πθ (Pt | Q, Ot , Mt )
+πθold (Pt | Q, Ot , Mt )
+
+With
+
+(5)
+
+where ρ is the importance sampling ratio, DKL [πθ ∥πref ] is the KL divergence from a reference
+policy, and β is the regularization coefficient. Since the reward is computed at the trajectory
+level, we assign the same score to all steps within a rollout and normalize across the group.
+The group-normalized advantage is:
+
+
+r (ei ) − mean {r (ek )}kG=1
+
+
+Ait =
+std {r (ek )}kG=1
+
+(6)
+
+where ei = (Q, Oi , Mi , Pi ) denotes the i-th experience. We acknowledge that broadcasting
+trajectory-level rewards to all steps makes credit assignment coarse; incorporating step-level
+process rewards (Chae et al., 2025) is a promising direction for future work.
+4.2
+
+Planner-only efficient training
+
+We freeze the Actor and Memory Manager during training, ensuring training focuses solely
+on enhancing the Planner’s ability to generate high-quality plans. During each episode, the
+Memory Manager provides retrieved memory, the Planner generates a plan and subgoals,
+and the frozen Actor executes. After the full trajectory is collected, a trajectory-level reward
+is assigned and used to update the Planner’s policy.
+
+5
+
+Experiments
+
+5.1
+
+Experimental setup
+
+Memory settings. We construct the memory bank from successful trajectories generated by
+our agent on websites including Amazon, Google Maps, Coursera, and Allrecipes, domains
+covered by WebVoyager (He et al., 2024). These rollouts serve as the source for both discrete
+and continuous memory. We set the initial number of retrieved examples to 10 and enable
+dynamic memory update during evaluation. Memory construction details and dynamic
+memory update mechanism can be found in Appendices A.4.1 and A.4.2.
+Training settings. We train all models using online GRPO (Shao et al., 2024) with trajectorylevel rewards from Qwen2.5-VL-32B via voting. Training is conducted on 320 tasks across
+four real-world websites, which were generated through a semi-automated pipeline. It
+ensures sufficient executability, diversity, and reliability for training tasks. Details about
+task generation, filtering, and hyperparameters are in Appendices A.4.1 and A.4.2.
+Evaluation tasks. We evaluate on three web-agent benchmarks: WebVoyager (He et al.,
+2024) (in-domain), Mind2Web (Deng et al., 2023) and MMInA (Tian et al., 2025) (outof-domain). We report task accuracy as our primary metric, evaluated with standard
+protocols. Additionally, we evaluate on OSWorld (Xie et al., 2024) for OS-level tasks and
+MCPBench (Wang et al., 2025) for tool-use tasks.
+5.2
+
+Baseline methods
+
+Closed-source base models. We compare against GPT-4o (OpenAI, 2024), Gemini-2.5Pro (Google, 2023), and Claude-4 (Anthropic, 2025). All use a single-model setup with
+screenshot-only observation and ReAct-style prompting, without access to external tools
+or agentic scaffolding. We note that systems with full agentic scaffolding (e.g., OpenAI
+Operator (OpenAI, 2025)) achieve substantially higher absolute numbers.
+6
+
+Preprint. Under review.
+
+Table 3: Task success rates (%) across WebVoyager, Mind2Web, and MMInA. Best opensource results in each domain are bolded. “OOD” denotes out-of-domain evaluation. ∆
+shows relative improvement over the backbone’s single-model baseline.
+WebVoyager (In Domain)
+Cour
+
+Recp
+
+Map
+
+Mind2Web & MMInA (OOD)
+
+Backbone
+
+Model/Method
+
+Amz
+
+Info
+
+Svc
+
+Ent
+
+Trav
+
+Wiki
+
+Closed-Source
+
+GPT-4o
+Gemini-2.5-Pro
+Claude-4
+
+24.4% 7.1% 13.3% 36.6% 7.8% 14.1%
+41.7% 28.6% 20.0% 53.7% 16.7% 22.4%
+63.4% 28.6% 33.3% 70.0% 25.6% 40.0%
+
+3.4%
+0.0%
+6.9%
+
+19.4% 51.0% 19.7%
+19.4% 50.0% 29.6%
+9.7% 52.0% 36.6%
+
+Open-Source
+
+Qwen2.5-VL-32B
+CogAgent
+WebSight
+UI-TARS-1.5-7B
+
+46.3% 26.2% 6.7% 29.3% 14.1% 20.0% 6.9% 9.7% 43.0% 22.5%
+12.2% 9.5% 26.7% 9.8% 24.4% 8.2% 13.8% 16.1% 21.0% 15.7%
+24.4% 4.8% 13.3% 29.3% 10.3% 3.5% 3.4% 0.0% 12.0% 11.2%
+31.7% 16.7% 20.0% 31.7% 6.4% 4.7% 6.9% 0.0% 36.0% 17.1%
+
+∆
+
+Avg.
+
+Baseline
+7.3% 11.9% 8.9% 4.9% 12.8% 4.7% 6.9% 6.5% 7.0% 7.9%
+(+0.0%)
+Qwen2.5-VL-3B +Base RL
+31.7% 33.3% 20.0% 29.3% 19.2% 16.5% 10.3% 6.5% 23.0% 21.1% (+167.1%)
++Multi-Agent
+22.0% 14.3% 4.4% 14.6% 15.4% 5.9% 13.8% 6.5% 15.0% 12.4% (+57.0%)
++Multi-Agent RL 31.7% 33.3% 24.4% 41.5% 21.8% 17.6% 13.8% 12.9% 23.0% 24.0% (+203.8%)
+Baseline
++ReasoningBank
++AWM
+Qwen2.5-VL-7B +CoMEM
++Base RL
++Multi-Agent
++Multi-Agent RL
+
+14.6%
+29.3%
+17.1%
+24.4%
+46.3%
+56.1%
+68.3%
+
+2.4%
+9.5%
+4.8%
+17.1%
+21.4%
+33.3%
+38.1%
+
+15.9%
+6.7%
+11.1%
+8.9%
+24.4%
+24.4%
+33.3%
+
+16.7%
+29.3%
+29.3%
+34.1%
+48.8%
+48.8%
+63.4%
+
+9.0%
+9.0%
+7.7%
+16.7%
+23.1%
+15.4%
+21.8%
+
+11.8% 0.0% 4.4%
+20.0% 3.4% 6.5%
+10.6% 0.0% 6.5%
+23.5% 10.3% 12.9%
+23.5% 6.9% 6.5%
+21.2% 3.4% 3.2%
+23.5% 10.3% 12.9%
+
+Baseline
++ReasoningBank
++AWM
++CoMEM
++Base RL
++Multi-Agent
++Multi-Agent RL
+
+36.6%
+36.6%
+39.0%
+43.9%
+46.3%
+56.1%
+63.4%
+
+16.7%
+11.9%
+19.0%
+19.0%
+38.1%
+33.3%
+42.9%
+
+13.3%
+17.8%
+8.9%
+17.8%
+33.3%
+28.9%
+37.8%
+
+43.9%
+31.7%
+31.7%
+34.1%
+48.8%
+58.5%
+53.7%
+
+9.0%
+10.3%
+12.5%
+12.5%
+25.6%
+21.8%
+26.9%
+
+20.0%
+24.7%
+16.5%
+17.9%
+18.8%
+27.1%
+23.5%
+
+Qwen3-VL-8B
+
+38.0%
+44.0%
+31.0%
+47.0%
+34.0%
+41.0%
+44.0%
+
+12.5% (+0.0%)
+17.5% (+40.0%)
+13.1% (+4.8%)
+21.7% (+73.6%)
+26.1% (+108.8%)
+27.4% (+119.2%)
+35.1% (+180.8%)
+
+10.3% 9.7% 38.0% 21.9%
+17.2% 6.5% 48.0% 22.7%
+6.9% 16.1% 48.0% 22.1%
+3.4% 19.4% 42.0% 23.3%
+10.3% 6.5% 45.0% 30.3%
+20.7% 16.1% 54.0% 35.2%
+17.2% 9.7% 51.0% 35.8%
+
+(+0.0%)
+(+3.7%)
+(+0.9%)
+(+6.4%)
+(+38.4%)
+(+60.7%)
+(+63.5%)
+
+Open-source base models. We include Qwen2.5-VL-32B (Bai et al., 2025), CogAgent (Hong
+et al., 2024), WebSight (Bhathal & Gupta, 2025), and UI-TARS-1.5-7B (Qin et al., 2025).
+Memory-augmented baselines. ReasoningBank (Ouyang et al., 2025) and Agent Workflow
+Memory (AWM) (Wang et al., 2024) distill experience into textual prompts. Continuous
+Memory (CoMEM) (Wu et al., 2025b;c) compresses multimodal trajectories into continuous
+embeddings. Evaluations reveal the effectiveness of memory in single model setting.
+RL-trained base models. We fine-tune models using the same data and hyperparameters
+as our method, but in a single-model training setup (“Base RL”). This serves as a controlled
+baseline to highlight the improvements introduced by our memory-augmented multi-agent
+design, particularly in scaling and generalization to unseen tasks.
+5.3
+
+Main results
+
+Table 3 presents comprehensive evaluation results. We highlight three key findings.
+Multi-agent architecture enables strong performance. The training-free Qwen2.5-VL7B + Multi-Agent achieves 27.4% overall, more than doubling its single-model baseline
+(12.5%) and surpassing GPT-4o (19.7%) and specialized fine-tuned agents like UI-TARS1.5-7B (17.1%). This validates that shifting cognitive load from a monolithic model to a
+collaborative system releases latent reasoning capabilities. Note that although our multiagent setup uses more inference compute (three model calls per step); the gains substantially
+exceed what would be expected from simply scaling inference compute in a single model.
+More discussions about inference compute analysis can be found in Appendix A.7.
+Planner-centric RL further improves performance. Applying RL to the multi-agent setup
+yields consistent improvements across all model scales. For Qwen2.5-VL-7B, RL boosts
+7
+
+Preprint. Under review.
+
+Table 4: Performance on OSWorld across different methods.
+Office
+Method
+
+Daily
+
+Professional
+
+Others
+
+Writer Calc Impress Avg. Thunder. VLC Chrome Avg. GIMP VSCode Avg. M-Apps
+
+OS
+
+Overall
+
+Qwen2.5-VL-7B 4.3% 2.1%
++ReasoningBank 8.7% 2.1%
++Multi-Agent
+8.7% 0.0%
+
+2.1%
+2.1%
+4.3%
+
+2.6%
+3.4%
+3.4%
+
+0.0%
+13.3%
+13.3%
+
+5.9%
+0.0%
+0.0%
+
+11.1%
+6.5%
+8.7%
+
+7.8% 0.0%
+6.4% 11.5%
+7.9% 11.5%
+
+0.0%
+4.6%
+0.0%
+
+0.0%
+8.3%
+6.3%
+
+2.0%
+0.9%
+3.1%
+
+12.5%
+12.5%
+12.5%
+
+3.9%
+4.7%
+5.3%
+
+Qwen3-VL-8B
+27.3% 4.3%
++ReasoningBank 18.2% 8.5%
++Multi-Agent
+27.3% 8.7%
+
+19.0%
+10.6%
+10.4%
+
+14.6%
+11.2%
+13.0%
+
+40.0%
+53.3%
+46.7%
+
+17.7%
+23.5%
+29.4%
+
+28.3%
+26.1%
+34.8%
+
+28.2% 30.8%
+30.8% 36.0%
+35.9% 46.2%
+
+18.2%
+27.3%
+22.7%
+
+25.0%
+31.9%
+35.4%
+
+7.4%
+6.3%
+9.6%
+
+29.2%
+41.7%
+41.7%
+
+18.1%
+19.0%
+22.1%
+
+Table 5: Performance comparison on MCPBench across different methods.
+Task Completion
+
+Tool Usage
+
+Planning Eff.
+
+Execution Fidelity
+
+Model
+
+Task
+Info
+Tool Param Dep Parallel Schema Valid Tool Exec
+Fail
+Fulfill. Ground. Appr. Acc. Aware.
+Eff.
+Compli.
+Rate
+Success Rate
+
+Qwen2.5-VL-7B
++ReasoningBank
++Planner+Actor
++Planner+Actor+Memory
+
+4.72
+6.09
+6.78
+6.82
+
+4.54
+5.84
+6.68
+6.69
+
+4.46
+5.50
+6.70
+5.86
+
+4.42
+5.67
+6.51
+6.20
+
+4.08
+5.71
+5.83
+5.23
+
+3.73
+4.70
+5.26
+4.85
+
+0.57
+0.81
+0.89
+0.80
+
+0.57
+0.74
+0.92
+0.74
+
+0.52
+0.68
+0.91
+0.70
+
+0.05
+0.10
+0.01
+0.04
+
+Qwen3-VL-8B
++ReasoningBank
++Planner+Actor
++Planner+Actor+Memory
+
+5.67
+6.93
+8.71
+8.10
+
+5.68
+7.04
+8.59
+8.26
+
+5.69
+6.96
+8.57
+8.29
+
+5.63
+6.84
+8.60
+8.15
+
+5.69
+6.79
+8.22
+8.26
+
+5.42
+6.57
+8.09
+7.51
+
+0.72
+0.90
+1.00
+1.00
+
+0.71
+0.85
+1.00
+1.00
+
+0.70
+0.81
+1.00
+1.00
+
+0.01
+0.05
+0.00
+0.00
+
+success from 27.4% to 35.1%, a 28% relative improvement. For Qwen2.5-VL-3B, RL nearly
+doubles the success rate from 12.4% to 24.0%, bridging the gap between reasoning and
+execution in capacity-constrained regimes.
+Robust generalization to out-of-domain tasks. Our method generalizes to out-of-domain
+benchmarks, confirming that we are not overfitting to training domains. On MMInA (Wiki),
+our Qwen3-VL-8B agent achieves 51.0%, outperforming memory-augmented baselines. The
+Planner’s learned reasoning ability transfers across unseen interface layouts.
+5.4
+
+Generalization to OS and tool-use tasks
+
+We evaluate on OSWorld (Xie et al., 2024) (OS-level desktop tasks, Table 4) and MCPBench (Wang et al., 2025) (multi-step tool-use tasks, Table 5). Our multi-agent framework
+consistently outperforms baselines on both benchmarks across Qwen2.5-VL-7B and Qwen3VL-8B backbones. Notably, with Qwen3-VL-8B on MCPBench, our approach achieves
+perfect Execution Fidelity scores (1.00), demonstrating that the planner-centric architecture
+generalizes well beyond web navigation.
+Further analysis
+
+RL training strategy ablation. We ablate which
+components are optimized during training: (1)
+Planner-only (ours), (2) Actor-only with frozen Planner, and (3) joint training of Planner and Actor with
+shared parameters. As shown in Table 6 and Figure 4,
+training the Planner alone achieves the best overall
+performance and most stable reward improvement.
+Joint training with shared parameters introduces competing objectives: the model must both reason over
+long-horizon plans and execute precise low-level actions, leading to role confusion. We note that an
+alternative joint-training approach with separate pa8
+
+1.0
+
+0.8
+
+Reward
+
+5.5
+
+0.6
+
+0.4
+
+Actor Only
+Planner Only
+Jointly Train
+
+0.2
+
+0.0
+
+0
+
+10
+
+20
+
+30
+
+40
+
+50
+
+Training Step
+
+60
+
+70
+
+80
+
+Figure 4: Reward curves under different RL training strategies.
+
+Preprint. Under review.
+
+rameters and alternating updates may alleviate this
+issue, but would approximately double training cost.
+Actor-only training cannot improve reasoning quality:
+the Actor operates under the Planner’s guidance and has limited ability to improve plan
+correctness. Planner-only training allows focused improvement of high-level reasoning while the
+frozen Actor reliably follows instructions, yielding the best division of labor.
+Table 6: Task success rates with different training strategies.
+Training Strategy
+
+Amazon
+
+Map
+
+Cour
+
+Recp
+
+Planner-only (Ours)
+Actor-only
+Joint Training
+
+68.3%
+48.8%
+48.8%
+
+58.5%
+58.5%
+58.5%
+
+38.1%
+31.0%
+42.9%
+
+28.9%
+22.2%
+13.3%
+
+Ablation on continuous memory. We compare our method with and without continuous
+memory (CoMEM). In Table 7, CoMEM consistently improves success rates, with +7.1%,
++4.4%, and +4.9% gains on Coursera, Allrecipes, and Google Maps, respectively, confirming
+that continuous multimodal memory complements discrete text summaries.
+
+6
+
+Related work
+
+Multi-agent systems for digital tasks. Advances in vision–language models (VLMs)
+have enabled agents to ground language instructions in visual interfaces with increasing
+accuracy (Hong et al., 2024). Single-agent systems tackle end-to-end web and desktop
+tasks by directly interacting with live interfaces (He et al., 2024; OpenAI, 2025). Tool-use
+agents further integrate reasoning with tool invocation, supported by frameworks like
+the Model Context Protocol (MCP) (Yao et al., 2023b; Schick et al., 2023; Anthropic, 2024).
+Multi-agent systems enhance task performance by distributing roles among specialized
+model instances (Wu et al., 2023; Qian et al., 2024). Plan-and-Act (Erdogan et al., 2025)
+decomposes tasks into planner and actor roles, showing planning as the main contributor
+to performance. Frameworks like CES (Deng et al., 2025) and AgentFlow (Li et al., 2025)
+focus on high-level module training and planner-centric optimization for tool-use scenarios,
+while COLA (Zhao et al., 2025) explores multi-agent setups for Windows UI automation.
+Long-horizon planning for agents. Long-horizon tasks often rely on reasoning–acting
+loops, such as ReAct (Yao et al., 2023b), or plan-then-execute frameworks (Erdogan et al.,
+2025), where reasoning is interleaved with action execution. Methods like memory augmentation (Wang et al., 2024; Packer et al., 2024), test-time scaling (Yao et al., 2023a; Wang
+et al., 2023), and search-guided backtracking (Zhou et al., 2024a; Putta et al., 2024) enhance
+performance in sparse-reward environments. Reflective memory approaches (Shinn et al.,
+2023; Wu et al., 2025a) and decomposition-based replanning (Prasad et al., 2024) further
+improve recovery in complex tasks.
+Training for agents. Supervised fine-tuning (SFT) learns reliable action priors (Sun et al.,
+2025; Trabucco et al., 2025), but expert trajectories are scarce. Automatic pipelines explore
+environments and generate training data (Pahuja et al., 2025; Sun et al., 2025), though quality
+remains an open issue. RL from online interaction has shown promise for long-horizon
+interactive tasks (Wei et al., 2025; Qi et al., 2025; Li et al., 2025), though sparse rewards
+and long trajectories make training challenging. Process reward models provide denser
+step-level signals (Chae et al., 2025).
+
+7
+
+Conclusion
+
+We studied the challenges of long-horizon task completion for autonomous agents and
+identified high-level planning as the primary bottleneck through systematic computeallocation analysis. By deploying a multi-agent framework that separates planning, memory
+9
+
+Preprint. Under review.
+
+Table 7: Performance with and without continuous memory across different domains.
+Setting
+
+Map
+
+Cour
+
+Recp
+
+Overall
+
+w/ CoMEM
+w/o CoMEM
+
+63.4%
+58.5%
+
+45.2%
+38.1%
+
+33.3%
+28.9%
+
+47.3%
+36.9%
+
+management, and action execution, we achieved substantial improvements across web, OS,
+and tool-use benchmarks. Our scaling analysis quantitatively demonstrates that the planner
+is the dominant component: its scaling coefficient matches that of scaling all modules
+simultaneously. Building on this insight, our planner-centric RL approach yields robust
+and compute-efficient gains. We hope this work provides practical guidance for compute
+allocation in multi-agent systems and inspires further research on planner-first designs
+under constrained budgets.
+
+References
+Mohamed Aghzal, Gregory J. Stein, and Ziyu Yao. Why do llm-based web agents fail? a
+hierarchical planning perspective, 2026. URL https://arxiv.org/abs/2603.14248.
+Anthropic. Introducing the model context protocol. https://www.anthropic.com/news/
+model-context-protocol, November 2024. Accessed: 2026-01-27.
+Anthropic. Claude 4, 2025. URL https://www.anthropic.com/news/claude-4. Accessed:
+2026-01-27.
+Shuai Bai, Keqin Chen, Xuejing Liu, Jialin Wang, Wenbin Ge, Sibo Song, Kai Dang, Peng
+Wang, Shijie Wang, Jun Tang, Humen Zhong, Yuanzhi Zhu, Mingkun Yang, Zhaohai
+Li, Jianqiang Wan, Pengfei Wang, Wei Ding, Zheren Fu, Yiheng Xu, Jiabo Ye, Xi Zhang,
+Tianbao Xie, Zesen Cheng, Hang Zhang, Zhibo Yang, Haiyang Xu, and Junyang Lin.
+Qwen2.5-vl technical report, 2025. URL https://arxiv.org/abs/2502.13923.
+Tanvir Bhathal and Asanshay Gupta. Websight: A vision-first architecture for robust web
+agents, 2025. URL https://arxiv.org/abs/2508.16987.
+Florian Bordes, Richard Yuanzhe Pang, Anurag Ajay, Alexander C Li, Adrien Bardes,
+Suzanne Petryk, Oscar Mañas, Zhiqiu Lin, Anas Mahmoud, Bargav Jayaraman, et al. An
+introduction to vision-language modeling. arXiv preprint arXiv:2405.17247, 2024.
+Hyungjoo Chae, Sunghwan Kim, Junhee Cho, Seungone Kim, Seungjun Moon, Gyeom
+Hwangbo, Dongha Lim, Minjin Kim, Yeonjun Hwang, Minju Gwak, Dongwook Choi,
+Minseok Kang, Gwanhoon Im, ByeongUng Cho, Hyojun Kim, Jun Hee Han, Taeyoon
+Kwon, Minju Kim, Beong woo Kwak, Dongjin Kang, and Jinyoung Yeo. Web-shepherd:
+Advancing prms for reinforcing web agents, 2025. URL https://arxiv.org/abs/2505.
+15277.
+Weihua Cheng, Ersheng Ni, Wenlong Wang, Yifei Sun, Junming Liu, Wangyu Shen, Yirong
+Chen, Botian Shi, and Ding Wang. Mga: Memory-driven gui agent for observation-centric
+interaction, 2025. URL https://arxiv.org/abs/2510.24168.
+Xiang Deng, Yu Gu, Boyuan Zheng, Shijie Chen, Samuel Stevens, Boshi Wang, Huan Sun,
+and Yu Su. Mind2web: Towards a generalist agent for the web, 2023. URL https:
+//arxiv.org/abs/2306.06070.
+Zehao Deng, Tianjie Ju, Zheng Wu, Zhuosheng Zhang, and Gongshen Liu. Training highlevel schedulers with execution-feedback RL for long-horizon GUI automation. arXiv
+preprint arXiv:2511.22235, 2025.
+Lutfi Eren Erdogan, Nicholas Lee, Sehoon Kim, Suhong Moon, Hiroki Furuta, Gopala
+Anumanchipalli, Kurt Keutzer, and Amir Gholami. Plan-and-act: Improving planning of
+agents for long-horizon tasks, 2025. URL https://arxiv.org/abs/2503.09572.
+10
+
+Preprint. Under review.
+
+Gemini Team Google. Gemini: a family of highly capable multimodal models. arXiv preprint
+arXiv:2312.11805, 2023.
+Boyu Gou, Zanming Huang, Yuting Ning, Yu Gu, Michael Lin, Weijian Qi, Andrei Kopanev,
+Botao Yu, Bernal Jiménez Gutiérrez, Yiheng Shu, et al. Mind2web 2: Evaluating agentic
+search with agent-as-a-judge. arXiv preprint arXiv:2506.21506, 2025.
+Jiawei Gu, Xuhui Jiang, Zhichao Shi, Hexiang Tan, Xuehao Zhai, Chengjin Xu, Wei Li,
+Yinghan Shen, Shengjie Ma, Honghao Liu, Saizhuo Wang, Kun Zhang, Yuanzhuo Wang,
+Wen Gao, Lionel Ni, and Jian Guo. A survey on llm-as-a-judge, 2025. URL https:
+//arxiv.org/abs/2411.15594.
+Hongliang He, Wenlin Yao, Kaixin Ma, Wenhao Yu, Yong Dai, Hongming Zhang, Zhenzhong
+Lan, and Dong Yu. Webvoyager: Building an end-to-end web agent with large multimodal
+models. arXiv preprint arXiv:2401.13919, 2024.
+Wenyi Hong, Weihan Wang, Qingsong Lv, Jiazheng Xu, Wenmeng Yu, Junhui Ji, Yan Wang,
+Zihan Wang, Yuxuan Zhang, Juanzi Li, Bin Xu, Yuxiao Dong, Ming Ding, and Jie Tang.
+Cogagent: A visual language model for gui agents, 2024. URL https://arxiv.org/abs/
+2312.08914.
+Jing Yu Koh, Robert Lo, Lawrence Jang, Vikram Duvvur, Ming Chong Lim, Po-Yu Huang,
+Graham Neubig, Shuyan Zhou, Ruslan Salakhutdinov, and Daniel Fried. Visualwebarena:
+Evaluating multimodal agents on realistic visual web tasks, 2024. URL https://arxiv.
+org/abs/2401.13649.
+Zhuofeng Li, Haoxiang Zhang, Seungju Han, Sheng Liu, Jianwen Xie, Yu Zhang, Yejin Choi,
+James Zou, and Pan Lu. In-the-flow agentic system optimization for effective planning
+and tool use. arXiv preprint arXiv:2510.05592, 2025.
+Yongyuan Liang, Shijie Zhou, Yu Gu, Hao Tan, Gang Wu, Franck Dernoncourt, Jihyung Kil,
+Ryan A. Rossi, and Ruiyi Zhang. Anticipatory planning for multimodal ai agents, 2026.
+URL https://arxiv.org/abs/2603.16777.
+Jie Liu, Gongye Liu, Jiajun Liang, Yangguang Li, Jiaheng Liu, Xintao Wang, Pengfei Wan,
+Di Zhang, and Wanli Ouyang. Flow-grpo: Training flow matching models via online rl,
+2025. URL https://arxiv.org/abs/2505.05470.
+Run Luo, Lu Wang, Wanwei He, Longze Chen, Jiaming Li, and Xiaobo Xia. Gui-r1: A generalist r1-style vision-language action model for gui agents. arXiv preprint arXiv:2504.10458,
+2025.
+Earl K. Miller and Jonathan D. Cohen. An integrative theory of prefrontal cortex function.
+Annual Review of Neuroscience, 24:167–202, 2001. doi: 10.1146/annurev.neuro.24.1.167.
+OpenAI. Gpt-4o technical report. https://openai.com/index/hello-gpt-4o/, 2024. Accessed September 2025.
+OpenAI. Computer-using agent. OpenAI (Release), January 2025. URL https://openai.
+com/index/computer-using-agent/. Accessed: 2026-01-27.
+OpenAI. Introducing operator. https://openai.com/index/introducing-operator/, 2025.
+Accessed: March 31, 2026.
+OpenAI. Operator system card. Technical report, OpenAI, January 2025. URL https:
+//cdn.openai.com/operator_system_card.pdf. Accessed: 2026-01-27.
+Siru Ouyang, Jun Yan, I-Hung Hsu, Yanfei Chen, Ke Jiang, Zifeng Wang, Rujun Han, Long T.
+Le, Samira Daruki, Xiangru Tang, Vishy Tirumalashetty, George Lee, Mahsan Rofouei,
+Hangfei Lin, Jiawei Han, Chen-Yu Lee, and Tomas Pfister. Reasoningbank: Scaling agent
+self-evolving with reasoning memory, 2025. URL https://arxiv.org/abs/2509.25140.
+11
+
+Preprint. Under review.
+
+Charles Packer, Sarah Wooders, Kevin Lin, Vivian Fang, Shishir G. Patil, Ion Stoica, and
+Joseph E. Gonzalez. Memgpt: Towards llms as operating systems, 2024. URL https:
+//arxiv.org/abs/2310.08560.
+Vardaan Pahuja, Yadong Lu, Corby Rosset, Boyu Gou, Arindam Mitra, Spencer Whitehead,
+Yu Su, and Ahmed Awadallah. Explorer: Scaling exploration-driven web trajectory
+synthesis for multimodal web agents, 2025. URL https://arxiv.org/abs/2502.11357.
+Jiayi Pan, Yichi Zhang, Nicholas Wang, Hanqi Hu, Elena Glassman, Heng Ji, Kai-Wei Chang,
+Nanyun Peng, and Huaxiu Wang. Autonomous evaluation and refinement of digital
+agents, 2024.
+Archiki Prasad, Alexander Koller, Mareike Hartmann, Peter Clark, Ashish Sabharwal, Mohit
+Bansal, and Tushar Khot. Adapt: As-needed decomposition and planning with language
+models, 2024. URL https://arxiv.org/abs/2311.05772.
+Pranav Putta, Edmund Mills, Naman Garg, Sumeet Motwani, Chelsea Finn, Divyansh Garg,
+and Rafael Rafailov. Agent q: Advanced reasoning and learning for autonomous ai agents,
+2024. URL https://arxiv.org/abs/2408.07199.
+Zehan Qi, Xiao Liu, Iat Long Iong, Hanyu Lai, Xueqiao Sun, Wenyi Zhao, Yu Yang, Xinyue
+Yang, Jiadai Sun, Shuntian Yao, Tianjie Zhang, Wei Xu, Jie Tang, and Yuxiao Dong. Webrl:
+Training llm web agents via self-evolving online curriculum reinforcement learning, 2025.
+URL https://arxiv.org/abs/2411.02337.
+Chen Qian, Wei Liu, Hongzhang Liu, Nuo Chen, Yufan Dang, Jiahao Li, Cheng Yang,
+Weize Chen, Yusheng Su, Xin Cong, Juyuan Xu, Dahai Li, Zhiyuan Liu, and Maosong
+Sun. Chatdev: Communicative agents for software development, 2024. URL https:
+//arxiv.org/abs/2307.07924.
+Yujia Qin, Yining Ye, Junjie Fang, Haoming Wang, Shihao Liang, Shizuo Tian, Junda Zhang,
+Jiahao Li, Yunxin Li, Shijue Huang, Wanjun Zhong, Kuanye Li, Jiale Yang, Yu Miao, Woyu
+Lin, Longxiang Liu, Xu Jiang, Qianli Ma, Jingyu Li, Xiaojun Xiao, Kai Cai, Chuang Li,
+Yaowei Zheng, Chaolin Jin, Chen Li, Xiao Zhou, Minchao Wang, Haoli Chen, Zhaojian
+Li, Haihua Yang, Haifeng Liu, Feng Lin, Tao Peng, Xin Liu, and Guang Shi. Ui-tars:
+Pioneering automated gui interaction with native agents, 2025. URL https://arxiv.org/
+abs/2501.12326.
+Timo Schick, Jane Dwivedi-Yu, Roberto Dessì, Roberta Raileanu, Maria Lomeli, Luke
+Zettlemoyer, Nicola Cancedda, and Thomas Scialom. Toolformer: Language models can
+teach themselves to use tools, 2023. URL https://arxiv.org/abs/2302.04761.
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang,
+Mingchuan Zhang, YK Li, Yang Wu, et al. Deepseekmath: Pushing the limits of mathematical reasoning in open language models. arXiv preprint arXiv:2402.03300, 2024.
+Noah Shinn, Federico Cassano, Edward Berman, Ashwin Gopinath, Karthik Narasimhan,
+and Shunyu Yao. Reflexion: Language agents with verbal reinforcement learning, 2023.
+URL https://arxiv.org/abs/2303.11366.
+Qiushi Sun, Kanzhi Cheng, Zichen Ding, Chuanyang Jin, Yian Wang, Fangzhi Xu, Zhenyu
+Wu, Chengyou Jia, Liheng Chen, Zhoumianze Liu, Ben Kao, Guohao Li, Junxian He,
+Yu Qiao, and Zhiyong Wu. Os-genesis: Automating gui agent trajectory construction via
+reverse task synthesis, 2025. URL https://arxiv.org/abs/2412.19723.
+Sara M. Szczepanski and Robert T. Knight. Insights into human behavior from lesions to
+the prefrontal cortex. Neuron, 83(5):1002–1018, 2014. doi: 10.1016/j.neuron.2014.08.011.
+Yunteng Tan, Zhi Gao, and Xinxiao Wu. Enhancing web agents with a hierarchical memory
+tree, 2026. URL https://arxiv.org/abs/2603.07024.
+Shulin Tian, Ziniu Zhang, Liangyu Chen, and Ziwei Liu. Mmina: Benchmarking multihop
+multimodal internet agents, 2025. URL https://arxiv.org/abs/2404.09992.
+12
+
+Preprint. Under review.
+
+Brandon Trabucco, Gunnar Sigurdsson, Robinson Piramuthu, and Ruslan Salakhutdinov.
+Insta: Towards internet-scale training for agents, 2025. URL https://arxiv.org/abs/
+2502.06776.
+Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc Le, Ed Chi, Sharan Narang, Aakanksha
+Chowdhery, and Denny Zhou. Self-consistency improves chain of thought reasoning in
+language models, 2023. URL https://arxiv.org/abs/2203.11171.
+Zhenting Wang, Qi Chang, Hemani Patel, Shashank Biju, Cheng-En Wu, Quan Liu, Aolin
+Ding, Alireza Rezazadeh, Ankit Shah, Yujia Bao, et al. Mcp-bench: Benchmarking
+tool-using llm agents with complex real-world tasks via mcp servers. arXiv preprint
+arXiv:2508.20453, 2025.
+Zora Zhiruo Wang, Jiayuan Mao, Daniel Fried, and Graham Neubig. Agent workflow
+memory, 2024. URL https://arxiv.org/abs/2409.07429.
+Zhepei Wei, Wenlin Yao, Yao Liu, Weizhi Zhang, Qin Lu, Liang Qiu, Changlong Yu, Puyang
+Xu, Chao Zhang, Bing Yin, Hyokun Yun, and Lihong Li. Webagent-r1: Training web
+agents via end-to-end multi-turn reinforcement learning, 2025. URL https://arxiv.org/
+abs/2505.16421.
+Qingyun Wu, Gagan Bansal, Jieyu Zhang, Yiran Wu, Beibin Li, Erkang Zhu, Li Jiang,
+Xiaoyun Zhang, Shaokun Zhang, Jiale Liu, Ahmed Hassan Awadallah, Ryen W White,
+Doug Burger, and Chi Wang. Autogen: Enabling next-gen llm applications via multi-agent
+conversation, 2023. URL https://arxiv.org/abs/2308.08155.
+Qinzhuo Wu, Pengzhi Gao, Wei Liu, and Jian Luan. Backtrackagent: Enhancing gui agent
+with error detection and backtracking mechanism, 2025a. URL https://arxiv.org/abs/
+2505.20660.
+Wenyi Wu, Zixuan Song, Kun Zhou, Yifei Shao, Zhiting Hu, and Biwei Huang. Towards
+general continuous memory for vision-language models. arXiv preprint arXiv:2505.17670,
+2025b.
+Wenyi Wu, Kun Zhou, Ruoxin Yuan, Vivian Yu, Stephen Wang, Zhiting Hu, and Biwei
+Huang. Auto-scaling continuous memory for gui agent. arXiv preprint arXiv:2510.09038,
+2025c.
+Tianbao Xie, Danyang Zhang, Jixuan Chen, Xiaochuan Li, Siheng Zhao, Ruisheng Cao,
+Toh Jing Hua, Zhoujun Cheng, Dongchan Shin, Fangyu Lei, Yitao Liu, Yiheng Xu, Shuyan
+Zhou, Silvio Savarese, Caiming Xiong, Victor Zhong, and Tao Yu. Osworld: Benchmarking
+multimodal agents for open-ended tasks in real computer environments, 2024. URL
+https://arxiv.org/abs/2404.07972.
+Shunyu Yao, Dian Yu, Jeffrey Zhao, Izhak Shafran, Thomas L. Griffiths, Yuan Cao, and
+Karthik Narasimhan. Tree of thoughts: Deliberate problem solving with large language
+models, 2023a. URL https://arxiv.org/abs/2305.10601.
+Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan, and
+Yuan Cao. React: Synergizing reasoning and acting in language models, 2023b. URL
+https://arxiv.org/abs/2210.03629.
+Jingyi Zhang, Jiaxing Huang, Sheng Jin, and Shijian Lu. Vision-language models for vision
+tasks: A survey. IEEE transactions on pattern analysis and machine intelligence, 46(8):5625–
+5644, 2024.
+Di Zhao, Longhui Ma, Siwei Wang, Miao Wang, and Zhao Lv. Cola: A scalable multi-agent
+framework for windows ui task automation, 2025. URL https://arxiv.org/abs/2503.
+09263.
+Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao
+Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric P. Xing, Hao Zhang, Joseph E. Gonzalez,
+and Ion Stoica. Judging LLM-as-a-judge with MT-Bench and chatbot arena. In Advances
+in Neural Information Processing Systems, 2023.
+13
+
+Preprint. Under review.
+
+Andy Zhou, Kai Yan, Michal Shlapentokh-Rothman, Haohan Wang, and Yu-Xiong Wang.
+Language agent tree search unifies reasoning acting and planning in language models,
+2024a. URL https://arxiv.org/abs/2310.04406.
+Shuyan Zhou, Frank F. Xu, Hao Zhu, Xuhui Zhou, Robert Lo, Abishek Sridhar, Xianyi Cheng,
+Tianyue Ou, Yonatan Bisk, Daniel Fried, Uri Alon, and Graham Neubig. Webarena: A
+realistic web environment for building autonomous agents, 2024b. URL https://arxiv.
+org/abs/2307.13854.
+Sibo Zhu, Wenyi Wu, Kun Zhou, Stephen Wang, and Biwei Huang. Hybrid self-evolving
+structured memory for gui agents, 2026. URL https://arxiv.org/abs/2603.10291.
+
+14
+
+Preprint. Under review.
+
+A
+
+Appendix
+
+A.1
+
+Ethics statement
+
+This work aims to improve the reasoning and memory capabilities of autonomous agents
+in a planner-centric multi-agent framework. All web-browser experiments are conducted
+on public websites (e.g., Amazon, Google Maps, wikipedia, etc.), commonly used in prior
+research. To ensure safety, we employ a VLM to detect when the agent navigates to login or
+sensitive pages; in such cases, the agent is redirected to the main page. No login-protected
+content or private data are involved. For Operation system tasks, we use environment in
+virtual machine provided by OSWorld (Xie et al., 2024). For tool-use MCP tasks, all tools are
+officially provided my different websites.
+While our study poses no immediate privacy or ethical risks, we recognize that deploying
+web agents at scale requires strong safeguards. Without proper constraints, agents may
+unintentionally perform harmful or unauthorized actions. Future real-world applications
+should incorporate safety mechanisms and human oversight to ensure responsible and
+ethical use.
+A.2
+
+Reproducibility statement
+
+Training hyperparameters are in Appendix A.4.2; task generation and filtering in Appendix A.4.1; VLM-as-judge prompt in Appendix A.6; all agent prompts in Appendix A.11.
+Evaluation uses standard protocols on publicly available benchmarks. Our code will be
+publicly released to support the reproducibility.
+A.3
+
+Action space definition
+
+The action space A consists of parameterized interaction primitives. Each action is a tuple
+(type, params) where type specifies the action type, and params specifies the target and
+additional arguments. The action space is divided into two categories based on the nature of
+the task: actions for GUI-based environments (web and OS) and actions for tool-use tasks.
+Actions for GUI tasks. GUI-based actions involve interacting with visual user interfaces
+for both web and OS environments. These actions are executed via Playwright5 and
+PyAutoGUI6 for OS operation. Concretely, the following action types are available:
+• Click(element_id): Click on the element identified by its index in the accessibility tree.
+• Type(element_id, text): Enter text into the specified input field.
+• Scroll(direction, amount): Scroll the page in the given direction.
+• Select(element_id, option): Choose an option from a dropdown menu.
+• Stop(answer): Terminate the episode and return a final answer.
+Actions for tool-use tasks. Tool-use actions focus on interacting with external tools
+through API-based commands or invoking operations defined by the tool. These actions are
+designed for multi-tool integration systems such as MCP (Model Context Protocol) (Wang
+et al., 2025). Tool-use actions include:
+• ToolInvoke(tool_name, tool_params): Invoke a specific tool with the provided parameters. The argument tool_name specifies which tool to use, and tool_params supplies the
+arguments required by the tool (e.g., API endpoint, input data).
+• Stop(answer): Terminate the episode and return a final answer.
+Tool-use actions are executed through the MCP framework, which standardizes interactions
+by enabling seamless tool calls and parameter passing across diverse tool APIs.
+5 https://playwright.dev/
+
+6 https://pyautogui.readthedocs.io/
+
+15
+
+Preprint. Under review.
+
+A.4
+
+Experiment details
+
+A.4.1
+
+Training task generation
+
+We develop a pipeline for automated task generation and filtering using Qwen2.5-VL-32B.
+For each webpage screenshot, we generate contextual descriptions and propose K = 10
+structured tasks with difficulty labels. Tasks are filtered through: (1) automatic executability
+checks with N = 6 rollouts per task, retaining only those with non-zero success rate; and (2)
+manual quality assurance. This yields 320 high-quality tasks spanning multiple domains
+and difficulty levels.
+A.4.2
+
+Training parameters
+
+We list our hyperparameter setting for planner-centric RL training in table 8. All our ablation
+RL training use the identical parameter setting.
+Table 8: Training hyperparameters for planner-centric RL.
+
+A.4.3
+
+Parameter
+
+Value
+
+Planner Temperature
+Learning Rate
+Batch Size
+Rollouts per Sample
+KL-Divergence Coefficient (β)
+
+0.5
+2 × 10−6
+6
+8
+0.1
+
+Memory construction details
+
+Trajectories Collection. We leverage the autonomous task generation and rollout framework described by Wu et al. (2025c) to collect trajectories across websites including Amazon,
+Google Maps, Coursera, and Allrecipes. Following the same setup as in Section A.4.1, we
+perform N = 6 rollouts per task and retain only successful trajectories.
+Discrete memory. We use Qwen2.5-VL-7B to extract key steps from successful trajectories,
+identifying important subgoals, salient UI elements, and critical action summaries. This
+yields compact symbolic representations provided to the Planner as context.
+Continuous memory. Following Wu et al. (2025b), we use a VLM-based encoder consisting
+of the trained Planner model and a pretrained Q-Former. The trajectory is processed
+through the Planner to obtain hidden states, which are compressed into n = 8 latent tokens:
+Mc = QFormer(Planner(h−1 )) ∈ R8×d . These tokens are prepended to the Planner’s input
+embeddings during inference.
+A.5
+
+Baseline setup and comparison context
+
+Closed-source baseline configuration. All closed-source models (GPT-4o, Gemini-2.5-Pro,
+Claude-4) are evaluated in a single-model, screenshot-only setup. Specifically:
+• Observation: The model receives a high-resolution screenshot of the current webpage
+at each step, along with the accessibility tree (element IDs and text content). No DOM
+HTML is provided.
+• Prompting: We use ReAct-style prompting where the model is asked to reason about the
+current state and then produce a single action.
+• No external tools: The models do not have access to any external tools, APIs, or agentic
+scaffolding beyond the basic action space (Click, Type, Scroll, Select, Stop).
+• Step limit: All models are limited to a maximum of 15 steps per task.
+16
+
+Preprint. Under review.
+
+Context on absolute performance levels. We note that our reported absolute numbers
+on benchmarks like WebVoyager are lower than some recently reported state-of-the-art
+results. For example, systems such as OpenAI Operator (OpenAI, 2025) and browser-use
+frameworks with extended agentic scaffolding have reported substantially higher success
+rates on WebVoyager. This discrepancy is due to several key differences in our evaluation
+setting:
+1. Dynamic web environments: Real-world websites change continuously, such as page
+layouts, product listings, UI elements, and even entire website structures are updated
+frequently. Tasks that were valid months ago may no longer be feasible in their original
+form. Our evaluation is conducted on live websites at the time of our experiments,
+meaning the difficulty may differ from prior evaluations conducted on older snapshots.
+2. Step limit: We enforce a strict 15-step limit for all methods and models, which is more
+restrictive than some prior work that allows 50-100 steps.
+3. No website-specific optimization: We do not fine-tune prompts, action spaces, or memory banks to specific websites. Our framework uses the same configuration across all
+evaluation domains.
+4. Fair comparison environment: All methods and models in our evaluation, including
+closed-source baselines, open-source models, memory-augmented variants, and our
+multi-agent framework, are evaluated under identical conditions (same websites, same
+tasks, same step limits, same evaluation time window). This ensures that performance
+differences reflect genuine method improvements rather than evaluation setup advantages.
+The focus of our work is not to achieve the highest absolute numbers, but rather to provide
+a controlled and fair analysis of how compute allocation and training strategy affect multiagent system performance. Our key findings: the planner is the dominant bottleneck and
+that planner-centric RL is effective, hold regardless of absolute performance levels.
+A.6
+
+VLM-as-judge evaluation details
+
+Overview. Using LLMs and VLMs as automated evaluators has become a widely adopted
+paradigm across NLP and agent research. Zheng et al. (2023) introduced the LLM-as-ajudge framework and demonstrated that strong LLMs such as GPT-4 can achieve over 80%
+agreement with human annotators, matching inter-annotator agreement levels. Since then,
+this approach has been extensively adopted in agent evaluation: WebVoyager (He et al., 2024)
+employs GPT-4V to judge task completion from screenshots, replacing fragile rule-based
+heuristics; VisualWebArena (Koh et al., 2024) uses multimodal LLMs to assess open-ended
+visual web tasks; Pan et al. (2024) propose using LLMs for both evaluating and refining agent
+trajectories; and several RL-based agent training methods (Qi et al., 2025; Liu et al., 2025) rely
+on LLM/VLM judges to provide trajectory-level reward signals. A recent comprehensive
+survey (Gu et al., 2025) systematically reviews the reliability, biases, and mitigation strategies
+of LLM-as-a-judge systems, confirming that with appropriate prompting and aggregation,
+VLM-based evaluation provides a scalable and reliable alternative to human annotation for
+agent tasks.
+Following this established practice, our VLM evaluator (Qwen2.5-VL-32B) receives the task
+description, the full sequence of screenshots, all planner outputs, and the final answer. It
+evaluates on three criteria: (1) Task correctness: whether the final state satisfies the original
+task requirements; (2) Reasoning coherence: whether the planning steps form a logical
+sequence toward the goal; (3) Interaction efficiency: whether the agent avoids unnecessary
+repetition or wasted actions. The evaluator assigns a holistic score of r ∈ {1, 3, 5} where 1 =
+failure, 3 = partial success, 5 = full success. We use K = 3 independent evaluations and take
+the mode to reduce variance. Evaluation prompt can be found in Appendix A.11.
+Human–VLM agreement analysis. Prior work has shown that LLM-based judges can
+achieve human-level agreement when properly calibrated (Zheng et al., 2023; Gou et al.,
+2025), but domain-specific validation remains important, particularly for visually grounded
+agent tasks where evaluation requires jointly reasoning over screenshots, action sequences,
+and task semantics. To validate the reliability of our VLM-as-judge reward in this specific
+17
+
+Preprint. Under review.
+
+setting, we conduct a human agreement study: three human annotators independently
+score a random subset of trajectories using the same rubric as the VLM evaluator (1 = failure,
+3 = partial, 5 = success). We then compute agreement between the majority human label
+and the VLM judge’s mode score across K = 3 evaluations. Results are shown in Table 9.
+Table 9: Agreement between VLM-as-judge (Qwen2.5-VL-32B) and human annotations on a
+sample of evaluation trajectories.
+
+A.7
+
+Metric
+
+Value
+
+Number of trajectories evaluated
+Exact agreement rate
+Agreement within ±1 level
+
+100
+88.3%
+96.7%
+
+Inference compute analysis
+
+Table 10: Inference compute comparison between single-model and multi-agent setups.
+Backbone
+
+Amazon
+Time (s)
+Acc.
+
+Google Map
+Time (s)
+Acc.
+
+Coursera
+Time (s)
+Acc.
+
+Allrecipes
+Time (s)
+Acc.
+
+GPT-4o
+Claude-4
+Qwen2.5-VL-7B
++ Multi-Agent
+
+323.4
+100.7
+163.8
+154.3
+
+248.6
+91.6
+162.8
+162.6
+
+272.2
+161.1
+134.4
+153.7
+
+295.4
+174.1
+209.1
+220.5
+
+24.4%
+63.4%
+14.6%
+68.3%
+
+36.6%
+70.0%
+16.7%
+63.4%
+
+7.1%
+28.6%
+2.4%
+38.1%
+
+13.3%
+33.3%
+15.9%
+33.3%
+
+Here we analyze the average time cost in seconds for each task across different domains,
+and average accuracy. The results in Table 10 demonstrate that the multi-agent framework
+achieves comparable or even reduced inference time compared to single-model baselines,
+despite additional computation from the Planner, Actor, and Memory Manager. On domains
+such as Coursera and Amazon, the multi-agent system significantly reduces time costs (e.g.,
+163.8s to 153.7s on Coursera) by optimizing decision paths, making them more focused and
+efficient.
+Moreover, the multi-agent setup consistently improves accuracy across all domains. For
+example, on Google Maps, accuracy rises from 16.7% (Qwen2.5-VL-7B) to 63.4%, while
+maintaining similar inference time. This shows that the multi-agent approach better leverages memory and collaboration to reduce unnecessary steps and enhance task success rates,
+making it both an efficient and reliable choice for real-world applications.
+A.8
+
+Evaluation benchmarks
+
+WebVoyager (He et al., 2024) includes real-world tasks from 15 websites. Mind2Web (Deng
+et al., 2023) features over 2,000 tasks from 137 websites across 31 domains; we use the first
+100 tasks from test-domain and test-website splits. MMInA (Tian et al., 2025) assesses
+agents on real websites across information searching, shopping, and travel; we evaluate
+on the Wikipedia domain using 100 test tasks. OSWorld (Xie et al., 2024) requires agents
+to complete tasks in desktop applications via multi-turn interaction. MCPBench (Wang
+et al., 2025) tests multi-step tasks requiring tool use via MCP servers. For WebVoyager and
+Mind2Web, we use Qwen2.5-VL-32B as the LLM-as-judge. For MMInA, we compare the
+agent’s final answer with ground truth using an LLM.
+A.9
+
+Limitations
+
+While our study provides significant insights into employing multi-agent frameworks for
+diverse domain-specific tasks, there are several limitations to note. In the joint training
+ablation, the Actor and Planner share the same parameters, and we did not validate the
+optimization of two distinct models simultaneously. This decision was made due to computational resource constraints. Additionally, the experiments were restricted to a maximum
+18
+
+Preprint. Under review.
+
+of 15 steps for task execution, a setting imposed by cost and time limitations. Expanding the step limit in future work could provide a more comprehensive evaluation of the
+framework’s effectiveness in longer tasks and complex scenarios.
+A.10
+
+Case studies
+
+A.10.1
+
+Case study for training-free planner
+
+Figure 5: Success and failure cases of the training-free planner.
+We analyze a representative task: finding a surge protector on Amazon with specific constraints. In the successful case, the Planner effectively decomposes the task into subgoals
+and adapts based on feedback. In the failure case, the actor clicks into a wrong page and the
+Planner cannot recover, getting stuck repeating the same subgoal. This highlights the need
+for RL to improve adaptive decision-making.
+A.10.2
+
+Case study for multi-agent vs. single-agent
+
+The single-agent baseline relies solely on search queries, failing to leverage sidebar filters and
+entering repetitive loops. Our multi-agent framework demonstrates structured reasoning:
+the Planner decomposes the query, dynamically adjusts the plan after observing mixed
+results, and instructs the Actor to apply specific constraints, leading to successful retrieval
+in fewer steps.
+
+19
+
+Preprint. Under review.
+
+Figure 6: Qualitative comparison on Amazon. Top: The multi-agent framework successfully
+decomposes the task with the Planner instructing the Actor to apply price filters. Bottom:
+The single-agent baseline fails to utilize UI filters, repeating search queries until reaching
+the step limit.
+
+20
+
+Preprint. Under review.
+
+A.11
+
+Instruction prompts
+
+Plan generation and update prompt
+Plan generation instruction
+You are a task planning assistant. Given a current task and similar past
+experiences, generate a concise and actionable step-by-step plan.
+Current Task: {QUERY}
+Similar Past Experiences: {DISCRETE MEMORY}
+Based on the current task and the similar experiences above, generate a step-bystep plan that:
+1. Is concise and actionable
+2. Breaks down the task into clear, sequential steps
+3. Uses insights from similar experiences when relevant
+Format your response as a numbered list of steps.
+
+Plan update instruction
+You are a task planning assistant. Update the original plan based on recent
+observations and actions.
+Experience Memory: {DISCRETE MEMORY}
+Original Plan: {PLAN}
+Recent Screenshot Observations: {SCREENSHOTS}
+Recent Actions: {ACTIONS}
+Current Observation: {SCREENSHOT}
+Based on the recent actions and observations, update the plan to:
+1. Reflect what has been accomplished
+2. Adjust remaining steps based on current progress
+3. Keep it concise (3-5 steps total)
+4. Clearly state the next single step. If the task is finished, yield STOP.
+5. Do NOT repeat actions that have already failed.
+Output format:
+<plan>Your updated plan here</plan>
+<subgoal>next single step</subgoal>
+
+21
+
+Preprint. Under review.
+
+Action generation prompt
+System instruction
+You are a helpful execution agent following the given plan.
+Task: {QUERY}
+Plan: {PLAN}
+Available Actions: {ACTION_SPACE}
+Constraints:
+1. Follow the plan step by step.
+2. Specify the element number to interact with.
+3. Don't repeat failed actions.
+4. Provide an answer within the remaining steps.
+5. Output one action at a time.
+
+Memory check and update prompt
+Input prompt
+You are helping a GUI agent decide if it should look for different reference
+experiences.
+Original Task: {QUERY}
+Recent Observations: {SCREENSHOTS}
+Recent Actions: {ACTIONS}
+Current Memories: {DISCRETE MEMORY}
+Rules:
+1. Memories are loose references - they don't need to match perfectly.
+2. If current memories are related, output NO_UPDATE.
+3. Only output NEEDS_UPDATE if the agent moved to a completely different activity
+type.
+Output: "NO_UPDATE" or "NEEDS_UPDATE: <2-5 keywords>"
+
+22
+
+Preprint. Under review.
+
+VLM-as-Judge Evaluation Prompt
+System instruction
+You are an expert at analyzing web browsing task completion from screenshots. You
+will be given a task instruction and a series of screenshots and
+corresponding plans of a web browsing session.
+Please analyze the screenshots and provide a detailed assessment of the task
+completion by following the steps below:
+1. First, understand the task instruction. Describe what successful task
+completion should look like (i.e., what the final screenshot should show).
+2. For each screenshot, analyze:
+- What is visible on the page (URL, elements, forms, buttons, messages, etc.)
+- What action the user performed (click, type, scroll, etc.)
+- Whether and how the action contributed to progress (or caused mistakes)
+3. Carefully observe URL bars, form fields, search boxes, buttons, error messages,
+results, and confirmation screens.
+4. After analyzing all screenshots, provide your reasoning about:
+- Whether the task was completed
+- How clear, logical, and efficient the interaction sequence was
+- Whether actions were redundant or irrelevant
+Then, assign a score using this 3-level scale:
+SCORING SCALE:
+- 5 -- Task Fully Completed and Efficiently Done
+- The final screenshot shows the task was clearly and completely fulfilled
+- Actions followed a logical, goal-directed path
+- No major mistakes or repetitions
+- The agent shows strong understanding of the task
+- 3 -- Task Partially Completed with Some Mistakes
+- The task was partially fulfilled, but the final state is incomplete
+- The agent made some progress, e.g., found the right page or filled part of a
+form
+- There may be inefficient actions, repetition, or missed final steps
+- The agent shows some understanding, but does not complete the task
+- 1 -- Task Not Completed / Mostly Failed
+- The task was not completed at all
+- Actions are largely random, irrelevant, or repetitive
+- The final screenshot does not reflect any meaningful progress
+- The agent shows poor understanding of the goal
+Your response must strictly follow this format:
+TASK REQUIREMENT:
+[Summary of what the task is asking for and what success looks like]
+SCREENSHOT ANALYSIS:
+Screenshot 1:
+[What is visible + what action was performed + how it contributed]
+Screenshot 2:
+...
+...
+REASONING:
+[Overall reasoning -- was the task completed? Was the interaction logical? Any
+key mistakes?]
+
+23
+
+Preprint. Under review.
+
+FINAL ANSWER:
+[Short conclusion about task success and agent behavior]
+SCORE: [1/3/5]
+Now, please strictly follow the format above and analyze the following
+screenshots:
+Task Instruction: {instruction}
+Screenshots (by order):
+
+24
+

@@ -1,0 +1,924 @@
+Agentics 2.0: Logical Transduction Algebra for Agentic
+Data Workflows
+Alfio Massimiliano Gliozzo ∗
+
+gliozzo@us.ibm.com
+
+IBM
+
+Junkyu Lee ∗
+
+junkyu.lee@ibm.com
+
+IBM
+
+arXiv:2603.04241v1 [cs.AI] 4 Mar 2026
+
+Nahuel Defosse
+
+nahuel.defosse@ibm.com
+
+IBM
+
+Abstract
+Agentic AI is rapidly transitioning from research prototypes to enterprise deployments, where requirements extend to meet the software quality attributes of reliability, scalability, and observability
+beyond plausible text generation. We present Agentics 2.0, a lightweight, Python-native framework for building high-quality, structured, explainable, and type-safe agentic data workflows. At the
+core of Agentics 2.0, the logical transduction algebra formalizes a large language model inference call as a typed semantic transformation, which we call a transducible function that enforces
+schema validity and the locality of evidence. The transducible functions compose into larger programs via algebraically grounded operators and execute as stateless asynchronous calls in parallel
+in asynchronous Map-Reduce programs. The proposed framework provides semantic reliability
+through strong typing, semantic observability through evidence tracing between slots of the input
+and output types, and scalability through stateless parallel execution. We instantiate reusable design
+patterns and evaluate the programs in Agentics 2.0 on challenging benchmarks, including DiscoveryBench for data-driven discovery and Archer for NL-to-SQL semantic parsing, demonstrating
+state-of-the-art performance.
+
+1
+
+Introduction
+
+Agentic AI systems are rapidly transitioning from prototypes to production across real-world enterprise domains
+(Wang et al., 2024; Guo et al., 2024), yet most current agentic data workflows still revolve around prompt chaining, state-graph orchestration, or schema-enforced function calls (Dao et al., 2025). These approaches struggle to
+deliver reliability, observability, and scalability at the levels required by enterprise workloads 1 . Recent study confirms
+that practical systems significantly constrain autonomy and rely heavily on persistent human oversight (Pan et al.,
+2025).
+We argue that these limitations stem from an agent-centric, anthropomorphic perspective that views the large language
+model (LLM) inference call as a conversation over agents with personas and roles. We can see two common patterns:
+the first is conversational agents that rely on black-box planners to generate and execute multi-step workflows through
+natural-language prompt chains, lacking verifiable control flows. The second is mutli-agent system that divides the
+task into sub-tasks in natural language and executes and coordinates via unreliable conversations. Prior work on
+agentic workflow has shown that casting the LLM inference call into typed function calls improves the reliability and
+reusability of the agentic AI programs (Gliozzo et al., 2025; Pydantic AI, 2025; Mellea, 2025; Khattab et al., 2024).
+However, without function-level semantics, programs are limited in composing reliable workflows.
+In this paper, we propose a principled programming model for LLM transduction inference that (1) constrains input
+and output with frames or semantic types, (2) composes transductions as functions in programming languages, and
+∗ Equal contribution.
+1 The standard quality metrics can be found in the standardized vocabulary (ISO/IEC/IEEE, 2017).
+
+1
+
+(3) preserves the semantic evidence that explains how the output semantic types are transduced from the input type.
+We formalize LLM transduction as a typed, composable, and evidence-preserving function algebra, which we call it
+as a transducible function. From the proposed formalism, the reliability becomes a software quality attribute because
+every step of LLM transduction must be a well-typed contract between input and output types. Namely, any ill-formed
+outputs trigger an error rather than a silent corruption of the text. Evidence requirements in transduction that explain
+how the slots in the input type are mapped to the output type prevent hallucinated slot fillings. Software observability
+is typically tracked at the level of LLM inference calls. In the proposed framework, it can be elevated to the level
+of semantics. Scalability can also be achieved in a high-level program by writing the agentic data workflow as a
+composition of stateless transductions, instead of deligating it to lower-level orchestrations of LLM API invocations.
+This paper contributes: (1) a typed, composable function algebra for LLM computation by formalizing transducible
+functions, (2) agentic AI programming model that interleaves deterministic code and LLM transductions via typed
+asynchronous coroutines, (3) semantic observability through the provenance and confidence across composed workflows, and (4) empirical validation across challenging agentic AI benchmarks.
+
+2
+
+Logical Transduction Algebra
+
+2.1
+
+Background
+
+Existing agentic AI programming frameworks offer workflows modeled with types and structured schemas. Gliozzo
+et al. proposed a logical transduction algebra that formulates transduction as schema-constrained LLM inference.
+Conceptually, logical transduction is an abstraction of LLM-based transformation of frames or semantic types. This
+approach maps structured input objects to another output typed object, and it allows asynchronous execution across a
+list of objects of the same type. Shifting the focus from conversation to transduction has improved the reliability of the
+pipeline by validating the types of LLM-generated text. Additionally, it supports a Map-Reduce style programming
+model for scaling out batch tasks.
+Yet, the schema-constrained transduction still presents a conceptual gap in a multi-step pipeline that composes stateto-state transductions, since it does not account for the type contracts and the evidence of generations across transductions. The absence of function composition semantics affects completeness and diminishes software quality, making
+it difficult to manage the accumulation of semantic errors that pass syntactic tests.
+2.2
+
+Types as Semantically Grounded Objects
+
+A type in the logical transduction algebra is a finite record of named slots, each associated with specific types, realized
+in practice as Pydantic models (Gliozzo et al., 2025). The semantics of a type arise not only from syntactic constraints
+but also from natural language descriptions attached to its fields, which guide LLMs to be aware of the meanings of
+the type during structured decoding. Thus, types serve as executable specifications for input-output contracts. They
+validate generated instances, ground parameterized prompts, and act as a carrier of meaning throughout the workflow.
+Formally, A type T is defined recursively as T := b | [s1 : T1 , . . . , sn : Tn ], where b can be a basic type in
+programming languages {str, int, float, bool, . . . }. We use lowercase letters to denote an instance or state
+of a type, e.g., t is a state of T . We denote the i-th slot of T by Ti , and a subset of slots of T by TS with S ⊂
+{s1 , s2 , . . . , sn }.
+Basic type operators enable the construction of composite states using the following operations on types.
+• Merge: Combines slots of two types X and Y as X&Y that contains all the slots from both. In the presence
+of conflicts when merging two instances x and y, we resolve them by preferring one side.
+• Projection: Projects type X onto a new type Y by restricting the slots in X to a subset TS as Y =⇓TS X.
+We abuse the notation XS =⇓TS X when it is clear from context.
+
+• Composition: Forms a tuple of the source X and target Y types, X ⊗ Y = X, Y .
+These operations make intermediate representations explicit and align with function interfaces in the next subsection.
+2
+
+2.3
+
+Transducible Functions
+
+In this paper, we introduce a transducible function as a typed semantic transformation f : X → Y that satisfies the
+following four properties:
+• Typed: f returns a well-typed state y ∈ Y .
+• Explainability: Given states x and y, there exists an explanation e = φ(x, y).
+• Local Evidence: A non-empty subset of input slots XS was used to compute the value yi .
+• Provenance: For all slots Yi ∈ Y , there exists a mapping that records the slot Yi to local evidence XS .
+Transducible functions extend computable functions by requesting explicit explainability, the locality of evidence, and
+provenance maps that connect each output slot to specific input slots. Note that any deterministic program satisfying
+these properties is also a transducible function. In addition, transducible functions can be realized by LLMs provided
+they satisfy the above properties.
+Example 1. Let’s take an example from credit risk assessment. The input type X models a loan application, and the
+output type Y is a credit evaluation. Given an input state x, consider a transducible function f returns y = f (x) with
+the explanation and provenance map for Y . Notice that the slot last_name has not been taken into consideration
+for the explanation.
+Listing 1: Credit Risk Assessment Example
+1
+2
+3
+4
+5
+6
+7
+8
+
+9
+
+# Type declarations
+X: [last_name: str, income: float, debt: float, credit_history: str],
+Y: [risk_score: int,risk_class: [low, medium, high]],
+# Instance of X and Y
+x: {last_name: Smith, income: 60000, debt: 25000, credit_history: ’late payment in 2021’}
+y = f(x)
+- y: {risk_score: 62, risk_class: medium}
+- explanation: ’The debt-to-income ratio is moderate, and a historical late payment increases
+risk’
+- provenance: [income, debt, credit_history]
+
+Gliozzo et al. introduces a logical transduction operator ≪ as a LLM-based transformation from a typed object x to y,
+Y ≪ X. In this paper, we propose to extend the operator ≪ to denote the class of all transducible functions mapping
+from type X to Y . Given concrete types X and Y and a natural language instruction string I, we can view ≪ as a
+realization of transducible functions selected by an LLM that is the most consistent with I. From the perspective of
+logical transduction algebra, the internal behavior of LLMs can remain as a black box as long as the external type
+contract and properties of the transducible function are respected.
+2.4
+
+Algebraic Structure of Transducible Functions
+
+Transducible functions form an algebra under standard operations whose objects are types and whose morphisms are
+transductions.
+Identity and Associativity.
+
+For every type X, there exists an identity transduction
+IX : X ≪ X,
+
+IX (x) = x,
+
+which uses all slots of X as evidence and satisfies f ◦ IX = f = IY ◦ f for all f : Y ≪ X.
+Composition.
+
+Given f1 : Y ≪ X and f2 : Z ≪ Y , their sequential composition can be defined as,
+f2 ◦ f1 : Z ≪ X,
+
+(f2 ◦ f1 )(x) = f2 (f1 (x)).
+3
+
+We can show that transducible functions are closure under composition. Namely, the composed mapping is itself
+transducible. Its evidence subset is obtained by chaining the evidence of f1 and f2 , and provenance traces can be
+composed accordingly.
+Composition is associative, f3 ◦ (f2 ◦ f1 ) = (f3 ◦ f2 ) ◦ f1 , so the set of all transducible functions with composition
+and identities forms a monoid.
+Canonical Type Transductions. We extend the concept of transduction to the types, namely, types themselves
+induce transductions. Let G be a generic input type such as unstructured or weakly structured data, e.g., text, JSON
+fragments, tables, or multimodal signals. For each type T , there is a canonical constructor φT : T ≪ G, which acts as
+a schema-constrained semantic parser from the generic input G to the structured type T . Then, typing becomes a form
+of computation. Given x ∈ G, the expression T (x) = (T ≪ G)(x) parses and validates x into a well-typed instance
+of T .
+2.5
+
+Map-Reduce Semantics
+
+The transducible functions can be applied in parallel using the Map-Reduce programming model. Let X N denote a
+sequence of N states of type X, [x1 , . . . , xN ].
+Map. Given a transducible function f : Y ≪ X and a collection X N = [x1 , . . . , xN ] with xi ∈ X, map applies f
+pointwise,
+map(f ) : Y N ≪ X N ,
+map(f )([x1 , . . . , xN ]) = [f (x1 ), . . . , f (xN )].
+Each element is processed independently, preserving per-element evidence and provenance maps. map can be processed in parallel and is well-suited to asynchronous execution.
+Reduce. Let r : Z ≪ Y N be a transducible function that aggregates a collection Y N into a single output z ∈ Z, e.g.,
+voting, averaging, consensus formation, or global summarization. Because r is itself transducible, its output carries an
+evidence subset and a provenance mapping that links each part of z to the contributing elements of the collection Y N ,
+r : Y ≪ XN ,
+r([x1 , . . . , xN ]) = z.
+Map-Reduce.
+
+A full map-reduce computation can be obtained by composition,
+
+
+r ◦ map(f ) : r ◦ Y N ≪ X N = (Z ≪ Y N ) ◦ Y N ≪ X N = Z ≪ X N ,
+
+which is again a transducible function from a collection of inputs X N to a single aggregate output in Z. The algebra
+is also closed under these map and reduce operators. Note that asynchronous independence in the map phases and
+structured aggregation in the reduce phases ensure scalability. The locality of evidence and the provenance property
+guarantee that explainability is preserved across the entire composed pipeline.
+
+3
+
+Agentics 2.0
+
+Agentics 2.02 is a Python software library that implements the logical transduction algebra, extended with transducible
+functions. The core design principle is to extend standard Python abstractions such as Pydantic types and asynchronous
+functions with new operators that make logical transduction a first-class citizen in the language.
+Concretely, Agentics 2.0 overloads operators such as ≪ (transduction), @ (type composition), and & (type merge) so
+that Pydantic types, instances, and asynchronous functions can be combined into larger transducible workflows. In
+the rest of this section, we first introduce these language primitives and illustrate basic syntax and examples. Once
+imported, Agentics 2.0 extends the behavior of Pydantic models and asynchronous functions by introducing a small
+set of primitives.
+2 The framework provides native support for integrating LLMs, MCP tools, and structured data sources such as databases, JSON, and CSV files.
+It also offers built-in vector search and clustering functionality.
+
+4
+
+3.1
+
+The ≪ Operator
+
+The operator ≪ generates transducible functions from a pair of types. In Agentics 2.0, any pair of Pydantic types X
+and Y can be combined into a transducible function Y ≪ X, which is stateless and async callable.
+1
+
+from pydantic import BaseModel
+
+2
+3
+4
+5
+
+class Question(BaseModel):
+prompt: str
+options: list[str]
+
+6
+7
+8
+9
+
+class Answer(BaseModel):
+options: list[str]
+choice: str
+
+10
+11
+12
+
+# Create a transducible function "decide"
+decide = Answer << Question
+
+Once a transducible function decide is created, the transduction can be invoked like any other async function.
+1
+2
+3
+
+q = Question(
+prompt="When an electric motor has bearing damage , which sensor should be monitored?",
+options=["axial flux", "vibration", "voltage", "cooling gas", "partial discharge"])
+
+4
+5
+6
+
+answer = await decide(q)
+print(answer.choice)
+
+Internally, decide triggers an LLM-backed stateless agent that executes the transduction and returns a well-typed
+Answer state. The transduction parameters, such as instructions, tools, model and temperature can be configured by
+wrapping them in an instance of type With.
+1
+2
+3
+4
+
+5
+6
+7
+8
+
+decide = (Answer << With(
+Question,
+instructions=(
+"Pick the best option and justify it using evidence from the prompt and your domain
+knowledge."
+),
+tools=[sensor_knowledge_base],
+model="gpt-oss-120"),
+explanation=True)
+
+Here With(...) refines the canonical transducible function Answer ≪ Question with the task-specific instructions and tools without changing the typed interface. When explanation is set to True, the transducible function
+returns two arguments, the second of them returning explanations and evidence traces.
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+answer, explanation = await decide(q)
+print(explanation)
+{
+"explanation": "The option vibration was selected because ...",
+"relevant_source_attributes": [
+"prompt",
+"options"
+],
+"confidence": 0.96
+}
+
+3.2
+
+Type Operators
+
+Type Composition with @. In Agentics 2.0, the operator @ performs state composition between two Pydantic types
+or states. Given types A and B, the composed type A @ B is a new type with two fields, left: A and right:
+B, used to keep an original object and its derived state together.
+5
+
+1
+2
+3
+4
+
+ComposedType = Answer @ Question
+print(ComposedType.model_fields)
+{’left’: FieldInfo(annotation=Question),
+’right’: FieldInfo(annotation=Answer)}
+
+Type Merge with &. The operator & performs a merge of any two Pydantic Types or states. At the type level,
+MergedType = Answer & Question produces a new type that combines the fields of both into a single field,
+preferring one side when assigning values from two instances. At the instance level, & aggregates two compatible
+instances into one, with the one side taking precedence when both define a value.
+1
+2
+3
+4
+5
+
+MergedType = Answer & Question
+print(MergedType.model_fields)
+{ ’prompt’: FieldInfo(annotation=str, ...),
+’options’: FieldInfo(annotation=list[str], ...),
+’choice’: FieldInfo(annotation=str, ...),}
+
+3.3
+
+Map-Reduce Semantics
+
+When invoked on a list of inputs of the required source types, transducible functions can either execute map or reduce
+operator over all the input states. When executing the map operator on the transducible function, all the input states
+are processed in parallel, and it returns a corresponding list of outputs, whose order reflects the original input order.
+On the other hand, a reduce operator accepts a list of states as input and returns a single state as output. If the input
+list is too large to fit into a single LLM prompt, Agentics 2.0 internally reduces it into parallel, asynchronous batches,
+which are then aggregated in stages to produce a single final state.
+1
+2
+
+questions: list[Question] = ...
+answers: list[Answers] = await decide(contexts)
+
+3.4
+
+Decorator @transducible
+
+Agentics 2.0 provides the ability to wrap an arbitrary asynchronous Python function into a transducible function using the @transducible decorator, provided they take a single Pydantic input state and return a single Pydantic
+output state. This feature provides a lightweight map-reduce design pattern that facilitates scaling their execution.
+A transducible function can invoke multiple transductions, which makes it easier to develop highly composable and
+controllable workflows. Additionally, Agentics 2.0 offers primitives that enable the creation of sophisticated behaviors where regular Python code and LLM-based transduction can be combined in a transducible function. This is
+made possible through the ability to return and manipulate Pydantic objects. In the example below, the input state is
+manipulated (concatenated send it to Agent) and then sent to transduction (Transduce).
+1
+2
+3
+4
+5
+6
+
+from agentics import transducible
+@transducible(provide_explanation=True)
+async def write_an_email_to_alfio(state: GenericInput) -> Email:
+"""Write an email about the provided content"""
+state.content=state.content + " send it to Agent"
+return Transduce(state)
+
+4
+
+DiscoveryBench
+
+4.1
+
+Task and Benchmark Summary
+
+Problem DiscoveryBench3 formalizes data-driven discovery as a benchmark task (Majumder et al., 2025).
+Given one or more datasets in a comma-separated-value (CSV) file and metadata, the main goal is to derive a hypothesis h as a function of context c, variables v, and relations r that constitute ψ(c, v, r). This hypothesis function
+3 https://github.com/allenai/discoverybench
+
+6
+
+can express a declarative statement, "under context c, variables v have relationship r". Solutions typically require
+multi-step analysis pipelines that combine semantic reasoning for mapping required terms to columns and statistical
+analysis for model selection. The hypothesis in the problems has a tree structure, where a hypothesis consists of
+several sub-hypotheses over a path in the tree.
+The benchmark comprises manually created DB-REAL and LLM-generated DB-SYNTH. DB-REAL comprises 10
+problem sets ranging from archaeology, requirement engineering, regression, etc 4 . In the benchmark results from
+ASTABench (Bragg et al., 2025), we see that the best reported final score is 33.7, reflecting significant challenges for
+solving this benchmark.
+Evaluation The hypotheses are natural language sentences, and the evaluation protocol uses an LLM–as–judge
+approach to compute the Hypothesis Matching Score (HMS) or final score. The score computation procedure first
+decomposes both the gold and predicted hypotheses into sub-hypotheses, then scores context alignment, variable
+alignment, and relationship accuracy, and finally combines the three scores and multiplies the result by 100 to get the
+final score between 0 and 100.
+We use Inspect AI (UK AI Security Institute, 2024) to evaluate all agents, and we use the default gpt-4o model
+as the evaluation model for all experiments.
+4.2
+
+Agentics 2.0 Implementation
+
+We summarize the common design patterns that leverage the Agentics 2.0 framework5 . We first define types for
+transduction from the inintial input Question to the final Answer through IntermediateEvidence types.
+Listing 2: Pydantic Types for Question, Answer, Evidence
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+
+class IntermediateEvidence(BaseModel):
+evidence_found: bool | None
+evidence: str | None
+partial_answer: str | None
+class Answer(BaseModel):
+short_answer: str | None
+selected_evidence: list[IntermediateEvidence] | None
+class Question(BaseModel):
+question: str | None
+question_type: str | None
+dataset: str | None
+metadata: dict | None
+dbs: list[AgenticDB] | None
+
+The overall agentic data workflow is a two-stage pipeline. The first stage is to collect IntermediateEvidence states
+from available sources such as the structured data in CSV files and all the outputs from ReAct agent.
+Listing 3: Stage 1. Collects Evidence Direclty from Structured Data
+1
+2
+3
+4
+5
+6
+7
+
+8
+
+async def collect_evidence_for_source(table_df, q: Question) -> list[IntermediateEvidence]:
+# Canonical type transduction from table
+data = AG.from_dataframe(table_df)
+evidence = await (AG(
+atype=IntermediateEvidence,
+transduction_type="areduce",
+instructions="You are extracting INTERMEDIATE EVIDENCE to answer the QUESTION later.") <<
+data)
+return evidence.states
+
+The second stage aggregates collected intermediate answers across multiple input sources into a single final answer.
+4 In our evaluation, we took 9 problem sets except for the meta-regression-raw, and excluded 2 problems in the world-bank-education-gdp
+
+domain. In total, we evaluated 186 problems.
+5 Due to the space limit, we provide the full implementation in the supplementary material.
+
+7
+
+Listing 4: Stage 2. Reduce Evidence to Final Answer as a Hypothesis
+1
+2
+3
+4
+5
+
+6
+
+async def synthesize_hypothesis(evidences: list[IntermediateEvidence], q: Question) -> Answer:
+ans = await (AG(
+atype=Answer,
+transduction_type="areduce",
+instructions="Given prior INTERMEDIATE EVIDENCE from multiple sources, produce one hypothesis
+.") << AG(atype=IntermediateEvidence, states=evidences))
+return ans[0] if len(ans)>0 else Answer()
+
+Both stages can be called in a driver function per question as follows. The function processes each question in parallel,
+and For each question, it collects multiple pieces of evidence from database sources, typically one to three csv files
+specified in the problem description. Then, the collected evidence is reduced to the final answer type with a hypothesis
+to be graded by LLMs.
+Listing 5: Map-Reduce Driver Function
+1
+2
+3
+4
+5
+6
+7
+8
+
+async def answer_question_from_data(q: Question) -> Question:
+per_source = []
+for db in q.dbs:
+# map over sources
+per_source += await collect_evid_for_src(db.df, q)
+# reduce across sources
+final = await synthesize_hypothesis(per_source, q)
+return q
+
+Compared with the prompt-centric implementation of ReAct agents (Yao et al., 2022), the above agentic data workflow
+implementation in Agentics 2.0 leverages the advantage of the strongly typed transducible functions, and prompting
+is a part of a larger Python program. Note that the raw table imported from a data frame is also parsed into a Pydantic
+type directly via canonical type transduction without human annotation of the database.
+4.3
+
+Evaluation Results
+
+We evaluate agents written in Agentics 2.0 and the baseline ReAct agent following the evaluation protocols of the ASTSA-Bench on DB-REAL datasets. Agents written in Agentics 2.0 are wrapped as a
+solver of agent-baselines (Allen AI Institute, 2025) and we evaluate the baseline ReAct solver of the
+agent-baselines implementation. In total, we evaluated four algorithm configurations: baseline-react,
+agentics-agg that reduces structured data into intermediate evidence, agentics-react that maps the ReACT
+agent generations into intermediate evidence, and agentics-both that collects intermediate evidence from both
+structured data and ReAct agent generations.
+The score of the agents also depends on the generation model, and we evaluated all algorithm configurations on
+gemini-3-flash-preview and gpt-4.1 models. For each algorithm configuration, we run it at least 5 times
+to compute the mean and standard deviation of the scores.
+4.3.1
+
+Aggregated Scores
+
+Figure 1 shows summary of hypothesis matching scores, context scores, relation scores, and variable scores of
+four algorithm configurations using two LLMs. We see that agentics-both and agentics-react are
+the two top performers among the four configurations. Note that agentics-both achieves the average final
+score 37.27 6 . The evaluation result of baseline-react is similar to the scores reported in the leaderboard
+https://allenai-asta-bench-leaderboard.hf.space/data-analysis. When we look into the
+three scores from Figure 1b to 1d, All agents achieve relatively higher scores in extracting the context and variables,
+but struggle to extract the correct relations between variables.
+6 This
+score is higher than the best score (33.7 by baseline
+allenai-asta-bench-leaderboard.hf.space/data-analysis
+
+8
+
+ReAct)
+
+available
+
+in
+
+the
+
+leaderboard
+
+https://
+
+(a) Hypothesis Matching Scores
+
+(b) Context Scores
+
+(c) Relation Scores
+
+(d) Variable Scores
+
+Figure 1: Overall aggregated scores. All figures show the aggregated scores over 10 problem domains, evaluating
+agentics-agg (ag-agg), agentics-both (ag-both), agentics-react (ag-react), and baseline-react (bl-react) using gemini-3-flash-previuew (gemini3flash) and gpt-4.1 (gpt4.1) models.
+
+4.3.2
+
+Per Dataset Scores
+
+Next, we break down the aggregated score for each of the ten datasets. Figure 2 shows the hypothesis matching scores from the four algorithm configurations. We see that agentics-both, agentics-react, and
+baseline-react show a similar pattern overall, only differing at the level of the scores, with agentics-both
+being the highest and baseline-react being the lowest.
+CSV File
+archaeology/capital.csv
+archaeology/time_series_data.csv
+archaeology/pollen_openness_score_...csv
+intro-path-plants/temporal_trends_contingency_table.csv
+intro-path-plants/invasion_success_pathways.csv
+intro-path-plants/invaded_niche_pathways.csv
+meta-reg/joined-data.csv
+meta-reg-raw/success-data.csv
+meta-reg-raw/study-data.csv
+nls-incarc/processed.csv
+nls-raw/raw.csv
+nls-ses/ses-processed.csv
+req-eng-ML/req-eng-ml.csv
+wb-edu-gdp/wb-edu-gdp.csv
+wb-edu-gdp-ind/ndicator.csv (6 files)
+
+Rows
+400
+3600
+4084
+12
+81
+632
+88
+928
+143
+12014
+12686
+8773
+276
+13
+2 each
+
+Cols
+14
+37
+3
+3
+19
+25
+59
+50
+15
+6
+62
+9
+214
+45
+2 each
+
+Table 1: Size of CSV Files. The number of rows and columns of the CSV files in each dataset.
+
+Note that agentics-agg performs well or is competitive to the other three configurations on five data sets: archaeology, introduction pathways non-native plants, requirements engineering for ML enabled systems, worldbank
+eduction gdp, and worldbank education gdp indicators. This implies that LLMs can extract context, variables, and re9
+
+(a) Gemini-3-Flash-Preview
+
+(b) GPT-4.1
+
+Figure 2: Aggregated scores per dataset. All figures show the aggregated hypothesis matching scores per each dataset, and show
+the results from four algorithm configurations agentics-agg (ag-agg), agentics-both (ag-both), agentics-react (agreact), and baseline-react (bl-react).
+
+lations solely from table inputs with additional metadata, without fitting any machine learning models to those problem
+sets.
+Table 1 shows the size of CSV files in each dataset. We see that agentics-agg failed to solve a single problem in
+nls-incarceration, nls-raw, and nls-ses, which has large number of rows. On the other hand, worldbank eduction gdp,
+and worldbank education gdp indicators have only two rows and two columns over 6 files, and requirements engineering for ML enabled systems has 276 rows and 214 columns. This indicates that agentics-agg can aggregate the
+input table to extract meaningful intermediate evidence when the size of the table is manageable.
+4.3.3
+
+Per Question Type Scores
+
+Figure 3 shows the hypothesis-matching scores across three question types. We observe that all four algorithm configurations perform best on context questions and worst on variable questions. This indicates that the task of generating
+the question by hiding the variables is the most difficult of the three. Especially agentics-agg shows signicant
+drop from 27.9 in context questions to 6.6 in variable questions when it uses gemini-3-flash-preview model.
+On the other hand, agentics-agg remains relatively robust to the change of the question types compared with the
+other three, dropping from 44.5 to 29.6.
+
+(a) Context questions
+
+(b) Relationship questions
+
+(c) Variable questions
+
+Figure 3: Aggregated scores per question types. All figures show the aggregated scores for three question types: context questions,
+relationship questions, and variable questions.
+
+4.4
+
+Take Away
+
+Since our paper presents the Agentics 2.0 framework, we didn’t incorporate benchmark-specific techniques and focused on developing agents with transducible functions over structured data. First, we see that agents implemented in
+Agentics 2.0 consistently outperform the best-known baseline in the leaderboard. Second, when the dataset is small,
+aggregating tables performs well without generating code to fit models. Third, all agents perform relatively better on
+context questions or achieve higher context scores, but they struggle to solve variable questions and show lower scores
+in extracting the correct relations between variables.
+10
+
+Figure 4: Archer English Devset Execution Match. The figure shows the aggregated execution match score on the English devest,
+and shows the results from Agentics 2.0 implementation in blue bars and the Archer leaderboard results in orange bars.
+
+5
+
+Archer NL to SQL
+
+5.1
+
+Task and Benchmark Summary
+
+Problem Archer is a bilingual natural language (NL) to structured query language (SQL) benchmark designed to
+test reasoning capabilities along with the NL to SQL semantic parsing task Zheng et al. (2024). Semantic parsing
+from NL to SQL is extremely challenging compared with mathematical or common-sense reasoning tasks. Indeed, the
+leaderboard of Archer 7 still shows that the best test score is merely 54.96 from OraPlan-SQL Liu et al. (2025). Compared with other NL to SQL benchmarks Li et al. (2023), Archer requires arithmetic, common sense, and hypothetical
+reasoning to derive the database entities or expressions to capture the desired intent in the question.
+
+Evaluation Following the most popular evaluation protocol for NL to SQL, we compute the execution match score
+by comparing the result sets returned by the gold and the predicted SQL queries. Namely, the score is 1 if both result
+sets match and 0 otherwise. In addition, we report a relaxed metric that computes the F1 score by comparing both
+result sets, assigning a partial score if the predicted result set contains partially correct results.
+
+7 https://sig4kg.github.io/archer-bench/
+
+11
+
+5.2
+
+Agentics Implementation
+
+To address the challenges of reproducing leaderboard baseline scores, we implemented two agents in Agentics 2.0.
+The basic agent generates an SQL query from the given question and verifies its correctness against the database
+engine, providing feedback if it contains any syntax errors.
+The reasoning-validation agent follows a more reasoning-intensive workflow. It begins by selecting natural language
+and SQL pairs from the training examples that share the same reasoning type. Next, it analyzes the extracted few-shot
+dataset to understand the task and formulate a strategy to address the reasoning challenges in SQL generation. After
+generating a syntactically verified SQL query, it performs an additional reasoning step to validate its semantics by
+checking the previously developed strategies and thoughts generated in the previous iterations.
+5.3
+
+Evaluation Result
+
+Figure 4 shows the execution match scores from Agentics 2.0 implementations and the leaderboard results. The reaval denotes the agent that performs reasoning and semantic validation, and base denotes the agent that performs basic
+generation and verification. We see that the NL to SQL agents implemented in Agentics 2.0 outperform all leaderboard
+submissions except for the OraPlan-SQL Liu et al. (2025), which involves a sophisticated benchmark-specific strategy
+for domain analysis and planning.
+Table 2 shows the detailed scores aggregated per reasoning type for the reasoning-validation agent. We can see
+that GPT-O3 outperformed the Gemini-3 Flash model in the reasoning category that requires both arithmetic and
+commonsense reasoning.
+Reasoning
+
+Model
+
+EX
+
+F1
+
+Count
+
+A
+A
+
+Gemini-3-flash
+GPT-o3
+
+0.875
+0.833
+
+0.875
+0.872
+
+24
+24
+
+AC
+AC
+
+Gemini-3-flash
+GPT-o3
+
+0.393
+0.607
+
+0.474
+0.674
+
+28
+28
+
+AH
+AH
+
+Gemini-3-flash
+GPT-o3
+
+0.682
+0.591
+
+0.808
+0.682
+
+22
+22
+
+ACH
+ACH
+
+Gemini-3-flash
+GPT-o3
+
+0.467
+0.433
+
+0.467
+0.515
+
+30
+30
+
+Table 2: Archer NL to SQL by Reasoning Type. The score shows the result from the reasoning-validation agent using two bestperforming models, Gemini-3-flash and GPT-O3. A, C, and H refer to arithematic, commonsense, and hypothetical reasoning,
+respectively.
+
+5.4
+
+Take Away
+
+Agents developed within Agentics 2.0 perform competitively compared to submissions on the Archer leaderboard.
+The NL to SQL agent involves multiple stages of problem analysis, SQL query execution, and several iterations
+of generation, verification, and refinement. It may also use the external tools, such as a schema linker to extract a
+relevant view of the database to shorten the context length of the prompt, or a database query engine to sample the
+database to gain a better understanding of its content. Similar to DiscoveryBench, we see a promising direction for the
+Agentics 2.0 framework to extend its implementation by incorporating problem-specific techniques to further improve
+performance.
+
+6
+
+Discussion
+
+Advantages. Our experiments show that developing agentic data workflows with transducible functions demonstrates several advantages. The input and output types can be validated early to catch errors caused by failures in
+LLM inference calls or by decoding at the boundary between steps. The evidence traces provide justification for the
+12
+
+predicted slots, the algebra of transducible functions, and the Map-Reduce model enable reusable design patterns. The
+asynchronous workload orchestraion leverage the backend parallelism.
+Limitation and Future Works. Our work has the following limitations. The evidence formalization is still at the
+high-level and it requires richer logical systems to improve the fidelity of reasoning. Second, our current implementation assumes a single LLM backend, and integrating heterogeneous models and cost-aware scheduling is left for future
+work. Third, while the present experiments span challenging benchmark domains such as hypothesis discovery and
+NL to SQL semantic parsing, broader evaluations and techniques tailored to each domain are desired.
+
+7
+
+Conclusion
+
+We introduced Agentics 2.0, a Python-native framework for building type-safe, explainable, and scalable agentic data
+workflows grounded in the logical transduction algebra. By modeling LLM transduction inference as a sequence of
+transducible functions and leveraging the asynchronous Map-Reduce programming model, the proposed framework
+reconciles the flexibility of agentic systems with the rigor of typed semantics and logical evidence.
+Through the design patterns that leverage asynchronous transducible functions, we have shown that a generic agent
+based on transducible functions can be implemented to achieve competitive performance against benchmark-specific
+state-of-the-art agents.
+
+References
+Allen AI Institute. agent-baselines, 2025. URL https://github.com/allenai/agent-baselines.
+Jonathan Bragg, Mike D’Arcy, Nishant Balepur, Dan Bareket, Bhavana Dalvi, Sergey Feldman, Dany Haddad, Jena D
+Hwang, Peter Jansen, Varsha Kishore, et al. Astabench: Rigorous benchmarking of ai agents with a scientific
+research suite. arXiv preprint arXiv:2510.21652, 2025.
+Dung Dao, Quy Minh Le, Hoang Thanh Lam, Duc-Trong Le, Quoc-Viet Pham, Barry O’Sullivan, and Hoang D.
+Nguyen. Agentic design patterns: A system-theoretic framework. In NeurIPS 2025 Workshop on Bridging Language, Agent, and World Models for Reasoning and Planning, 2025. URL https://openreview.net/
+forum?id=AkLMUn0n2i.
+Alfio Gliozzo, Naweed Khan, Christodoulos Constantinides, Nandana Mihindukulasooriya, Nahuel Defosse, Gaetano Rossiello, and Junkyu Lee. Transduction is all you need for structured data workflows. arXiv preprint
+arXiv:2508.15610, 2025.
+Taicheng Guo, Xiuying Chen, Yaqi Wang, Ruidi Chang, Shichao Pei, Nitesh V Chawla, Olaf Wiest, and Xiangliang
+Zhang. Large language model based multi-agents: A survey of progress and challenges. In Proceedings of the
+Thirty-Fourth International Joint Conference on Artificial Intelligence. International Joint Conferences on Artificial
+Intelligence, 2024.
+ISO/IEC/IEEE.
+ISO/IEC/IEEE International Standard - Systems and software engineering–Vocabulary.
+ISO/IEC/IEEE 24765:2017(E), pp. 1–541, 2017. doi: 10.1109/IEEESTD.2017.8016712.
+Omar Khattab, Arnav Singhvi, Paridhi Maheshwari, Zhiyuan Zhang, Keshav Santhanam, Sri Vardhamanan A, Saiful
+Haq, Ashutosh Sharma, Thomas T. Joshi, Hanna Moazam, Heather Miller, Matei Zaharia, and Christopher Potts.
+DSPy: Compiling declarative language model calls into state-of-the-art pipelines. In The Twelfth International Conference on Learning Representations, 2024. URL https://openreview.net/forum?id=sY5N0zY5Od.
+Jinyang Li, Binyuan Hui, Ge Qu, Jiaxi Yang, Binhua Li, Bowen Li, Bailin Wang, Bowen Qin, Ruiying Geng, Nan
+Huo, et al. Can llm already serve as a database interface? a big bench for large-scale database grounded text-to-sqls.
+Advances in Neural Information Processing Systems, 36:42330–42357, 2023.
+Marianne Menglin Liu, Sai Ashish Somayajula, Syed Fahad Allam Shah, Sujith Ravi, and Dan Roth. Oraplan-sql: A
+planning-centric framework for complex bilingual nl2sql reasoning. arXiv preprint arXiv:2510.23870, 2025.
+13
+
+Bodhisattwa Prasad Majumder, Harshit Surana, Dhruv Agarwal, Bhavana Dalvi Mishra, Abhijeetsingh Meena, Aryan
+Prakhar, Tirth Vora, Tushar Khot, Ashish Sabharwal, and Peter Clark. Discoverybench: Towards data-driven discovery with large language models. In The Thirteenth International Conference on Learning Representations, 2025.
+URL https://openreview.net/forum?id=vyflgpwfJW.
+Mellea. IBM Research, 2025. URL https://mellea.ai/.
+Melissa Z Pan, Negar Arabzadeh, Riccardo Cogo, Yuxuan Zhu, Alexander Xiong, Lakshya A Agrawal, Huanzhi Mao,
+Emma Shen, Sid Pallerla, Liana Patel, et al. Measuring agents in production. arXiv preprint arXiv:2512.04123,
+2025.
+Pydantic AI. Pydantic Service Inc., 2025. URL https://ai.pydantic.dev/.
+UK AI Security Institute. Inspect AI: Framework for Large Language Model Evaluations, 2024. URL https:
+//inspect.aisi.org.uk/.
+Lei Wang, Chen Ma, Xueyang Feng, Zeyu Zhang, Hao Yang, Jingsen Zhang, Zhiyuan Chen, Jiakai Tang, Xu Chen,
+Yankai Lin, et al. A survey on large language model based autonomous agents. Frontiers of Computer Science, 18
+(6):186345, 2024.
+Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik R Narasimhan, and Yuan Cao. React: Synergizing
+reasoning and acting in language models. In The eleventh international conference on learning representations,
+2022.
+Danna Zheng, Mirella Lapata, and Jeff Pan. Archer: A human-labeled text-to-sql dataset with arithmetic, commonsense and hypothetical reasoning. In Proceedings of the 18th Conference of the European Chapter of the Association
+for Computational Linguistics (Volume 1: Long Papers), pp. 94–111. Association for Computational Linguistics,
+2024.
+
+A
+
+AI Usage Disclosure
+
+LLMs were used for language polishing and LaTex formatting, fixing typos and punctuation. The code assistant
+LLMs are used to generate LaTex code for tables and Python scripts for generating figures using matplotlib
+Python package. All technical content in the paper was written by the authors.
+
+14
+

@@ -1,0 +1,1474 @@
+Mason: Type- and Name-Guided Program Synthesis
+Jasper Geer
+
+Fox Huston
+
+Jeffrey S. Foster
+
+University of British Columbia
+Vancouver, Canada
+jasper.geer@ubc.ca
+
+Tufts University
+Medford, USA
+hello@fox.boston
+
+Tufts University
+Medford, USA
+jeffrey.foster@tufts.edu
+
+arXiv:2602.16981v1 [cs.PL] 19 Feb 2026
+
+Abstract
+
+via sketching [17] in Java [11, 13], and generating mock library implementations [10] for program analysis. However,
+such techniques are either highly domain specific or synthesize low-level implementation details while requiring the
+programmer to supply the boilerplate.
+In this paper, we introduce Mason, a new tool for synthesizing object-oriented programs, and we show how to use it
+to automatically insert design patterns into programs. The
+key novelty of Mason is that it synthesizes object-oriented
+programs from partial program pieces guided by both types
+and names. In Mason, the programmer provides a partial
+candidate program, a set of unit tests it must pass, and a
+library of partial program pieces that describe a design pattern. We call these program pieces fragments, and they may
+include holes in place of type or member names. Mason begins search by traversing the candidate program to generate
+typing constraints. Then, Mason solves typing constraints
+in one of two ways: unifying the name of a constrained type
+or member with a name in the candidate program by filling a
+hole, or synthesizing a definition for a missing type or member by merging a fragment into the candidate program. After
+each transformation, Mason rechecks constraints and backtracks if any are contradicted. Once all goals are discharged,
+the candidate program is run and Mason backtracks if any
+unit tests fail.
+We formalize Mason for a core object-oriented language
+L𝑀 which permits holes in place of type and member names.
+We define a type inference algorithm for L𝑀 in two parts:
+first, a syntax-directed procedure for generating typing constraints from L𝑀 programs; second, a constraint rewriting
+system that checks and simplifies constraints in the context
+of a candidate program. Programs may be partial, so some
+constraints may be unsatisfied because they constrain undefined types or members; we call these suspended. We then
+define the rules of type- and name-guided synthesis which
+solves suspended constraints by composing fragments and
+filling holes with concrete names.
+We implement Mason in Scala as a tool that accepts partial
+Java programs with holes. We adapt our non-deterministic
+synthesis rules to a search procedure by imposing an ordering on suspended constraints. We also implement two
+extensions that prune candidates that cannot be eliminated
+using typing constraints: Trace-guided backtracking is a nonlocal backtracking heuristic that uses the execution traces
+of failing unit tests and name patterns, which may be used
+
+Object-oriented programs tend to be written using many
+common coding idioms, such as those captured by design
+patterns. While design patterns are useful, implementing
+them is often tedious and repetitive, requiring boilerplate
+code that distracts the programmer from more essential details. In this paper, we introduce Mason, a tool that synthesizes object-oriented programs from partial program pieces,
+and we apply it to automatically insert design patterns into
+programs. At the core of Mason is a novel technique we call
+type- and name-guided synthesis, in which an enumerative
+solver traverses a partial program to generate typing constraints; discharges constraints via program transformations
+guided by the names of constrained types and members; and
+backtracks when a constraint is violated or a candidate program fails unit tests. We also introduce two extensions to
+Mason: a non-local backtracking heuristic that uses execution traces, and a language of patterns that impose syntactic
+restrictions on missing names. We evaluate Mason on a
+suite of benchmarks to which Mason must add various wellknown design patterns implemented as a library of program
+pieces. We find that Mason performs well when very few
+candidate programs satisfy its typing constraints and that
+our extensions can improve Mason’s performance significantly when this is not the case. We believe that Mason
+takes an important step forward in synthesizing multi-class
+object-oriented programs using design patterns.
+
+1
+
+Introduction
+
+Users of object-oriented programming languages often
+use design patterns, recipes for common idioms in software
+engineering [5]. Design patterns aid in building more maintainable software and facilitate communication between software engineers. However, many design patterns require the
+programmer to lay down large amounts of uninteresting
+boilerplate code before they can focus on essential details.
+A potential solution to this problem is program synthesis, which seeks to make programmers more productive by
+automatically generating code from user-provided specifications. Prior work in synthesis for object-oriented languages
+is capable of leveraging lightweight formal specifications to
+synthesize methods in Ruby [7, 8], synthesizing programs
+Authors’ Contact Information: Jasper Geer, University of British Columbia,
+Vancouver, Canada, jasper.geer@ubc.ca; Fox Huston, Tufts University, Medford, USA, hello@fox.boston; Jeffrey S. Foster, Tufts University, Medford,
+USA, jeffrey.foster@tufts.edu.
+1
+
+Jasper Geer, Fox Huston, and Jeffrey S. Foster
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+
+class Canvas extends Object {
+Integer brushX;
+Integer brushY;
+Image image;
+... // other fields
+Canvas(...) { ... }
+Image currImage() { ... }
+void startDrawing() { ... }
+void stopDrawing() { ... }
+void moveBrush(Integer x, Integer y) {
+...
+this.setBrushX(this.brushX + x);
+this.setBrushY(this.brushY + y);
+...
+} }
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+
+class CanvasLogger {
+List log = new ArrayList();
+// state-change handlers
+void onUpdateX(Integer newX) {
+this.log.add("x: "
+.concat(newX.toString()));
+}
+void onUpdateY(Integer newY) {
+this.log.add("y: "
+.concat(newY.toString()));
+}
+// other methods
+getLogEntry(Integer i) {
+return this.log.get(i);
+} }
+
+Figure 1. Partial Program Input to Mason
+to decorate holes with constraints on the set of names that
+may fill them.
+We evaluate Mason and its extensions using a suite of
+benchmarks that we developed in which Mason must apply
+Gang of Four [5] design patterns implemented as a library of
+fragments. Each benchmark is scalable relative to a natural
+number, and we measure Mason’s time to find a correct
+solution at increasing scales. We find that baseline Mason
+performs well in benchmarks where the number of welltyped synthesizable programs remains low. For all but one of
+the remaining benchmarks, trace-guided backtracking allows
+Mason to synthesize larger programs before the timeout,
+and name patterns reduce times from above 120 seconds to
+below 6 seconds for two benchmarks.
+We believe that Mason takes an important step forward
+in synthesizing multi-class object-oriented programs using
+design patterns.
+
+2
+
+In concrete terms, we envision a special setter method
+for each of brushX and brushY, as well as a method for registering new CanvasLoggers to a Canvas. To communicate
+this intent to Mason, we provide a fragment library, a set
+of program pieces from which Mason may derive new type
+and method declarations, as well as a set of unit tests which
+the synthesized program must pass.
+Fragments. One of these program pieces, or fragments,
+is shown in Figure 2. The @MemberFragment annotations indicates that we intend Mason to synthesize member implementations using this fragment. The identifiers prefixed with
+? on lines 2, 3, 5 4, 6, and 7 are holes, syntactic metavariables
+that Mason is expected to fill. Holes indicate which details
+Mason is allowed to manipulate to adapt a fragment into a
+new context. For example, the class name, ?Update, will be
+flled with the name of an existing class, and their declarations
+merged. From the structure of the method definition we also
+see that this fragment will be used to synthesize one of our
+setter methods, updating some field ?field with a new value
+of some type ?T, and calling some handler ?notify, on each
+?Observer to notify it of the change. By passing newValue
+to ?notify, we communicate a key detail about this design
+pattern’s shape: each state-changing method of our subject
+is mapped to an particular handler of the observer.
+
+Motivating Example
+
+We now use Mason to complete a partial Java program by
+implementing the Observer [5] design pattern. Mason is
+provided with an initial partial program piece along with a
+library of program pieces, and composes a solution guided
+by types, names, and unit tests.
+Consider the definitions of Canvas and CanvasLogger
+shown in Figure 1. Canvas is a class that allows a client
+to manipulate an image with a virtual brush. Instances
+of CanvasLogger record the movements of said brush using two handlers: onUpdateX and onUpdateY. We also require that a single Canvas be able to notify multiple subscribed CanvasLoggers. This is a common kind of dependency which is addressed by the Observer [5] design pattern.
+In the Observer pattern, subject objects carry a set of observers. The subject is responsible for notifying each of its
+observers whenever a meaningful change in state occurs. In
+the version of the pattern we intend to synthesize, certain
+state-changing methods of the subject will be responsible
+for notifying any subscribed observers of the change.
+
+1
+2
+3
+4
+5
+6
+7
+8
+
+@MemberFragment
+class ?Update {
+void ?{(set)(?field)}(?T newValue) {
+this.?field = newValue;
+for (int i = 0; i < this.?{(num)(?)}(); i++) {
+?Observer o = this.?{(get)(?)}(i));
+o.?notify(newValue);
+} } }
+
+Figure 2. Example Element of Fragment Library Provided
+to Mason. Holes begin with ? and are written in red.
+
+2
+
+Mason: Type- and Name-Guided Program Synthesis
+
+Constraint Generation. Mason traverses the initial fragment, collecting typing constraints. Notice that the implementation of Canvas in Figure 1 is incomplete. Specifically, the body of moveBrush references undefined methods setBrushX and setBrushY. Instead of signalling failure,
+however, Mason emits two suspended typing constraints:
+
+suspended constraint to solve and explores possible solutions
+by applying synthesis rules, which produce new candidate
+programs by filling holes or synthesizing definitions.
+Suppose that Mason has instantiated the fragment from
+Figure 2 as the body for both setBrushX and setBrushY
+and correctly mapped ?Observer to CanvasLogger,
+?{(num)(?)} to numLoggers, and ?{(get)(?)} to
+getLogger. This state corresponds to s0 in Figure 3.
+Mason first explores 𝑠1, filling ?field with brushY in
+the body of setBrushX to solve a suspended constraint
+(Canvas ≤ [?field : 𝛾]). However, name constraints are
+renamed with the rest of the program, and this substitution
+transforms the previously mentioned constraint into
+setBrushX c (set)(brushY), which fails constraint resolution, causing Mason to reject s1. Constraint resolution
+also fails for s2 and a series of elided candidates. Eventually,
+Mason reaches the only valid choice, brushX, and we
+arrive at s3. Here too, only a single choice is valid and we
+inevitably arrive at s4.
+
+(Canvas ≤ [setBrushX : (Integer) → 𝛼])
+(Canvas ≤ [setBrushY : (Integer) → 𝛽])
+Informally, each constraint is satisfied if Canvas defines
+a method with the given name from Integer to some type,
+represented by the type variables 𝛼 and 𝛽. The delimiters
+(_) denote that while neither is satisfied, they each contain
+some undefined part that we may synthesize at some later
+step. In this case, neither setBrushX nor setBrushY is defined. We observe that constraints like these correspond to
+synthesis goals; we must synthesize implementations for
+both setBrushX and setBrushY before we can produce an
+executable program. Mason searches the fragment library
+for a method of identical arity and compatible type and may
+choose, for example, the fragment from Figure 2.
+Note the unique syntax of the method name
+?{(set)(?field)}. To provide a more detailed specification to Mason, we have imposed a naming convention
+with the use of a name pattern. This pattern enforces that
+any name used to fill the hole, e.g., setBrushX, must consist
+of set followed by the name found in place of ?field,
+modulo case. However, ?field is not yet known. To ensure
+that whichever name fills ?field is consistent with the
+pattern, Mason emits a name constraint:
+
+Trace-Guided Backtracking. When static information
+does not sufficiently narrow the search space, Mason relies on dynamic information provided by unit tests to perform non-local backtracking. Below is one such test, which
+we have provided to Mason to specify the behavior of the
+solution. Referring to Figure 1, this test will pass only if
+setBrushX calls onUpdateX.
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+setBrushX c (set)(?field)
+The left operand of the constraint is a name and the right
+operand is a name pattern. The constraint is satisfied if its
+left operand is concrete and matches the pattern on the right;
+holes like ?field are treated as wildcards. We describe name
+patterns in detail in Section 4.2. Mason does not use name
+constraints as synthesis goals but they can be highly effective
+at pruning the search space, as we will describe shortly.
+
+@Test
+static void testUpdateX() {
+CanvasLogger cl = new CanvasLogger();
+Canvas c = new Canvas(...);
+c.registerLogger(cl);
+assert(c.getLogger(0) == cl);
+assert(c.numLoggers() == 1)
+c.setBrushX(10);
+assert(cl.log.contains("x: 10"));
+}
+
+Three well typed options exist to fill ?notify: onUpdateX,
+onUpdateY, and getLogEntry. Suppose that Mason makes
+the wrong choice, picking getLogEntry and arriving in s5.
+Despite correctly completing the body of setBrushY, s6
+fails test testUpdateX. Under a naive backtracking strategy,
+Mason might attempt different setBrushY implementations
+with s7 and s8, but this is will be fruitless; setBrushY is
+never invoked during the execution of testUpdateX.
+Mason mechanizes this intuition as trace-guided backtracking. For each synthesis step, Mason computes the interference set of methods whose implementation the step may
+affect. Then, for each test, Mason tracks a dependency set of
+methods upon which the outcome of the test might depend.
+If a synthesis step’s interference set intersects with the dependency set of a unit test, then Mason has determined that
+the synthesis step may affect the outcome of that test.
+Upon synthesizing a complete, well-typed candidate program, Mason discovers dependencies by executing unit tests
+sequentially, short-circuiting on the first failing test. Mason
+
+Synthesis. Mason searches for a program that satisfies
+all type and name constraints via a depth-first backtracking search, which is visualized in Figure 3. Each element of
+the search space is characterized by a candidate program
+and a set of constraints. Mason first performs constraint
+resolution, rewriting constraints in the context of the candidate program. Constraint resolution has two purposes: first,
+to typecheck partial programs, failing if subsequent steps
+could not possibly result in a well-typed program; second, to
+update Mason’s synthesis goals by discharging any solved
+constraints and suspending any eligible constraints. If constraint resolution fails, Mason backtracks. We see this in
+s2, where field image of type Image is assigned newX of type
+Integer; constraint resolution fails and Mason backtracks
+to s0. If constraint resolution succeeds, Mason chooses a
+3
+
+Jasper Geer, Fox Huston, and Jeffrey S. Foster
+s0
+setBrushX(Integer newX) { ... }
+setBrushY(Integer newY) { ... }
+
+✘
+
+s1
+
+s3
+
+setBrushX(Integer newX) {
+this.brushY = newX;
+...
+}
+
+✘
+
+setBrushX(Integer newX) {
+this.brushX = newX;
+...
+}
+
+s2
+
+setBrushX(Integer newX) {
+this.image = newX;
+...
+}
+
+s4
+
+✘ ...
+
+s9
+
+setBrushY(Integer newY) {
+this.brushY = newY
+...
+}
+
+✘
+...
+
+setBrushX(Integer newX) {
+this.brushX = newX;
+for (...) {
+CanvasLogger o = ...;
+o.onUpdateX(newX);
+}
+}
+
+interference = [ setBrushX ]
+
+✔
+
+s5
+
+s6
+
+✘ (failed testUpdateX)
+setBrushY(Integer newY) {
+this.brushY = newY;
+for (...) {
+CanvasLogger o = ...;
+o.onUpdateY(newY);
+}
+...
+}
+
+s10
+
+setBrushY(Integer newY) {
+this.brushY = newY;
+for (...) {
+CanvasLogger o = ...;
+o.onUpdateY(newY);
+}
+}
+
+setBrushX(Integer newX) {
+this.brushX = newX;
+for (...) {
+CanvasLogger o = ...;
+o.getLogEntry(newX);
+}
+...
+}
+interference = [ setBrushY ]
+
+dependencies =
+[ setBrushX, getLogEntry, Canvas ]
+
+✘
+
+s7
+
+✘
+
+setBrushY(Integer newY) {
+this.brushY = newY;
+for (...) {
+CanvasLogger o = ...;
+o.onLogEntry(newY);
+}
+}
+
+s8
+
+setBrushY(Integer newY) {
+this.brushY = newY;
+for (...) {
+CanvasLogger o = ...;
+o.onUpdateX(newY);
+}
+}
+
+Figure 3. Mason’s search for the correct Observer pattern implementation. Nodes denote synthesis steps and edges denote a
+particular choice taken at a given synthesis step. Each node is annotated with the candidate program before the synthesis
+step is taken and the interference or dependency sets of select steps are given in a box below. Leaves annotated with ✘ are
+candidates rejected for failing constraint resolution, or for failing unit tests. gray nodes and edges are paths left unexplored by
+trace-guided backtracking. The green dotted arrows trace the path of the search under trace-guidance.
+there are 32 possible executable candidates reachable from
+s4. With trace-guided backtracking we visit at most 3 × 2.
+
+records the set of methods that were invoked during the
+execution of this last unit test, its execution trace, and adds
+these to the test’s dependency set. Then, Mason backtracks
+non-locally until reaching a synthesis step whose interference set intersects with the dependency set of the failing
+test, selects an unvisited candidate to explore, and replays
+any choices from the previous path that it can.
+We observe this in Figure 3. Because the choice made at
+the outgoing edges of s4 affects, or interferes with the implementation of setBrushX, it is added to s4’s interference
+set (see Section 4.2 for a definition of interference). Likewise,
+the interference set of s5 includes setBrushY. After executing the program at s6, testUpdateX fails with setBrushX,
+getLogEntry, and Canvas as dependencies, since these were
+the function calls made prior to the failure.
+After backtracking to s5, Mason backtracks again, skipping s7 and s8 because s5 interferes only with setBrushY,
+which testUpdateX does not depend on. After reaching s4,
+Mason correctly chooses onUpdateX and replays (s5, s6),
+to find the solution, s10. In this way, Mason prunes large
+swathes of the search space by only reevaluating choices
+which may have contributed to a test failure. In this scenario,
+
+3
+
+Formalism
+
+In this section, we define an object-oriented core language
+L𝑀 to formalize type- and name-guided program synthesis.
+The top portion of Figure 4 shows the syntax of L𝑀 . Here, the
+notation 𝑎 indicates a sequence of zero or more occurrences
+of 𝑎. Programs consist of type declarations 𝑑, each defining
+a class or interface. Classes contain methods 𝑚 and fields 𝑓 ,
+while interfaces contain method signatures 𝑠. Every class
+has a superclass and implements zero or more interfaces.
+The bodies of L𝑀 methods consist of a single expression 𝑒,
+which may be a variable reference 𝑥, field access 𝑒.M, method
+call 𝑒.𝑀 (𝑒), or type cast (𝐴) 𝑒. We omit forms such as assignment and sequencing but it is straightforward to extend our
+system to include such features. Type and method names
+may either be concrete names A and M for classes and methods, respectively, or holes ?A and ?M, which are replaced by
+concrete names during synthesis.
+4
+
+Mason: Type- and Name-Guided Program Synthesis
+
+::=
+::=
+|
+𝑚 ::=
+𝑠 ::=
+𝑓 ::=
+𝑒 ::=
+A ::=
+M ::=
+𝑃
+𝑑
+
+𝑡
+𝐶
+
+TFld
+
+TVar
+
+𝑑
+class A extends A implements A { 𝑓 𝑚 }
+interface A { 𝑠 }
+A M(A 𝑥) { 𝑒 }
+A M(A 𝑥)
+AM
+𝑥 | 𝑒.M | 𝑒.𝑀 (𝑒) | (A)𝑒
+A | ?A
+M | ?M
+
+Γ ⊢𝑒 :𝑡
+
+Γ ⊢ 𝑥 : Γ (𝑥 )
+
+𝛼 fresh
+
+TCast
+
+Γ ⊢𝑒 :𝑡
+
+A≤𝑡
+
+exists(A)
+
+Γ ⊢ (A) 𝑒 : A
+
+TCall
+
+Γ ⊢ 𝑒0 : 𝑡0
+
+Γ ⊢𝑒 :𝑡
+
+𝑡 0 ≤ [M : 𝑡 → 𝛼 ]
+
+𝛼 fresh
+
+Γ ⊢ 𝑒 0 .M(𝑒 ) : 𝛼
+
+TMethD
+
+::= A | 𝛼 | 𝑡 → 𝑡
+::= 𝐶 ∧ 𝐶 | 𝑡 ≤ 𝑡 | 𝑡 ≤ [M : 𝑡] | implements(A, A)
+| exists(A) | (𝐶)
+
+this : A0 , super : super(𝑃, A0 ), 𝑥 : A2 ⊢ 𝑒 : 𝑡
+𝑡 ≤ A1
+exists(A1 )
+exists(A2 )
+
+TFldD
+
+𝑃 ; A0 ⊢ A1 𝑀 (A2 𝑥 ) {𝑒 }
+
+𝑃 ⊢AM
+
+exists(A)
+
+TCls
+
+Figure 4. L𝑀 Syntax, Types, and Constraints.
+
+𝑃 ; A0 ⊢ 𝑚
+𝑃⊢𝑓
+exists(A)
+implements(A0 , A)
+
+exists(A1 )
+
+𝑃 ⊢ class A0 extends A1 implements A { 𝑓 𝑚 }
+
+Typing Constraints. Typechecking L𝑀 programs consists of generating and resolving typing constraints, the syntax of which is given in the bottom portion of Figure 4. Constraints make assertions about the structure of definitions
+and the inheritance graph.
+Types 𝑡 are either type names A, variables 𝛼, or method
+types 𝑡 → 𝑡. Constraints, which may be conjoined by ∧, take
+several forms. A nominal subtyping constraint 𝑡 1 ≤ 𝑡 2 holds if
+𝑡 1 inherits from 𝑡 2 or implements 𝑡 2 , possibly via inheritance.
+The existential constraint exists(A) holds when the program
+contains a class or interface definition for A. Finally, we
+have two structural subtyping constraints. The constraint
+𝑡 ≤ [M : 𝑡𝑀 ] holds if 𝑡 defines or inherits a member M of type
+𝑡𝑀 . The constraint implements(A1, A2 ) holds if A1 defines
+or inherits members of the same name and compatible type
+for each member of A2 .
+Finally, constraints may also be suspended, denoted (𝐶).
+We suspend constraints that are unsatisfied because they
+reference some undefined type or member. For example, we
+might suspend exists(A) as (exists(A)) if 𝑃 currently contains no definition for A. As discussed below in Section 3.2,
+during synthesis we unsuspend such constraints when we
+add to the program such that the constraints may become satisfied. Our implementation also supports name constraints,
+which are discussed in Section 4.
+3.1
+
+𝑡 ≤ [M : 𝛼 ]
+Γ ⊢ 𝑒.M : 𝛼
+
+TIntf
+exists(A𝑖0 )
+
+exists(A𝑖1 )
+
+𝑃 ⊢ interface A { A𝑖0 M𝑖 (A𝑖1 𝑥𝑖 ) }
+
+Figure 5. Type Inference and Constraint Generation for L𝑀 .
+program. Notice that in a more typical type inference algorithm, these two conditions would be checked immediately,
+but in our system we need to generate constraints because
+the program may be partial. Lastly, TCall types a method
+call 𝑒 0 .M(𝑒) by constraining 𝑡 0 , the type of the receiver, to
+contain a method that takes an argument of type 𝑡, the type
+of 𝑒, and returns some type 𝛼.
+The remaining rules type declarations. TMethD types a
+method by ensuring that the method body 𝑒 meets its specification. Notice that this rule generates exists constraints for
+the types mentioned in the method definition. TFldD similarly generates an exists constraint for the field type. TCls
+types a class definition by typing its fields and methods;
+generating exists constraints for the classes it mentioned (except A0 , which is being defined); and generating implements
+constraints to ensure 𝐴0 is compatible with its superclass
+and interfaces. Note that we abuse notation slightly here by
+Ó
+writing exists(𝐴) for the set of constraints exists(𝐴𝑖 ) for
+𝐴𝑖 ∈ 𝐴, and similarly for implements(𝐴0, 𝐴). Finally, TIntf
+types an interface by generating constraints that all classes
+mentioned in the interface exist.
+
+Type Inference for L𝑀
+
+Our synthesis algorithm uses type inference as a subroutine
+to generate and solve constraints among types and type variables. Figure 5 gives the type inference rules for L𝑀 . The
+first several rules type expressions. TVar types variables in
+the usual way. TFld types a field access 𝑒.𝑀 by generating a
+constraint that the type 𝑡 of the object must contain a field 𝑀
+of type 𝛼, where 𝛼 is a fresh type variable. TCast types a
+cast (A)𝑒 by generating two constraints: A ≤ 𝑡 requires that
+𝐴 is a subtype of 𝑡, and exists(A) requires that 𝐴 exists in the
+
+Constraint Resolution. After type inference generates
+constraints, constraint resolution iteratively rewrites the constraints until they are in a solved form. In standard constraint
+resolution, constraints that are unsatisfiable always cause
+type inference to fail. In contrast, in Mason, there are two
+possibilities: Contradictory constraints, which can never become satisfiable, force the synthesis algorithm to backtrack
+5
+
+Jasper Geer, Fox Huston, and Jeffrey S. Foster
+
+Nominals
+
+𝑃 ⊢ 𝐶 ∧ exists(A)
+𝑃 ⊢ 𝐶 ∧ exists(A)
+
+Methods
+
+Variables
+
+Interfaces
+
+𝑃 ⊢𝐶 ∧A ≤ A
+𝑃 ⊢ 𝐶 ∧ A ≤ A′
+𝑃 ⊢ 𝐶 ∧ A ≤ A′
+𝑃 ⊢ 𝐶 ∧ A ≤ A′
+𝑃 ⊢ 𝐶 ∧ A ≤ A′
+𝑃 ⊢ 𝐶 ∧ A ≤ A′
+
+Existentials
+
+𝑃 ⊢ 𝐶 ↠ 𝐶′
+↠
+↠
+↠
+↠
+↠
+↠
+
+𝐶
+𝐶 ∧ (A ≤ A′ )
+⊥
+𝐶
+𝐶 ∧ (A ≤ A′ )
+⊥
+
+↠
+↠
+
+if A ∉ 𝑃
+if A ∈ interfaces(𝑃 ) and A′ ∈ classes(𝑃 )
+if A inherits from or implements A′
+if A inherits from or implements some A𝑖 where A𝑖 is a hole or A𝑖 ∉ 𝑃
+otherwise
+
+𝐶
+𝐶 ∧ (exists(A))
+
+if A ∈ 𝑃
+if A ∉ 𝑃
+
+𝑃 ⊢ 𝐶 ∧ implements(A, A′ )
+
+↠
+
+𝐶 ∧ implements(A, A′ ) ∧ A ≤ [M : A → A𝑟 ]
+
+𝑃 ⊢ 𝐶 ∧ implements(A, A′ )
+𝑃 ⊢ 𝐶 ∧ implements(A, A′ )
+
+↠
+↠
+
+⊥
+𝐶 ∧ (implements(A, A′ ))
+
+𝑃 ⊢𝐶 ∧A ≤ 𝛼 ∧𝛼 ≤ 𝑡
+
+𝐶 ∧A ≤ 𝛼 ∧𝛼 ≤ 𝑡 ∧A ≤ 𝑡
+
+↠
+
+𝑃 ⊢ 𝐶 ∧ A ≤ [M : 𝑡 → 𝑡𝑟 ]
+𝑃 ⊢ 𝐶 ∧ A ≤ [M : 𝑡 → 𝑡𝑟 ]
+
+↠
+↠
+
+𝐶 ∧ 𝑡 ≤ 𝑡 ′ ∧ 𝑡𝑟′ ≤ 𝑡𝑟
+𝐶 ∧ 𝑡 ≤ 𝑡 ′ ∧ 𝑡𝑟′ ≤ 𝑡𝑟
+
+𝑃 ⊢ 𝐶 ∧ A ≤ [M : 𝑡 → 𝑡𝑟 ]
+
+↠
+
+𝐶 ∧ (A ≤ [M : 𝑡 → 𝑡𝑟 ])
+
+if A′ ∈ interfaces(𝑃 )
+where (A′ .M : A → A𝑟 ) ∈ 𝑃
+if A′ ∈ classes(𝑃 )
+otherwise
+
+if (A.M : 𝑡 ′ → 𝑡𝑟′ ) ∈ 𝑃
+if (A′ .M : 𝑡 ′ → 𝑡𝑟′ ) ∈ 𝑃
+where A inherits from A′
+otherwise
+
+Figure 6. Selected Constraint Resolution Rules.
+and try a different solution. Otherwise, if the constraints
+could become satisfiable during synthesis, those constraints
+are suspended, and constraint resolution continues.
+Figure 6 presents a selection of our constraint resolution
+rules, formalized as a relation 𝑃 ⊢ 𝐶 ↠ 𝐶 ′ , meaning given
+program 𝑃, the constraints 𝐶 are rewritten to 𝐶 ′ . We write
+↠∗ for the reflexive, transitive closure of ↠. Contradictory
+constraints are those that are rewritten to ⊥. Note that we
+use the term implements in the transitive sense; we say that
+𝐴 implements 𝐴′ if 𝐴 implements 𝐴′ appears in source code
+or if one of 𝐴’s superclasses implements 𝐴′ .
+The nominal rewriting rules handle constraints of the
+form A ≤ A′ . The first rule handles the case when A and A′
+are in 𝑃 and the constraint is satisfiable, in which case it is
+discharged. The next rule raises a contradiction if A is an
+interface and A′ is a class. The following two rules suspend
+the constraint when it is not currently satisfiable, but the
+inheritance or implementation chain includes a hole that is
+potentially on the path from A to A′ , since filling that hole
+could make this constraint satisfiable.
+The existential rewriting rules either discharge a constraint exists(A) if A ∈ 𝑃 or suspend the constraint, since
+synthesis could add A to the program. The interface rewriting rules reason about implements(A, A′ ) constraints. If A′
+is an interface in the program, then we generate new constraints that all the methods in A′ are included in A. If A′ is a
+class, then we have a contradiction. Otherwise, we suspend
+the constraint until A′ is added to the program.
+
+The remaining rewriting rules are standard. The variable
+rule implements transitive closure.
+3.2
+
+Synthesis, Formally
+
+Programs are synthesized from fragments, which we define
+as a 2-tuple ⟨𝑃, 𝐶⟩ of a program 𝑃 and constraints 𝐶. Our
+goal is to derive, from ⟨𝑃, 𝐶⟩ and a set of fragments 𝐹 (a
+fragment library), some fragment ⟨𝑃 ′, 𝐶 ′ ⟩ where 𝐶 contains
+no suspended constraints.
+The synthesis rules require a few key definitions. A substitution 𝜎 is a mapping of hole names to concrete type and
+member names. If 𝜎 = {?A ↦→ A, ?M ↦→ M}, then 𝜎 (⟨𝑃, 𝐶⟩ )
+denotes the program produced by replacing all instances of
+?A with A and ?M with M in 𝑃 and 𝐶.
+We define a partial binary operator ⊕ on declarations.
+𝑑 1 ⊕ 𝑑 2 is defined when 𝑑 1 and 𝑑 2 are of the same kind
+(class or interface), extend the same type, and contain no
+identically named members. The result contains the union
+of the members of 𝑑 1 and 𝑑 2 ; if 𝑑 1 and 𝑑 2 are classes, the
+composition implements all interfaces implemented by either. We lift ⊕ to programs by composing each pair of
+identically- named declarations; declarations with no counterpart are preserved in the result. Finally, we lift ⊕ to fragments: ⟨𝑃, 𝐶⟩ ⊕ ⟨𝑃 ′, 𝐶 ′ ⟩ = ⟨𝑃 ⊕ 𝑃 ′, 𝐶 ∧ 𝐶 ′ ⟩.
+Type- and Name-Guided Synthesis. Mason synthesizes
+programs by solving suspended constraints with type- and
+6
+
+Mason: Type- and Name-Guided Program Synthesis
+
+𝐹 ⊢ ⟨𝑃, 𝐶⟩ ⇝ ⟨𝑃 ′, 𝐶 ′ ⟩
+
+Rule Synth-Type discharges a suspended existential constraint (exists(A0 )) by synthesizing fresh code. The rule selects a fragment 𝑃 𝑓 , 𝐶 𝑓 from fragment library 𝐹 with a
+type declaration named A1 and uses 𝜎 to unify it with A0 in
+both ⟨𝑃, 𝐶⟩ and 𝑃 𝑓 , 𝐶 𝑓 . It composes the resulting fragments to produce ⟨𝑃 ′, 𝐶𝑟 ⟩, in which a definition now exists
+for 𝜎 (A0 ).
+Rule Synth-Member discharges a suspended structural
+subtyping constraint (A0 ≤ [M0 : 𝑡]) by adding a new member to A0 whose type is compatible with 𝑡. The rule selects a
+fragment 𝑃 𝑓 , 𝐶 𝑓 from 𝐹 and selects a method A1 .M1 from
+this fragment which to add to A0 using fragment composition. To make merging A0 and A1 possible and to match the
+constraint, 𝜎 unifies three pairs of names: method names M0
+and M1 ; type names A0 and A1 ; the supertypes of both types
+A𝑠0 and A𝑠1 . Applying 𝜎 to both fragments and composing
+them results in 𝜎 (A0 ) containing a definition for 𝜎 (M0 ).
+These rules are highly non-deterministic; given a set of
+suspended constraints, the rules may be applied in many different orders. In Section 4, we will describe how the Mason
+implementation systematically applies these rules to yield a
+search procedure.
+
+Fill-Type
+A1 ∈ 𝑃
+𝜎 (A0 ) = 𝜎 (A1 )
+⟨𝑃 ′ , 𝐶𝑟 ⟩ = 𝜎 ( ⟨𝑃, 𝐶 ∧ exists(A0 ) ⟩ )
+𝑃 ′ ⊢ 𝐶𝑟 ↠∗ 𝐶 ′
+𝐹 ⊢ 𝑃, 𝐶 ∧ (exists(A0 )) ⇝ ⟨𝑃 ′ , 𝐶 ′ ⟩
+
+Fill-Member
+
+A′ ∈ super∗ (𝑃, A) ∪ {A}
+(A′ .M1 ) ∈ 𝑃
+𝜎 (M0 ) = 𝜎 (M1 )
+⟨𝑃 ′ , 𝐶𝑟 ⟩ = ⟨𝑃, 𝐶 ∧ A ≤ [M0 : 𝑡 ] ⟩
+𝑃 ′ ⊢ 𝐶𝑟 ↠∗ 𝐶 ′
+
+𝐹 ⊢ 𝑃, 𝐶 ∧ (A ≤ [M0 : 𝑡 ]) ⇝ ⟨𝑃 ′ , 𝐶 ′ ⟩
+
+Synth-Type
+𝑃𝑓 , 𝐶𝑓 ∈ 𝐹
+A1 ∈ 𝑃 𝑓
+𝜎 (A0 ) = 𝜎 (A1 )
+⟨𝑃 ′ , 𝐶𝑟 ⟩ = 𝜎 (⟨𝑃, 𝐶 ∧ exists(A0 ) ⟩) ⊕ 𝜎 ( 𝑃 𝑓 , 𝐶 𝑓 )
+𝑃 ′ ⊢ 𝐶𝑟 ↠∗ 𝐶 ′
+𝐹 ⊢ 𝑃, 𝐶 ∧ (exists(A0 )) ⇝ ⟨𝑃 ′ , 𝐶 ′ ⟩
+
+Synth-Member
+A0 ∈ 𝑃
+𝑃𝑓 , 𝐶𝑓 ∈ 𝐹
+(A1 .M1 : 𝑡 𝑓 ) ∈ 𝑃 𝑓
+A𝑠0 = super(𝑃, A0 )
+A𝑠1 = super(𝑃 𝑓 , A1 )
+𝜎 (M0 ) = 𝜎 (M1 )
+𝜎 (A0 ) = 𝜎 (A1 )
+𝜎 (A𝑠0 ) = 𝜎 (A𝑠1 )
+⟨𝑃 ′ , 𝐶𝑟 ⟩ = 𝜎 (⟨𝑃, 𝐶 ∧ A0 ≤ [M0 : 𝑡 ] ⟩) ⊕ 𝜎 ( 𝑃 𝑓 , 𝐶 𝑓 )
+𝑃 ′ ⊢ 𝐶𝑟 ↠∗ 𝐶 ′
+𝐹 ⊢ 𝑃, 𝐶 ∧ (A0 ≤ [M0 : 𝑡 ]) ⇝ ⟨𝑃 ′ , 𝐶 ′ ⟩
+
+4
+
+Figure 7. Synthesis Rules.
+
+Implementation
+
+Mason is implemented in roughly 5,000 lines of Scala 3 code.
+It takes as input an initial fragment containing unit tests and
+a library of fragments used to complete the initial fragment.
+Both are written using a modified Java syntax that admits
+holes and name patterns.
+The initial fragment cannot contain any holes, but is free
+to reference types and methods that do not yet exist. We
+designate the class that declares the program’s main method
+as its test harness. The main method may contain any number of unit tests, which are static void methods with the
+annotation @Test. Unit tests may not rely on the result of
+any code executed outside their body, as trace-guided backtracking relies on this property during backtracking, and
+must raise an execution-halting exception to signal failure.
+Although fragments are whole programs in the formalism,
+in the Mason implementation they are restricted to containing a single type declaration. While it is useful to typecheck
+a fragment as a whole program, we have not found a use
+for a multi-declaration fragment in representing any of our
+chosen design patterns.
+We also divide fragments between type-fragments and
+member-fragments, i.e., between those which Mason will
+use to synthesize new types using Synth-Type and those
+which Mason will use to synthesize new methods using
+Synth-Member. We denote this in the fragment source
+code using the type annotations @TypeFragment and
+@MemberFragment. This distinction prevents Mason from
+wasting time by applying fragments in the wrong context.
+For example, in Section 2, the purpose of the fragment
+
+name-guided synthesis, the rules of which we describe in Figure 7. Rules prove judgments of the form 𝐹 ⊢ ⟨𝑃, 𝐶⟩ ⇝
+⟨𝑃 ′, 𝐶 ′ ⟩ meaning that ⟨𝑃 ′, 𝐶 ′ ⟩ can be synthesized from
+⟨𝑃, 𝐶⟩ using fragment library 𝐹 .
+Each synthesis rule matches on a suspended constraint in
+the fragment ⟨𝑃, 𝐶⟩ ; applies some transformation to ⟨𝑃, 𝐶⟩
+to produce ⟨𝑃 ′, 𝐶𝑟 ⟩; type checks the result by resolving 𝐶𝑟
+in the context of 𝑃 ′ to produce 𝐶 ′ ; and produces a new
+well-typed fragment ⟨𝑃 ′, 𝐶 ′ ⟩ in which the constraint is discharged. The Fill- rules do so by filling holes, while the
+Synth- rules do so by synthesizing new types and members.
+Rule Fill-Type discharges a suspended existential constraint (exists(A0 )) by unifying a hole with a concrete type
+name. The first name, A0 , is referenced in the constraint,
+while the other, A1 , must occur as the name of a type declaration. The rule defines 𝜎 as the substitution unifying A0
+and A1 ; recall that substitutions must map holes to concrete
+names. It then applies 𝜎 to ⟨𝑃, 𝐶⟩ to create a program in
+which a definition exists for 𝜎 (A0 ).
+Rule Fill-Member discharges a suspended structural subtyping constraint (A ≤ [M0 : 𝑡]) by unifiying M0 with the
+name of one of A’s members whose type is compatible with
+𝑡. Since A can inherit members from its supertypes, FillMember considers all member names from supertypes of A
+as candidates to unify with M0 .
+7
+
+Jasper Geer, Fox Huston, and Jeffrey S. Foster
+
+?Update shown in Figure 2 is to synthesize setter methods on existing classes. Using this fragment to synthesize a
+new class with a single member would uselessly expand the
+search space, so we designate ?Update a member-fragment.
+Finally, to prevent unintended aliasing between holes introduced in different synthesis steps, the Mason implementation 𝛼-renames holes in newly synthesized code.
+4.1
+
+given that no fragment exists to synthesize a new field, choosing the constraint on Foo first leads to a failure, since nothing
+that can be done to Foo will satisfy the constraint.
+As a third example, consider a situation in which a constraint containing a hole can only be satisfied once a constraint containing a concrete name is satisfied. Consider
+the constraints (Foo ≤ [f : Integer]) and (Foo ≤ [?g :
+Integer]) and following snippet:
+
+Synthesis, Practically
+1
+2
+3
+4
+
+In this subsection we describe the restrictions we impose to recover a search procedure from the highly nondeterministic synthesis rules described in Figure 7.
+
+If Mason chooses to satisfy (Foo ≤ [f : Integer]) first,
+we can fill ?h with f in this step and then satisfy (Foo ≤
+[?g : Integer]) by filling ?g with f. However, addressing
+the constraints in the opposite order fails, since our rules
+do not allow us to unify ?g and ?h. A similar situation may
+arise if (Foo ≤ [f : Integer]) is satisfied by synthesizing a
+new field.
+For these three kinds of dependencies we impose three
+rules. First, existential constraints are always satisfied before
+subtyping constraints. Second, constraints on supertypes
+always precede those on subclasses. Third, for pairs of constraints not already comparable via the first two rules, a
+constraint containing no holes always precedes a constraint
+containing some.
+As a result, if a concrete name for a type or member exists in the current constraint set, Mason will synthesize its
+definition before filling any holes for which it is a solution.
+Regardless of ordering, if a concrete-named definition for a
+type or member exists in a fragment, it will be available for
+use via the Synth- rules. Still, if the correct substitute for a
+hole exists only in a constraint within a library fragment,
+Mason may attempt to fill the hole before first pulling in
+the fragment and be unable to solve it. Thus, our constraint
+ordering guaratees that Mason will find a solution as long
+as the name of every synthesized type and member in the
+solution is given either as a concrete reference in the initial
+fragment or as the name of a definition in a library fragment.
+
+Backtracking Search. After parsing and typechecking
+both the initial fragment and the fragment library, Mason
+performs a depth-first backtracking search through the space
+of synthesizable candidate programs. At each partial candidate program, it chooses a suspended existential or structural
+subtyping constraint and attempts to synthesize a new candidate program according to the rules in Figure 7. Recall we
+use two kinds of rules to solve subtyping constraints: Fillrules and Synth- rules. We prefer to explore smaller candidates first, so Mason will exhaustively explore the space of
+candidates reachable by applying the Fill- rule before doing the same for Synth-. If no solution is found here either,
+Mason backtracks to the previous candidate.
+Constraint Ordering. The order in which constraints
+are chosen affects the space of synthesizable programs. If
+suspended constraints can be addressed in any order, Mason
+may attempt to solve a constraint before it is possible to do so.
+For example, suppose Mason chooses a suspended constraint
+(Foo ≤ [f : Integer]) given the following snippet:
+1
+2
+
+class Bar { Integer f; }
+class Foo extends ?X { }
+
+Two rules, Fill-Member and Synth-Member, match on
+this constraint. Our first option here is to apply Fill-Member
+to concretize the name of a field, but Foo has no eligible fields.
+The second is to synthesize a new field with Synth-Member,
+but what if our fragment library contains no compatible
+member fragments? Instead, the solution here is to fill in
+Foo’s superclass ?X with Bar, making f available through inheritance. However, Mason will attempt the first two strategies and backtrack, missing the solution. As a result, it might
+only be possible to solve a constraint once a class has inherited particular members.
+A variation of this dependency may also exist between
+two structural subtyping constraints. Consider the following
+snippet and the constraints (Foo ≤ [f : Integer]) and
+(Bar ≤ [f : Integer]):
+1
+2
+
+class Bar {
+Integer foo() { return this.?g }
+Integer ?h;
+}
+
+4.2
+
+Extensions
+
+We now describe two extensions to Mason aimed at mitigating combinatorial explosion, particularly in cases where
+Mason must choose between a number of type-correct options which differ only in their runtime behavior.
+Name Patterns. Synthesis in Mason revolves around filling holes with concrete names, thus we can prune a great
+deal of the search space by imposing a naming convention
+to which candidate substitutions must adhere. As described
+in Section 2, Mason lets the programmer encode such a convention using name patterns.
+Name patterns may appear in source code in place of
+type or member names and enclosed by ?{_}. They use a
+
+class Bar { Integer ?f; }
+class Foo extends Bar { }
+
+Satisfying the constraint on Bar first concretizes the hole
+?f and indirectly resolves the constraint on Foo. However,
+8
+
+Mason: Type- and Name-Guided Program Synthesis
+
+restricted regular expression syntax with the addition of
+holes prefixed by ?. For the purposes of this paper we retain
+only the choice |, grouping (), and implicit concatenation
+operators. Name patterns are compiled to regular expressions
+by replacing every alphanumeric sequence prefixed by ? with
+.* and all uppercase letters with their lowercase counterpart.
+For each type name pattern ?{A} or member name pattern ?{M} that appears in the source, Mason generates a
+corresponding name constraint M c M or A c A, where
+M, A, is the entire ?{_}-enclosed sequence interpreted as a
+type or member name. A name constraint is satisfied when
+its left-hand side is a concrete name matched by the pattern
+on its right-hand side.
+The holes contained within a name pattern are renamed
+with the rest of the fragment during synthesis. For example, the substitution {?field ↦→ name} applied to pattern
+(set)(?field) yields (set)(name). Name patterns can encode syntactic relationships between various holes, e.g., the
+relationship between the name of a setter and the name of
+the field it mutates, as was shown in Section 2.
+
+We further expand the dependency set to include the names
+of any methods prior to being renamed by Fill-Member.
+When Mason encounters a unit test failure, the dependency set for that test is updated and Mason backtracks
+non-locally until reaching a synthesis step whose interference set intersects with the dependency set. Search resumes
+without non-local backtracking, although if Mason visits
+every outgoing edge without finding a executable program,
+non-local backtracking resumes using the same dependency
+set. During this time, Mason prioritizes any choices made
+while synthesizing the last executable program.
+It is possible that in attempting to correct for a failure
+of some unit test 𝑇2 , Mason makes a change that causes a
+previously passing test 𝑇1 to fail. In this case, we backtrack
+and search for a new solution with the intent of passing both
+𝑇1 and 𝑇2 . Mason must revise its choices at steps that affect
+both tests, so the dependency set of 𝑇1 becomes the union of
+the dependency sets of 𝑇1 and 𝑇2 . The execution trace, and
+trace-guided backtracking, proceed as usual.
+
+Trace-Guided Backtracking. Mason implements a nonlocal backtracking heuristic, trace-guided backtracking,
+which we briefly described in Section 2. To enable this, Mason tracks an interference set for every synthesis step taken
+and a dependency set for every unit test run.
+The interference set of a synthesis step tracks the set of
+methods whose implementation may depend on its outcome.
+It begins empty for each step and is populated with the methods that synthesis rules interfere with as they are attempted.
+If Fill-Member is used to rename a hole ?M, it interferes
+with the following methods:
+
+5
+
+Evaluation
+
+We evaluate Mason on a suite of benchmarks that involve
+synthesizing programs using common design patterns. The
+questions we aim to answer in our evaluation are:
+RQ1 How well does Mason achieve its stated goal of automatically synthesizing implementations of design
+patterns? How do particular aspects of a synthesis
+problem cause Mason to perform well or poorly?
+RQ2 To what extent and in which scenarios are the two
+extensions to Mason effective in improving its performance?
+
+• any member in which ?M appeared prior to renaming
+• if this step gave a concrete name to a member named
+?M in type 𝑡, any member with a hole name that ever
+exists (exists now or is synthesized later) in 𝑡.
+
+5.1
+
+Benchmarks
+
+We developed our own synthetic benchmark suite designed
+to reveal Mason’s strengths and weaknesses. In each benchmark, Mason synthesizes a program by adding a Gang of
+Four [5] design pattern, which we have implemented as a
+fragment library. The initial fragment for each benchmark
+includes a set of unit tests that instantiate classes and check
+that the design pattern was implemented correctly. For example, the unit tests for the Accessor benchmark check that
+setters mutate the correct fields and that these mutations are
+correctly observed by getters. The size of each benchmark
+can be adjusted by a scaling factor 𝑛, so that we can evaluate
+Mason’s performance as benchmark size grows. To give a
+sense of scale, Mason synthesizes 298 additional lines of
+code (as measured by cloc [2]) to complete the VirtualProxy
+benchmark at size 32. We now describe each benchmark.
+
+The second item is necessary because giving a particular
+name to one method in a type declaration prevents that name
+from ever being given to any other method currently in the
+declaration or ever added to the declaration in the future.
+If Synth-Member is used to synthesize a method M in
+type 𝑡, it interferes with the following:
+• any member in which ?M appeared prior to renaming
+• any new member synthesized during this step
+• any member with a hole name that ever exists in 𝑡, its
+subclasses, or its supertypes
+If a synthesis step applies Fill-Class or Synth-Class, the
+interference set is every method in the program.
+The dependency set of a unit test tracks the set of methods
+upon whose correctness the outcome of the unit test might
+depend. When any unit test fails, the set of methods called
+during its execution are added to the test’s dependency set.
+
+• Factory. The initial fragment consists of 𝑛 product
+classes that implement a common interface. For each,
+9
+
+Jasper Geer, Fox Huston, and Jeffrey S. Foster
+
+Figure 8. Benchmark size versus median wall time over 21 trials for each of our 8 benchmarks. Note that y-axis scales vary
+between subplots. We stop plotting points once the median trial exceeds the timeout. The last data point for each series of
+tests is marked with an ×. Runs where at least one trial timed out are marked with a •.
+Mason must synthesize a concrete factory that instantiates objects of that class. Mason must also synthesize an abstract factory interface that the concrete factories implement. The fragment library contains type
+fragments for synthesizing concrete factory classes
+and the abstract factory interface.
+• Singleton. To each of 𝑛 classes in the initial fragment,
+Mason must add a field _instance and a method that
+calls the class’s constructor to initialize _instance if
+it is uninitialized, returning its value otherwise. The
+fragment library contains a member fragment that
+includes both the field and method.
+• Accessor. The initial fragment contains a class with
+𝑛 fields, all of the same type. For each, Mason must
+synthesize setters and getters. The fragment library
+contains a member fragment for synthesizing setters
+and another for getters.
+• Observer. This benchmark generalizes the example
+from Section 2. Along with 𝑛 setters on a subject class,
+Mason must synthesize a fixed number of helper
+methods for managing observers. The fragment library contains a member fragment containing the
+helper methods and the fragment shown in Figure 2,
+for setters.
+• Builder. The initial fragment contains a class with 𝑛
+constructor parameters. Mason synthesizes a concrete
+
+builder for this class, which has a setter for each parameter and a method for instantiating the class. The
+fragment library contains a class fragment for synthesizing the builder, a member fragment for setters, and
+member fragments which instantiate classes.
+• Virtual Proxy. Mason must synthesize a virtual
+proxy, which exposes the same interface as a given
+class with 𝑛 methods but redirects calls to an instance
+of the class that it instantiates lazily. The fragment
+library contains type fragments for synthesizing the
+proxy class and method fragments for proxy methods.
+• Adapter. Mason must synthesize an adapter that
+wraps an object of a given class with 𝑛 methods, while
+implementing an incompatible interface by redirecting method calls to the wrapped object. The fragment
+library contains type fragments for synthesizing the
+adapter class and method fragments for synthesizing
+its methods.
+• Composite. Given 2𝑛 classes that define a tree structure, Mason must synthesize a shared interface and
+implementations of it for each class, allowing a client
+to perform the same operation across leaves and nonleaves. The fragment library contains a type fragment
+and member fragment for synthesizing and populating the shared interface, a member fragment with
+“non-leaf” methods and another with “leaf” methods.
+10
+
+Mason: Type- and Name-Guided Program Synthesis
+
+5.2
+
+Results
+
+the baseline, Mason does not fare as well in Composite: here,
+Mason is more prone to make changes that cause previously
+passing tests to fail, which expands dependency sets, making
+trace-guided backtracking less effective. Note too that the initial Composite program is larger than the others, containing
+2𝑛 incomplete classes.
+
+Figure 8 shows the results of running Mason on our benchmark suite. The data was collected on an 2023 Macbook Pro
+with an M2 Pro processor and 16GB of RAM. The benchmarks themselves were run on a JVM with a maximum of
+1GB of stack space and 8GB of heap.
+For each benchmark, we ran and plotted three series of
+tests. The first, our baseline, referred to in the legend as
+Base, were performed without trace-guided backtracking or
+name constraints. The second, labelled Trace-Guided, runs
+with only trace-guided backtracking switched on. The third,
+labelled Trace-Guided + Name Patterns, runs with both extensions on.
+In each series, we instantiated the benchmark at progressively higher scaling factors, beginning at one and increasing
+by increments of one up to and including 32. At each scaling
+factor we ran 21 trials with a timeout of 120 seconds and
+recorded the total wall clock time spent in synthesis and
+unit test execution before all unit tests passed. We then plotted the median of these times. If a majority of the 21 trials
+resulted in a timeout, we did not run tests for any larger
+scaling factors and did not plot a value.
+
+With Name Patterns. When Mason is also permitted
+to use the name constraints generated from name patterns
+embedded in fragments, we see a noticable improvement
+in performance in four benchmarks: Factory, Accessor, Observer, and Composite. Of these, Factory and Accessor see the
+most benefit, with median synthesis times for Factory never
+exceeding six seconds and median times for Accessor never
+exceeding five seconds.
+This is somewhat expected; at the synthesis steps which
+cause combinatorial explosion in both benchmarks, name
+constraints force a single option. In Accessor this is the choice
+of field to manipulate in each setter and getter (similar to
+the example from Section 2), and in Factory this is the choice
+of class to instantiate in each concrete factory. For Observer
+and Composite, name constraints fail to fully constrain every
+important choice, but still eliminate a significant amount
+of unnecessary search: in Observer at size eight, name constraints bring median synthesis times from 98 seconds to 13
+seconds; in Composite at size six, they bring median synthesis
+times from 107 seconds to 14 seconds.
+
+Baseline. Baseline Mason performs well when a welltyped candidate program tends to be a correct one. This is
+the case for the Singleton benchmark, in which the special
+constructor for each class is synthesized using a single member fragment, both of whose holes are filled immediately by
+Synth-Member. Likewise, for VirtualProxy, there are only
+ever two possible well-typed candidates, in one of which the
+virtual proxy erroneously wraps an object of its own class.
+As a result, synthesis times do not exceed 0.7 seconds for
+Singleton, and 15 seconds for VirtualProxy.
+For the remaining benchmarks, increasing scale vastly
+increases the number of well-typed synthesizable programs,
+and performance suffers as a result. For example, in the
+Accessor benchmark, baseline Mason times out for a majority
+of trials at a scale factor of three. This makes sense when we
+examine the benchmark; for Accessor at scale factor three,
+Mason chooses, for each of three setter and three getter
+methods, the correct field to access, for a total of 33 × 33 or
+729 possible programs.
+
+6
+
+Future Work
+
+There are several interesting directions for future work.
+Name Patterns. Name patterns caused the most drastic
+performance improvements in Figure 8, specifically with the
+Factory and Accessor benchmarks. However, the language
+of name patterns is limited, and they can only be used to
+express constraints between type and member names. Future
+work could extend name patterns to refer to names found in
+other parts of the AST, e.g., the names of method parameters.
+Synthesizing Low-Level Details. With Mason’s higher
+level of abstraction comes a loss of expressiveness. For instance, Mason is unable to synthesize abritrary expressions
+or sequences of statements. Future work might consider integrating Mason with existing program synthesis techniques
+to make this possible. We might permit holes to appear in
+expression position, with Mason producing sketches [17] to
+be solved using a tool like JSketch [11].
+
+With Trace-Guided Backtracking. With the addition
+of trace-guided backtracking, Mason is able to synthesize
+correct solutions within the timeout at larger scale factors for
+Accessor, Observer, Builder, Adapter, and Composite. Like the
+Observer example from Section 2, the source of combinatorial
+explosion in these benchmarks is a series of choices made
+when synthesizing disjoint methods.
+This is most pronounced in Builder, where Mason with
+trace-guided backtracking reaches size 24 and encounters
+no timeouts through size 22. Baseline Mason times out in
+a majority of trials after size four. Though outperforming
+
+More Expressive Specifications. Our evaluation demonstrates that Mason performs particularly well when static
+information tightly constrains the search space. However,
+Java types are a fairly coarse specification. LiquidJava [4]
+extends the Java type system with statically checked predicates. Future work could extend Mason’s system of type
+11
+
+Jasper Geer, Fox Huston, and Jeffrey S. Foster
+
+constraints to include these richer types and therefore prune
+more candidates during search.
+
+7
+
+to use design patterns. In contrast to Mason, these techniques are applied to complete programs, and are thus intended for use later in the development process. Remodel [9]
+leverages a genetic algorithm to apply minitransformations [1], small code changes that can compose design patterns, and determines fitness using software engineering metrics. JungGL [19] and R 2 [12] are tools for writing refactoring
+scripts, which apply design patterns using a specialized API.
+Like Mason’s fragments, scripts allow user configuration,
+but authors of refactoring scripts must devise an algorithm,
+while Mason obviates this need. Producing well-typed programs is also a concern in this domain; Tip et al. [18] use
+typing constraints to ensure the well-typeness of refactorings. Like us, they define a system of typing constraints for
+a Java subset and use them to constrain possible program
+transformations. However their treatment of constraints is
+specific to each refactoring: some constraints must hold following the transformation, while the rest need not.
+
+Related Work
+
+Synthesis of Object-Oriented Programs. Pasket [10]
+also synthesizes Java program using design patterns. However, while Mason’s output is intended for use by programmers, Pasket produces framework models for symbolic execution. Using logs produced by example framework clents,
+Pasket instantiates design patterns to produce a sketch [17]
+of the solution, which it completes using a tool called JSketch [11]. Like fragments, sketches are partial programs
+with holes, but holes range over expressions rather than
+names. To solve sketches, JSketch reasons about dynamic
+semantics but not static semantics, thus JSketch and Pasket
+may produce ill-typed programs, while type-guided Mason
+will not. A consequence of reasoning about dynamic semantics is that JSketch and Pasket cannot synthesize code that
+uses library methods without a semantic model; meanwhile,
+Mason only needs type signatures, which are available by
+default.
+Various techniques [3, 7, 8, 13] exist to synthesize individual functions in object-oriented languages like Ruby and
+Java. These techniques synthesize expressions or sequences
+of statements that Mason cannot but lack the ability to create new classes, interfaces, and members. Of these, RbSyn,
+which synthesizes Ruby functions from API calls, shares
+similarities with Mason. RbSyn also uses unit tests and test
+failures to guide search, though it does so by requiring candidate programs to perform additional side ffects, which RbSyn
+reasons about directly. However, RbSyn requires that library
+methods include effect annotations as a result.
+
+8
+
+Conclusion
+
+In this paper, we presented Mason, a tool that, guided by
+types and names, synthesizes object-oriented programs from
+program pieces. We gave a formal model of our approach,
+introducing a constraint-based type inference algorithm for
+a core object-oriented language and a set of type- and nameguided synthesis rules. We also introduced two extensions
+to Mason with the goal of improving performance.
+We used Mason to apply design patterns to a suite of
+benchmarks. We found baseline Mason to perform well
+when very few well-typed programs can be synthesized.
+When this is not the case, but the source of combinatorial
+explosion is distributed among distinct methods and unit
+tests, trace-guided backtracking can improve performance
+over baseline Mason significantly. Name patterns further
+improve performance when a naming convention can be
+imposed on types and members. We believe that Mason
+takes an important step in synthesizing multi-class objectoriented programs using design patterns.
+
+Type-Directed Synthesis. Synqid [16], Myth [15], and
+Scythe [14] represent the traditional approach to typedirected synthesis, deriving synthesis rules from proof
+systems for typechecking and type inference. In contrast,
+though type inference is a key part of synthesis in Mason,
+Mason’s synthesis rules do not follow its structure. In addition, all three synthesize individual functions or expressions
+in a functional language. Like Mason, Synqid guides synthesis with subtyping constraints, but uses more expressive
+refinement types which are annotated with logical predicates.
+Like Mason, Myth also uses test cases to guide synthesis,
+but these are less expressive input-output examples. However, Myth is able to refine its examples alongside synthesis,
+using them to eliminate candidates during search. Scythe
+carries a set of typing constraints through synthesis for a
+similar reason to Mason: in the context of type inference,
+filling in parts of a program may have non-local implications.
+However, Scythe reasons only about equality constraints.
+
+Data Availability Statement
+We have made the source code for Mason, the benchmark
+suite used in the paper, scripts and instructions to reproduce
+our results from Section 5, and a Docker image available as
+an artifact [6].
+
+References
+[1] M.O. Cinneide. 2000. Automated refactoring to introduce design
+patterns. In Proceedings of the 2000 International Conference on Software
+Engineering. ICSE 2000 the New Millennium. 722–724. doi:10.1145/
+337180.337612
+[2] Albert Danial. 2021. cloc: v1.92. doi:10.5281/zenodo.5760077
+
+Design Pattern Automation. A related topic in the software engineering literature is automatic refactoring of code
+12
+
+Mason: Type- and Name-Guided Program Synthesis
+
+[3] Yu Feng, Ruben Martins, Yuepeng Wang, Isil Dillig, and Thomas W.
+Reps. 2017. Component-based synthesis for complex APIs. In Proceedings of the 44th ACM SIGPLAN Symposium on Principles of Programming Languages (Paris, France) (POPL ’17). Association for Computing Machinery, New York, NY, USA, 599–612. doi:10.1145/3009837.
+3009851
+[4] Catarina Gamboa, Paulo Canelas, Christopher Timperley, and Alcides
+Fonseca. 2023. Usability-Oriented Design of Liquid Types for Java. In
+Proceedings of the 45th International Conference on Software Engineering
+(Melbourne, Victoria, Australia) (ICSE ’23). IEEE Press, 1520–1532.
+doi:10.1109/ICSE48619.2023.00132
+[5] E. Gamma, R. Helm, R. Johnson, and J. Vlissides. 1994. Design Patterns:
+Elements of Reusable Object-Oriented Software. Pearson Education.
+https://books.google.com/books?id=6oHuKQe3TjQC
+[6] Jasper Geer and Fox Huston. 2026. Artifact for Mason: Type- and
+Name-Guided Program Synthesis. doi:10.5281/zenodo.18676122
+[7] Sankha Narayan Guria, Jeffrey S. Foster, and David Van Horn. 2021.
+RbSyn: type- and effect-guided program synthesis. In Proceedings of
+the 42nd ACM SIGPLAN International Conference on Programming
+Language Design and Implementation (Virtual, Canada) (PLDI 2021).
+Association for Computing Machinery, New York, NY, USA, 344–358.
+doi:10.1145/3453483.3454048
+[8] Sankha Narayan Guria, Jeffrey S. Foster, and David Van Horn. 2023. Absynthe: Abstract Interpretation-Guided Synthesis. Proc. ACM Program.
+Lang. 7, PLDI, Article 171 (June 2023), 24 pages. doi:10.1145/3591285
+[9] Adam C. Jensen and Betty H.C. Cheng. 2010. On the use of genetic programming for automated refactoring and the introduction of design
+patterns. In Proceedings of the 12th Annual Conference on Genetic and
+Evolutionary Computation (Portland, Oregon, USA) (GECCO ’10). Association for Computing Machinery, New York, NY, USA, 1341–1348.
+doi:10.1145/1830483.1830731
+[10] Jinseong Jeon, Xiaokang Qiu, Jonathan Fetter-Degges, Jeffrey S. Foster,
+and Armando Solar-Lezama. 2016. Synthesizing framework models for
+symbolic execution. In Proceedings of the 38th International Conference
+on Software Engineering (Austin, Texas) (ICSE ’16). Association for
+Computing Machinery, New York, NY, USA, 156–167. doi:10.1145/
+2884781.2884856
+[11] Jinseong Jeon, Xiaokang Qiu, Jeffrey S. Foster, and Armando SolarLezama. 2015. JSketch: sketching for Java. In Proceedings of the 2015
+10th Joint Meeting on Foundations of Software Engineering (Bergamo,
+Italy) (ESEC/FSE 2015). Association for Computing Machinery, New
+York, NY, USA, 934–937. doi:10.1145/2786805.2803189
+[12] Jongwook Kim, Don Batory, and Danny Dig. 2015. Scripting parametric refactorings in Java to retrofit design patterns. In Proceedings of
+the 2015 IEEE International Conference on Software Maintenance and
+Evolution (ICSME) (ICSME ’15). IEEE Computer Society, USA, 211–220.
+doi:10.1109/ICSM.2015.7332467
+[13] Benjamin Mariano, Josh Reese, Siyuan Xu, ThanhVu Nguyen, Xiaokang Qiu, Jeffrey S. Foster, and Armando Solar-Lezama. 2019. Program synthesis with algebraic library specifications. Proc. ACM Program. Lang. 3, OOPSLA, Article 132 (Oct. 2019), 25 pages. doi:10.1145/
+3360558
+[14] Peter-Michael Osera. 2019. Constraint-based type-directed program
+synthesis. In Proceedings of the 4th ACM SIGPLAN International Workshop on Type-Driven Development (Berlin, Germany) (TyDe 2019).
+Association for Computing Machinery, New York, NY, USA, 64–76.
+doi:10.1145/3331554.3342608
+[15] Peter-Michael Osera and Steve Zdancewic. 2015. Type-and-exampledirected program synthesis. In Proceedings of the 36th ACM SIGPLAN
+Conference on Programming Language Design and Implementation
+(Portland, OR, USA) (PLDI ’15). Association for Computing Machinery,
+New York, NY, USA, 619–630. doi:10.1145/2737924.2738007
+[16] Nadia Polikarpova, Ivan Kuraj, and Armando Solar-Lezama. 2016. Program Synthesis from Polymorphic Refinement Types. In Proceedings
+
+of the 37th ACM SIGPLAN Conference on Programming Language Design and Implementation (Santa Barbara CA USA, 2016-06-02). ACM,
+522–538. doi:10.1145/2908080.2908093
+[17] Armando Solar-Lezama. 2009. The Sketching Approach to Program
+Synthesis. In Programming Languages and Systems. Springer Berlin
+Heidelberg, Berlin, Heidelberg, 4–13.
+[18] Frank Tip, Adam Kiezun, and Dirk Bäumer. 2003. Refactoring for
+generalization using type constraints. In Proceedings of the 18th Annual
+ACM SIGPLAN Conference on Object-Oriented Programing, Systems,
+Languages, and Applications (Anaheim, California, USA) (OOPSLA ’03).
+Association for Computing Machinery, New York, NY, USA, 13–26.
+doi:10.1145/949305.949308
+[19] Mathieu Verbaere, Ran Ettinger, and Oege de Moor. 2006. JunGL: a
+scripting language for refactoring. In Proceedings of the 28th International Conference on Software Engineering (Shanghai, China) (ICSE ’06).
+Association for Computing Machinery, New York, NY, USA, 172–181.
+doi:10.1145/1134285.1134311
+
+13
+

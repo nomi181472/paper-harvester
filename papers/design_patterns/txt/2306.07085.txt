@@ -1,0 +1,1443 @@
+arXiv:2306.07085v1 [cs.DB] 12 Jun 2023
+
+Extracting JSON Schemas with Tagged Unions
+Stefan Klessinger
+
+Meike Klettke
+
+University of Passau
+Passau, Germany
+stefan.klessinger@uni-passau.de
+
+University of Regensburg
+Regensburg, Germany
+meike.klettke@ur.de
+
+Uta Störl
+
+Stefanie Scherzinger
+
+University of Hagen
+Hagen, Germany
+uta.stoerl@fernuni-hagen.de
+
+University of Passau
+Passau, Germany
+stefanie.scherzinger@uni-passau.de
+
+ABSTRACT
+With data lakes and schema-free NoSQL document stores, extracting a descriptive schema from JSON data collections is an acute
+challenge. In this paper, we target the discovery of tagged unions, a
+JSON Schema design pattern where the value of one property of an
+object (the tag) conditionally implies subschemas for sibling properties. We formalize these implications as conditional functional
+dependencies and capture them using the JSON Schema operators
+if-then-else. We further motivate our heuristics to avoid overfitting.
+Experiments with our prototype implementation are promising,
+and show that this form of tagged unions can successfully be detected in real-world GeoJSON and TopoJSON datasets. In discussing
+future work, we outline how our approach can be extended further.
+
+1
+
+INTRODUCTION
+
+JSON is a popular data exchange format. Extracting a schema from
+collections of JSON documents is a real-world challenge which is
+actively being researched [3, 4, 10, 31, 32, 43, 51, 54].
+Ideally, the extracted schema describes the data tightly, yet without overfitting. In this article, we target the detection of a specific
+schema design pattern in the JSON Schema language, the pattern of
+tagged unions, also known as discriminated unions, labeled unions,
+or variant types. This is a recommended design pattern [11], and
+has been found to be quite common in real-world schemas [5].
+Example 1. Figure 1 shows GeoJSON data. The array starting in
+line 2 holds four objects, of type Point and LineString. Point
+coordinates are encoded as an array of numbers, while lines are
+encoded as an array of points, and hence, an array of number arrays.
+The GeoJSON specification (IETF RFC 7946, clickable link embedded in the PDF) describes six types of geometries, including polygons and multi-polygons. Consistently, the property type serves as
+a tag to distinguish the subschema of sibling property coordinates,
+thereby instantiating a tagged union.
+GeoJSON comes without an official JSON Schema specification [16]. In Figure 2, we therefore show a hand-crafted excerpt
+using the if-then-else construct to enforce the tagged union,
+with the following semantics: If the object in question has a property labeled type with the value Point, then the value of property
+coordinates must be an array of numbers. Else, if the property
+type has the value LineString, the value of coordinates must
+be an array of points, and hence, an array of number arrays.
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+
+{ " type ": " G e o m e t r y C o l l e c t i o n " ,
+" geometries ": [
+{ " type ": " Point " ,
+" coordinates ": [30 ,10] } ,
+{ " type ": " Point " ,
+" coordinates ": [40 ,15] } ,
+{ " type ": " LineString " ,
+" coordinates ": [[55 ,5] , [10 ,30] ,
+[10 ,10]] } ,
+{ " type ": " LineString " ,
+" coordinates ": [[30 ,10] ,
+[10 ,30] , [40 ,40]] }
+] }
+
+Figure 1: GeoJSON data. The value of property type (here
+Point and LineString) determines the subschema of property
+coordinates as either encoding a geometric point (an array
+of numbers), or a line (an array of points).
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+
+" if ": {
+" properties ": {
+" type ": { " const ": " Point " } } ,
+" required ": [ " type " ] } ,
+" then ": {
+" properties ": {
+" coordinates ": {
+" type ": " array " ,
+" items ": { " type ": " number " } }
+} },
+" else ": {
+" if ": {
+" properties ": {
+" type ": { " const ": " LineString "
+} },
+" required ": [ " type " ] } ,
+" then ": {
+" properties ": {
+" coordinates ": {
+" type ": " array " ,
+" items ": {
+" type ": " array " ,
+" items ": { " type ": "
+number " } } } } }
+}
+
+Figure 2: JSON Schema snippet declaring a tagged union for
+GeoJSON geometry objects Point and LineString.
+Example 2. Various schemas listed on SchemaStore.org, a community-curated collection of JSON Schema declarations, encode
+tagged unions using if-then-else. Among them are the Minecraft
+
+Stefan Klessinger, Meike Klettke, Uta Störl, and Stefanie Scherzinger
+
+schemas which use tagged unions to encode so-called data packs
+for configuring Minecraft worlds. Other examples are Github Issue
+Forms, or the cloudify schema (clickable links in the PDF).
+In schema extraction, the detection of tagged unions has so far
+received limited attention: Several approaches are able to detect
+union types, i.e., properties whose type is a union of types, but
+they do not detect the dependency w.r.t. a specific property value
+(the “tag” in the tagged union). Figure 3a shows an example: This
+schema for GeoJSON data does not restrict the values for property
+type (it allows all strings) and allows alternative subschemas for
+property coordinates. As it is overly general, the schema allows
+to encode lines as mere arrays of numbers (rather than arrays of
+number-arrays), in violation of the GeoJSON specification.
+Existing approaches to JSON Schema extraction fail to detect
+tagged unions. Notably, in describing their approach to schema
+extraction based on typing JSON values, Baazizi et al. [4] outline
+how their approach can be extended to include tagged unions.
+However, they do not discuss strategies against overfitting to the
+input data during the discovery of tagged unions.
+Our proposal follows a different approach, and relies on a relational encoding of JSON objects from which we then derive conditional dependencies. A central part of our contribution are our
+heuristics, which filter out dependencies that have insufficient support in the input data, so that they are not reflected in the derived
+schema. Specifically, ours is the first proposal towards the discovery
+of tagged unions that — to our knowledge — includes an experimental evaluation over real-world data.
+Contributions. This paper makes the following contributions:
+• We target the detection of tagged unions in JSON schema
+extraction, specifically, tagged unions that are based on
+dependencies between a property value and the implied
+subschema of its sibling properties.
+• Our approach relies on the discovery of unary constant conditional functional dependencies in a relational encoding
+of the JSON objects. Traditionally, conditional functional
+dependencies are employed in the context of data cleaning,
+and we apply them to a new domain.
+• Our approach is composable with existing algorithms for
+JSON schema extraction, as we impose the tagged unions on
+top of the schemas derived by state-of-the-art third-party
+tools.
+• Our experiments on real-world GeoJSON datasets (and its
+sibling format TopoJSON) show that meaningful tagged
+unions can indeed be identified. We illustrate the impact of
+a configurable threshold on the number of tagged unions detected, and consequently, the size of the extracted schema.
+We further outline promising directions of future work.
+Artifact availability and reproducibility. We have made our research artifacts (code, data, extracted schemas), as well as a fully
+automated reproduction package, long-term available online [30].
+Structure of this paper. In Section 2, we introduce the preliminaries. Section 3 discusses related work. In Section 4, we present
+our approach, specifically the architecture and heuristics employed,
+and an outlook on future extensions. In Section 5, our experiments
+
+are presented and discussed. In Section 6, we draw our conclusions
+and discuss opportunities for future work.
+
+2 PRELIMINARIES
+2.1 JSON Data Model and JSON Schema
+JSON data model.
+The grammar below (adopted from [2]) captures the syntax of
+JSON values, namely basic values, objects, or arrays. Basic values 𝐵
+include the null value, Booleans, numbers 𝑛, and strings 𝑠. Objects 𝑂
+represent sets of members, each member being a name-value pair,
+arrays 𝐴 represent sequences of values.
+𝐽 ::= 𝐵 | 𝑂 | 𝐴
+𝐵 ::= null | true | false | 𝑛 | 𝑠
+𝑂 ::= {𝑙 1 : 𝐽1 , . . . , 𝑙𝑛 : 𝐽𝑛 }
+𝐴 ::= [ 𝐽1 , . . . , 𝐽𝑛 ]
+
+𝑛 ∈ Num, 𝑠 ∈ Str
+𝑛 ≥ 0, 𝑖 ≠ 𝑗 ⇒ 𝑙𝑖 ≠ 𝑙 𝑗
+𝑛≥0
+
+JSON Schema. JSON Schema is a language for defining the structure of JSON documents. The syntax and semantics of JSON Schema
+have been formalized in [45], and we informally present some of
+the main keywords:
+Assertions include required, enum, const, pattern and type,
+and indicate a test that is performed on the corresponding instance.
+Applicators include the Boolean operators not, anyOf, allOf,
+oneOf, as well as, if-then-else. They further include the object operators patternProperties, additionalProperties, and
+properties, and the array operator items, and the reference operator $ref. They apply a different operator to the same instance
+or to a component of the current instance.
+Annotations (title, description, and $comment) do not affect
+validation but indicate an annotation associated to the instance.
+Union types. A property with several possible types (or subschemas) can be described as a union type [52], i.e., the union of all
+types the property assumes. In JSON Schema, this can be encoded
+by a disjunction, using the union operators anyOf or oneOf (where
+the former is inclusive, and the latter exclusive). Such an encoding
+is exemplified in Figure 3a for GeoJSON. Union types are recognized by most of the existing tools for JSON Schema extraction
+(as we will discuss in greater detail in our discussion of related
+work). While the schema distinguishes two variants for encoding
+coordinates (an array of numbers, or an array thereof), it does
+not capture any dependencies between the value of property type
+and the subschema for the sibling property coordinates. Also, the
+domain of property type is not restricted to specific string values.
+Tagged unions. The if-then-else operator allows for declaring
+tagged unions, and was introduced (rather recently) with JSON
+Schema Draft 7.
+In Example 1, we informally introduced the semantics. As for
+terminology, we distinguish one property as the tag (in our example,
+the property labeled type), and identify one or more properties
+with implied subschemas (in our example, for coordinates).
+The tag-property may go by any name. While the schemas for
+GitHub Issue Forms and cloudify from Example 2 incidentally also
+rely on a tag labeled “type”, in the example of Minecraft (see data
+snippets in Figure 5), the tag-property is labeled “condition”.
+An alternative encoding for tagged unions is to use a union operator, as shown in Figure 3b. Two different combinations of values
+
+Extracting JSON Schemas with Tagged Unions
+1 " anyOf ": [
+2
+{ " type ": " object " ,
+3
+" properties ": {
+4
+"type": { "type": "string" },
+5
+" coordinates ": {
+6
+" type ": " array " ,
+7
+" items ": { " type ": " number " } } }
+8
+},
+9
+{ " type ": " object " ,
+10
+" properties ": {
+11
+"type": { "type": "string" },
+12
+" coordinates ": {
+13
+" type ": " array " ,
+14
+" items ": { " type ": " array " ,
+15
+" items ": { " type ": " number " }
+16
+} } } } ]
+
+1 " anyOf ": [
+2
+{ " type ": " object " ,
+3
+" properties ": {
+4
+"type": { "const": "Point" },
+5
+" coordinates ": {
+6
+" type ": " array " ,
+7
+" items ": { " type ": " number " } } }
+8
+},
+9
+{ " type ": " object " ,
+10
+" properties ": {
+11
+"type": { "const": "LineString" },
+12
+" coordinates ": {
+13
+" type ": " array " ,
+14
+" items ": { " type ": " array " ,
+15
+" items ": { " type ": " number " }
+16
+} } } } ]
+
+(a) Union type.
+
+(b) Tagged union.
+
+Figure 3: Snippets of different encodings of GeoJSON geometries in JSON Schema. Left: Union type encoding, as extracted by
+traditional schema extraction tools (with syntactic variations, depending on the tool). Right: Tagged union encoding using
+anyOf, as an alternative to the if-then-else construct. While near-identical in syntax, differing only in lines 4 and 11, the
+schema semantics differ, as the union type allows incorrect encodings of points or line strings in GeoJSON.
+for property type and subschemas for property coordinates are
+given in accordance with the GeoJSON definition. Again, an object
+may either be a “Point” with coordinates encoded as an array of
+numbers or a “LineString” with an array of points.
+Note that while Figures 3a and 3b differ only marginally in their
+syntax, the difference in semantics is striking: The tagged union
+captures the dependency between the value of property type and
+the subschema of property coordinates. While union type encodings can be derived by several state-of-the-art schema extraction
+tools, schemas with tagged unions are – so far – manually crafted,
+since existing approaches to schema extraction are not capable of
+discovering value-based dependencies.
+Our approach can produce either the if-then-else encoding
+or the encoding exemplified in Figure 3b. We chose to implement
+the former, because it is more lenient w.r.t. unexpected tag values
+(in this case no restrictions are specified). Note that this is not a
+limitation of our approach, and a merely technical limitation.
+
+2.2
+
+Dependencies
+
+For the relational model, the concept of functional dependencies
+is well explored, and various generalizations are known, such as
+conditional functional dependencies [7] which only apply to a
+subset of the tuples. In the following, we extend these notions to
+JSON data, assuming a relational encoding of all objects that are
+reachable by the same path from the document root. This idea of
+a relational encoding of semi-structured data for the definition or
+detection of dependencies is a common approach, e.g., for XML [1],
+JSON [40], or RDF data [34].
+Relational encoding. Given a JSON value, we consider all labeled
+paths from the root to a JSON object. Paths may be encoded in
+JSONPath [15], a straightforward path language for JSON.
+We next introduce the schema for our relational encoding. We
+reserve attribute 𝑂.id for an (internal) object identifier. The object
+identifier must be unique, but we do not impose any constraints on
+its semantics. In the following, we will simply use the line of code
+
+in the file containing the JSON Schema declaration (after pretty
+printing), where the scope of the object is first entered.
+We identify the labels of all properties reachable by a given
+path 𝑝:
+𝐿𝑝 = {𝑙𝑖 | object{𝑙 1 : 𝐽1, . . . , 𝑙𝑛 : 𝐽𝑛 } is reachable by path 𝑝}
+For each property label 𝑙𝑖 in 𝐿𝑝 where 𝐽𝑖 occurs as a basic value,
+we define a relational attribute 𝑙𝑖 .value that captures the basic
+value 𝐽𝑖 . These properties are considered to be candidates for tags.
+Further, for each property label 𝑙𝑖 in 𝐿𝑝 , we define an attribute
+𝑙𝑖 .type, capturing the subschema directly derived from its value 𝐽𝑖 .
+For each object reachable by path 𝑝, we then insert one tuple into
+this relation, choosing some unique object identifier for each object.
+The attribute values are populated with the semantics described
+above; null values mark missing entries.
+Example 3. Table 1 shows the encoding for the JSON objects from
+Figure 1 in the array starting from line 3, reachable by the JSONPath
+/geometries[*]. By t1 and t2, we abbreviate the subschemas directly derived from the JSON values, requiring an array of numbers
+(t1) and an array of arrays of numbers (t2), namely
+{ "type" : "array",
+(t1)
+"items": { "type":"number" }}
+and further
+{ "type": "array", "items":{
+"type": "array",
+
+(t2)
+
+"items": { "type": "number" }}}
+Dependencies. We next introduce dependencies over this relational encoding. Traditional functional dependencies (FDs) capture
+constraints that hold on all tuples of a relation. Moreover, conditional functional dependencies (CFDs) [7] are functional dependencies that hold on only a subset of the tuples. While in their full
+generality, CFDs are a generalization of classical functional dependencies, we will focus on a very restricted subclass that is related
+to association rules [46], and that can be defined quite compactly.
+
+Stefan Klessinger, Meike Klettke, Uta Störl, and Stefanie Scherzinger
+
+Table 1: Relational encoding for the objects in Figure 1 that
+are reachable by path /geometries[*] (JSONPath syntax).
+Subschemas t1 and t2 abbreviated as in Example 3.
+𝑂.id
+
+type.value
+
+type.type
+
+coordinates.type
+
+3
+5
+7
+9
+
+Point
+Point
+LineString
+LineString
+
+string
+string
+string
+string
+
+t1
+t1
+t2
+t2
+
+Definition 4. If A is a set of attributes, then a unary constant conditional functional dependency over A (ucCFD) is an expression of
+the form
+[𝐴 = 𝑎] → [𝐵 = 𝑏]
+where 𝐴, 𝐵 are attributes in A and 𝑎, 𝑏 are constants from the
+domains of 𝐴 and 𝐵 respectively. A relation 𝑅 over A satisfies [𝐴 =
+𝑎] → [𝐵 = 𝑏] if for each pair of tuples 𝑠, 𝑡 ∈ 𝑅, 𝜋𝐴 (𝑠) = 𝜋𝐴 (𝑡) = 𝑎
+implies 𝜋𝐵 (𝑠) = 𝜋𝐵 (𝑡) = 𝑏.
+Example 5. The dependency below holds in Table 1 and reads as
+follows:
+[type.value = "Point"] → [coordinates.type = t1]
+The left-hand-side, in brackets, declares a condition that must
+be satisfied for the dependency to hold: We consider all attributes
+where the value of attribute type.value is the string “Point”. For
+all tuples where this condition is satisfied, the value of attribute
+coordinates.type must be the subschema abbreviated as t1.
+In our domain of application, namely JSON values, these dependencies express powerful constraints between property values and
+subschemas: In the example dependency above, it is implied that
+if the value of property type is the string constant “Point”, then
+the value of the sibling property coordinates must conform to the
+subschema t1.
+In the remainder of this article, we exclusively focus on the
+discovery of such value-type constraints, where the attribute on
+the left-hand-side of a ucCFD is of the form “𝐴.value” (the value
+of property 𝐴, which we consider to be a candidate for a tag in a
+tagged union), and the attribute on the right-hand-side is of the
+form “𝐵.type” (the subschema of the sibling property 𝐵).
+Traditionally, tagged unions are declared by switching on the
+value of a single tag property. This is also the recommended practice
+in JSON Schema [11], and in agreement with what we observe in
+real-world data [5]. We are therefore confident that our restriction
+to unary dependencies is justified.
+
+3
+
+RELATED WORK
+
+Our article builds upon the rich body of related work in the area of
+schema extraction and the theory of data dependencies.
+Schema and constraint definition. Schema languages for semistructured data are well-researched.
+XML was developed as a semi-structured data format with implicit structural information and an optional explicit schema. The
+simplest schema language for XML is DTD (Document Type Definition). The lack of means to express data types and exact cardinalities
+
+in DTDs motivated the development of further schema languages,
+such as XML Schema [55], Schematron [26], and RelaxNG [25]. All
+three support the definition of constraints. In XML Schema, alternatives can be defined by specifying conditions on path expressions
+(XPath). In version 1.1 of XML Schema, the concept of assertions
+allows to encode constructs such as tagged unions. Schematron can
+define rules with context information (XPath) and messages (that
+are sent in the success or error case). RelaxNG enables the definition
+of inference rules. This historical excursion shows the necessity of
+exact and expressive schema languages. The same holds true for
+the description of JSON data. The preliminaries on JSON Schema
+were already covered in Section 2.1.
+Schema extraction. In relational databases which follow a schemafirst approach, all available databases have an explicit schema stored
+in the databases catalog. With semi-structured data, on the other
+hand, there are many datasets available that have been published
+without such explicit schema information. Schema extraction (also
+known as reverse engineering) is therefore an important subtask
+in data profiling for semi-structured data.
+XML schema extraction. For schema extraction from XML documents, different approaches have been developed, (e.g. [8, 20, 23, 29,
+41, 42]). In all algorithms, a simple schema consisting of element
+and attribute names, nesting, optional and required information is
+derived. We are not aware of any approaches to extracting complex
+schema constraints, such as tagged unions.
+JSON schema extraction. Early work on schema extraction from
+JSON data [32] adds — besides the schema itself — also the extraction
+of statistics and a detection of outliers. In [31], the extraction of
+schema versions over time, as well as evolution operations mapping
+between consecutive schema versions, is presented.
+Recent surveys of different schema extraction approaches were
+provided by [10] (qualitative comparison) and [54] (quantitative
+comparison). Several of the examined approaches also support
+the extraction of union types: [32] and [17] use the JSON Schema
+keyword oneOf, while [4] use the union type constructor of their
+own proprietary schema language. The authors of [47] encode the
+extracted schema in the XML Schema language, and encode union
+types using entity versioning, while [27] pursue an alternative
+approach of reducing different types to their most generic type.
+But neither Klettke et al. [32] nor Frozza et al. [17] support tagged
+unions within their extraction of union types. The approach by
+Baazizi et al. [4] is based on type inference. They achieve scalability
+by inferring types in a MapReduce-based approach. The authors
+do discuss the challenge of extracting tagged unions, and describe
+an extension to their algorithm to address this challenge. However,
+there is no implementation or evaluation of this feature, or of any
+heuristics to prevent overfitting in tagged unions.
+In a further, recent contribution, Spoth et al. [51] focus on resolving ambiguities during schema extraction, such as sets encoded
+as objects rather than arrays. As their approach does not consider
+property values, it cannot detect tagged unions.
+Durner et al. [12] recently presented an approach for fast analytics on semi-structured data. Using various algorithms, the JSON
+data is divided into tiles, and local schemas are extracted. However,
+tagged unions are neither considered nor recognized.
+
+Extracting JSON Schemas with Tagged Unions
+
+A completely different approach for schema inference has been
+suggested in [19]. In this work, a supervised learning method (based
+on the well-known C4.5 classification algorithm) is used for detecting hidden rules in the different variants of datasets. These rules can
+be either structure-based or value-based. An interesting observation of this work was that based on an empirical study (interviews),
+value-based rules are considered more important by human consumers than structure-based rules to distinguish variants. The result
+of the approach is a decision tree that distinguishes the different
+schema variants with value-based or structure-based conditions on
+each edge. Even if the approach in the paper is very different from
+ours, we recognize the motivation that considering value-based
+conditions in heterogeneous databases is important.
+Dependencies. For an overview of data dependencies, we refer to
+a comprehensive survey [50], and focus on functional, inclusion,
+and conditional functional dependencies in the following.
+Functional dependencies and inclusion dependencies. Functional
+dependencies [22, 33, 36, 40] and inclusion dependencies on semistructured data [35, 40] define semantic constraints on data to
+guarantee certain data characteristics, to normalize data [53], and
+to ensure data quality. These constraints can also be applied in
+data cleaning. In [9], an overview over different methods and the
+semantic constraints, rules, or patterns to detect errors in the data
+cleaning process is given. Schelter et al. [48] use declarative rules
+in unit tests to check the data quality (defined with several metrics).
+Some examples are: completeness of datasets, range conditions,
+certain cardinalities and constraints on statistics. Both approaches
+do not infer the semantic constraints from data but show how
+declarative rules can be leveraged during data preprocessing.
+The discovery of valid uniqueness constraints, functional dependencies and inclusion dependencies is a well-studied field in
+relational databases [6, 28, 39, 44, 57] and even more relevant in
+JSON data (or, more generally, NoSQL data) because often these
+semantic constraints are not predefined in the NoSQL databases.
+They are implicitly available in the data but for data cleaning tasks,
+this information is required in form of rules and constraints. Hence,
+development of algorithms to derive explicit semantic constraints
+from NoSQL data is of particular importance.
+Methods for deriving semantic constraints from data can build
+upon the algorithms developed for relational databases. Additionally, the algorithms have to scale with large volumes of data, and
+be robust despite the heterogeneity of datasets (variety) and low
+data quality (outliers in datasets).
+Arenas and Libkin define functional and inclusion dependencies
+for XML [1], as a basis for schema normalization. More recently,
+Mior [40] targets the mining of functional and inclusion dependencies from JSON data. Both formalisms do not allow to capture the
+conditional functional dependencies required in our context.
+However, Mior compares the performance of dependency discovery in a relational encoding of the JSON data (termed “static
+unrolling”) with a dynamic unrolling technique, showing that the
+latter has superior runtime performance. Mior focuses on the discovery of functional dependencies and inclusion dependencies. While
+his approach does not consider the special case of conditional functional dependencies, which is relevant in our context, it is capable
+
+of deriving approximate dependencies, thus being more robust w.r.t.
+vagueness in the input data.
+Kruse et al. developed in [35] the scalable discovery of inclusion
+dependencies from data. Scalability of the approach is achieved by
+two reasons: the approach is only concentrating on discovery of
+unary inclusion dependencies (consisting of one attribute on the
+left-hand and on the right-hand side) and is developing a distributed
+approach. Combining both, a very efficient algorithm can be developed for analyzing large datasets. The heterogeneity of datasets
+has not been considered in this approach. In previous work on inferring inclusion dependencies from JSON data [31], we suggested
+an efficient method that uses lattice characteristics to optimize the
+algorithm. To consider outliers, a threshold is introduced. With it,
+it is possible to derive related inclusion dependencies which are
+violated by a small number of outliers.
+A further relaxation of functional dependency discovery has been
+suggested in [21] for data lakes. Here, outliers are not ignored, but
+properties that have different yet similar labels are combined. This
+method can be used for data exploration and profiling of datasets
+with lower data quality.
+Conditional functional dependencies. Conditional functional dependencies [7] were first introduced for relational data, in the context of data cleaning. We apply conditional functional dependencies
+in a new context, the relational encoding of JSON objects.
+In [13, 14], three algorithms for CFD mining are proposed and
+evaluated: CTANE and FastCFD build upon existing algorithms for
+FD discovery, TANE and FastFD, respectively and are intended for
+general CFD discovery. The third algorithm is custom-designed for
+constant CFDs, as also targeted by us.
+In [37], additional rules for pruning the search space and consequently speeding up the mining process are proposed for constant
+CFDs. Further approaches, based on FD discovery and pattern mining, are explored in [46].
+
+4
+
+APPROACH
+
+Our end-to-end approach is sketched in Figure 4. In our upcoming walk-through of the architecture, we first focus on the basic
+approach, as well as our heuristics against overfitting and schema
+bloat. We then outline future work extensions to robustly generalize
+our approach to a larger family of tagged unions.
+
+4.1
+
+Architecture
+
+Composability. We design our approach to be composable with
+existing schema extraction algorithms: Given a collection of JSON
+values, we extract a JSON Schema description 𝑆, using any thirdparty tool. Along the process sketched along the bottom, we further
+derive the declaration of tagged unions, denoted 𝑇 , a sequence of
+(possibly nested) JSON Schema if-then-else statements.
+By the conjunction of the subschemas as
+{"allOf": [S,𝑇 ]}, the composite schema requires the JSON values
+to satisfy both subschemas, imposing tagged unions on schema 𝑆.
+This approach allows us to focus on the particular challenge of
+identifying tagged unions, while conveniently leveraging state-ofthe-art schema extraction tools for describing the other aspects of
+the schema. We leave it to future work to recursively merge the
+
+Stefan Klessinger, Meike Klettke, Uta Störl, and Stefanie Scherzinger
+
+Schema 𝑆
+
+1
+JSON
+
+2
+
+Schema Extraction, e.g. [32]
+
+8
+
+Parse
+Tree
+
+Comp.
+Records of Rel.
+Encoding
+
+A
+
+XYZ
+· · ·
+· · · 4
+· · ·
+
+B
+
+C
+
+3
+
+...
+...
+...
+...
+...
+...
+...
+...
+...
+
+JSON
+Schema
+
+Position
+List
+Indices
+
+𝜋X ={. . . }
+𝜋Y ={. . . } 5
+𝜋Z ={. . . }
+
+if-then-else 7
+Constraints 𝑇 CFDs List
+
+CFDs
+Candidate List
+[X=v1 ]→[Y=t1 ]
+[X=v2 ]→[Y=t2 ]
+[X=v3 ]→[Z=t3 ]
+
+JSON
+Schema
+{allOf:[𝑆,𝑇 ]}
+
+[X=v1 ]→[Y=t1 ]
+
+6
+
+[X=v2 ]→[Y=t2 ]
+[X=v3 ]→[Z=t3 ]
+
+Dependency Discovery
+
+Figure 4: System architecture overview. (1) A third-party tool is used to extract a JSON Schema description 𝑆 of JSON input
+data. Steps (2) through (7) visualize the discovery of tagged unions as schema 𝑇 , and are described in Section 4. In step (8), the
+schemas 𝑆 and 𝑇 are composed into a composite schema. Boxed areas capture state-of-the-art algorithms integrated in our
+architecture. A, B and C are JSON property labels while X, Y and Z are attributes in our relation encoding (e.g., A.value).
+composite schema, thereby improving the readability as well as the
+locality of the interacting constraints.
+Relational encoding. In a first step towards the discovery of
+tagged unions, we parse all JSON values into a single parse tree
+(adding a virtual root node), and determine the set of all labeled
+paths from the root to a JSON object. For each such path, we then
+derive the relational encoding of all properties in the reachable
+objects. We have already introduced this data structure in Section 2,
+and resume the discussion of our running example.
+Example 6. Consider the GeoJSON value in Figure 1. Table 1 shows
+the relational encoding of the four objects reachable by the path
+/geometries[*]. The role of the unique object identifier is to preserve cardinalities in repeating attribute values, allowing us to later
+filter dependencies based on their support in the input.
+The running example has been designed to be simple, and it
+ignores challenges such as properties with varying types, dealing
+with several properties whose values have basic types, or nullvalues in the relational encoding. Our approach can be extended to
+robustly handle these cases as well, and we refer to Section 4.3 for
+a discussion on the most interesting future generalizations.
+Dependency discovery. Based on the relational encoding, we discover conditional functional dependencies. We restrict ourselves to
+unary constant conditional dependencies in our relational encoding,
+of the form
+[𝐴.value = 𝑐] → [𝐵.type = 𝜎]
+where the left-hand-side denotes the value of the candidate tag, and
+the right-hand-side a property with an implied subschema. Above, 𝐴
+and 𝐵 are distinct property labels, 𝑐 is a basic-value constant, and 𝜎
+denotes the implied subschema. Recall that with the dot-notation,
+we distinguish the value of JSON property 𝐴 (i.e., 𝐴.value) from
+the subschema of sibling property 𝐵 (i.e., 𝐵.type) in our relational
+encoding of JSON objects.
+Example 7. From the relational encoding in Table 1, we derive the
+following dependencies, again using the abbreviations t1 and t2 for
+the subschemas introduced earlier:
+[type.value = "Point"] → [coordinates.type = t1]
+[type.value = "LineString"] → [coordinates.type = t2]
+
+Recall that in our application context, they are interpreted as follows. Given a JSON object reachable by the path /geometries[*],
+if the value of property type is “Point”, the value of the sibling
+property coordinates must conform to the subschema t1 (an array of numbers). If the value of property type is “LineString”, then
+the value of sibling property coordinates must conform to the
+subschema t2 (an array of points).
+In the discovery of these dependencies, we leverage state-of-theart algorithms [24, 44, 49, 56] (originally developed for the discovery of traditional functional dependencies), such as a compressedrecords encoding of the relation, computing position list indexes
+(PLIs) and producing a sequence of candidate dependencies. PLIs
+are calculated for each column of the relational encoding and allow
+to effectively group all rows (identified by their row number) with
+the same value in the same subset.
+In the following, we outline the general idea. Inferring conditional functional dependencies from PLIs can be achieved by finding
+inclusions between them: given PLIs 𝜋A.value = {{1, 2, 3}, {4, 5, 6}}
+of attribute 𝐴.value and 𝜋B.type = {{1, 2, 3, 4}, {5}, {6}} of attribute
+𝐵.type, we receive the inclusion {1, 2, 3} ⊂ {1, 2, 3, 4}, allowing us
+to infer that the values of JSON property A corresponding to rows
+1, 2 and 3 determine the subschemas of the sibling property B.
+More sophisticated algorithms developed for the discovery of
+conditional functional dependencies (CFDs), such as CFDMiner,
+CTANE and FastCFD [13], could be deployed just as well. As our
+current restrictions, most notably the one to unary dependencies,
+obfuscate many of the challenges in FD and CFD discovery, we
+opted for our simpler approach.
+Pruning candidate dependencies. To avoid overfitting in the derived schemas, we heuristically prune candidate dependencies, as
+described in the upcoming Section 4.2.
+Finalization. In a final step, the conditional functional dependencies are transformed into nested if-then-else statements in JSON
+Schema 𝑇 . This step is merely technical, as is the construction of
+the composite schema.
+
+4.2
+
+Heuristics
+
+In our approach, an inherent challenge is dealing with high numbers of discovered dependencies, which may lead to overfitting the
+
+Extracting JSON Schemas with Tagged Unions
+
+derived schema w.r.t. the input data. We next distinguish default
+heuristics and heuristics that are configurable by an expert user.
+
+1
+2
+3
+
+4.2.1 Default Heuristics. The following heuristics are always applied, as they prevent schema bloat due to overfitting.
+Single-valued attributes. In discovering dependencies, we ignore
+all attributes from the relational encoding with a single-valued
+domain. In Table 1, this concerns the attribute type.type.
+Unique attributes. Unique property values are recognized as conditional functional dependencies, and ultimately, cause overfitting
+and schema bloat. In dependency discovery, we therefore ignore
+all attributes where the domain consists of unique values (such as
+the object identifier 𝑂.id, which does not appear in the input data,
+and need not be considered in dependency discovery).
+
+(a) The value of property min (line 3) is numeric.
+1
+
+Minimum Threshold 𝜋min . Especially in large datasets, it is to
+be expected that dependencies are inferred that have no real semantics, despite us ignoring attributes with unique values. Our
+implementation has a configurable minimum threshold: Dependencies with insufficient support in the input are then ignored during
+the generation of if-then-else statements.
+By allowing to configure this threshold, either as an absolute
+or relative value, the number of discovered dependencies can be
+influenced. Our experiments evaluate this effect.
+
+4.3
+
+Future Generalizations of the Approach
+
+In GeoJSON data, which served as our motivation for the discovery
+of tagged unions, the geometry objects are highly regular. When
+inspecting further instances of tagged unions in real-world data,
+we encounter variations that require us to generalize our approach.
+For illustration, we again resort to an example.
+Example 8. We consider JSON data used in the Minecraft game, as
+shown in Figure 5. The property condition functions as a tag, and
+distinguishes notions such as “time checks” and “weather checks”,
+among others. Depending on the tag value, different sibling properties exist: Given that the tag value is a “weather check”, sibling
+properties labeled raining and thundering exist. Given that the
+tag value is a “time check”, sibling properties labeled period and
+value exist.
+To extend our approach to such more general forms of tagged
+unions, we need to be able to detect conditional dependencies
+between the value of a candidate tag, and the existence of a sibling
+property (which we term value-label constraints, to distinguish
+from the value-type constraints that we already handle). Here, a
+specific challenge is to handle optional sibling properties, which
+are not always present.
+Example 9. Resuming the previous example of a Minecraft “time
+check”, the subschema for property value is an object with a property min. The subschema of property min, however, may vary. In
+
+[ { " condition ": " minecraft :
+weather_check " ,
+" raining ": false ,
+" thundering ": false } ,
+{ " condition ": " minecraft : time_check " ,
+" period ": 24000 ,
+" value ": {
+" min ": {
+" target ": {
+" name ": "% StartSunburn " ,
+" type ": " minecraft : fixed
+" },
+" score ": " Daytime " ,
+" type ": " minecraft : score " }
+} } ]
+
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+
+Union rule. We apply the union rule to the discovered dependencies, so that one tag may imply the subschemas for several sibling
+properties. This improves schema succinctness.
+4.2.2 Configurable Heuristics. The following heuristics is reasonable in many cases. As it is not universally applicable, we make it
+configurable.
+
+[ { " condition ": " minecraft : time_check " ,
+" period ": 24000 ,
+" value ": { " min ": 0.0 } } ]
+
+(b) The value of property min (line 7) is of type object.
+
+Figure 5: Minecraft JSON data (snippets edited and shortened,
+clickable links to GitHub source in the subcaptions). Property
+condition functions as the tag in the tagged union.
+
+the top example, it is a numeric value. In the bottom example, it
+is a nested object. Our approach outlined so far cannot detect this
+conditional functional dependency, because the subschemas of the
+sibling property differ.
+To detect value-type dependencies where the types on the righthand-side may vary, we need to relax the recognized subschema.
+In our current prototype implementation, we introduce attributes
+min.type1 , . . . , min.type𝑘 (e.g., for a fixed limit 𝑘 = 6), where we
+describe the subschema with a varying degree of detail. For instance,
+from a shallow min.type1 = {"type": "object} to a very finegrained description that fully captures all nested objects. In pruning
+candidate dependencies, we only keep the most detailed subschema
+for which a CFD still holds. This allows us to detect a common
+subschema in many practical cases.
+
+5
+
+EXPERIMENTS
+
+We next describe our experiments using real-world geo-spatial
+datasets encoded in JSON. For notational simplicity, we will write
+“CFDs” when we refer to the subfamily of unary constant conditional functional dependencies, as introduced in Section 2.
+
+5.1
+
+Setup
+
+Implementation. Our prototype is implemented in Python, using
+the library anytree for managing parse trees. For schema validation,
+we use the Python library jsonschema (clickable links in the PDF).
+For the “third-party” schema extraction tool, we employ a tool
+that we have built in earlier work [32]. Note that our approach is
+designed to work with any other tool for JSON Schema extraction.
+Also, since we construct the composite schema by combining two
+subschemas, we are not restricted to Python-based tools.
+To confirm the composability of our approach, we have successfully built a variant of our architecture based on the schema
+
+Stefan Klessinger, Meike Klettke, Uta Störl, and Stefanie Scherzinger
+
+Table 2: Summary of experimental results. Links embedded in the PDF refer to the original dataset (𝐷). We state the dataset
+format (TopoJSON or GeoJSON) and report its size (|𝐷 |) in lines of code (LoC), the size of the conventionally extracted schema 𝑆
+(in LoC) and the number of theoretically detectable Geo-/TopoJSON CFDs (𝐷𝑒𝑡𝐺𝑒𝑜 ). For different threshold settings 𝜋 min , we
+produce a subschema 𝑇 encoding the tagged unions. “Ratio𝑇 ” reports the share of 𝑇 w.r.t. the size of the composite schema.
+Further, the number of CFDs initially discovered (w/o heuristics), after applying threshold 𝜋min (see Section 4.2.2), and after
+applying the remaining default heuristics (see Section 4.2.1) are reported. The last column reports the result of checking
+whether dataset 𝐷 is valid w.r.t. the extracted composite schema (a checkmark symbol “✓” denotes a successful check). The
+checkmarks are clickable links, embedded in the PDF, to the composite schema.
+
+Dataset D
+
+Format
+
+|D|
+(LoC)
+
+|S|
+(LoC)
+
+DetGeo
+
+Map Germany
+
+T
+
+181 585
+
+405
+
+6
+
+Map EU
+
+T
+
+122 380
+
+359
+
+6
+
+WorldGen Berlin
+
+G
+
+56 441
+
+1 339
+
+11
+
+US House Members
+
+G
+
+22 745
+
+493
+
+2
+
+Wildlife Sites
+
+G
+
+876 482
+
+143
+
+2
+
+𝜋min
+
+|T|
+(LoC)
+
+Ratio𝑇
+
+50%
+35%
+15%
+50%
+35%
+15%
+50%
+35%
+15%
+50%
+35%
+15%
+50%
+35%
+15%
+
+126
+158
+190
+95
+95
+127
+150
+182
+278
+54
+54
+54
+38
+38
+92
+
+23.6%
+27.9%
+31.7%
+20.7%
+20.7%
+25.9%
+10.0%
+11.9%
+17.1%
+9.8%
+9.8%
+9.8%
+20.5%
+20.5%
+38.5%
+
+extraction tool by Frozza et al. [17, 18] (with minor technical adaptions), but we do not report the results, since they do not contribute
+new insights.
+Artifact availability and reproducibility. Our research artifacts
+(code, data, extracted schemas), as well as a fully automated reproduction package, are available online [30]. Additionally, in the PDF
+version of this article, clickable links in Table 2 allow our readers to
+directly inspect the input datasets, as well as the extracted schemas.
+Datasets. We consider the five JSON datasets listed in Table 2,
+all in the GeoJSON or the related TopoJSON format. For simplicity, we will commonly treat the formats GeoJSON and TopoJSON
+synonymously, in discussing our results.
+We identified these datasets by manually searching open data
+servers, as well as by performing a search over all open-source
+licensed repositories on GitHub using Google BigQuery. Our selection criteria were (1) a sufficiently large document size and (2) that
+at least two different types of geometries co-occur, so that we may
+be able to infer tagged unions.
+We briefly describe the datasets:
+• Map Germany is a TopoJSON dataset, describing a map of
+Germany and surrounding areas, including cities, urban
+areas, and rivers. This dataset uses geometry types Point,
+LineString, MultiLineString, Polygon and MultiPolygon.
+• Map EU is a TopoJSON dataset. Its structure is comparable
+to Map Germany but describes countries in the EU in detail
+and contains the borders of some adjacent countries.
+• WorldGen Berlin is a GeoJSON dataset from OpenStreetMap.
+
+CFDs w/o
+Heuristics
+44
+
+10
+
+1 243
+
+719
+
+360
+
+CFDs w/
+𝜋 min
+
+CFDs w/ 𝜋min
+and Heuristics
+
+Valid
+
+11
+14
+20
+6
+6
+8
+76
+109
+184
+459
+470
+660
+18
+18
+50
+
+4
+5
+6
+3
+3
+4
+4
+5
+8
+2
+2
+2
+1
+1
+3
+
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+
+• US House Members lists members of the US House of representatives, including their place of birth, hometown and
+congressional district, encoded in GeoJSON.
+• Wildlife Sites contains wildlife sites in West Yorkshire, described either as a GeoJSON Polygon or MultiPolygon.
+The datasets encode GeoJSON or the related TopoJSON format
+(distinguished as formats “T” and “G” in the table). We list the size
+of each dataset in lines of code after pretty-printing (column |𝐷 |).
+In lieu of a ground truth describing the number of conditional
+functional dependencies in the data that is not GeoJSON-encoded,
+we report in the table the number of detectable CFDs in the GeoJSONparts only (𝐷𝑒𝑡𝐺𝑒𝑜 ). We manually determine this value for each
+dataset, inspecting all distinct types of GeoJSON objects (e.g., Point,
+LineString, Polygon) on each different path. We ignore all paths
+where the value of the GeoJSON type does not vary. While these
+can be detected as CFDs from the data, they are not meaningful for
+recognizing tagged unions, and should be modeled, for instance,
+simply as constant values instead.
+Execution environment. Our experiments were conducted on an
+off-the-shelf notebook with an Intel i7-1165G7 CPU with 4.7GHz
+and 16GB of main memory.
+
+5.2
+
+Experimental Design
+
+Workflow. For each data collection, we extract composite schemas
+choosing three settings for the minimum threshold 𝜋min : an aggressive setting of 50%, requiring a conditional functional dependency
+to occur in at least half of the tuples in the relational encoding of all
+
+Extracting JSON Schemas with Tagged Unions
+
+objects reachable by a given path, and more lenient settings with
+35% and 15%, respectively.
+For each threshold setting, we generate schemas 𝑆 (from the
+third-party tool) and 𝑇 (encoding the tagged unions), as well as the
+composite schema.
+Each composite schema is validated against the specification
+of JSON Schema Draft-07, confirming that the composite schema
+conforms. The input datasets are further validated against the extracted composite schema, checking for any logical errors in schema
+extraction.
+Metrics. In our quantitative assessment, we report schema sizes
+(after syntactic normalization by pretty-printing), the number of
+conditional functional dependencies initially discovered, and after
+filtering according to our heuristics.
+We use DetGeo as a target in discussing recall of dependency
+discovery in the GeoJSON part of the input.
+
+5.3
+
+Results
+
+Table 2 summarizes our results. Note that all composite schemas
+successfully validate against Draft-07, and further, that all JSON
+datasets validate against the composite schemas.
+Decreasing the threshold 𝜋min leads to more conditional functional dependencies being discovered. The share of the subschema
+encoding tagged unions compared to the entire composite schema
+ranges between 10% and up to approx. 38%. While the 38% share
+might appear to be large, the composite schema has less than 250
+lines in total, compared to 800K lines of JSON input. Thus, this
+dataset is highly regular in its structure, and the extracted schema
+comparatively compact.
+For the bottom three datasets, we detect conditional functional
+dependencies in the hundreds, even more than one thousand in the
+case of the WorldGen Berlin data. However, applying the threshold
+and the other heuristics drastically reduces the dependencies towards the number of tagged unions that we expect to find (c.f. the
+target DetGeo ). Note that there are only six distinct geometries in
+GeoJSON which may, however, occur on different paths, leading to
+more than six if-then-else statements in the GeoJSON part.
+After applying heuristics and a threshold of 15%, we only miss
+two detectable CFDs in Map EU and three in WorldGen Berlin.
+Missed CFDs can be attributed to the threshold being too coarse.
+Manually inspecting the final dependencies, we find one unexpected dependency for Wildlife Sites with a threshold of 15%. This
+is the only false positive dependency across all datasets. It results
+in a tagged union being declared for a specific date, which is not
+semantically meaningful. Further, this dependency is outside the
+GeoJSON-encoded part of the data, explaining why the number of
+detected CFDs is higher than 𝐷𝑒𝑡𝐺𝑒𝑜 . Thus, we have a single case of
+overfitting for the datasets analyzed. Overall, we observe very high
+precision in recognizing the GeoJSON/TopoJSON dependencies
+resident in the data.
+We do not focus on runtime evaluation, as our implementation
+is prototypical and unoptimized. Yet to provide a general perspective, we share our observation that runtimes vary greatly between
+datasets, ranging from roughly one second to approximately one
+minute. This is a waiting time which we deem acceptable for a
+non-interactive, irregular task.
+
+Since our approach is main-memory based, memory is a physical limitation to the inputs that we can process. For the datasets
+considered here, 16GB of RAM are sufficient to run our experiments.
+
+5.4
+
+Discussion
+
+The comparison between the number of dependencies found with
+different heuristics shows the effectiveness of these heuristics in
+pruning dependencies. In particular, this concerns the configuration
+knob represented by minimum threshold.
+Our approach to setting this threshold is rather coarse, with 50%
+obviously too rigid, but 15% delivering meaningful results. In future
+work, we plan to investigate how to auto-adjust the threshold, based
+on statistical distributions obtained by profiling the input.
+An obvious threat to the generalizability of our results — however promising they are — is that the GeoJSON datasets are highly
+regular in their structure. In the GeoJSON-part, they contain only a
+small number of detectable dependencies, between two and eleven.
+Therefore, we refrain from computing the metrics precision and recall, as they are easily distorted when working with small numbers.
+However, the manual inspection of the derived dependencies, and
+the comparison against the target DetGeo , shows that our approach
+is indeed successful for the input datasets chosen.
+To counter the threat of generalizability, further experiments
+over different real-world datasets (e.g., the datasets listed in Example 2), as well as synthetic data, and data not encoding any tagged
+unions, are required.
+We do not focus on the performance of our unoptimized prototype implementation, as the algorithm is only executed once for
+each dataset. Of course, scalability to larger inputs is an issue to
+be addressed in future work, as CFD discovery in general is an expensive problem: Already in addressing the discovery of functional
+dependencies in their full generality, algorithms have exponential
+runtime complexity [38]. Several algorithms for the specific problem of CFD discovery have been proposed [13]. Their evaluations
+show that runtime performance depends heavily on the input, with
+some algorithms scaling better with size of the dataset (i.e., the number of tuples) thus being suitable for large datasets, while others
+perform better with higher arity. For constant CFDs, Li et al. [37]
+achieved promising runtime improvements by applying custom
+rules for pruning the search space.
+With strong restrictions to the problem space, such as our restriction to unary constant CFDs in our case, we can expect reasonable
+runtime performance on real-world inputs (which are often reasonably well-behaved).
+In our experiments, we observed a considerable impact of our
+heuristics and threshold on runtime, reducing the processing time
+for all datasets by up to two orders of magnitude. This is promising
+for further optimizations.
+
+6
+
+CONCLUSION AND OUTLOOK
+
+In this article, we proposed a method to infer conditional functional
+dependencies from JSON data. We use the identified dependencies
+as the basis for declaring tagged unions in JSON schema extraction.
+This allows us to capture value-based constraints. In fact, in [19]
+Gallinucci et al. report on expert interviews with users, regarding
+the users’ preferences in schemas over nested data. Their interviews
+
+Stefan Klessinger, Meike Klettke, Uta Störl, and Stefanie Scherzinger
+
+reveal that value-based conditions have a greater influence on the
+differentiation of schema variants than structural constraints, and
+are therefore preferred.
+In future work, our approach can be extended for the extraction
+of further variants of dependencies, for instance, traditional conditional functional dependencies that capture implications between
+atomic property values, or dependencies where the value of the
+tag property implies the existence of a specific sibling property, as
+discussed in greater detail in Section 4.3. This allows to recognize a
+larger family of tagged unions.
+Our prototype implementation is currently main-memory based,
+which limits the size of inputs that we can handle. Making our
+implementation scale to larger inputs is one of the immediate next
+steps. Here, we may build upon first results by Mior [40], who
+shows that discovering dependencies in a relational encoding of
+JSON data has inferior runtime performance when compared to
+discovering dependencies in a streaming fashion. Also, we plan to
+consider a MapReduce-based approach to schema extraction, as
+implemented by Baazizi et al. in [4].
+Ultimately, our goal is to obtain a schema declaration that human
+consumers consider to be comprehensive, but that may also be
+efficiently processed programmatically. In order to obtain more
+succinct schemas, we need to resolve redundancies between the
+schema extracted by a third-party tool and our encoding of tagged
+unions. This requires rewriting the composite schema based on an
+algebraic representation of JSON Schema operators, such as the
+schema algebra proposed by Attouche et al. [2].
+Further, identifying metrics that capture the quality of the extracted schemas will allow to quantitatively compare schemas extracted by different approaches. Given suitable metrics, the configuration of heuristics could even be adjusted automatically. A
+possible direction is to explore the notions of precision and recall,
+and the proxy-metric of schema entropy, as introduced by Spoth et
+al. in [51].
+A further task is to adopt a CFD inference algorithm that is
+robust despite poor data quality and that can infer constraints
+despite outliers in the data. Naturally, this requires a relaxation to
+“soft” CFDs, a task where we may also build upon existing work on
+relational [46] and even JSON data [40].
+In summary, our long-term vision is to extract comprehensible
+and therefore human-consumable schema declarations from JSON
+data. We believe that the detection of schema design patterns that
+are popular among schema designers, such as tagged unions, is an
+important building block towards realizing this vision.
+Acknowledgments: This work was funded by Deutsche Forschungsgemeinschaft (DFG, German Research Foundation) grant #385808805.
+We thank Thomas Kirz for expertly typesetting the systems architecture in LATEX.
+
+REFERENCES
+[1] Marcelo Arenas and Leonid Libkin. 2004. A Normal Form for XML Documents.
+ACM Trans. Database Syst. 29, 1 (2004), 195–232.
+[2] Lyes Attouche, Mohamed Amine Baazizi, Dario Colazzo, Giorgio Ghelli, Carlo
+Sartiani, and Stefanie Scherzinger. 2022. Witness Generation for JSON Schema.
+CoRR abs/2202.12849 (2022). arXiv:2202.12849 https://arxiv.org/abs/2202.12849
+[3] Mohamed Amine Baazizi, Clément Berti, Dario Colazzo, Giorgio Ghelli, and
+Carlo Sartiani. 2020. Human-in-the-Loop Schema Inference for Massive JSON
+Datasets. In Proc. EDBT. 635–638.
+
+[4] Mohamed Amine Baazizi, Dario Colazzo, Giorgio Ghelli, and Carlo Sartiani. 2019.
+Parametric schema inference for massive JSON datasets. VLDB J. 28, 4 (2019),
+497–521.
+[5] Mohamed Amine Baazizi, Dario Colazzo, Giorgio Ghelli, Carlo Sartiani, and
+Stefanie Scherzinger. 2021. An Empirical Study on the "Usage of Not" in RealWorld JSON Schema Documents. In Proc. ER. 102–112.
+[6] Jana Bauckmann, Ulf Leser, Felix Naumann, and Véronique Tietz. 2007. Efficiently
+detecting inclusion dependencies. In Proc. ICDE. 1448–1450.
+[7] Philip Bohannon, Wenfei Fan, Floris Geerts, Xibei Jia, and Anastasios Kementsietsidis. 2007. Conditional Functional Dependencies for Data Cleaning. In Proc.
+ICDE. 746–755.
+[8] Boris Chidlovskii. 2002. Schema Extraction from XML Collections. In Proc. JCDL.
+291–292.
+[9] Xu Chu, Ihab F. Ilyas, Sanjay Krishnan, and Jiannan Wang. 2016. Data Cleaning:
+Overview and Emerging Challenges. In Proc. SIGMOD. 2201–2206.
+[10] Pavel Contos and Martin Svoboda. 2020. JSON Schema Inference Approaches.
+In Proc. ER (Workshops). 173–183.
+[11] Michael Droettboom. 2022. Understanding JSON Schema. https://jsonschema.org/understanding-json-schema/reference/conditionals.html#if-thenelse. Draft 2020-12.
+[12] Dominik Durner, Viktor Leis, and Thomas Neumann. 2021. JSON Tiles: Fast
+Analytics on Semi-Structured Data. In Proc. SIGMOD. 445–458.
+[13] Wenfei Fan, Floris Geerts, Laks V. S. Lakshmanan, and Ming Xiong. 2009. Discovering Conditional Functional Dependencies. In Proc. ICDE. 1231–1234.
+[14] Wenfei Fan, Floris Geerts, Jianzhong Li, and Ming Xiong. 2011. Discovering
+Conditional Functional Dependencies. IEEE Trans. Knowl. Data Eng. 23, 5 (2011),
+683–698.
+[15] Jeff Friesen. 2019. Java XML and JSON: Document Processing for Java SE. Apress,
+Chapter Extracting JSON Values with JsonPath, 299–322.
+[16] Angelo Augusto Frozza and Ronaldo dos Santos Mello. 2020. JS4Geo: A canonical
+JSON Schema for geographic data suitable to NoSQL databases. GeoInformatica
+24, 4 (2020), 987–1019.
+[17] Angelo Augusto Frozza, Ronaldo dos Santos Mello, and Felipe de Souza da Costa.
+2018. An Approach for Schema Extraction of JSON and Extended JSON Document
+Collections. In Proc. IRI. 356–363.
+[18] Angelo Augusto Frozza, Ronaldo dos Santos Mello, and Felipe de Souza da Costa.
+2018. An Approach for Schema Extraction of JSON and Extended JSON Document
+Collections (Software). https://github.com/gbd-ufsc/JSONSchemaDiscovery.
+[19] Enrico Gallinucci, Matteo Golfarelli, and Stefano Rizzi. 2018. Schema profiling
+of document-oriented databases. Inf. Syst. 75 (2018), 13–25.
+[20] Minos Garofalakis, Aristides Gionis, Rajeev Rastogi, Sridhar Seshadri, and
+Kyuseok Shim. 2000. XTRACT: A system for extracting document type descriptors from XML documents. In Proc. SIGMOD. 165–176.
+[21] Rihan Hai, Christoph Quix, and Dan Wang. 2019. Relaxed Functional Dependency
+Discovery in Heterogeneous Data Lakes. In Proc. ER. 225–239.
+[22] Sven Hartmann and Sebastian Link. 2003. More Functional Dependencies for
+XML. In Advances in Databases and Information Systems, Leonid Kalinichenko,
+Rainer Manthey, Bernhard Thalheim, and Uwe Wloka (Eds.). Springer Berlin
+Heidelberg, Berlin, Heidelberg, 355–369.
+[23] Jan Hegewald, Felix Naumann, and Melanie Weis. 2006. XStruct: Efficient Schema
+Extraction from Multiple and Large XML Documents. In Proc. Workshops ICDE.
+[24] Ihab F. Ilyas and Xu Chu. 2019. Data Cleaning. ACM.
+[25] ISO/IEC. 2008. ISO/IEC 19757-2:2008 Information technology — Document Schema
+Definition Language (DSDL) — Part 2: Regular-grammar-based validation — RELAX
+NG. ISO/IEC Standard. https://www.iso.org/standard/52348.html
+[26] ISO/IEC. 2020. ISO/IEC 19757-3:2020 Information technology — Document Schema
+Definition Languages (DSDL) — Part 3: Rule-based validation — Schematron.
+ISO/IEC Standard. https://www.iso.org/standard/74515.html
+[27] Javier Luis Cánovas Izquierdo and Jordi Cabot. 2013. Discovering Implicit
+Schemas in JSON Data. In Proc. ICWE. 68–83.
+[28] Jyrki Kivinen and Heikki Mannila. 1995. Approximate inference of functional
+dependencies from relations. Theoretical Computer Science 149, 1 (1995), 129–149.
+[29] Michal Klempa, Michal Kozák, Mario Mikula, Robert Smetana, Jakub Stárka,
+Michal Svirec, Matej Vitásek, Martin Necaský, and Irena Holubová. 2015. jInfer:
+A Framework for XML Schema Inference. Comput. J. 58 (2015), 134–156.
+[30] Stefan Klessinger, Meike Klettke, Uta Störl, and Stefanie Scherzinger. 2022. Extracting JSON Schemas with Tagged Unions (Reproduction Package). https:
+//doi.org/10.5281/zenodo.6985647
+[31] Meike Klettke, Hannes Awolin, Uta Störl, Daniel Müller, and Stefanie Scherzinger.
+2017. Uncovering the evolution history of data lakes. In Proc. Big Data. 2462–
+2471.
+[32] Meike Klettke, Uta Störl, and Stefanie Scherzinger. 2015. Schema Extraction and
+Structural Outlier Detection for JSON-based NoSQL Data Stores. In Proc. BTW,
+Vol. P-241. GI, 425–444.
+[33] Lucja Kot and Walker M. White. 2007. Characterization of the Interaction of
+XML Functional Dependencies with DTDs. In Proc. ICDT. 119–133.
+[34] Sebastian Kruse, Anja Jentzsch, Thorsten Papenbrock, Zoi Kaoudi, Jorge-Arnulfo
+Quiané-Ruiz, and Felix Naumann. 2016. RDFind: Scalable Conditional Inclusion
+
+Extracting JSON Schemas with Tagged Unions
+
+Dependency Discovery in RDF Datasets. In Proc. SIGMOD. 953–967.
+[35] Sebastian Kruse, Thorsten Papenbrock, and Felix Naumann. 2015. Scaling Out
+the Discovery of Inclusion Dependencies. In Proc. BTW. 445–454.
+[36] Mong Li Lee, Tok Wang Ling, and Wai Lup Low. 2002. Designing Functional
+Dependencies for XML. In Proc. EDBT. 124–141.
+[37] Jiuyong Li, Jixue Liu, Hannu Toivonen, and Jianming Yong. 2013. Effective
+Pruning for the Discovery of Conditional Functional Dependencies. Comput. J.
+56, 3 (2013), 378–392.
+[38] Jixue Liu, Jiuyong Li, Chengfei Liu, and Yongfeng Chen. 2012. Discover Dependencies from Data - A Review. IEEE Trans. Knowl. Data Eng. 24, 2 (2012),
+251–264.
+[39] Heikki Mannila and Kari-Jouko Räihä. 1992. On the complexity of inferring
+functional dependencies. Discrete Applied Mathematics 40, 2 (1992), 237–243.
+[40] Michael J. Mior. 2021. Fast Discovery of Nested Dependencies on JSON Data.
+CoRR abs/2111.10398 (2021). arXiv:2111.10398 https://arxiv.org/abs/2111.10398
+[41] Irena Mlýnková and Martin Nečaský. 2013. Heuristic Methods for Inference
+of XML Schemas: Lessons Learned and Open Issues. Informatica 24, 4 (2013),
+577–602.
+[42] Chuang-Hue Moh, Ee-Peng Lim, and Wee-Keong Ng. 2000. DTD-Miner: a tool
+for mining DTD from XML documents. In Proc. WECWIS. 144–151.
+[43] Justin Namba. 2021. Enhancing JSON Schema Discovery by Uncovering Hidden
+Data. In Proc. VLDB 2021 PhD Workshop.
+[44] Thorsten Papenbrock and Felix Naumann. 2016. A Hybrid Approach to Functional Dependency Discovery. In Proc. SIGMOD. 821–833.
+[45] Felipe Pezoa, Juan L. Reutter, Fernando Suárez, Martín Ugarte, and Domagoj
+Vrgoc. 2016. Foundations of JSON Schema. In Proc. WWW. 263–273.
+[46] Joeri Rammelaere and Floris Geerts. 2018. Revisiting Conditional Functional
+Dependency Discovery: Splitting the "C" from the "FD". In Proc. ECML PKDD.
+552–568.
+
+[47] Diego Sevilla Ruiz, Severino Feliciano Morales, and Jesús García Molina. 2015.
+Inferring Versioned Schemas from NoSQL Databases and Its Applications. In
+Proc. ER. 467–480.
+[48] Sebastian Schelter, Dustin Lange, Philipp Schmidt, Meltem Celikel, Felix Biessmann, and Andreas Grafberger. 2018. Automating large-scale data quality verification. Proc. VLDB Endow. 11, 12 (2018), 1781–1794.
+[49] Philipp Schirmer, Thorsten Papenbrock, Sebastian Kruse, Felix Naumann, Dennis
+Hempfing, Torben Mayer, and Daniel Neuschäfer-Rube. 2019. DynFD: Functional
+Dependency Discovery in Dynamic Datasets. In Proc. EDBT. 253–264.
+[50] Shaoxu Song, Fei Gao, Ruihong Huang, and Chaokun Wang. 2022. Data Dependencies Extended for Variety and Veracity: A Family Tree. IEEE Transactions on
+Knowledge and Data Engineering 34, 10 (2022), 4717–4736.
+[51] William Spoth, Oliver Kennedy, Ying Lu, Beda Christoph Hammerschmidt, and
+Zhen Hua Liu. 2021. Reducing Ambiguity in JSON Schema Discovery. In Proc.
+SIGMOD. 1732–1744.
+[52] Fernando Suárez, Juan Reutter, Domagoj Vrgoc, Martín Ugarte, and Felipe Pezoa. 2016. JSON Schema: Multiple Types (Software). https://cswr.github.io/
+JsonSchema/spec/multiple_types/.
+[53] Tamás Vajk, Péter Fehér, Krisztián Fekete, and Hassan Charaf. 2013. Denormalizing data into schema-free databases. In Proc. CogInfoCom. 747–752.
+[54] Ivan Veinhardt Latták. and Pavel Koupil. 2022. A Comparative Analysis of JSON
+Schema Inference Algorithms. In Proc. ENASE. 379–386.
+[55] W3C. 2012. W3C XML Schema Definition Language (XSD) 1.1 Part 1: Structures.
+W3C Recommendation. https://www.w3.org/TR/xmlschema11-1/
+[56] Ziheng Wei and Sebastian Link. 2019. Discovery and Ranking of Functional
+Dependencies. In Proc. ICDE. 1526–1537.
+[57] Hong Yao and Howard J Hamilton. 2008. Mining functional dependencies from
+data. Data Mining and Knowledge Discovery 16, 2 (2008), 197–219.
+

@@ -1,0 +1,1589 @@
+B EYOND T OKENS : A U NIFIED F RAMEWORK FOR
+L ATENT C OMMUNICATION IN LLM- BASED
+M ULTI -AGENT S YSTEMS
+A P REPRINT
+Yingzhuo Liu
+Companion repository: https://github.com/enochliu98/Awesome-Latent-Communication
+
+arXiv:2606.05711v3 [cs.CL] 15 Jul 2026
+
+liuyingzhuo86@bupt.edu.cn
+
+A BSTRACT
+Multi-agent systems built on large language models (LLMs) typically communicate through naturallanguage messages. Although readable and interoperable, this protocol requires the sender to decode
+internal computation into tokens and the receiver to encode those tokens again; under finite message
+budgets, it may also omit uncertainty and alternative hypotheses. Latent communication instead
+transfers continuous model state—embeddings, hidden states, or key–value (KV) caches—directly
+between agents. This survey provides a scoped review of this emerging area through searches of
+arXiv, ACL Anthology, and OpenReview, supplemented by backward snowballing, with a cut-off date
+of 15 July 2026. We organise eighteen representative works using three axes: WHAT is transferred,
+WHICH sender and receiver spaces or layers are aligned, and HOW the received state is fused.
+Beyond taxonomy, we derive deployment-oriented design rules, separate semantic latent messaging
+from systems-level cache reuse, and identify the conditions under which reported efficiency gains are
+comparable. The synthesis exposes recurring trade-offs among information capacity, transport cost,
+architectural dependence, trainability, and auditability. It also motivates a research agenda spanning
+cross-architecture alignment, secure latent channels, compression, evaluation standardisation, and
+hybrid text–latent protocols.
+Keywords Latent Communication · Multi-Agent LLMs · KV-Cache · Hidden States · Embeddings · Agent
+Communication · Survey
+
+1. I NTRODUCTION
+Multi-agent systems built on top of large language models (LLMs) have rapidly become a workhorse for complex
+reasoning, planning, code generation, scientific question answering, and tool orchestration [Wu et al., 2023, Hong et al.,
+2023, Li et al., 2023, Liu et al., 2026a]. In the canonical architecture, several specialised LLM agents — each typically
+instantiated as a separate model call with its own role prompt — collaborate by exchanging natural language messages.
+A planner proposes a strategy in text; a critic reads the proposal and replies in text; a coder edits the plan in text; and
+so on. The result is a visible, inspectable, human-readable communication trace that doubles as an audit log and a
+debugging surface. The way such a system partitions a complex task across agents — which subtask to assign to which
+agent — is itself a non-trivial design choice, and recent work has begun to study adaptive task-decomposition strategies
+empirically [Liu et al., 2025a].
+Despite its success, the text-only communication protocol is being increasingly questioned. Three structural limitations
+stand out:
+1. Inference cost. Every message forces the sender to autoregressively decode a token sequence and the receiver to
+prefill that sequence. The exact cost depends on attention implementation, context length, batching, and cache reuse,
+but it grows with both message length and the number of communication rounds.
+
+Latent Communication
+
+A P REPRINT
+
+2. Potential information loss during discretisation. A text message maps a rich internal state to a discrete sequence.
+Per token, the selected symbol conveys at most log2 V bits under a fixed vocabulary; a multi-token message can,
+of course, encode more. The practical concern is that finite message budgets and decoding choices may omit
+uncertainty, alternatives, and task-relevant detail.
+3. Redundancy and ambiguity of natural language. Generated text is optimised for linguistic fluency rather than
+task-relevant information density. Idioms, hedging, and vague referents add overhead; disagreements about role
+assignment or background knowledge can render entire messages irrecoverable.
+In response, a new line of work—collectively called latent communication—lets agents exchange continuous internal
+representations directly: embeddings, hidden states, or key–value (KV) caches. Skipping part of the text round trip can
+preserve task-relevant state or reduce inference time under favourable conditions. It also introduces costs: the channel
+is opaque to humans, architecture-dependent, and harder to inspect, secure, and version.
+The field has grown explosively. The accompanying repository Awesome-Latent-Communication already tracks more
+than fifteen distinct methods, and the diversity of design choices is striking: some methods transmit embeddings, others
+transmit hidden states, still others transmit KV-caches. Some methods align the last layer of the sender to the first
+layer of the receiver; others align all layers. Some fuse information by concatenation; others by prepending, addition,
+or learned cross-attention. Some are training-free; others require distillation. A new researcher entering the area is
+therefore confronted by a fragmented landscape with no shared vocabulary.
+Contributions.
+
+This paper turns a fragmented set of methods into a comparable design space. Specifically:
+
+• We define the scope of latent communication and document a reproducible review protocol, including search sources,
+inclusion criteria, boundary cases, and a fixed cut-off date.
+• We propose a 3-axis decomposition—WHAT (transmitted representation), WHICH (sender–receiver alignment),
+and HOW (receiver-side fusion)—and use it to compare eighteen representative works.
+• We derive deployment-oriented design rules that connect representation choice to model heterogeneity, context length,
+bandwidth, training budget, and auditability.
+• We identify evaluation confounders and formulate an actionable research agenda for alignment, security, compression,
+theory, and deployment.
+Organisation. Section 2 describes the review protocol and scope; Section 3 introduces notation; Section 4 develops
+the motivation and boundary conditions; Section 5 presents the WHAT / WHICH / HOW framework and design
+guidance; Section 6 analyses implementation and training regimes; Section 7 formulates the research agenda; and
+Section 8 distinguishes adjacent areas. Detailed method cards and the cross-paper benchmark synthesis are provided in
+Sections A and B.
+
+2. R EVIEW S COPE AND M ETHODOLOGY
+2.1 Search Strategy and Cut-off
+We searched arXiv, ACL Anthology, and OpenReview using combinations of latent communication, activation
+communication, hidden-state communication, KV-cache sharing, cache transfer, multi-agent LLM, and language-model
+agents. We supplemented keyword search with backward snowballing from the retrieved papers and periodic screening
+of the companion repository. The review covers work available on or before 15 July 2026. Because terminology is not
+yet standardised, the search deliberately combines representation-centric terms (e.g., hidden state) with systems-centric
+terms (e.g., cache transfer).
+2.2 Eligibility and Boundary Cases
+A work enters the primary corpus when it satisfies three conditions: (1) at least two model instances, roles, or agent
+modules exchange information; (2) the exchanged object includes a continuous internal representation or reusable
+inference state; and (3) that object affects the receiver’s computation without requiring a complete text-only decode–
+encode round trip. We include peer-reviewed papers and technically substantive preprints because much of the area
+post-dates established venue cycles. We exclude ordinary prompt sharing, semantic retrieval caches that store only text
+or external embeddings, and single-agent latent reasoning unless they clarify the boundary of inter-agent communication.
+Some works occupy the boundary rather than the centre of this definition. Runtime systems such as TokenDance [Bian
+et al., 2026] and AAFLOW+ [Sarker et al., 2026] reuse or orchestrate KV state across agent workflows but do not
+2
+
+Latent Communication
+
+A P REPRINT
+
+necessarily define a new semantic message protocol. Conversely, internalised-debate methods such as Latent Agents [Yi
+et al., 2026] move multi-agent structure into a single model at deployment time. We discuss these as adjacent evidence
+rather than silently merging them with direct sender–receiver protocols.
+2.3 Extraction and Coding
+For each primary work, we record the transmitted representation, sender–receiver compatibility assumptions, layer mapping, fusion operator, training requirement, communication topology, evaluation tasks, and reported efficiency/quality
+metrics. We then code each method along the WHAT / WHICH / HOW axes. When a paper spans multiple choices, the
+comparison table reports the dominant inference path and the method card records variants. Reported numerical results
+are retained as within-paper evidence; we do not treat them as a leaderboard because backbones, hardware, context
+lengths, baselines, and latency definitions differ.
+Scope Principle
+This survey distinguishes three objects that are often conflated: semantic latent messages exchanged to improve
+collaboration, reusable inference state exchanged to avoid computation, and internalised multi-agent reasoning
+distilled into one model. They share mechanisms but answer different research questions.
+
+3. BACKGROUND AND P RELIMINARIES
+This section fixes the notation and terminology used throughout the paper.
+3.1 Multi-Agent LLM Systems
+A multi-agent LLM system (MAS) consists of N LLM agents A = {A1 , A2 , . . . , AN }, each equipped with a rolespecific system prompt, optional tool access, and a communication channel. At each step, an agent Ai (the sender)
+produces a message that is delivered to one or more peer agents (the receivers). A controller — explicit or implicit —
+decides the order of speakers. The communication channel is the focus of this paper: classical systems use a natural
+language channel (Section 3.2); the methods surveyed in this paper use a latent channel (Section 3.2).
+3.2 Natural Language vs. Latent Communication
+• Natural Language Communication (NL-Comm). The sender generates a discrete token sequence y =
+(y1 , y2 , . . . , yT ) by sampling from a vocabulary V. The receiver re-encodes the token sequence into its own embedding space. The two-step pipeline — sender decode → token transport → receiver encode — is what we refer to as
+the language bottleneck.
+• Latent Communication (Latent-Comm). The sender exposes one of its internal continuous representations —
+the input embedding, the hidden state of a particular layer/token, or the KV-cache — and the receiver injects this
+representation into its own computation without round-tripping through the vocabulary.
+A high-level comparison of the two pipelines is shown in Figure 1.
+3.3 Prefill and Decode
+LLM inference is split into two phases that we will repeatedly refer to:
+• Prefill phase. Given a prompt x = (x1 , . . . , xT ), the model processes the entire sequence in parallel and produces
+the first output token. All key–value pairs computed during prefill are stored in the KV-cache.
+• Decode phase. The model generates one token at a time. At each step t > T , it takes the previously generated token
+yt−1 and the cached KV from earlier steps, and produces a new token yt (and a new KV entry).
+The distinction matters for latent communication because the kind of internal state available differs between the two
+phases. During prefill, the sender has access to per-token hidden states and KV-caches for every input token. During
+decode, the sender has only the hidden state of the most recently generated token plus an ever-growing KV-cache.
+3
+
+Latent Communication
+
+A P REPRINT
+
+Figure 1: Comparison of natural-language and latent communication pipelines, including (left) a Transformer block
+with its accessible intermediate representations, (top-right) a comparison of token-level vs. hidden-state reasoning
+information density, and (bottom-right) the prefill/decode phases that produce per-token KV-caches.
+3.4 Embedding, Hidden State, KV-Cache, Activation
+We adopt the following precise definitions, which the rest of the paper relies on:
+Embedding.
+A continuous vector ei ∈ Rd that maps a discrete input symbol xi to a dense semantic space. Embeddings are the
+input to the first Transformer block.
+Hidden state.
+(ℓ)
+The output of a complete Transformer block, denoted hi ∈ Rd for token i at layer ℓ. Hidden states are the stable,
+layer-wise semantic representations passed between adjacent Transformer blocks. When the receiver consumes a
+hidden state, it typically receives one of the intermediate-layer outputs.
+KV-Cache.
+The collection of per-token key and value tensors computed in each self-attention layer during prefill, denoted
+(ℓ)
+(ℓ)
+KV = {(ki , vi )Ti=1 }L
+ℓ=1 . The KV-cache is what the model reuses to make decode efficient.
+Activation.
+A more general term: any intermediate output of a sub-module (attention projection, feed-forward transformation,
+etc.). Hidden states are a subset of activations that serve as stable layer-wise representations. Methods that transmit
+“activations” often transmit a more granular quantity (e.g., a single attention head’s output) than methods that
+transmit “hidden states.”
+A schematic of these quantities in a Transformer block is included in the left panel of Figure 1.
+3.5 Why Now?
+Latent communication has become practical only recently. Three enabling trends converged around 2023–2024:
+1. Open-weight LLMs at scale. Methods that pipe a sender’s hidden state into a receiver’s forward pass require
+white-box access to both models. The release of Llama, Qwen, Mistral, and similar families has made such access
+routine.
+2. KV-cache engineering. The KV-cache has gone from an implementation detail to a first-class optimisation target,
+with rich infrastructure for compression, sharing, and off-loading. Methods that transmit KV-caches piggy-back on
+this infrastructure.
+4
+
+Latent Communication
+
+A P REPRINT
+
+3. Multi-agent frameworks. Frameworks like LangGraph, AutoGen, CrewAI, and MetaGPT have lowered the cost
+of orchestrating multiple LLM agents, making the latent channel itself a meaningful object of study rather than a
+curiosity.
+
+4. T HE C ASE FOR L ATENT C OMMUNICATION
+Before diving into the framework, we articulate the case for and against latent communication. We argue that the
+trade-off is context-dependent: latent communication is preferable when (a) the agents are tightly coupled, (b) the
+cost of natural language overhead dominates, and (c) the channel can be made interpretable enough for downstream
+debugging.
+4.1 Limitations of Natural Language Communication
+4.1.1 High Inference Cost
+Consider a two-agent system where agent A1 produces a T -token message to agent A2 . The total cost is:
+• A1 ’s decode of T tokens: O(L · T · d) FLOPs, where L is the number of layers and d is the hidden dimension. The
+KV-cache read/write is the dominant term.
+• A2 ’s re-encoding of T tokens: the same O(L · T · d) FLOPs in prefill.
+• The token-by-token transport itself: negligible.
+So the overhead of natural language communication is roughly 2× the cost of generating the message, even before
+accounting for A2 ’s own reasoning. Latent communication can reduce this to a single embedding/hidden-state/KV-cache
+transport that the receiver injects without re-encoding.
+4.1.2 Information Loss During Discretization
+The pipeline is
+sample
+
+linear
+
+hcontext −−−→ z ∈ RV −−−→ y ∈ V,
+
+(1)
+
+where hcontext is the sender’s high-dimensional hidden state, z is the logit vector over the vocabulary, and y is the
+sampled token. The mutual information I(hcontext ; y) is upper-bounded by H(y) ≤ log2 |V| ≈ 15–17 bits. Meanwhile,
+hcontext itself typically lives in Rd with d ≥ 4096 and is parameterised by 32-bit floats, so its raw representational
+capacity exceeds 40,000 bits. The compression factor is therefore on the order of 103 –104 .
+Concretely: a hidden state encodes not just which token to say next, but also the alternatives considered, their relative
+probabilities, the salience of different parts of the context, and uncertainty. All of this is lost the moment we sample
+a single token. A visual comparison of these information densities (Figure 2(a)) and the resulting communication
+pipelines (Figure 2(b)) is given in Figure 2.
+4.1.3 Redundancy and Ambiguity of Natural Language
+Generated text is optimised for linguistic coherence (a stylistic objective from pre-training) rather than for task-relevant
+information density. Sentences are padded with politeness markers, hedging, and reformulation. References to prior
+context are often under-specified (“the previous step”, “that approach”), forcing the receiver to reconstruct the referent.
+When sender and receiver disagree on background knowledge, role assignment, or terminology, the natural language
+channel can become lossy in a semantic sense that goes beyond the numerical bits/token argument. In contrast, latent
+channels operate on the agents’ own representational manifolds and avoid this kind of semantic mismatch — at the cost
+of interpretability.
+4.2 Advantages of Natural Language Communication
+Latent communication is not a universal replacement. Natural language retains one decisive advantage:
+• High interpretability. A natural language message is immediately readable by humans. This is essential for
+debugging, alignment auditing, safety review, and human–AI interaction. Latent messages, in contrast, are opaque
+vectors that require auxiliary tooling to interpret.
+5
+
+Latent Communication
+
+(a) Information density: ≈ 15 bits per token.
+
+A P REPRINT
+
+(b) Pipeline comparison: NL-Comm vs. Latent-Comm.
+
+Figure 2: Why latent communication wins on information density. Left (a): Bar chart comparing the information
+content of a discrete token (≈ 15 bits) with that of a single hidden state of the last token (≈ 40,000 bits). The gap
+of three to four orders of magnitude motivates the move to latent communication. Right (b): Pipeline comparison.
+NL-Comm routes a sender’s hidden state through a vocabulary bottleneck; Latent-Comm exchanges a continuous vector
+directly, preserving orders of magnitude more information per communication step.
+In practice, the field has converged on a hybrid view: natural language for tasks where human oversight is needed (e.g.,
+final answers, justifications) and latent communication for intermediate, agent-to-agent signalling. A schematic of this
+hybrid view is shown in Figure 2(b).
+4.3 When to Prefer Latent Communication
+Synthesising the above, latent communication tends to win when all of the following hold:
+1. The two agents are tightly coupled (e.g., a planner feeding directly into an executor).
+2. The communication is intermediate — the user does not need to see the message.
+3. The sender and receiver share (or can be aligned to) a common latent space (e.g., same backbone, or compatible
+architectures).
+4. Latency is a binding constraint (e.g., real-time pipelines, edge deployment, or large agent counts).
+Conversely, natural language wins when interpretability, cross-organisation interoperability, or human oversight is
+required.
+
+5. A U NIFIED F RAMEWORK FOR L ATENT C OMMUNICATION
+We now present the central contribution of this paper: a unified framework that describes the core data path of latent
+communication methods along three axes. A protocol can be represented by the triple
+Method = (
+
+WHAT
+| {z }
+
+, |WHICH
+{z }, |HOW
+{z }).
+
+type of information
+
+alignment
+
+(2)
+
+fusion
+
+The framework is summarised schematically in Figure 3.
+At a glance
+WHERE does the information come from? WHAT is its format? WHICH layer/head in the receiver does it
+target? HOW is it combined? These three questions (WHAT / WHICH / HOW) uniquely determine any latent
+communication protocol.
+5.1 Axis 1 — WHAT: Types of Communicated Information
+The first axis asks: what continuous quantity does the sender expose to the receiver? The dominant choices in the
+literature are Embeddings, Hidden States, and KV-Caches, with several methods exploring other quantities (state
+deltas, persistent memory, attention-only signals).
+6
+
+Latent Communication
+
+A P REPRINT
+
+Figure 3: The unified 3-axis framework. The three axes — WHAT (types of communicated information), WHICH
+(sender–receiver alignment), and HOW (information fusion strategy) — together span the design space of latent
+communication methods.
+5.1.1 Embeddings
+The sender transmits its input embedding ei ∈ Rd for one or more tokens. Embeddings are the lowest-level continuous
+representation; they are model-agnostic in the sense that any model with a compatible embedding dimension can in
+principle consume them. CIPHER [Liu et al., 2024] is the canonical example: it computes a weighted embedding where
+the weights are derived from the sender’s output logits, so that the embedding encodes the sender’s full vocabulary
+distribution rather than a single sampled token.
+Strengths.
+Architecture-light (only the embedding table needs to be shared). Simple to implement. Robust to backbone
+changes.
+Limitations.
+Embeddings are the least informative of the three options. They do not encode the agent’s intermediate computations
+or its attended context.
+5.1.2 Hidden States
+(ℓ)
+
+The sender transmits the hidden state hi of token i at layer ℓ. Hidden states are richer than embeddings: they encode
+the agent’s intermediate reasoning, including the effect of attention over its context. AC [Ramesh and Li, 2025],
+Interlat [Du et al., 2026], SDE [Yang et al., 2025], ThoughtComm [Li et al., 2025], and Mixture of Thoughts [Fein-Ashley
+et al., 2025] all use hidden states as the communicated quantity.
+Strengths.
+Encodes intermediate computation. Often training-free. Easy to align to the receiver’s first layer (Section 5.2).
+Limitations.
+Less informative than the full KV-cache (it does not include the keys needed to attend back to earlier tokens).
+Architecture-dependent: the receiver must share a similar backbone.
+5.1.3 KV-Caches
+The sender transmits its per-token, per-layer KV-cache. The receiver can then resume generation as if it had prefilled the sender’s context. KVComm [Wang et al., 2025a], Cache-to-Cache [Liu et al., 2025b], LatentMAS [Wang
+et al., 2025b], Q-KVComm [Park et al., 2025], LRAgent [Jeon et al., 2026], RelayCaching [Geng et al., 2026], Agent
+Memory [Shkolnikov, 2026], Agent Primitives [Jin et al., 2026], and Edge LLM Handover [Lee et al., 2026] all use
+KV-caches.
+7
+
+Latent Communication
+
+A P REPRINT
+
+Table 1: Types of communicated information used by representative methods (✓ = yes). † denotes boundary or adjacent
+work not counted among the 18 primary methods.
+Method
+
+Embedding
+
+CIPHER [Liu et al., 2024]
+AC [Ramesh and Li, 2025]
+Interlat [Du et al., 2026]
+SDE [Yang et al., 2025]
+KVComm [Wang et al., 2025a]
+Cache-to-Cache [Liu et al., 2025b]
+LatentMAS [Wang et al., 2025b]
+ThoughtComm [Li et al., 2025]
+Q-KVComm [Park et al., 2025]
+LRAgent [Jeon et al., 2026]
+RelayCaching [Geng et al., 2026]
+Agent Memory [Shkolnikov, 2026]
+Agent Primitives [Jin et al., 2026]
+Edge LLM Handover [Lee et al., 2026]
+Vision Wormhole [Liu et al., 2026b]
+BIGMAS [Hao et al., 2026]
+Mixture of Thoughts [Fein-Ashley et al., 2025]
+Five Ws Survey [Chen et al., 2026]
+
+✓ (weighted)
+
+Hidden State
+
+KV-Cache
+
+Other
+
+✓
+✓
+delta
+✓
+✓
+✓
+✓
+✓ (comp.)
+✓ (base+lr)
+✓ (dec)
+✓ (Q4)
+✓ (inter)
+✓ (backhaul)
+UVC
+workspace
+✓ (proj.)
+(all)
+
+(all)
+
+†
+
+TokenDance [Bian et al., 2026]
+AAFLOW+† [Sarker et al., 2026]
+When Latent Agents Lie† [Brito and Baquero, 2026]
+Latent Agents† [Yi et al., 2026]
+
+✓ (subspaces)
+
+(all)
+
+(taxonomy)
+
+✓ (shared/diff)
+✓ (distributed)
+✓ (full)
+
+runtime reuse
+operators
+visible text
+internalised
+
+Strengths.
+Retains token- and layer-specific attention state, allowing the receiver to attend over a richer history than a single
+hidden vector. Compatible with existing KV-cache infrastructure.
+Limitations.
+Largest payload (proportional to sequence length × number of layers × number of heads × head dimension). Most
+architecture-dependent: a KV-cache from a 4096-d Llama cannot be directly consumed by a 5120-d Qwen. Requires
+careful alignment across architectures.
+5.1.4 Other Communicated Quantities
+A small but growing set of methods transmits non-standard quantities:
+• State delta trajectory (SDE [Yang et al., 2025]): the change in hidden state at each layer, rather than the state itself.
+This compresses the information into a direction in latent space and has been shown to be more robust when sender
+and receiver architectures differ slightly.
+• Persistent KV-cache memory (Agent Memory [Shkolnikov, 2026]): a disk-persistent 4-bit-quantised KV-cache, used
+to offload the cache to edge devices.
+• Visual-latent wormhole (Vision Wormhole [Liu et al., 2026b]): a sender’s hidden state is rendered into a VLM’s
+visual input space, exploiting the VLM’s visual pathway as a universal channel.
+• Centralised workspace state (BIGMAS [Hao et al., 2026]): a shared workspace in which agents deposit and read
+structured latent messages, mediated by an orchestrator.
+5.1.5 Comparative Summary
+Table 1 summarises which information type each primary method uses and places the four recently added boundary
+works in the same representation space.
+
+8
+
+Latent Communication
+
+A P REPRINT
+
+Table 2: Sender–receiver alignment assumptions. † denotes boundary or adjacent work.
+Method
+
+Latent Information Alignment
+
+CIPHER, AC, SDE, KVComm, QKVComm, LRAgent, RelayCaching,
+Agent Memory, Agent Primitives,
+Edge LLM Handover, ThoughtComm, BIGMAS
+Interlat, Cache-to-Cache, LatentMAS
+Vision Wormhole
+Mixture of Thoughts
+TokenDance† , AAFLOW+†
+When Latent Agents Lie†
+Latent Agents†
+
+None (same model assumed)
+
+Learned projection (homogeneous backbone)
+Universal Visual Codec (heterogeneous)
+Interaction layers (heterogeneous)
+Same-checkpoint cache compatibility plus position/runtime metadata
+Same-model KV payload; integrity binding rather than semantic alignment
+Intra-model agent subspaces; no inter-agent alignment at deployment
+
+Takeaway 1 — Information–Cost–Dependence Trade-off
+Payload size and architecture dependence generally increase from embeddings to selected hidden states to full
+KV-caches. Useful task information need not follow the same strict ordering: alignment error, token selection, and
+fusion can make a smaller representation more effective than a larger one.
+Takeaway 2 — Prefill vs. Decode Choice
+KV-Cache methods are concentrated in the prefill phase (because the cache is naturally produced there), while
+Embedding/Hidden State methods are concentrated in the decode phase (because the last-token hidden state is
+what the model uses to predict the next token). When the receiver only consumes prefill-phase information, the
+sender’s decode phase can be skipped entirely, yielding a major inference speed-up — the key insight behind all
+KV-cache methods.
+5.2 Axis 2 — WHICH: Sender–Receiver Alignment
+The second axis asks: which parts of the sender correspond to which parts of the receiver? Alignment has two
+sub-dimensions: latent information alignment (does the sender’s semantic space match the receiver’s?) and layer
+alignment (which layer of the sender feeds into which layer of the receiver?).
+5.2.1 Latent Information Alignment
+If the sender and receiver are the same model (e.g., two instances of Llama-3-8B), their latent spaces are identical
+by construction — no alignment is needed. If they are different but architecturally compatible (e.g., two Llama-3
+fine-tunes), the spaces are close but not identical; methods such as Interlat [Du et al., 2026] and Cache-to-Cache [Liu
+et al., 2025b] apply learned projection heads to bridge the gap. If they are architecturally heterogeneous (e.g., Llama-3
+and Qwen-2), a Universal Visual Codec [Liu et al., 2026b] or a learned interaction layer [Fein-Ashley et al., 2025] is
+needed.
+Table 2 indicates which methods perform explicit alignment.
+5.2.2 Layer Alignment
+The second sub-axis specifies the layer-to-layer correspondence between sender and receiver. Two natural extremes
+appear repeatedly:
+• Last → First. The sender exposes the hidden state of its last layer, and the receiver injects it at its first layer. Used
+by CIPHER, AC, Interlat. This is the simplest mapping and works well when the sender’s last layer is the most
+semantically rich.
+• All → Corresponding. The sender exposes the hidden state of every layer, and the receiver injects each one into the
+corresponding layer (i.e., layer ℓ of the sender feeds layer ℓ of the receiver). Used by Cache-to-Cache, LatentMAS,
+SDE. This preserves the layer-wise structure of the sender’s computation and is the natural choice for KV-cache
+methods.
+9
+
+Latent Communication
+
+A P REPRINT
+
+Intermediate variants include:
+• Selected → Selected. The sender selects n ≥ 1 layers via a heuristic or learned gate, and the receiver injects them at
+the same indices. Used by AC, KVComm, Q-KVComm.
+• Sparse top-k attention. A sub-variant of selected → selected in which the receiver attends over only the top-k most
+relevant layers (used by KVComm).
+Takeaway 3 — Layer Mapping Strategies
+For homogeneous agents (same backbone), both the “last → first” and “all → corresponding” strategies are
+simple, training-free, and competitive. The “selected → selected” strategy adds complexity but can yield accuracy
+or latency gains when the agent has many layers and the relevant information is concentrated in a few. For
+heterogeneous agents, learned alignment (projection, universal codec, or interaction layers) becomes necessary.
+
+5.3 Axis 3 — HOW: Information Fusion Strategy
+The third axis asks: how is the communicated information incorporated into the receiver’s computation? The major
+options are:
+5.3.1 Concatenation
+The sender’s latent is concatenated with the receiver’s prompt embedding (or hidden state) along the token axis. This is
+the simplest fusion and is used by CIPHER, Interlat, and several early hidden-state methods.
+5.3.2 Prepending (Token-axis Prepend)
+The sender’s latent is prepended to the receiver’s KV-cache. This is the natural fusion for KV-cache methods: the
+receiver can attend over the sender’s context as if it were the first few tokens of its own prompt. Used by KVComm,
+LatentMAS, and others.
+5.3.3 Mathematical Operation
+The sender’s latent is combined with the receiver’s hidden state (or KV-cache) by an element-wise operation: addition,
+subtraction, or a small learned linear projection. Used by AC (addition of last-token hidden states), SDE (addition of
+state deltas), and others.
+5.3.4 Cross-Attention
+The receiver attends over a set of sender latents using a learned cross-attention layer. Used by Mixture of Thoughts [FeinAshley et al., 2025], where a primary expert attends over a top-K set of peer experts’ projected hidden states.
+5.3.5 Cache Restoration / Direct Injection
+The receiver replaces part of its own KV-cache with the sender’s KV-cache. Used by RelayCaching [Geng et al., 2026]
+and Agent Memory [Shkolnikov, 2026], where the goal is to avoid recomputation rather than to mix information.
+5.3.6 Comparative Table
+Table 3 lists the fusion strategy for the primary methods and the newly added boundary works.
+Takeaway 4 — Fusion Strategy Spectrum
+Concatenation and prepending are the most common, simplest, and often training-free. Mathematical operations
+(addition, learned linear) are slightly more expressive but require architectural compatibility. Cross-attention is the
+most expressive but requires training. Cache restoration is the most efficient (avoids recomputation entirely) but is
+the most restrictive in scope.
+
+10
+
+Latent Communication
+
+A P REPRINT
+
+Table 3: Fusion strategies by method. † denotes a boundary or adjacent work not counted among the 18 primary
+methods.
+Method
+
+Fusion Strategy
+
+Detail
+
+CIPHER [Liu et al., 2024]
+
+Concatenation
+
+AC [Ramesh and Li, 2025]
+
+Math operation
+
+Interlat [Du et al., 2026]
+
+Concatenation
+
+SDE [Yang et al., 2025]
+
+Math operation
+
+KVComm [Wang et al., 2025a]
+
+Prepend
+
+Cache-to-Cache [Liu et al., 2025b]
+LatentMAS [Wang et al., 2025b]
+
+Math operation
+Prepend
+
+ThoughtComm [Li et al., 2025]
+Q-KVComm [Park et al., 2025]
+LRAgent [Jeon et al., 2026]
+
+Math operation
+Prepend
+Math operation
+
+RelayCaching [Geng et al., 2026]
+
+Cache restoration
+
+Agent Memory [Shkolnikov, 2026]
+
+Cache restoration
+
+Agent Primitives [Jin et al., 2026]
+Edge LLM Handover [Lee et al., 2026]
+
+Prepend
+Hybrid
+
+Vision Wormhole [Liu et al., 2026b]
+
+Visual injection
+
+BIGMAS [Hao et al., 2026]
+Mixture of Thoughts [Fein-Ashley et al.,
+2025]
+
+Workspace fusion
+Cross-attention
+
+Weighted embedding concat. at
+each step
+Hidden state of last token
+added/combined
+Latent appended to prompt embeddings
+State delta added to corresponding
+layer/token
+Sender KV prepended to receiver
+KV
+Learned fuser
+Sender KV prepended to receiver
+KV
+Hidden-state combination
+Compressed KV prepended
+Base + low-rank adapter inside
+fused kernel
+Direct transplant + sparse recomputation
+Q4 disk-resident cache reloaded
+into attention
+Inter-primitive KV exchange
+Partial re-prefill + partial KV transfer
+Latent rendered into VLM’s visual
+input space
+Orchestrator routes full shared state
+Primary expert attends over top-K
+peer hidden states
+
+TokenDance† [Bian et al., 2026]
+
+Collective cache reuse
+
+AAFLOW+† [Sarker et al., 2026]
+
+Cache orchestration
+
+When Latent Agents Lie† [Brito and Baquero, 2026]
+Latent Agents† [Yi et al., 2026]
+
+KV injection + integrity
+Post-training internalisation
+
+Master–Mirror sparse-difference
+restoration
+Materialise, transfer, fork, compose,
+evict, and restore
+Full-KV coordination with a cryptographically bound manifest
+No inter-agent receiver fusion at deployment
+
+5.4 Combining the Axes
+The three axes are conceptually separable, although not fully independent in implementations: KV-caches favour
+layer-wise injection, whereas embeddings naturally enter near the input. Their combinations nevertheless reveal
+unexplored regions, such as compressed heterogeneous caches and auditable multi-sender latent aggregation.
+5.5 From Taxonomy to Design Decisions
+The axes describe a protocol, but system builders need the inverse mapping: given a workload, which point in the
+design space is defensible? Table 4 summarises the strongest recurring correspondences. These are design heuristics
+rather than universal rankings; they should be validated under the target model, hardware, and communication topology.
+Three consequences follow. First, representation richness is not the same as useful information: a larger KV payload
+may contain more state but can still harm the receiver if positions, layers, or model manifolds are misaligned. Second,
+the optimal unit of communication depends on topology. Pairwise hidden-state exchange may be adequate for a pipeline,
+whereas a dense debate may require routing or a shared workspace. Third, auditability is a protocol property, not an
+optional visualisation layer. Once agents communicate across trust boundaries, a pure latent channel should be treated
+as an untrusted binary interface with provenance, integrity, and fallback requirements.
+
+11
+
+Latent Communication
+
+A P REPRINT
+
+Table 4: Decision guide linking deployment constraints to protocol choices.
+Dominant constraint
+
+Promising choice
+
+Rationale and caveat
+
+Same backbone; long shared con- KV-cache transfer or restoration
+text
+Heterogeneous backbones
+Projected hidden states or shared
+codec
+Tight bandwidth or edge deploy- Selected layers, quantisation,
+ment
+low-rank deltas
+
+Avoids repeated prefill, but payload and positional
+compatibility must be controlled.
+Smaller interface than full-cache translation, but
+alignment normally requires data or training.
+Reduces bytes transferred; quality must be measured
+after compression rather than inferred from reconstruction error alone.
+Strict auditability or external Hybrid text–latent channel
+A concise visible commitment supports oversight,
+trust boundary
+while the latent payload carries detail; the two must
+be cryptographically and semantically bound.
+Many senders or dense topology Routing, pooling, or collective Prevents communication cost from scaling naively
+reuse
+with every sender–receiver pair, but may suppress
+minority evidence.
+No training data or rapidly chang- Same-model, training-free injec- Minimises adaptation cost, but does not remove dising models
+tion
+tribution shift or implementation sensitivity.
+
+Takeaway 5 — Conditional, Not Universal, Superiority
+Latent communication is most compelling when it removes a measurable decode–encode or re-prefill bottleneck
+under compatible models. Natural language remains preferable when interoperability, human review, or organisational boundaries dominate. Hybrid protocols are therefore a first-class design point rather than a temporary
+compromise.
+
+6. I MPLEMENTATION AND T RAINING R EGIMES
+A practical latent channel comprises four stages: extraction from the sender, optional alignment or compression,
+transport, and injection into the receiver. Training is only one design choice within this pipeline. Even a parameter-free
+method can require non-trivial model instrumentation, cache bookkeeping, positional correction, and memory transfer.
+6.1 An End-to-End Implementation Pipeline
+Extraction. The sender must expose a stable interface at the intended point of computation. Embedding methods
+operate near the vocabulary projection; activation methods register hooks on a residual-stream layer; and KV methods
+capture per-layer key/value tensors together with positions, attention masks, and cache-layout metadata. Reproducible
+implementations should state whether the payload is taken during prefill or decode, which token positions are retained,
+and whether sampling occurs before extraction.
+Alignment and compression. Same-checkpoint agents can often share tensors directly, but model variants may differ
+in hidden width, layer count, head grouping, rotary-position conventions, tokenizer, or fine-tuning-induced geometry.
+Alignment can therefore range from an identity map to layer selection, a linear projection, cross-attention, a universal
+codec, quantisation, or low-rank factorisation. Dimensional compatibility alone is insufficient: tensors with the same
+shape may still encode incompatible features.
+Transport. End-to-end latency depends on where the agents run. On one accelerator, latent transfer may be a view or
+device-to-device copy; across GPUs or edge nodes, serialisation and network time may dominate. Let S be payload size,
+B effective bandwidth, tsetup transfer setup, and tsaved avoided decode/prefill time. Transfer is beneficial only when
+S
+tsaved > tsetup + + talign + tinject .
+(3)
+B
+This break-even condition explains why the same protocol can accelerate long-context local inference yet regress on
+short prompts or slow networks.
+Injection and validation. The receiver may append embeddings, graft or combine hidden states, prepend KV entries,
+or restore cache blocks. Correctness requires attention-mask and position consistency, bounded tensor norms, and
+isolation between sessions. A robust implementation should support a text-only fallback and validate that malformed or
+missing latent state fails closed rather than silently contaminating later generations.
+12
+
+Latent Communication
+
+A P REPRINT
+
+Table 5: Training regime by method. (✓ = training-free; • = training required; † = boundary or adjacent work.)
+Method
+
+Training-Free?
+
+Notes
+
+—
+CIPHER, AC, SDE, KVComm, LatentMAS, ✓
+Q-KVComm, LRAgent, RelayCaching, Agent
+Memory, Agent Primitives, Edge LLM Handover, BIGMAS, ThoughtComm
+Interlat
+✓ for same-model; learned projection —
+otherwise
+Cache-to-Cache
+•
+Learned fuser
+Vision Wormhole
+•
+Label-free distillation
+Mixture of Thoughts
+•
+Router + interaction layers
+trained
+TokenDance† , AAFLOW+† , When Latent ✓
+Agents Lie†
+Latent Agents†
+•
+
+Runtime or security mechanisms
+Two-stage post-training
+and internalisation
+
+6.2 Training Regimes
+Table 5 groups the surveyed methods by their dominant inference-time regime.
+Training-free injection. Identity mappings, replacement, addition, and cache restoration minimise data and adaptation
+costs. They are attractive for same-model agents and rapidly changing backbones. Their weakness is sensitivity to layer
+choice, tensor scale, position semantics, and workload shift; parameter-free does not mean assumption-free.
+Lightweight alignment. Linear projections, gates, routers, or fusers add a small trainable interface while keeping
+the underlying LLMs frozen. This regime is appropriate when model families differ or when multiple senders must
+be aggregated. Its central evaluation question is generalisation: an adapter trained on one task, context length, or
+sender–receiver pair may not transfer to another.
+End-to-end training or distillation. Joint training can shape both the message and its interpretation, enabling
+heterogeneous codecs and internalised multi-agent behaviours. It has the highest data and compute cost and risks
+entangling the protocol with the training distribution. Internalised debate [Yi et al., 2026], for example, removes explicit
+inter-agent messages at deployment time and therefore belongs adjacent to, rather than inside, direct communication.
+6.3 Engineering Failure Modes
+Four failure modes recur across implementations:
+1. Positional mismatch: reused keys may encode positions that differ from the receiver’s sequence, especially under
+RoPE.
+2. Geometric mismatch: compatible tensor shapes can conceal incompatible activation distributions or fine-tuning
+shifts.
+3. Memory-bound transfer: a full cache can save FLOPs while increasing wall-clock latency because bytes, not
+arithmetic, dominate.
+4. State contamination: stale, cross-session, or adversarial tensors can affect future turns without a readable trace.
+Accordingly, papers should report model hashes, extraction layers and phases, tensor shapes and precision, cache
+positions, hardware topology, transfer bytes, and whether latency includes serialisation and synchronisation. These
+details determine whether a result is reproducible and whether it generalises beyond a single software stack.
+
+7. O PEN P ROBLEMS AND F UTURE D IRECTIONS
+Latent communication is a young field. We organise its open questions as a research agenda. For each direction, the
+key issue is not merely whether a technique is possible, but which hypothesis and evaluation protocol would establish
+progress.
+13
+
+Latent Communication
+
+A P REPRINT
+
+7.1 Cross-Architecture Alignment
+Most methods exploit shared or approximately shared representation geometry. Heterogeneous agents may differ
+in width, depth, tokenizer, attention type, and training history, so a translator that matches tensor dimensions need
+not preserve task-relevant information. The important research question is whether a reusable interface can scale
+sub-quadratically with the number of model families. Promising approaches include hub-and-spoke codecs, modelagnostic concept subspaces, and alignment through common multimodal interfaces. Evaluation should separate pair
+memorisation from transfer to unseen model pairs, tasks, and context lengths.
+7.2 Security and Robustness
+A latent channel is an opaque, high-privilege interface. Threats include in-transit modification, replay, cross-session
+cache confusion, malicious but correctly signed senders, and privacy leakage from activations. Recent evidence shows
+that text-only verification can miss tampered KV state and that transport integrity checks can reject recorded payload
+modifications [Brito and Baquero, 2026]. Integrity is necessary but not sufficient: a valid sender may still communicate
+harmful state. Future benchmarks should therefore distinguish transport integrity, semantic consistency between
+visible and latent messages, adversarial robustness, and information leakage. Hybrid protocols should bind a visible
+commitment, model identity, session, tensor metadata, and payload digest.
+7.3 Compression and Quantisation
+KV payloads scale with context length and layer count, turning a compute optimisation into a bandwidth and memory
+problem. Quantisation, token selection, layer selection, low-rank factorisation, and delta coding attack different
+sources of redundancy. The central metric should be task utility per transmitted byte, not reconstruction error alone: a
+numerically accurate cache may preserve irrelevant state, while a lossy summary may retain precisely the evidence
+needed by the receiver. Compression studies should report quality–bytes–latency Pareto curves and include the cost of
+compression and decompression.
+7.4 Theoretical Understanding
+The field is largely empirical. A useful theory must distinguish channel capacity from usable task information, and
+arithmetic savings from end-to-end latency. Equation (3) gives a systems-level condition; a complementary statistical
+account would characterise when a receiver can decode a sender representation under distribution or architecture shift.
+Lower bounds on sufficient message size, invariance under model transformations, and error propagation across multiple
+communication rounds would make claims of superiority more precise.
+7.5 Evaluation and Reproducibility
+Cross-paper comparison is currently confounded by different backbones, hardware, prompts, context lengths, numbers of
+agents, and latency boundaries. A standard benchmark should pair quality metrics with generated tokens, prefill/decode
+FLOPs, bytes transferred, peak memory, TTFT, inter-token latency, and end-to-end wall-clock time. It should include
+identical-model and heterogeneous-model tracks, short and long contexts, local and networked execution, and a text-only
+baseline matched for model calls and information access. Negative results and break-even points are as important as
+peak speedups.
+7.6 Latent Communication vs. Latent CoT
+Latent CoT carries state across reasoning steps within one agent; latent communication carries state across agent
+boundaries. Distillation methods further blur this distinction by internalising multi-agent interaction into one deployed
+model [Yi et al., 2026]. A unified account should therefore model both temporal flow (step to step) and organisational
+flow (agent to agent), while retaining the distinction between an inference-time communication protocol and a learned
+internal computation.
+7.7 Real-World Deployment
+Deployment conditions determine whether transfer beats recomputation. Edge devices emphasise memory, battery,
+intermittent links, and model heterogeneity; data centres emphasise topology-aware bandwidth, batching, isolation, and
+scheduler integration. Systems such as AAFLOW+ treat KV state as a distributed workflow object [Sarker et al., 2026],
+but reported gains depend on network and cost-model assumptions. Future work should measure energy and tail latency,
+14
+
+Latent Communication
+
+A P REPRINT
+
+Table 6: Boundary between latent communication and adjacent research areas.
+Area
+
+State flow
+
+Latent communication
+
+Agent → agent
+
+Primary objective
+
+Distinction from this survey
+
+Collaboration and/or avoided Explicit inference-time interface across
+recomputation
+agent boundaries.
+Latent CoT
+Step → step within one Internal reasoning
+No organisational sender–receiver
+model
+boundary.
+Internalised debate
+Multi-agent training → Distil interaction benefits
+Multi-agent structure may disappear at
+one model
+inference.
+MARL learned communi- Policy agent → policy Task reward and coordination Messages are learned jointly with polication
+agent
+cies, usually without pretrained LLM
+internals.
+Emergent language
+Agent → agent
+Protocol emergence
+Often discrete or symbolic; interpretability and compositionality are central.
+KV serving and reuse
+Request/workflow → Reduce memory and prefill Shared state need not encode a new seruntime
+cost
+mantic agent message.
+
+support state versioning and eviction, and evaluate failures under bandwidth variation rather than only steady-state
+throughput.
+
+8. R ELATED W ORK
+Latent communication sits between representation learning, multi-agent coordination, and inference systems. The
+closest areas often share tensors or terminology while optimising different objects. Table 6 makes these boundaries
+explicit.
+8.1 Latent Chain-of-Thought
+Latent CoT is the practice of reasoning in continuous latent space within a single LLM. Representative works include
+Coconut [Hao et al., 2024] and LatentSeek [Wang et al., 2025c]; community lists provide broader coverage [Awesome
+Latent Space Contributors, 2024, EIT-NLP Contributors, 2025]. Latent Agents [Yi et al., 2026] is a particularly
+informative boundary case: it distils multi-agent debate into agent-specific subspaces within one model, reducing
+explicit inference-time communication.
+The areas share machinery—hidden states, recurrent latent tokens, activation steering, and sometimes caches—but differ
+in where state crosses a boundary. This boundary determines security, interoperability, and deployment requirements:
+an intra-model recurrent state does not need a network format, whereas an inter-agent payload requires versioning,
+access control, and compatibility checks.
+8.2 Multi-Agent Reinforcement Learning (MARL)
+MARL has a long tradition of learned communication between agents [Foerster et al., 2016]. Methods such as
+CommNet, TarMAC, and IC3Net learn continuous message vectors that are exchanged between agents. The modern
+LLM-based latent communication methods surveyed in this paper can be seen as a white-box, inference-time counterpart
+to MARL’s learned communication. The Five Ws survey [Chen et al., 2026] is a recent effort to bridge the two. On the
+empirical side, toolkits such as RainbowArena [Liu et al., 2026a] provide standardised tabletop-game environments
+where both RL and LLM-based agents can be evaluated under controlled multi-agent conditions, offering a natural
+experimental bridge between the MARL and LLM-MAS communities.
+8.3 Emergent Language
+Emergent language studies protocols that arise when agents are trained to communicate [Lazaridou and Baroni, 2017].
+Messages may be discrete symbols or continuous vectors, but they are typically learned jointly with relatively small
+policies and evaluated for task success, compositionality, or human interpretability. LLM latent communication instead
+starts from large pretrained representations and asks how to expose, align, and reuse them without destroying their
+existing capabilities.
+15
+
+Latent Communication
+
+A P REPRINT
+
+8.4 KV-Cache Compression and Sharing
+A large body of work optimises the KV-cache for single-model inference, including eviction and compression approaches
+such as H2O [Zhang et al., 2023]. Multi-agent methods extend the problem from one sequence to multiple roles, models,
+or workflow stages. TokenDance [Bian et al., 2026] performs round-level collective reuse and stores sibling caches as
+sparse differences under an All-Gather pattern; AAFLOW+ [Sarker et al., 2026] exposes distributed operators for KV
+materialisation, transfer, fork, composition, and eviction. These systems can complement semantic latent messaging,
+but avoiding repeated prefill is not by itself evidence that agents have developed a more expressive communication
+protocol.
+
+9. L IMITATIONS OF T HIS S URVEY
+This survey has four limitations. First, the field evolves faster than conventional publication cycles; despite the stated
+cut-off, some included results remain preprints and may change. Second, terminology is unstable, so keyword search
+may miss work framed as model composition, cache reuse, activation grafting, or distributed inference. Third, the
+corpus is small and heterogeneous. Counts within the taxonomy should therefore be interpreted as a map of the current
+literature, not as statistical evidence of community consensus. Fourth, reported accuracy and speedups are not directly
+comparable across papers. We preserve authors’ within-paper results but avoid constructing a numerical leaderboard
+without matched models, prompts, hardware, context lengths, and latency boundaries.
+The framework itself is descriptive rather than exhaustive. WHAT / WHICH / HOW captures message representation,
+alignment, and fusion, but it does not fully encode who communicates with whom, when communication occurs, or why
+a message is sent. These dimensions are complementary to broader communication taxonomies [Chen et al., 2026] and
+should be incorporated when analysing topology, scheduling, and incentives.
+
+10. C ONCLUSION
+We have presented a scoped review and unified framework for latent communication in LLM-based multi-agent systems.
+The framework organises eighteen representative works along WHAT is transferred, WHICH spaces and layers are
+aligned, and HOW the received state is fused. This decomposition makes visible the coupled trade-offs among task
+information, payload size, architectural dependence, training, and auditability.
+The evidence does not support a universal claim that latent channels dominate text. Their strongest case is conditional:
+compatible agents, sufficiently expensive decode or prefill, and a deployment path in which transfer and alignment cost
+less than the computation they replace. Text remains valuable for interoperability and oversight, while hybrid protocols
+offer a promising route across trust boundaries. Progress now depends less on another isolated peak speedup than on
+matched evaluation, secure interfaces, heterogeneous transfer, and reproducible break-even analysis.
+Reproducibility. The
+companion
+repository
+at
+https://github.com/enochliu98/
+Awesome-Latent-Communication maintains the paper list, code links, taxonomy artefacts, and figure-generation
+notes. The review cut-off is 15 July 2026; post-cut-off additions should be reported separately from the corpus analysed
+here.
+
+16
+
+Latent Communication
+
+A P REPRINT
+
+A. M ETHOD A NALYSIS UNDER THE F RAMEWORK
+This section provides a one-paragraph analysis for each of the eighteen methods, structured as: (a) core idea, (b)
+framework placement (WHAT / WHICH / HOW), (c) strengths, (d) limitations, and (e) reported results and code.
+Methods are grouped by the WHAT axis for narrative flow.
+A.1 Embedding-Based Methods
+CIPHER [Liu et al., 2024]
+Core idea. CIPHER is an early method for communicating embeddings rather than sampled tokens. The sender’s
+output logits over the vocabulary are converted to weights, and a weighted sum of embedding-table entries yields a
+soft embedding. The receiver concatenates this representation to its prompt at each decode step.
+Framework. WHAT = weighted Embedding. WHICH = last layer of sender → first layer of receiver. HOW =
+Concatenation.
+Strengths. Training-free. Backbone-light (only the embedding table must be shared, not the rest of the model).
+Robust to model mismatches.
+Limitations. Embeddings carry the least information of the three options. Performance gains are modest compared
+to KV-cache methods.
+Results & code. Improves over token-level multi-agent debate on several reasoning and QA benchmarks. ICLR
+2024. Code.
+A.2 Hidden-State-Based Methods
+AC — Communicating Activations [Ramesh and Li, 2025]
+Core idea. AC has the sender transmit the hidden state of the last token at a selected layer (typically a middle layer
+such as 16 in a 32-layer model). The receiver combines this hidden state with its own last-token hidden state via a
+simple mathematical operation (e.g., addition).
+Framework. WHAT = Hidden State (last token, selected layer). WHICH = same layer in sender and receiver.
+HOW = Mathematical operation.
+Strengths. Training-free. Encodes intermediate reasoning. Approximately 27% accuracy improvement over
+natural language communication on a representative benchmark suite.
+Limitations. Hidden state is not as informative as KV-cache. The choice of which layer to transmit requires
+heuristic tuning.
+Results & code. Up to +27% on math/reasoning benchmarks over NL-Comm. ICML 2025.
+Interlat [Du et al., 2026]
+Core idea. Interlat transmits the last-layer, last-token hidden state from sender to receiver and concatenates it with
+the receiver’s prompt embeddings. The receiver then proceeds with normal prefill. The authors introduce a small
+learned projection to align the sender’s and receiver’s last-layer spaces when the agents are different fine-tunes of
+the same backbone.
+Framework. WHAT = Hidden State. WHICH = last layer of sender → first layer of receiver, with optional learned
+projection. HOW = Concatenation.
+Strengths. Simple, training-free for same-model agents. Up to 24× speedup over NL-Comm on long-context
+multi-agent tasks.
+Limitations. Last-layer / last-token state is less informative than the full cache. Performance depends on alignment
+quality.
+Results & code. Up to 24× latency reduction on long-context tasks; competitive accuracy with NL-Comm. ACL
+2026. Code.
+SDE — State Delta Trajectory [Yang et al., 2025]
+Core idea. SDE transmits not the hidden state itself, but the change in hidden state at each layer (the “state
+delta”) during a reasoning step. The deltas form a trajectory in latent space that, in the receiver, is added to the
+corresponding layer/token of the receiver’s hidden state.
+Framework. WHAT = State-delta trajectory (a non-standard continuous quantity). WHICH = all layers. HOW =
+
+17
+
+Latent Communication
+
+A P REPRINT
+
+Mathematical operation (addition).
+Strengths. Designed to be more robust to small architectural mismatches than raw hidden states; reports strong
+results on several complex reasoning benchmarks.
+Limitations. The state-delta representation is unconventional and has not been widely adopted.
+Results & code. The paper reports improvements over its selected NL-Comm baselines. Code.
+ThoughtComm [Li et al., 2025]
+Core idea. ThoughtComm treats each agent’s thought (intermediate hidden state) as a first-class message. The
+sender exposes its current hidden state; the receiver combines it with its own current hidden state through a
+learnable gating mechanism.
+Framework. WHAT = Hidden State. WHICH = corresponding layer. HOW = Math operation (gated combination).
+Strengths. Naturally aligned with the agent’s internal monologue. Works across homogeneous backbones.
+Limitations. No public code at the time of writing.
+Mixture of Thoughts (MoT) [Fein-Ashley et al., 2025]
+Core idea. MoT is a heterogeneous latent communication method. A router selects a top-K set of frozen LLM
+experts per query, and a primary expert performs cross-attention over projected peer hidden states. Uniformly
+placed interaction layers map each expert to a shared space, avoiding a separate translator for every ordered model
+pair.
+Framework. WHAT = Hidden State (projected). WHICH = learned interaction layers. HOW = Cross-attention.
+Strengths. Supports heterogeneous experts and single-pass aggregation. The paper reports improvements over its
+comparison method on both in-distribution and out-of-distribution benchmarks.
+Limitations. Requires training the router and interaction layers.
+Results & code. The paper reports average gains of 0.38% on five in-distribution benchmarks and 2.92% on three
+out-of-distribution benchmarks over Avengers. Code.
+A.3 KV-Cache-Based Methods
+KVComm [Wang et al., 2025a]
+Core idea. KVComm transmits a selected subset of the sender’s KV-cache (a few selected layers) to the receiver.
+Within the same layer index, the sender’s KV is prepended to the receiver’s KV. A Gaussian-prior-based selection
+mechanism picks the most informative layers.
+Framework. WHAT = KV-Cache (selected layers). WHICH = selected → corresponding. HOW = Prepend.
+Strengths. Training-free. Reduces transmission cost relative to full-cache methods. Achieves strong latency
+improvements.
+Limitations. Performance depends on the layer-selection heuristic.
+Results & code. Strong latency reduction on multi-agent QA pipelines. ICLR 2026.
+Cache-to-Cache (C2C) [Liu et al., 2025b]
+Core idea. Cache-to-Cache transmits the entire KV-cache from sender to receiver. All sender layers feed the
+corresponding receiver layers, and a small learned fuser blends the two caches.
+Framework. WHAT = KV-Cache (all layers). WHICH = all → corresponding. HOW = Mathematical operation
+(learned fuser).
+Strengths. Maximally informative. Strong empirical results on multi-agent reasoning.
+Limitations. Highest transport cost among the surveyed methods. Fuser must be trained.
+Results & code. Significant accuracy gains on multi-agent benchmarks. Code.
+LatentMAS [Wang et al., 2025b]
+Core idea. LatentMAS extends Cache-to-Cache by interleaving prefill and decode: the sender’s KV-cache
+is exposed both during its prefill phase and accumulated during its decode phase. The receiver gets the full
+prefill+decode KV-cache, prepended at every layer.
+Framework. WHAT = KV-Cache (prefill + decode). WHICH = all → corresponding. HOW = Prepend.
+Strengths. Maximally informative. Training-free. Strong results on collaborative reasoning.
+
+18
+
+Latent Communication
+
+A P REPRINT
+
+Limitations. Largest transport cost.
+Results & code. The paper reports strong results on its collaborative reasoning benchmarks. Code.
+Q-KVComm [Park et al., 2025]
+Core idea. Q-KVComm compresses the sender’s KV-cache using an adaptive quantisation scheme that achieves
+5–6× compression while preserving semantic fidelity. The compressed cache is then transmitted to the receiver
+and prepended at the corresponding layers.
+Framework. WHAT = KV-Cache (compressed). WHICH = all → corresponding. HOW = Prepend.
+Strengths. Lowers transport cost by 5–6×. Compatible with existing KV-cache infrastructure.
+Limitations. Quantisation introduces small semantic drift.
+Results & code. 5–6× compression with negligible accuracy loss.
+LRAgent — Multi-LoRA KV Sharing [Jeon et al., 2026]
+Core idea. LRAgent addresses the multi-LoRA setting: when several agents share the same backbone but use
+different LoRA adapters, the base component of the KV-cache is identical across agents, while the adapter
+component is small and low-rank. LRAgent shares the base component and stores the adapter component in
+low-rank form. A custom Flash-LoRA-Attention kernel reconstructs adapter contributions without materialising
+the full cache.
+Framework. WHAT = KV-Cache (base + low-rank adapter). WHICH = same backbone. HOW = Additive fusion
+inside fused kernel.
+Strengths. Drastically reduces memory for multi-LoRA agents. Training-free at inference. Approximates fullyshared caching throughput.
+Limitations. Specific to multi-LoRA setting.
+Results & code. Memory overhead close to fully-shared caching; accuracy close to non-shared baseline. ICML
+2026.
+RelayCaching [Geng et al., 2026]
+Core idea. RelayCaching observes that when an agent’s decoded output becomes part of a downstream agent’s
+prompt, the decoding-phase KV-cache of the upstream agent is highly consistent with the prefill-phase KV-cache
+that the downstream agent would have computed. RelayCaching directly transplants the upstream decoding cache
+into the downstream prefill, with sparse selective recomputation at the few affected layers/positions.
+Framework. WHAT = KV-Cache (decoding-phase). WHICH = same model. HOW = Cache restoration + sparse
+recomputation.
+Strengths. Training-free. >80% cache reuse. Up to 4.7× TTFT reduction.
+Limitations. Same-model assumption; deviations at the boundary require recomputation.
+Results & code. 80%+ cache reuse, 4.7× TTFT speedup on math, code, and general knowledge tasks.
+Agent Memory [Shkolnikov, 2026]
+Core idea. Agent Memory targets edge devices with limited RAM. Each agent’s KV-cache is persisted to disk in
+4-bit quantised form (safetensors) and reloaded into attention layers on demand, eliminating the ∼15.7 s/agent
+re-prefill cost at 4K context.
+Framework. WHAT = KV-Cache (Q4 quantised, disk-persistent). WHICH = same agent across phases. HOW =
+Cache restoration + cross-phase context injection.
+Strengths. Frees up RAM; enables multi-agent inference on edge. Up to 136× TTFT speedup.
+Limitations. Quantisation introduces perplexity drift (Llama +2.8%, DeepSeek +3.0%, Gemma −0.7%).
+Results & code. TTFT speedups: Gemma 3 12B 22×–136×; DeepSeek-Coder-V2-Lite 16B 11×–76×; Llama
+3.1 8B 24×–111×. Code.
+Agent Primitives [Jin et al., 2026]
+Core idea. Agent Primitives decomposes a multi-agent system into a small library of reusable latent primitives
+(e.g., Review; Voting and Selection; Planning and Execution). Intra-primitive messaging uses shared KV-cache
+rather than natural language. An organiser agent composes primitives per query, and a knowledge pool stores
+previously successful configurations.
+Framework. WHAT = KV-Cache (inter-primitive). WHICH = same backbone within primitive. HOW = Primitive
+
+19
+
+Latent Communication
+
+A P REPRINT
+
+chaining.
+Strengths. Modular; reuses successful configurations. +12.0–16.5% average accuracy over single-agent baselines.
+3–4× lower token usage and latency than text-based MAS. Only 1.3–1.6× overhead vs. single-agent inference.
+Limitations. Specific to MAS architectures built around the proposed primitives.
+Edge LLM Handover [Lee et al., 2026]
+Core idea. Edge LLM Handover addresses the mobility setting: when a user equipment (UE) hands over between
+edge base stations during an LLM session, the system jointly optimises how much context to re-prefill from raw
+tokens vs. how much KV-cache to transfer over the backhaul, minimising worst-case handover delay.
+Framework. WHAT = KV-Cache (transferred over backhaul). WHICH = same edge LLM. HOW = Hybrid:
+partial re-prefill + partial KV transfer.
+Strengths. Tractable, step-wise solution; constructive multi-UE rate-scheduling policy. Outperforms baselines
+across a wide range of backhaul capacities, prefill speeds, and context sizes.
+Limitations. Simulation-only evaluation.
+
+A.4 Hybrid / Heterogeneous Methods
+Vision Wormhole [Liu et al., 2026b]
+Core idea. Vision Wormhole reconceptualises the visual interface of a VLM as a continuous communication channel.
+A sender’s reasoning trace is encoded into a shared continuous reference space (the Universal Visual Codec, UVC)
+and injected into the receiver’s visual pathway, bypassing tokenisation. The hub-and-spoke topology reduces the
+alignment cost from O(N 2 ) pairwise translators to O(N ) encoders/decoders, enabling cross-architecture latent
+transfer across disjoint model manifolds.
+Framework. WHAT = Hidden State (in UVC). WHICH = hub-and-spoke via UVC. HOW = Visual injection.
+Strengths. First method to support fully heterogeneous cross-architecture latent communication. Tested on
+Qwen-VL, Gemma, SmolVLM2, LFM2.5-VL across nine reasoning benchmarks.
+Limitations. Requires label-free distillation training. Code in progress.
+Results & code. Reduces end-to-end wall-clock time in most settings; positive macro-average ∆-accuracy.
+BIGMAS — Brain-Inspired Graph MAS [Hao et al., 2026]
+Core idea. BIGMAS organises specialised LLM agents as nodes in a dynamically constructed directed graph. A
+GraphDesigner builds the topology per problem, and an Orchestrator mediates access to a centralised shared
+workspace. The architecture is inspired by the global workspace theory of human cognition.
+Framework. WHAT = Shared workspace contents (hybrid latent/text). WHICH = common message-space
+contract. HOW = Global workspace fusion.
+Strengths. Topology adapts to the problem. Centralised workspace avoids the local-view bottleneck of pairwise
+communication.
+Limitations. Specific to graph-structured MAS. The exact storage format of the workspace contents is not explicitly
+specified.
+Results & code. Outperforms ReAct and Tree of Thoughts on Game24, Six Fives, and Tower of London with six
+frontier LLMs (standard + LRMs). Gains are orthogonal to model-level reasoning improvements.
+
+A.5 Survey and Aggregation Works
+The Five Ws of Multi-Agent Communication [Chen et al., 2026]
+Core idea. The Five Ws Survey unifies MARL, Emergent Language (EL), and LLM-based multi-agent communication under a single “Five Ws” (Who, Whom, When, What, Why) taxonomy. It surveys hand-designed protocols,
+end-to-end learned communication, emergent symbolic communication, and natural-language priors.
+Value for this paper. A meta-survey that contextualises our framework. The WHAT axis in the Five Ws survey
+corresponds to our WHAT axis; the WHEN and WHY axes are unique to that framework, providing the broader
+communication theory context in which our framework sits. TMLR 2026.
+
+20
+
+Latent Communication
+
+A P REPRINT
+
+Table 7: Trade-off profile of representative methods across four design dimensions. Symbols: ⋆⋆⋆ = excellent, ⋆⋆ =
+good, ⋆ = fair.
+Method
+
+Accuracy
+Gain
+
+Latency
+Reduction
+
+Generality
+(heterog.)
+
+Engineering
+Complexity
+
+Training-Free
+
+⋆⋆
+⋆⋆
+⋆⋆
+⋆⋆⋆
+⋆⋆
+⋆⋆⋆
+⋆⋆⋆
+⋆⋆
+⋆⋆
+⋆⋆
+⋆⋆
+⋆⋆⋆
+
+⋆⋆
+⋆⋆
+⋆⋆⋆
+⋆⋆
+⋆⋆
+⋆⋆⋆
+⋆⋆
+⋆⋆⋆
+⋆⋆⋆
+⋆⋆⋆
+⋆⋆
+⋆⋆
+
+⋆
+⋆
+⋆
+⋆⋆
+⋆
+⋆
+⋆
+⋆
+⋆
+⋆
+⋆⋆⋆
+⋆⋆⋆
+
+⋆
+⋆
+⋆⋆
+⋆⋆
+⋆⋆
+⋆⋆⋆
+⋆⋆
+⋆⋆
+⋆
+⋆⋆
+⋆⋆⋆
+⋆⋆⋆
+
+Yes
+Yes
+Mostly
+Yes
+Yes
+No
+Yes
+Yes
+Yes
+Yes
+No
+No
+
+CIPHER
+AC
+Interlat
+SDE
+KVComm
+Cache-to-Cache
+LatentMAS
+LRAgent
+RelayCaching
+Agent Memory
+Vision Wormhole
+MoT
+
+B. B ENCHMARK A NALYSIS AND E MPIRICAL I NSIGHTS
+This section synthesises reported results from the 18 methods. Direct cross-method comparison is challenging because
+the methods use different backbones, benchmarks, and reporting conventions; we therefore focus on trends and
+order-of-magnitude effects rather than head-to-head numbers.
+B.1 Benchmark Suites
+Methods are typically evaluated on a mix of:
+• Math reasoning: GSM8K, MATH, AIME.
+• General knowledge: MMLU, ARC.
+• Code generation: HumanEval, MBPP, LiveCodeBench.
+• Multi-modal reasoning: MathVista, MMMU, ChartQA.
+• Agentic QA: HotpotQA, 2WikiMultiHopQA, MuSiQue.
+• Game-like reasoning: Game24, Six Fives, Tower of London.
+• Competitive tabletop games: Mahjong, Uno, Honor of Kings — increasingly used as testbeds for evaluating
+inter-agent coordination under partial observability, for which dedicated toolkits such as RainbowArena [Liu et al.,
+2026a] provide standardised APIs, opponent pools, and replay infrastructure.
+B.2 Reported Quantitative Trends
+• Latency reduction. Several papers report 2–24× reductions relative to their chosen NL-Comm baselines; Interlat
+reports gains up to 24× after latent compression. These values are not directly comparable because latency boundaries
+and hardware differ.
+• TTFT speedups. KV-cache-based methods (RelayCaching, Agent Memory) report TTFT speedups of 4.7×–136×
+relative to full re-prefill.
+• Token savings. Latent methods typically reduce tokens generated by 3–4× (Agent Primitives reports 3–4× lower
+token usage vs. text-based MAS).
+• Task quality. Many papers report accuracy competitive with or better than their matched NL-Comm baselines. This
+pattern is encouraging but vulnerable to publication bias and baseline mismatch; it should not be read as a universal
+dominance claim.
+A schematic comparison of representative methods on the trade-off dimensions (accuracy, latency, generality, engineering complexity) is given in Table 7.
+21
+
+Latent Communication
+
+A P REPRINT
+
+B.3 Insights
+Three empirical patterns stand out:
+1. Long context benefits most. The latency advantage of latent communication grows with context length, because the
+receiver avoids re-encoding a long prompt.
+2. Same-model agents dominate. Most methods assume sender and receiver share the same backbone; crossarchitecture methods (Vision Wormhole, MoT) are still rare and require training.
+3. KV-cache is the emerging default. Of the 18 methods, 9 use KV-caches as the communicated quantity, and the
+share is growing.
+
+C. M ETHOD Q UICK -R EFERENCE TABLE
+Table 8: Quick-reference for the 18 primary methods and four boundary or adjacent works. WHAT / WHICH / HOW
+refer to the three axes of the unified framework (Section 5); † marks works outside the primary corpus.
+Method
+
+WHAT
+
+CIPHER [Liu et al., 2024]
+Weighted Embedding
+AC [Ramesh and Li, 2025]
+Hidden State (sel. layer, last tok.)
+Interlat [Du et al., 2026]
+Hidden State (last layer, last tok.)
+SDE [Yang et al., 2025]
+State-delta trajectory
+ThoughtComm [Li et al., 2025]
+Hidden State
+MoT [Fein-Ashley et al., 2025]
+Hidden State (proj.)
+KVComm [Wang et al., 2025a]
+KV-Cache (sel.)
+Cache-to-Cache [Liu et al., KV-Cache (all)
+2025b]
+LatentMAS [Wang et al., 2025b] KV-Cache (prefill+decode)
+Q-KVComm [Park et al., 2025] KV-Cache (compressed)
+LRAgent [Jeon et al., 2026]
+KV-Cache (base+low-rank)
+RelayCaching [Geng et al., 2026] KV-Cache (decoding)
+Agent Memory [Shkolnikov, KV-Cache (Q4, disk)
+2026]
+Agent Primitives [Jin et al., 2026] KV-Cache (inter-prim.)
+Edge LLM Handover [Lee et al., KV-Cache (backhaul)
+2026]
+Vision Wormhole [Liu et al., Hidden State (UVC)
+2026b]
+BIGMAS [Hao et al., 2026]
+Workspace state
+Five Ws Survey [Chen et al., All (taxonomy)
+2026]
+TokenDance† [Bian et al., 2026] KV-Cache (shared/diff)
+AAFLOW+† [Sarker et al., 2026] KV-Cache (distributed)
+When Latent Agents Lie† [Brito Full KV + visible text
+and Baquero, 2026]
+Latent Agents† [Yi et al., 2026] Activation subspaces
+
+WHICH
+
+HOW
+
+Train?
+
+Last→First
+Sel.→Sel.
+Last→First (+proj.)
+All→Corr.
+Corresponding
+Learned interaction
+Sel.→Sel.
+All→Corr.
+
+Concat
+Math
+Concat
+Math (add)
+Math (gate)
+Cross-attn
+Prepend
+Math (fuser)
+
+✓
+✓
+mostly
+✓
+✓
+•
+✓
+•
+
+All→Corr.
+All→Corr.
+Same backbone
+Same model
+Same agent
+
+Prepend
+Prepend
+Add (kernel)
+Restoration
+Restoration
+
+✓
+✓
+✓
+✓
+✓
+
+Same backbone
+Same edge LLM
+
+Chaining
+Hybrid
+
+✓
+✓
+
+Hub-and-spoke
+
+Visual inj.
+
+•
+
+Common contract
+N/A
+
+Global workspace
+N/A
+
+✓
+N/A
+
+Same checkpoint
+Same checkpoint
+Same model
+
+Collective reuse
+Orchestration
+Injection + integrity
+
+✓
+✓
+✓
+
+Intra-model
+
+Internalisation
+
+•
+
+R EFERENCES
+Qingyun Wu, Gagan Bansal, Jieyu Zhang, Yiran Wu, Beibin Li, Erkang Zhu, Li Jiang, Shaokun Zhang, Sashank Khosla,
+et al. Autogen: Enabling next-gen llm applications via multi-agent conversation. arXiv preprint arXiv:2308.08155,
+2023.
+Sirui Hong, Mingchen Zhuge, Jonathan Chen, Xiawu Zheng, Yuheng Cheng, Ceyao Zhang, Jinlin Wang, Zili Wang,
+Steven Ka Shing Yau, et al. Metagpt: Meta programming for a multi-agent collaborative framework. arXiv preprint
+arXiv:2308.00352, 2023.
+Guohua Li, Hasan Abed Al Kader Hammoud, Hani Itani, Dmitrii Khizbullin, and Bernard Ghanem. Camel: Communicative agents for “mind” exploration of llm society. arXiv preprint arXiv:2303.17760, 2023.
+Yingzhuo Liu, Shuodi Liu, Hongsong Tang, Yubing Ma, Zikang Li, Junge Zhang, Liuyu Xiang, and Zhaofeng He.
+Rainbowarena: A multi-agent toolkit for reinforcement learning and large language models in tabletop games.
+Knowledge-Based Systems, 333:115046, 2026a. doi:10.1016/j.knosys.2025.115046.
+Shuodi Liu, Yingzhuo Liu, Zi Wang, Yusheng Wang, Huijia Wu, Liuyu Xiang, and Zhaofeng He. Select-thendecompose: From empirical analysis to adaptive selection strategy for task decomposition in large language models.
+22
+
+Latent Communication
+
+A P REPRINT
+
+In Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing (EMNLP), pages
+5454–5477, 2025a. doi:10.18653/v1/2025.emnlp-main.278.
+Zhuohang Bian, Feiyang Wu, Chengrui Zhang, Hangcheng Dong, Yun Liang, and Youwei Zhuo. Tokendance:
+Scaling multi-agent llm serving via collective kv cache sharing. arXiv preprint arXiv:2604.03143, 2026. URL
+https://arxiv.org/abs/2604.03143.
+Arup Kumar Sarker, Alexander James Halpern, Mills Staylor, Aymen Alsaadi, Gregor von Laszewski, Yue Cheng,
+Shantenu Jha, and Geoffrey Fox. AAFLOW+: Stateful operator abstraction with zero-copy distributed kv cache
+orchestration for multi-agent workflows. arXiv preprint arXiv:2607.10987, 2026. URL https://arxiv.org/abs/
+2607.10987.
+John Seon Keun Yi, Aaron Mueller, and Dokyun Lee. Latent agents: A post-training procedure for internalized multiagent debate. In Proceedings of the 64th Annual Meeting of the Association for Computational Linguistics (Volume
+1: Long Papers), pages 15569–15602, 2026. doi:10.18653/v1/2026.acl-long.709. URL https://aclanthology.
+org/2026.acl-long.709/.
+Chunpu Liu, Xiangshen Dou, Long Wu, Hongbin Zhang, Yan Zhao, Yirong Li, Baochang Li, Shuo Wang, Derek F.
+Wong, et al. Let models speak ciphers: Multiagent debate through embeddings. In International Conference on
+Learning Representations (ICLR), 2024. URL https://arxiv.org/abs/2310.06272.
+Vignav Ramesh and Kenneth Li. Communicating activations between language model agents. In International
+Conference on Machine Learning (ICML), 2025. URL https://arxiv.org/abs/2501.14082.
+Zhuoyun Du, Runze Wang, Huiyu Bai, Zouying Cao, Xiaoyong Zhu, Yu Cheng, Bo Zheng, Wei Chen, and Haochao Ying.
+Enabling agents to communicate entirely in latent space. In Proceedings of the 64th Annual Meeting of the Association
+for Computational Linguistics (Volume 1: Long Papers), pages 27106–27129, 2026. doi:10.18653/v1/2026.acllong.1248. URL https://aclanthology.org/2026.acl-long.1248/.
+Runlin Yang, Jucheng Cao, Zhe Zhang, et al. Augmenting multi-agent communication with state delta trajectory. arXiv
+preprint arXiv:2506.19209, 2025.
+Ming Li et al. Thought communication in multiagent collaboration. arXiv preprint arXiv:2510.20733, 2025.
+Jacob Fein-Ashley, Dhruv Parikh, Rajgopal Kannan, and Viktor Prasanna. Mixture of thoughts: Learning to aggregate
+what experts think, not just what they say. arXiv preprint arXiv:2509.21164, 2025.
+Yifan Wang et al. Kvcomm: Enabling efficient llm communication through selective kv sharing. arXiv preprint
+arXiv:2510.03346, 2025a. Accepted at ICLR 2026.
+Jiaming Liu et al. Cache-to-cache: Direct semantic communication between large language models. arXiv preprint
+arXiv:2510.03215, 2025b.
+Zhenyu Wang et al. Latent collaboration in multi-agent systems. arXiv preprint arXiv:2511.20639, 2025b.
+Kwangyoun Park et al. Q-kvcomm: Efficient multi-agent communication via adaptive kv cache compression. arXiv
+preprint arXiv:2512.17914, 2025.
+Hyesung Jeon, Hyeongju Ha, and Jae-Joon Kim. Lragent: Efficient kv cache sharing for multi-lora llm agents. arXiv
+preprint arXiv:2602.01053, 2026. ICML 2026.
+Yingsheng Geng, Yuchong Gao, Weihong Wu, Guyue Liu, and Jiang Liu. Relaycaching: Accelerating llm collaboration
+via decoding kv cache reuse. arXiv preprint arXiv:2603.13289, 2026.
+Yakov Pyotr Shkolnikov. Agent memory below the prompt: Persistent q4 kv cache for multi-agent llm inference on
+edge devices. arXiv preprint arXiv:2603.04428, 2026.
+Haibo Jin, Peng Kuang, Ye Yu, Xiaopeng Yuan, and Haohan Wang. Agent primitives: Reusable latent building blocks
+for multi-agent systems. arXiv preprint arXiv:2602.03695, 2026.
+Seunghun Lee, Jihong Park, Ce Zheng, and Hyuncheol Park. Low-latency edge llm handover via joint kv cache transfer
+and token prefill. arXiv preprint arXiv:2603.28018, 2026.
+Xiaoze Liu, Ruowang Zhang, Weichen Yu, Siheng Xiong, Liu He, Feijie Wu, Hoin Jung, Matt Fredrikson, Xiaoqian
+Wang, and Jing Gao. The vision wormhole: Latent-space communication in heterogeneous multi-agent systems.
+arXiv preprint arXiv:2602.15382, 2026b.
+Guangfu Hao, Yuming Dai, Xianzhe Qin, and Shan Yu. Brain-inspired graph multi-agent systems for llm reasoning.
+arXiv preprint arXiv:2603.15371, 2026.
+Jingdi Chen, Hanqing Yang, Zongjun Liu, and Carlee Joe-Wong. The five ws of multi-agent communication: Who
+talks to whom, when, what, and why — a survey from marl to emergent language and llms. arXiv preprint
+arXiv:2602.11583, 2026. Accepted at TMLR 2026.
+23
+
+Latent Communication
+
+A P REPRINT
+
+Luís Brito and Carlos Baquero. When latent agents lie: Kv-cache integrity in multi-agent llm collaboration. arXiv
+preprint arXiv:2606.28958, 2026. URL https://arxiv.org/abs/2606.28958.
+Shibo Hao, Sainbayar Sukhbaatar, DiJia Su, Xian Li, Zhiting Hu, Jason Weston, and Yuandong Tian. Reasoning in
+latent space: An unconstrained chain-of-thought. arXiv preprint arXiv:2412.06769, 2024.
+Tian Wang et al. Seek in the dark: Reasoning via test-time instance-level policy gradient in latent space. arXiv preprint
+arXiv:2505.13308, 2025c.
+Awesome Latent Space Contributors.
+Awesome latent space.
+https://github.com/YU-deep/
+Awesome-Latent-Space, 2024.
+EIT-NLP Contributors. Awesome latent cot. https://github.com/EIT-NLP/Awesome-Latent-CoT, 2025.
+Jakob Foerster, Yannis M. Assael, Nando de Freitas, and Shimon Whiteson. Learning to communicate with deep
+multi-agent reinforcement learning. In Advances in Neural Information Processing Systems (NeurIPS), 2016.
+Angeliki Lazaridou and Marco Baroni. Emergent multi-agent communication in deep reinforcement learning. arXiv
+preprint arXiv:1706.02295, 2017.
+Zhenyu Zhang, Ying Yang, Zhe Yao, Yicheng Yan, Joseph E. Gonzalez, and Michael W. Mahoney. H2o: Heavy-hitter
+oracle for efficient generative inference of large language models. In Advances in Neural Information Processing
+Systems (NeurIPS), 2023.
+
+24
+
