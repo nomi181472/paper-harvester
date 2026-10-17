@@ -1,0 +1,720 @@
+1
+
+Large-Scale Application of Fault Injection into
+PyTorch Models - an Extension to PyTorchFI for
+Validation Efficiency
+
+arXiv:2310.19449v1 [cs.AI] 30 Oct 2023
+
+Ralf Gräfe∗ , Qutub Syed Sha∗† , Florian Geissler∗ , Michael Paulitsch (Senior Member, IEEE)∗
+∗ Intel Labs, Germany
+† Technical University of Munich, Germany
+
+Abstract—Transient or permanent faults in hardware can
+render the output of Neural Networks (NN) incorrect without
+user-specific traces of the error, i.e. silent data errors (SDE). On
+the other hand, modern NNs also possess an inherent redundancy
+that can tolerate specific faults. To establish a safety case, it is
+necessary to distinguish and quantify both types of corruptions.
+To study the effects of hardware (HW) faults on software (SW)
+in general and NN models in particular, several fault injection
+(FI) methods have been established in recent years. Current FI
+methods focus on the methodology of injecting faults but often
+fall short of accounting for large-scale FI tests, where many
+fault locations based on a particular fault model need to be
+analyzed in a short time. Results need to be concise, repeatable,
+and comparable.
+To address these requirements and enable fault injection
+as the default component in a machine learning development
+cycle, we introduce a novel fault injection framework called
+PyTorchALFI (Application Level Fault Injection for PyTorch)
+based on PyTorchFI. PyTorchALFI provides an efficient way to
+define randomly generated and reusable sets of faults to inject
+into PyTorch models, defines complex test scenarios, enhances
+data sets, and generates test KPIs while tightly coupling faultfree, faulty, and modified NN. In this paper, we provide details
+about the definition of test scenarios, software architecture, and
+several examples of how to use the new framework to apply
+iterative changes in fault location and number, compare different
+model modifications, and analyze test results.
+Index Terms—Machine Learning, Neural Networks, fault injection, PyTorch, PyTorchfi, silent data error
+
+I. I NTRODUCTION
+Ongoing shrinkage of transistor sizes in computer silicon
+and accompanying lower operating voltage leads to increased
+HW faults like bit flips during operation. This has high relevance in safety-critical applications like autonomous driving.
+The research by [1] comprehensively reviews probable
+soft errors that may arise in deep neural network (DNN)
+accelerators. The study specifically highlights transient faults
+that occur in the form of bit flips, which are a crucial concern
+for the model’s reliability and resilience. [2] and [3] show
+evidence that single transient bit-flips can lead to perturbations
+of DNN at the application level. [4] gives an overview of the
+types of hardware faults relevant to the execution of CNNs.
+Recent studies by [5] and [6] offer additional insights into
+the susceptibility of object detection and image classification
+models to hardware faults. These studies underscore the importance of detecting and mitigating faults in DNNs to maintain
+model accuracy and reliability.
+
+Determining the effect of HW faults on DNN is not straightforward because they have an unspecific redundancy and
+robustness against single faults in the computed path. However,
+a certain percentage of faults do cause output corruption in
+the DNN. In the following we refer to this effect as Silent
+Data Error (SDE). It is, therefore, important to analyze the
+sensitivity of the DNNs to the typical forms of hardwarerelated faults. [2] also shows that the number of parameters
+in a DNN model determines if a hardware fault leads to a
+critical failure depending on where in the network or input data
+the fault occurs. HW faults can be efficiently modelled as bit
+flips on the application level. A bit flip can affect different
+bit positions of a value where the most signification bits,
+e.g. exponent bits in floating point numbers, have the highest
+impact, different quantization could be used, and weights or
+neurons could be hit. Furthermore, different layers of a DNN
+can be more or less susceptible, or even different input classes
+can react differently to faults. Quantifying those effects on
+DNN enables developers to concentrate on the most vulnerable
+parts when making DNN more resilient and also provides
+vulnerability factors for formulating safety cases.
+To support this analysis, an established method is to perform
+fault injection at different HW/SW stack levels. Hardware
+stack fault simulation offers greater precision but is impractical
+for extensive fault injections in modern models with over
+10 million parameters. Also, the data type amplifies the
+number of vulnerable bits to be tested. For example, a 16bit model with over 10 million parameters will result in 160
+million vulnerable bits being tested against hardware faults,
+further decreasing testing efficiency. To make fault injection
+an efficient part of a continuous product development cycle, it
+must support large-scale fault injections with accurate logs to
+reproduce fault locations and compare results between faultfree, faulty, and improved hardened networks. It also needs
+to support the generation of performance metrics and match
+them with input data and fault locations.
+This paper describes a new fault injection framework called
+PyTorchALFI (Application Level Fault Injection for PyTorch)
+which extends PyTorchFI [7] to make it better suited for
+large-scale fault injection campaigns. PyTorchALFI adds the
+following features to the original PyTorchFI:
+• Simple definition of fault injection metadata: control total
+number of faults, type, and location through a configuration file and make fault definition and test parameters
+
+2
+
+available for subsequent experiments.
+Definition of complex test scenarios: easy iteration over
+different aspects of fault injection tests like location,
+different number of faults and mapping corresponding test
+results.
+• Tight integration of fault-free, faulty, and enhanced models: Enables synchronized inference and results in logging
+of separate DNN instances, allowing for comparison of
+fault effects on the original, fault-injected model and the
+modified mitigation model. This analysis can be done at
+a granular level of a single fault location and input data
+point or at a statistical level.
+• Data set enrichment: existing data sets are wrapped to
+provide additional metadata to enable later reproduction
+of fault conditions down to a single data item (e.g., a
+single image)
+• KPI generation: commonly used and new KPIs are automatically calculated at the end of test runs.
+In the remainder of this document, we give additional
+details on relevant aspects of PyTorch and PyTorchFI in the
+background section. We then explain how the SW architecture
+follows large-scale repeatable fault injection requirements.
+The evaluation section provides examples and reasoning to
+support how PyTorchALFI enhances application-level fault
+injection efficiency and explains the process of generating test
+results. The conclusion section finally provides a summary
+of the proposed approach, results, and future work. The tool
+is available as source code here: https://github.com/IntelLabs/
+PyTorchALFI.
+•
+
+II. BACKGROUND
+PyTorch is a popular Python framework for training and
+running neural networks. The framework offers flexibility in
+redefining the network’s structure and computational path,
+enabling analysis and modification of each layer’s input and
+output values during training and inference. This can happen by inserting additional processing steps or layers in the
+forward function or attaching hooks, i.e., callback functions,
+to selected model parts to modify input or output values on
+the fly. The PyTorch hook functionality can be used for fault
+injection and is indeed used for this purpose in PyTorchFI.
+One of the hook function parameters is the output of a specific layer’s MAC operation. The output values are modified
+in place. A fault injection routine can thus change one or
+more values in the output tensor. For instance, it can simulate
+faults in either the hardware component performing the MAC
+operation or the register storing the output values before
+forwarding them to an activation function. To clarify, hooks
+are used for fault injection in neurons, since the values of the
+tensor position that are to be corrupted are only determined
+during run time. Fault injections into weights don’t have to
+use hooks, because weights are defined before the inference
+run. PyTorchFI, the fault injection framework developed by
+the RSim Research Group [8], applies the above-mentioned
+methods to inject faults into neurons and weights. Its source
+code is available here: https://github.com/PyTorchfi/PyTorchfi.
+A branched-off version of PyTorchFI is used as the core of
+PyTorchALFI.
+
+Integrating a model for vulnerability assessment can be
+challenging, as the existing framework is not well suited for
+handling large-scale fault injections. To address these issues,
+we propose a new framework - PyTorchALFI.
+III. R ELATED W ORK
+Faults can be injected directly into the HW, HW simulations,
+or the application layer. Examples of HW level FI are RIFLE
+[9] or FIST [10], the first using pin-level fault injection and the
+latter using ion radiation. Simulation-based FI using languages
+like VHDL or Verilog is implemented in MEFISTO [11],
+DEPEND [12] or VERIFY [13]. Further techniques known
+as MUTANT and SABOTEUR are described in [14], and
+[15]. Software Level FI is demonstrated in FERRARI [16],
+XCEPTION [17], LLFI, and PINFI [18]. This paper focuses on
+application-level fault injection where either bit(s) are flipped
+or original values are randomly changed. So far, only a few
+FI tools that specialize in neural networks at the application
+level exist. Two examples of the frameworks TensorFlow and
+PyTorch are TensorFI [19] and PyTorchFI [7].
+IV. M ETHODOLOGY
+A. Requirements
+Our primary objective was to efficiently define, execute, and
+analyze large-scale fault injections, ensure the persistence and
+re-usability of utilized faults, and efficiently extract test results.
+There is a further requirement to systematically move the focus
+of the fault injection to specific layers of the CNN. Storing and
+reusing fault locations is essential to ensure the comparability
+and reproducibility of the researcher’s experiments.
+We reduced these high-level requirements to the following
+needs. The different components of a neural network that
+should be addressable by fault injection are:
+• types of layers
+• location of a layer within the model
+• location of a fault within a layer
+• injection into neurons or weights
+• numeric type used and bit position within this numeric
+type
+• fault model
+It should also be possible to set the number of faults that
+are applied to the input, e.g., a single image in the case of
+CNN, at the same time. Finally, for fault injection into weights,
+it is essential to decide the scope of a (weight) fault; this
+means defining whether a specific fault is applied to a single
+image, a batch of images, or even a whole epoch involving a
+complete test data set. Finally, the fault model should support
+both transient and permanent faults.
+B. Architectural design
+Figure 1 shows the software architecture for PyTorchALFI.
+The following components extend the original PyTorchFI solution. The tool’s core is the alficore component, which provides
+a test class that integrates all functionalities. The specifics
+of the fault injection campaign, such as the fault model
+and the number of injected faults, will be configured in the
+
+3
+
+scenario configuration component. The enhanced PyTorchFI
+component will take care of the fault injection execution. One
+of its core features is the use of PyTorch hooks. This allows
+the modification of neuron values in place.
+In addition to its core functionalities, alficore offers various
+optional features in the form of user-friendly data loader
+wrappers, monitoring capabilities (enabling the detection of
+NaN or Inf values and facilitating the integration of custom
+monitoring), evaluation functions (allowing the calculation of
+SDE or Detected and Uncorrected Errors (DUE) rates), and
+visualization tools, permitting the plotting of critical results,
+currently limited to object detection.
+
+Fig. 1: Software architecture of PyTorchALFI
+A fault injection campaign starts with an existing application that initiates a pre-trained PyTorch model and performs
+an inference run with input from a data set. This application is
+then augmented with PyTorchALFI function calls to perform
+fault injections into weights or neurons.
+Once PyTorchALFI has been added to the project folder, the
+parameter definitions are established in a distinct configuration
+scenario yml file called default.yml. After verification, these
+parameters are accessible during run time and can be altered as
+needed. For instance, iterative modification of the number of
+faults per inference can be performed, allowing for customization of the number of faults per image, batch, or epoch. Faults
+can be inserted in weights or neurons in a PyTorch model.
+It is possible to define the type of layer where fault injection
+happens. Supported layer types are conv2d, conv3d, and Linear
+(fully connected). The fault injections can be limited to specific
+layer numbers or a range of layer numbers. Furthermore, the
+random selection of layers can be weighted to increase the
+likelihood of selecting more significant layers.
+Modifications can be made to either numbers or specific bits
+of neurons/weights. In the former, random values are drawn
+from a specified min-max range of values. The latter identifies
+a range of bits from which the flipped bit is applied. The
+number of faults per image can be expressed as a fixed integer
+or a distribution. In the latter case, the distribution represents
+a fraction of the total number of weights or neurons.
+All faults are generated as a matrix before the inference run
+to enhance the explainability of faults. Each column in the
+matrix contains a single fault. Fault definitions comprise the
+fault location and value. The location parameters vary slightly
+between weight and neuron fault injections. Regarding neuron
+fault injection, the various rows in the matrix hold significance,
+as illustrated in Table I.
+Weight fault injection adheres to similar definitions as presented in Table I, with minor differences. The first row denotes
+the layer index, and the second and third rows specify the
+weight’s output and input channel, respectively. The number
+of columns (i.e., total faults) in the fault matrix is determined
+
+line number
+1
+2
+3
+4
+5
+6
+7
+
+ID
+Batch
+Layer
+Channel
+Depth
+Height
+Width
+Value
+
+Description
+number of images within a batch
+nth layer out of all available layers
+nth channel out of all available channels
+additional index for conv3d layers
+y position in input
+x position in input
+either a number or the index of bit position
+
+TABLE I: Fault definition parameters for neuron fault
+injection
+
+based on the data set size and the fault injection policy, which
+can be set per image, batch, or epoch. After generating the
+faults, the fault matrix is stored as a binary file. Consequently,
+the identical set of faults can be utilized across various
+experiments to evaluate the impact of model modifications
+on fault mitigation. A second binary file is generated after
+the fault injection experiment. This file comprises information
+on the fault locations and the original and altered values of
+the neuron/weight before and after the fault injection run.
+Additionally, it includes other monitored values, such as Inf
+and NaN, associated with each inference. PyTorchALFI saves
+all experiment parameters in a yml file format, which can be
+used to replicate an experiment for future purposes accurately.
+PyTorchALFI provides an iterator that returns the original
+model with different faults applied at each call during the
+inference run. The number and position of these faults are
+taken successively from the fault matrix. The initial PyTorch
+application determines the model used for fault injection, the
+data set size, and the number of epochs. The developer is flexible in how to use the faulty models created by PyTorchALFI
+in the application.
+V. U SING P Y T ORCH ALFI TO PERFORM EXPERIMENTS
+AND STORE RESULTS
+
+This section gives some examples of PyTorchALFI runs
+starting with a principle integration into one’s code, including
+parameters settings and results given the particular test goals
+in the following list.
+1) inject faults at random positions throughout the network
+– to determine the probability of failure in the model
+output in the presence of hardware faults producing bit
+flips
+2) iterate through a model to verify if certain components
+are more sensitive to faults than others
+a) iterate through single or groups of layers to determine which layers are more susceptible to errors.
+b) successively increase the number of concurrent
+faults per image – to verify how robust a model
+is and how many faults it can tolerate.
+c) switch between neuron and weight fault injection
+– to determine if a mitigation strategy (if applied)
+is equally effective for neuron or weight faults.
+d) change the bit flip position for either weight or
+neuron faults – to verify which bit positions with a
+particular fault model are likely to produce failures
+in the output.
+
+4
+
+PyTorchALFI can thus be used to implement the following
+use cases to PyTorch models.
+• Finding the most vulnerable components in a NN
+• Evaluating the vulnerability of different numeric types
+• Comparing the robustness of different types of NN
+• Verifying the efficiency of mitigation strategies against
+faults or attacks
+• Compare the robustness of NN between the original
+model and a pruned version
+• Finding the maximum amount of faults per image where
+the accuracy of the output of the NN stays within
+acceptable boundaries
+Independent of the use case, PyTorchALFI needs to be
+integrated with the existing NN project. There is a high-level
+and low-level method to do that. The integration methods are
+described first. After that, the implementation of use cases is
+described.
+A. Integration into own project - low level
+In the low-level method, only fault-injected models and
+their output is provided. The developer is free to use the raw
+results as needed. The pseudo-code listing 1 shows how to
+integrate PyTorchALFI into existing code using the low-level
+integration mode.
+from PyTorchfiwrapper.wrapper.ptfiwrap import
+ptfiwrap
+# Initiate the wrapper with the trained baseline
+model
+net=orig_model
+wrapper = ptfiwrap(model=net)
+# get an iterator over faulty models
+fault_iter = wrapper.get_fimodel_iter()
+for [loop through epochs and data set]
+CORRUPTED_MODEL = next(fault_iter)
+orig_output = orig_model(input)
+Corrupted_output = CORRUPTED_MODEL(input)
+# store and analyze Corrupted_output in
+# comparison to orig_output
+
+Listing 1: Pseudo code to integration PyTorchALFI into
+custom code
+The original model is handed over to the ptfiwrap object.
+fault_iter then provides a complete NN model with
+one or more new faults injected. Depending on the specific
+fault model, the developer can manipulate the frequency at
+which faults are altered by positioning the iterator at different
+locations within the program loop. For example, faults can be
+changed for each image, batch or once per epoch. The code
+expects the file default.yml inside folder scenarios.
+Details are given in the following sub-sections.
+Regarding the low-level integration, PyTorchALFI stores
+two binary files and a scenario yml file.
+
+for each case, test_error_models_imgclass.py and
+test_error_models_objdet.py respectively. These
+classes encapsulate the generation of wrapper instances that
+iteratively create faulty versions of the model under test and
+run it with batches of input images from the chosen data set.
+Listing 2 provides an example of high-level integration into
+one’s code using yolov3.
+from PyTorchfiwrapper.models.yolov3.darknet import
+Darknet
+from PyTorchfiwrapper.wrapper.
+test_error_models_objdet import
+TestErrorModels_ObjDet
+# Initiate the model
+yolov3 = Darknet("PyTorchfiwrapper/models/yolov3/
+config/yolov3.cfg").to(device)
+yolov3.load_darknet_weights("PyTorchfiwrapper/models
+/yolov3/weights/yolov3.weights")
+model = yolov3.eval().to(device)
+model_ErrorModel = TestErrorModels_ObjDet(model=
+model, resil_model=None, model_name=model_name,
+data set=data set_name, config_location=yml_file
+, dl_shuffle=False, device=device)
+model_ErrorModel.test_rand_ObjDet_SBFs_inj(
+fault_file=’’, num_faults=nr_faults, inj_policy=
+’per_image’)
+
+Listing 2: Pseudo code to integration PyTorchALFI into
+custom code
+This simple integration reads all configuration information
+from the config_location and initiates the data set given
+in the data set parameter. Several data sets are prepared for
+use with these classes. They provide data in the form of lists:
+[dict_img1{}, dict_img2(), dict_img3()] ->
+dict_img1 = {’image’:image,’image_id’:id,
+’height’:height, ’width’:width ...}
+to
+conserve the image locations for later results analysis.
+The primary purpose of these higher-level classes is the easy
+and concise preparation of test results. Each fault injection
+run produces up to 3 sets of outputs. One is a meta-file that
+contains information about all parameters used to run the
+fault injection. This includes the used model, the location of
+its implementation, the data set used, and the corresponding
+data loader, as well as any test parameters modified during
+the run in the form of a yml file. The second is a set of
+binary files of all faults and bit position changes (from 0
+→ 1 or vice-versa) that were applied in the test and can
+be reloaded using a configuration parameter. The third are
+default vulnerability results in the form of CSV or JSON files
+(CSV in the case of classification and JSON in the case of
+object detection networks).
+The results files allow a detailed analysis of the effects of
+applied faults down to the position of bits flipped and their
+flip direction for single images.
+
+B. Integration into own project - high level
+
+C. Random positions throughout the network
+
+High-level integration of PyTorchALFI addresses image
+classification and object detection networks using CNN by
+providing relevant result files. A separate class is provided
+
+This section describes the necessary configurations to apply
+faults to random locations throughout a network. This relates
+to the test goal listed in Section V item 1.
+
+5
+
+The initial configuration for each fault injection run happens in file default.yml. The file itself contains documentation on each parameter. The wrapper is designed to pregenerate all faults for the complete run. For any run, the
+total number of different faults that are needed is determined
+by the three variables dataset size (a), num runs (b)
+and max f aults per image (c). dataset size states how
+many images are contained in the used data set or how
+large the data subset will be used for the test. num runs
+states how often the data set will be used (epochs), and
+max f aults per image states how many different faults
+should be injected for the same image or rather while processing a single image. The number of faults n to prepare
+is determined by calculating the product of all three values
+n = a · b · c. Two types of faults can be injected: random
+numeric values or bit flips at given bit positions. For realistic
+simulation of hardware faults, bit flips should be used. The
+range of bits used for input values and weights and the
+content of bit positions that can be randomly selected must
+be specified. To allow all possible values in a 32-bit number,
+this value must be set to, e.g. rnd bit range : [0, 31].
+Apart from bit position, the location of layer number and
+values for height, width, and channel inside a layer are
+randomly selected. In addition, each layer’s relative size can be
+considered to determine the likelihood it is drawn. The relative
+size of each layer is calculated separately for weights and
+neurons by summing the quotient of the number of elements
+per layer divided by the total number of elements in the model.
+Qm
+j=1 dij
+Fi = Pn Qm
+(1)
+i=1
+j=1 dij
+Where Fi is the weight factor for layer i and dij are the
+sizes of the different dimensions of the layers tensor. The layer
+types (Conv2D, Conv3D, or fully connected) can be specified
+to define fault locations further.
+The location of faults is further determined by specifying if
+faults are injected in the neurons or the weights. Neurons and
+weights cannot be selected in the same fault injection run.
+D. Iterate through a model
+All usage models listed in Section V test goal item 2
+can be implemented in this way. Extending the concept
+described in the previous section, where parameters are set
+only once at the beginning of the fault injection run, for
+iterations of any sort, the original parameter set is accessible
+and can be modified during run-time. When iterating through
+layers, the start layer is set to an initial value, e.g., 1.
+After that, the data set is iterated over once. After that, the
+parameter can be reset to the following layer number and
+rewritten using the functions wrapper.get_scenario()
+and wrapper.set_scenario(). This also generates a
+new set of faults for the whole data set. A similar approach
+can be applied for iterating through faults per image or bit
+position for bit flips. In addition, a change between neuron
+and weight faults is equally possible. This method allows
+the efficient setup of fault injection scenarios without manual
+reconfiguration after each set of fault parameters.
+
+E. Data loader wrapper
+Dataloaders are enhanced to allow capturing additional information during fault injection runs. The minimal information
+stored about each image is directory+filename, height, width,
+and image id. This can be extended to individual needs. For
+consistent handling of different data sets, each dataset is first
+brought into a JSON format as used in the COCO data set [20].
+Facebook’s detectron2 project inspires PyTorchALFI’s data
+loader [21]. It builds on the user’s existing data loader. Currently, PyTorchALFI supports COCO-based Average-Precision
+metric variant (AP) evaluation. For instance, Intersection over
+Union (IoU), average precision (AP), and average recall (AR)
+are computed using COCO’s defined metrics.
+F. Result evaluation
+PyTorchALFI stores result from fault injection experiments
+in convenient CSV (for classification models) and JSON (for
+object detection models) formats. The SDE results presented
+in Figure 2 were obtained from previous research conducted
+using the PyTorchALFI tool for conducting fault injection
+experiments, as described in [6] and [5]. The focus lies on
+classification and object detection CNN, which have distinct
+KPIs.
+1) Classification CNN: Generally, the output for classification CNN focuses on the top 5 results, and hence PyTorchALFI, by default, stores top-5 classes and probabilities in
+addition to the ground truth label. Furthermore, the CSV file
+stores fault positions defined by layer, channel, height, width,
+and bit position that was flipped. This can be easily extended to
+top-K classes. In case of multiple faults per image, these fault
+positions are listed. PyTorchALFI stores three sets of outputs.
+a) meta-files - scenario.yml and the data loader’s absolute
+file path, b) fault location binary files, c) models output. The
+model’s fault files contain the same faults fed during the fault
+injection run. In addition, model fault files include bit flip
+direction and original and changed values of neurons/weights.
+The model’s outputs are the final top-5 output of the models
+(original model and model applied mitigation). In addition,
+outputs without fault injections are stored in a separate CSV
+file. This raw basic information is further processed to quantify
+the vulnerability. For example, the classification model’s silent
+data error (SDE) can be quantified easily using the third set
+of model files. For example, Figure 2a studies the SDE of
+ResNet-50, VGG-16, and AlexNet. The faults were injected
+at weight level only on exponential bits. Using the first set of
+outputs binary files, bit-wise and layer-wise, SDE information
+was easily extracted. As shown in Figure 2a, VGG-16 without
+protection has an 11.8% vulnerability when injected with a
+single fault per image inference. With the PyTorchALFI tool’s
+scalability, vulnerability analysis with different protections
+(e.g. Ranger/Clipper [6]) can be easily extracted for various
+models without additional adaptation.
+2) Object detection CNN: PyTorchALFI, in this case, also
+generates three sets of output files: a) Ground truth and Metafiles - the ground-truth JSON file, a list of annotations for each
+image bounding boxes and class ID, as well as scenario.yml
+storing all the run-time parameters used, b) intermediate result
+
+6
+
+(a) SDE rates for image classification models: Our previous work
+cited in [6], forms the basis for these results
+
+Fig. 3: PyTorchALFI’s Object detection submodule
+
+or result metrics. The tool is designed to easily incorporate
+new custom trainable layers not native to Pytorch by adding
+the custom layer’s type in the verif y layer function within
+the errormodels.py file. This feature provides flexibility in
+expanding the tool’s capabilities to support various model
+types. New signals at intermediate layers can also be efficiently
+monitored by including their respective monitoring functions
+in the attach hooks functions in the T estErrorM odels X
+classes, enabling a more comprehensive analysis of the
+model’s behaviour during fault injection. This modularity and
+flexibility make the tool suitable for researchers to adapt
+and extend for their specific use cases. Even the actual fault
+injector can be replaced or improved in the future. First, tests
+have been performed to integrate a fault injection method that
+relies on low-level ML library primitives to provide a more
+(b) SDE rates for object detection models: Our previous work cited realistic fault behaviour based on faults in specific HW units
+in [5], forms the basis for these results
+that perform the MAC operations in Convolutional Neural
+Networks. This work is still ongoing and not finalized. The
+Fig. 2: SDE rates for weight fault injection
+mentioned fault injection method is described in [22].
+lists containing predicted classes, scores, and bounding box location per object and c) mAP values. Object detection models
+are rather complex compared to classification models. Hence,
+intermediate results of an entire data set are exposed with one
+set of faults, each stored in separate JSON files as shown in
+Figure 3. During the post-processing stage of these results,
+the stored JSON files are used to analyze the impact of the
+fault injection. These JSON files are processed using metrics
+like COCO-API [20] and IVMOD [5] to estimate the object
+detection model’s vulnerability. For example, IV M ODSDE
+is shown in Figure 2b for the models YoloV3, Retina-Net
+and Faster-RCNN (FRCNN) trained on multiple datasets. As
+an example, when injected with a single fault per image
+inference, RetinaNet trained on CoCo has a vulnerability of
+4.2% in producing incorrect detections. Moreover, it has a
+low probability (< 10−2 ) of generating NaN/Inf values IV M ODDU E .
+
+VI. C ONCLUSION
+We presented the PyTorchALFI framework, focusing on
+efficiently incorporating fault injection into the regular SW development cycle, especially for safety-critical NN applications
+built with PyTorch. We identified the main requirements for
+efficient definition, execution and result analysis of large-scale
+fault injections, persistence and re-usability of used faults, and
+efficient extraction of test results. Based on that, we developed
+our architecture by enhancing the existing PyTorchFI tool
+with an easy definition of fault injection metadata, a detailed
+description of complex test scenarios, the tight coupling of
+fault-free, faulty and improved models, data set enhancement,
+and the generation of KPI. We finally showed how our
+framework could be integrated into existing PyTorch projects
+and how it is configured for different use cases.
+The tool is available as source code here: https://github.com/
+IntelLabs/PyTorchALFI.
+
+G. Extensibility
+PyTorchALFI has been designed with further extensibility,
+enabling the easy addition of more supported model types
+
+VII. ACKNOWLEDGMENT
+
+7
+
+This project has received funding from the European
+Union’s Horizon 2020 research and innovation program
+under grant agreement No 956123.
+
+R EFERENCES
+[1] Y. Ibrahim, H. Wang, J. Liu, J. Wei, L. Chen, P. Rech, K. Adam,
+and G. Guo, “Soft errors in DNN accelerators: A comprehensive
+review,” Microelectronics Reliability, vol. 115, p. 113969, 2020.
+[Online]. Available: https://www.sciencedirect.com/science/article/pii/
+S0026271420308003
+[2] G. Li, S. K. S. Hari, M. Sullivan, T. Tsai, K. Pattabiraman, J. Emer,
+and S. W. Keckler, “Understanding error propagation in Deep Learning
+Neural Network (DNN) accelerators and applications,” in Proceedings
+of the International Conference for High Performance Computing,
+Networking, Storage and Analysis, SC 2017, 2017.
+[3] C. Schorn, A. Guntoro, and G. Ascheid, “Efficient On-Line Error
+Detection and Mitigation for Deep Neural Network Accelerators,” in
+Computer Safety, Reliability, and Security, B. Gallina, A. Skavhaug,
+and F. Bitsch, Eds. Cham: Springer International Publishing, 2018, pp.
+205–219.
+[4] C. Torres-Huitzil and B. Girau, “Fault and Error Tolerance in Neural
+Networks: A Review,” pp. 17 322–17 341, Aug 2017.
+[5] S. Qutub, F. Geissler, Y. Peng, R. Gräfe, M. Paulitsch, G. Hinz, and
+A. Knoll, “Hardware faults that matter: Understanding and estimating
+the safety impact of hardware faults on object detection dnns,” in
+Computer Safety, Reliability, and Security: 41st International Conference, SAFECOMP 2022, Munich, Germany, September 6–9, 2022,
+Proceedings. Springer, 2022, pp. 298–318.
+[6] F. Geissler, S. Qutub, S. Roychowdhury, A. Asgari, Y. Peng,
+A. Dhamasia, R. Graefe, K. Pattabiraman, and M. Paulitsch, “Towards
+a safety case for hardware fault tolerance in convolutional neural
+networks using activation range supervision,” in Proceedings of the
+Workshop on Artificial Intelligence Safety 2021 co-located with the
+Thirtieth International Joint Conference on Artificial Intelligence (IJCAI
+2021), 2021. [Online]. Available: https://ceur-ws.org/Vol-2916/
+[7] A. Mahmoud, N. Aggarwal, A. Nobbe, J. R. Sanchez Vicarte, S. V.
+Adve, C. W. Fletcher, I. Frosio, and S. K. S. Hari, “PyTorchFI:
+A Runtime Perturbation Tool for DNNs,” in DSN-DSML, 2020.
+[Online]. Available: https://ieeexplore.ieee.org/document/9151812https:
+//github.com/pytorchfi/pytorchfi
+[8] Accessed: 2023-03-21. [Online]. Available: https://rsim.cs.illinois.edu/
+[9] H. Madeira, M. Rela, F. Moreira, and J. G. Silva, “RIFLE: A general
+purpose pin-level fault injector,” in Lecture Notes in Computer Science
+(including subseries Lecture Notes in Artificial Intelligence and Lecture
+Notes in Bioinformatics), vol. 852 LNCS. Springer Verlag, 1994, pp.
+199–216.
+[10] J. Karlsson, P. Liden, P. Dahlgren, R. Johansson, and U. Gunneflo,
+“Using heavy-ion radiation to validate fault-handling mechanisms,”
+IEEE Micro, vol. 14, no. 1, pp. 8–23, 1994. [Online]. Available:
+https://ieeexplore.ieee.org/document/259894
+[11] E. Jenn, J. Arlat, M. Rimen, J. Ohlsson, and J. Karlsson, “Fault
+injection into VHDL models: The MEFISTO tool,” in Digest of Papers
+- International Symposium on Fault-Tolerant Computing, 1994.
+[12] K. K. Goswami, R. K. Iyer, and L. Young, “DEPEND: A simulationbased environment for system level dependability analysis,” IEEE Transactions on Computers, vol. 46, no. 1, pp. 60–74, 1997.
+[13] V. Sieh, O. Tschäche, and F. Balbach, “VERIFY: Evaluation of reliability using VHDL-models with embedded fault descriptions,” Digest
+of Papers - 27th Annual International Symposium on Fault-Tolerant
+Computing, FTCS 1997, pp. 32–36, 1997.
+[14] J. Na and D. Lee, “Simulated fault injection using Simulator
+modification technique,” ETRI Journal, 2011. [Online]. Available:
+https://onlinelibrary.wiley.com/doi/abs/10.4218/etrij.11.0110.0106
+[15] J. C. Baraza, J. Gracia, D. Gil, and P. J. Gil, “Improvement of fault
+injection techniques based on VHDL code modification,” in Proceedings
+- IEEE International High-Level Design Validation and Test Workshop,
+HLDVT, vol. 2005, pp. 19–26.
+[16] G. A. Kanawati, N. A. Kanawati, and J. A. Abraham, “FERRARI:
+A Flexible Software-Based Fault and Error Injection System,” IEEE
+Transactions on Computers, vol. 44, no. 2, pp. 248–260, 1995.
+[17] J. Carreira, H. Madeira, and J.-P. Gabriel, “Xception: Software Fault
+Injection and Monitoring in Processor Functional Units1,” 1995.
+[18] J. Wei, A. Thomas, G. Li, and K. Pattabiraman, “Quantifying the
+accuracy of high-level fault injection techniques for hardware faults,”
+
+in Proceedings - 44th Annual IEEE/IFIP International Conference
+on Dependable Systems and Networks, DSN 2014, 2014. [Online].
+Available: https://ieeexplore.ieee.org/document/6903595
+[19] G. Li, K. Pattabiraman, and N. Debardeleben, “TensorFI: A Configurable
+Fault Injector for TensorFlow Applications,” in Proceedings - 29th
+IEEE International Symposium on Software Reliability Engineering
+Workshops, ISSREW 2018, 2018.
+[20] “COCO Dataset.” [Online]. Available: https://cocodataset.org/#home
+[21] Y. Wu, A. Kirillov, F. Massa, W.-Y. Lo, and R. Girshick, “Detectron2,”
+https://github.com/facebookresearch/detectron2, 2019.
+[22] P. Omland, Y. Peng, M. Paulitsch, J. Parra, G. Espinosa, A. Daniel,
+G. Hinz, and A. Knoll, “API-based Hardware Fault Simulation for DNN
+Accelerators,” IEEE Design and Test, 2022.
+

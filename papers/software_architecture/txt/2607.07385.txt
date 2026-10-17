@@ -1,0 +1,467 @@
+JAX-FVM: A differentiable, entropy-stable finite volume solver on
+unstructured meshes for compressible flows
+Guillaume de Romémonta,∗
+a INRIA, 200 Av. de la Vieille Tour, Talence, 33400 , France
+
+arXiv:2607.07385v1 [math.NA] 8 Jul 2026
+
+Abstract
+We present JAX-FVM, an open-source, fully differentiable finite volume method (FVM) for the twodimensional compressible Euler and Navier-Stokes equations on unstructured triangular meshes. The solver
+is written entirely in JAX, so that every operation : mesh connectivity, flux evaluation, slope limiting,
+and time integration is just-in-time compiled, vectorised, and end-to-end differentiable through automatic
+differentiation (AD), and runs transparently on CPU or GPU. On the numerical side, JAX-FVM is built around
+an entropy-conservative Tadmor/Ismail-Roe two-point flux supplemented with entropy-variable Rusanov
+or Roe dissipation, second-order MUSCL reconstruction of primitive variables with least-squares gradients
+and Venkatakrishnan limiting, and a family of explicit (RK2-4) and matrix-free implicit (Newton, SDIRK2)
+time integrators whose Jacobian actions are obtained by AD. The combination of an unstructured -mesh
+compressible FVM with end-to-end differentiability fills a gap left by existing differentiable CFD frameworks,
+which are almost exclusively restricted to structured grids or spectral discretisations. We describe the
+governing equations, the discretisation, the software architecture, and a set of standard verification cases.
+The code is openly available at https://github.com/guigzair/jax_fvm.
+Keywords: differentiable programming, JAX, finite volume method, unstructured meshes, entropy stability,
+compressible Euler and Navier-Stokes equations
+
+1. Introduction
+Computational fluid dynamics (CFD) has become an indispensable tool across science and engineering,
+from aerodynamics and combustion to biomedical flows (Brunton et al., 2020). The canonical use of a CFD
+solver is a forward one: given a geometry, boundary conditions, and physical parameters, one integrates the
+governing equations to obtain the flow field. Yet many of the most consequential problems are inverse in
+nature, since boundary conditions are only partially observed, constitutive or model parameters are poorly
+characterised, and turbulence closures carry model-form uncertainty. Such problems, for instance recovering
+vascular resistance and compliance from sparse clinical measurements (Pant et al., 2017), inferring geometry
+from surface pressure in shape optimisation, or identifying turbulence-closure corrections from reference
+data (Duraisamy et al., 2019), are naturally cast as PDE-constrained optimisation, and solving them at
+scale requires the gradient of the solver output with respect to its inputs. Finite-difference or derivative-free
+strategies become prohibitive in high dimension, so scalable sensitivity computation, historically via adjoint
+methods, is essential.
+Two developments have reshaped how these gradients are obtained. First, differentiable programming
+and automatic differentiation (AD) frameworks such as JAX (Bradbury et al., 2018), PyTorch (Paszke
+et al., 2019), TensorFlow (Abadi et al., 2016), and Julia (Bezanson et al., 2017) allow the derivative of an
+⋆
+∗ Corresponding author.
+
+Email address: guillaume dot romemont at protonmail dot com (Guillaume de Romémont)
+
+entire program to be evaluated to machine precision without hand-derived adjoints (Sapienza et al., 2024).
+Traditional adjoint CFD implementations, e.g. SU2 (Economon et al., 2016) or dolfin-adjoint (Mitusch et al.,
+2019), remain code-intrusive and are architecturally decoupled from the AD ecosystems in which modern
+machine-learning components are built. Second, the hybridisation of machine learning (ML) with CFD has
+grown into a dominant paradigm (Brunton et al., 2020; Karniadakis et al., 2021). Early hybrid models
+embedded offline-trained closures into conventional solvers (Duraisamy et al., 2019), but such loosely coupled
+models are not solver-consistent and can degrade or destabilise once deployed in the live solver (Wu et al.,
+2019). This has motivated fully coupled, differentiable approaches in which ML components and discrete
+operators are optimised end-to-end through the solver, including solver-in-the-loop and learned turbulence
+closures (List et al., 2022; Um et al., 2020), data-driven discretisations (Bar-Sinai et al., 2019; de Romémont
+et al., 2025, 2026), and hybrid architectures that combine differentiable PDE solvers with graph neural
+networks (de Avila Belbute-Peres et al., 2020; Pfaff et al., 2021). In all of these, differentiability through the
+solver is a structural prerequisite rather than a convenience.
+These requirements have driven a wave of GPU-native differentiable CFD platforms built on AD
+frameworks. Representative examples include JAX-CFD (Kochkov et al., 2021), a JAX-native incompressible
+solver widely used in ML-CFD studies; ΦFlow (Holl et al., 2020), a backend-agnostic differentiable PDE
+framework; JAX-Fluids (Bezgin et al., 2023), a high-order finite-volume solver for compressible and two-phase
+flows; WaterLily (Weymouth and Font, 2024), a Julia immersed-boundary solver; PICT (Franz et al., 2025),
+a differentiable multi-block PISO solver; and Diff-FlowFSI (Fan et al., 2026; Fan and Wang, 2024) for
+turbulence and fluid-structure interaction. A common limitation, however, is that these frameworks operate
+almost exclusively on structured Cartesian grids, where the regular data layout maps cleanly onto vectorised
+array operations. Unstructured meshes, which are indispensable for the body-conforming discretisation of
+geometrically complex domains and are the workhorse of industrial CFD, remain largely absent from the
+differentiable-simulation ecosystem, because their irregular connectivity and variable neighbour counts are
+hostile to the SIMD/SIMT execution model of accelerators. A recent preprint, DiFVM (Du et al., 2026),
+addresses this gap for incompressible flow by recasting the finite-volume operators as graph message-passing
+primitives (Pfaff et al., 2021); to our knowledge, however, no code is publicly available, and the compressible,
+entropy-stable regime is not its focus.
+On the numerical side, robustly simulating compressible flows on unstructured meshes raises its own
+difficulties. Nonlinear conservation laws admit discontinuous (shock) solutions, and naive discretisations are
+prone to spurious oscillations and nonlinear instability. Two complementary ingredients address this. Highresolution finite-volume schemes recover second-order accuracy away from discontinuities through gradient
+reconstruction and slope limiting on unstructured stencils (Barth and Jespersen, 1989; Venkatakrishnan,
+1993), while entropy-stable schemes provide a nonlinear stability framework by enforcing a discrete entropy
+inequality. Building on Tadmor’s entropy-conservative flux theory (Tadmor, 1987, 2003) and affordable
+entropy-consistent Euler fluxes (Ismail and Roe, 2009), together with the classical Roe approximate Riemann
+solver (Roe, 1981), one obtains schemes that are provably entropy-stable and robust for strong shocks such as
+the forward-facing step and double Mach reflection (Woodward and Colella, 1984) and the two-dimensional
+Riemann configurations of Lax and Liu (1998). Casting the entire scheme in an AD framework is particularly
+attractive here, since the entropy-variable Jacobians underlying the dissipation and the implicit solvers can
+be formed exactly by differentiation rather than by hand.
+JAX-FVM sits at the intersection of these two threads. It is, to our knowledge, one of the first openly
+available differentiable finite-volume solvers for the compressible Euler and Navier-Stokes equations that
+operates natively on unstructured triangular meshes, coupled with an entropy-stable Tadmor/Ismail-Roe
+discretisation. Relative to the concurrent DiFVM effort (Du et al., 2026), the present work is complementary:
+it targets compressible flows with entropy-stable numerics in a compact, research-oriented implementation.
+2. Statement of need
+JAX-FVM is designed to serve two communities that are rarely addressed by a single code. To the
+CFD practitioner it offers a compact, entropy-stable compressible solver on unstructured meshes; to the
+scientific-machine-learning practitioner it offers an unstructured compressible solver that is differentiable end
+2
+
+to end, so that gradients of any scalar functional of the flow can be propagated back to the initial condition,
+boundary data, physical parameters, or an embedded neural model.
+Three properties, taken together, distinguish JAX-FVM from existing tools:
+1. Differentiability. The entire residual–connectivity gathers, reconstruction, flux, and boundary
+treatment–is written in JAX and is differentiable by construction. AD is used not only to expose
+gradients to the user, but internally, to form Jacobian-vector products for the implicit time integrators
+and the entropy-consistent dissipation operators.
+2. Entropy stability. The default flux is an entropy-conservative Tadmor/Ismail-Roe two-point flux
+(Tadmor, 1987; Ismail and Roe, 2009) augmented with entropy-variable dissipation, so that the semidiscrete scheme respects a discrete entropy inequality–a property that is difficult to obtain and verify
+without an AD-enabled implementation.
+3. Unstructured meshes. Existing differentiable CFD frameworks such as JAX-CFD (Kochkov et al.,
+2021), JAX-Fluids (Bezgin et al., 2023), and ΦFlow (Holl et al., 2020) operate on Cartesian/structured
+grids. To our knowledge there is little to no publicly available differentiable unstructured FVM code
+for compressible flow. JAX-FVM targets exactly this niche.
+The solver is intended as a research platform.
+3. Governing equations
+JAX-FVM solves the two-dimensional compressible Navier-Stokes equations in conservative form,
+
+∂t w + ∇ · Fc (w) − Fv (w, ∇w) = 0,
+w = (ρ, ρu, ρv, E)⊤ ,
+
+(1)
+
+where ρ is the density, u = (u, v) the velocity, p the pressure, and E the total energy per unit volume. The
+inviscid (convective) flux is
+
+
+ρu
+Fc (w) = ρu ⊗ u + p I ,
+(2)
+(E + p) u
+closed by the ideal-gas relation. In the implementation the pressure is recovered from a non-dimensional
+form that carries a reference Mach number M ,
+E=
+
+1
+p
++ ρ (u2 + v 2 ),
+2
+(γ − 1) M
+2
+
+(3)
+
+with heat-capacity ratio γ = 1.4 by default. The viscous flux uses a Newtonian stress tensor under the Stokes
+hypothesis (zero bulk viscosity) together with Fourier heat conduction,
+
+
+p
+τ = µ ∇u + ∇u⊤ − 23 (∇ · u) I ,
+,
+(4)
+q = −k ∇T,
+T =
+ρR
+so that Fv · n = (0, τ · n, (τ u + q) · ·n)⊤ , with dynamic viscosity µ, thermal conductivity k, and specific
+gas constant R. The compressible Euler equations are obtained as the inviscid limit Fv ≡ 0.
+4. Finite volume discretisation on unstructured meshes
+4.1. Mesh representation
+The computational domain is triangulated with the MeshPy 1 /Triangle Delaunay mesh generator
+(Shewchuk, 1996), subject to a maximum-area and a minimum-angle (30◦ by default) constraint. The Mesh
+class stores the vertices, the triangle-vertex table, cell barycentres and areas, the global face list with per-face
+lengths and outward normals, and the cell-to-cell adjacency (neighbors) together with a face-connectivity
+map. Periodic boundaries are handled by matching opposite boundary faces and rewiring the adjacency
+accordingly. Each boundary face carries an integer marker that selects its boundary condition (Section 5);
+mesh output is written to VTK through meshio.
+1 https://github.com/inducer/meshpy
+
+3
+
+4.2. Semi-discrete form
+Integrating (1) over a triangle Ci and applying the divergence theorem yields the cell-centred semi-discrete
+update
+
+dwi
+1 X
+f
+= − Ri (w),
+Ri (w) =
+Ĥ wif , wj(f
+(5)
+) ; nf ℓf ,
+dt
+|Ci |
+f ∈∂Ci
+
+where wi is the cell-averaged state, |Ci | the cell area, ℓf the face length, nf the outward unit normal, and
+f
+Ĥ a consistent numerical flux evaluated from the reconstructed left/right face states wif , wj(f
+) . The residual
+Ri is the quantity that is just-in-time compiled and differentiated throughout the code.
+4.3. Gradient reconstruction and slope limiting
+Second-order accuracy is obtained by a MUSCL reconstruction of the primitive variables u = (ρ, u, v, p).
+Cell gradients are computed by a weighted least-squares (LSQ) fit that minimises
+X
+2
+wij ∇ui · ∆xij − (uj − ui ) ,
+wij = |∆xij |−2 ,
+(6)
+j∈N (i)
+
+where ∆xij joins the barycentres of cells i and j; the resulting 2 × 2 normal equations are solved per cell and
+per variable with a doubly-vectorised (vmap) linear solve. The face states are then extrapolated as
+
+ufi = ui + ϕi ∇ui · (xf − xi ) ,
+
+(7)
+
+with a slope limiter ϕi ∈ [0, 1]. Two limiters are provided: the smooth Venkatakrishnan limiter (Venkatakrishnan, 1993),
+a2 + 2ab + ω
+,
+ω = (K h)3 ,
+(8)
+ϕ(a, b) = 2
+a + 2b2 + ab + ω
+(with h a local length scale and K a tunable constant) and the classical minmod limiter. This LSQ+MUSCL
+construction follows the standard upwind unstructured meshes methodology of Barth and Jespersen (1989).
+For the viscous flux, the LSQ gradients are evaluated at faces by
+
+
+wj − w i
+∇wij = ∇wij +
+− ∇wij · r̂ij r̂ij
+|rj − ri |
+with
+∇wij =
+
+1
+(∇wi + ∇wj ),
+2
+
+r̂ij =
+
+rj − ri
+|rj − ri |
+
+Even if the stencil needed to compute the gradient is larger than the one needed for the convective flux, the
+scheme avoids the odd-even decoupling problem.
+4.4. Numerical fluxes
+The scheme is formulated in terms of the entropy variables associated with the specific entropy s =
+ln(p/ργ ). The default convective flux is the entropy-conservative two-point flux of Tadmor (Tadmor, 1987,
+2003)pin the affordable Ismail-Roe form (Ismail and Roe, 2009). Writing the Ismail-Roe parameter vector
+z = ρ/p (1, u, v, p)⊤ and denoting by (·) the arithmetic and by (·)ln the logarithmic mean (evaluated with
+a numerically stable Taylor expansion near equal arguments), the consistent, entropy-conservative interface
+state (ρ̂, û, v̂, p̂) is reconstructed and assembled into the physical flux Ĥ EC . A dissipation term is then added,
+Ĥ = Ĥ EC − 12 α |λmax |
+
+∂w
+(ηR − ηL ),
+∂η
+
+(9)
+
+where η are the entropy variables and λmax = c/M + |u · n| is the maximum wave speed. The jump is mapped
+from entropy to conservative variables through the Jacobian ∂w/∂η, whose action is evaluated exactly by a
+4
+
+forward-mode AD (jax.jvp) call rather than an analytical hand-derivation; this yields an entropy-stable
+Rusanov (local Lax-Friedrichs) dissipation. The dimensionless coefficient α tunes the amount of numerical
+viscosity. As alternatives, a full Roe matrix-dissipation flux (Roe, 1981) with Roe-averaged eigenstructure
+and entropy-variable scaling of the wave strengths and a plain central/Rusanov flux are also available.
+For the Navier-Stokes equations the viscous flux (4) is evaluated at faces from face-averaged primitive
+states and face-averaged LSQ gradients, and subtracted from the convective contribution in the residual.
+5. Boundary conditions
+Boundary conditions are encoded through the integer face markers attached to the mesh, and are applied
+by constructing an appropriate ghost/exterior face state: marker 1 denotes a periodic face; marker 2 a solid
+wall; marker 3 a supersonic (fully prescribed) inlet; marker 4 an outlet (zero-gradient extrapolation); and
+marker 5 a subsonic inlet. Walls are treated either as inviscid slip walls (velocity mirrored about the face
+normal) or as no-slip walls, selected at run time.
+6. Time integration
+Given the semi-discrete system (5), several time integrators are provided. The default explicit scheme is
+the two-stage strong-stability Heun/RK2 method; classical RK3 or RK4 are also available. For stiff or steady
+problems, two implicit schemes are implemented:
+a backward-Euler solve and a singly diagonally-implicit
+√
+RK2 (SDIRK2, with coefficient x = 1 − 1/ 2). Each implicit stage solves the nonlinear system
+G(w) ≡ w − wn + ∆t R(w) = 0
+
+(10)
+
+by a few Newton iterations. Crucially, the required Jacobian-vector products are never assembled: the
+action v 7→ v + ∆t (∂R/∂w) v is computed matrix-free by forward-mode AD (jax.jvp) and passed to a
+GMRES solver (jax.scipy.sparse.linalg.gmres), with light under-relaxation for robustness. The explicit
+time-step size is set from a convective CFL condition based on the local spectral radius; for viscous runs a
+diffusive limit ∆t ∼ ∆x2 /ν is also enforced, and the minimum of the two is taken.
+7. Differentiability and implementation
+JAX-FVM is written entirely against jax.numpy. The residual (5) and every time-stepper are wrapped
+in jax.jit, with the (static) mesh object passed as a compile-time argument. Per-cell operations such as the
+LSQ solve (6) and the face-connectivity search are expressed as nested jax.vmap maps. Forward-mode AD
+(jax.jvp) plays a dual role: it supplies the entropy-variable jumps in the dissipation (9) and the Jacobian
+actions in the implicit solvers.
+Because the whole residual is differentiable, reverse-mode AD can propagate the gradient of any scalar
+objective; for instance a mismatch against reference data or an aerodynamic functional back to the initial
+condition, the boundary data, the physical parameters (µ, k, γ, . . . ), or the parameters of an embedded model.
+The library depends on flax and optax, so that such optimisation and inverse-design loops can be assembled
+directly on top of the solver. Execution is hardware-agnostic: the same code runs on CPU or GPU (a CUDA
+build of JAX is used for GPU acceleration), and double precision can be enabled when strict conservation
+checks are required. A suite of diagnostics: total entropy, kinetic energy, enstrophy, palinstrophy, vorticity,
+and Mach number supports quantitative verification of the structure-preserving properties of the scheme.
+8. Software structure and workflow
+The package is organised into a mesh module (src/mesh), a solver module with sub-packages for the
+compressible Euler, compressible Navier-Stokes, projection-based incompressible Navier-Stokes, and a pseudospectral vorticity solver (src/solvers), and a library of initial conditions and mesh geometries (src/Cases).
+5
+
+A typical simulation follows four steps: build a mesh, prescribe an initial condition as primitive variables and
+convert to conserved variables, march in time, and post-process. Listing 1 condenses the forward-facing-step
+example.
+Listing 1: Minimal driver for the Mach 3 forward-facing step (condensed from examples/Euler_example.ipynb).
+import jax
+from jax_fvm.src.mesh import Mesh_cases
+from jax_fvm.src.Cases import Test_Cases
+from jax_fvm.src.solvers.Euler import Euler
+from jax_fvm.src.solvers import helper
+# 1. Build the unstructured mesh (geometry + boundary markers)
+mesh = Mesh_cases.Forward_Step().build(h=5e-4)
+# 2. Initial condition: primitives (rho, u, v, p) -> conserved state W
+Primitives = Test_Cases.ForwardFacingStep().build(mesh)
+W = helper.getConserved(Primitives)
+# 3. Time integration: stable dt from CFL, then explicit RK2 march
+t_final, CFL = 4.0, 0.2
+dt = helper.get_dt(W, mesh, CFL=CFL)
+N_t = int(t_final / dt) + 1
+for n in range(N_t):
+W = jax.jit(Euler.time_step_RK2, static_argnums=(1,))(W, mesh, dt)
+# 4. Post-process: back to primitives and plot the fields
+Primitives = helper.getPrimitive(W)
+mesh.plot_solution(Primitives[..., 0], labels=r’$\rho$’)
+
+9. Example and verification
+The headline example is the Mach 3 forward-facing step of Woodward and Colella (1984): a uniform flow
+at (ρ, u, v, p) = (1.4, 3, 0, 1) enters a wind tunnel containing a forward-facing step. The simulation develops
+the canonical unsteady shock system, a detached bow shock ahead of the step, a Mach stem, reflected shocks,
+and a contact/slip line which JAX-FVM captures on a fully unstructured triangulation. Figure 1 shows the
+computed density and pressure fields at t = 4.
+Beyond this case, the distribution ships a broad battery of verification problems, all defined in
+src/Cases/Test_Cases.py: the full set of nineteen two-dimensional Riemann configurations of Lax and
+Liu (1998); the double Mach reflection (Woodward and Colella, 1984); the Kelvin-Helmholtz instability;
+the Taylor-Green vortex; several isentropic low-Mach vortex problems (advected, dipole, co-rotating, and
+merging Lamb-Oseen pairs, initialised in mechanical equilibrium via a pressure-Poisson projection to suppress
+spurious acoustics); and a cylinder-in-channel geometry. Structure-preserving behaviour is monitored through
+the entropy, energy, and enstrophy diagnostics noted above.
+10. Future work
+One of the main limitations of the current implementation is that the mesh input is restricted to the
+built-in MeshPy/Triangle2 generator. A VTK mesh reader is planned, which will allow the solver to operate
+on arbitrary unstructured meshes produced by external mesh generators. The current implementation is also
+limited to two-dimensional triangular meshes; extension to three-dimensional tetrahedral meshes is planned.
+Finally, the current implementation does not include a turbulence model; the addition of a turbulence closure,
+such as a Smagorinsky model or a Reynolds-averaged Navier-Stokes (RANS) model, is planned for future
+releases.
+2 https://github.com/inducer/meshpy
+
+6
+
+Figure 1: Mach 3 forward-facing step at t = 4 on an unstructured triangular mesh: density ρ (top) and pressure p (bottom). The
+bow shock, Mach stem, reflected shocks, and slip line are resolved. Computed with the entropy-conservative Tadmor/Ismail-Roe
+flux, MUSCL reconstruction with Venkatakrishnan limiting, and explicit RK2 time stepping.
+
+7
+
+11. Conclusion
+JAX-FVM provides, in a single compact code base, an entropy-stable compressible Euler/Navier-Stokes
+finite volume solver on unstructured meshes that is differentiable end to end and runs on CPU or GPU. Its
+distinctive combination of unstructured geometry, entropy-consistent numerics, and JAX-based automatic
+differentiation makes it a natural platform for gradient-based inverse problems, PDE-constrained optimisation,
+and hybrid physics/machine-learning modelling–a space that current structured-grid differentiable CFD
+frameworks do not cover. Planned extensions include gradient-based shape and inverse-design workflows
+built on the existing flax/optax dependencies, and completion of the VTK mesh-input path.
+Acknowledgements
+This work was carried out at INRIA. A deep thank you to Julien, Anass and Mathias for their support
+and feedback.
+Declaration of Generative AI and AI-assisted technologies in the writing process
+During the preparation of this work the authors used the Claude large language model inside the VSCode
+IDE to assist in writing code. After using this tool, the authors reviewed and edited the content as needed
+and takes full responsibility for the content of the published article.
+
+8
+
+References
+Abadi, M., Barham, P., Chen, J., Chen, Z., Davis, A., Dean, J., Devin, M., Ghemawat, S., Irving, G., Isard,
+M., et al., 2016. TensorFlow: a system for large-scale machine learning, in: 12th USENIX Symposium on
+Operating Systems Design and Implementation (OSDI 16), pp. 265–283.
+de Avila Belbute-Peres, F., Economon, T., Kolter, Z., 2020. Combining differentiable PDE solvers and
+graph neural networks for fluid flow prediction, in: International Conference on Machine Learning (ICML),
+PMLR. pp. 2402–2411.
+Bar-Sinai, Y., Hoyer, S., Hickey, J., Brenner, M.P., 2019. Learning data-driven discretizations for partial
+differential equations. Proceedings of the National Academy of Sciences 116, 15344–15349. doi:10.1073/
+pnas.1814058116.
+Barth, T., Jespersen, D., 1989. The design and application of upwind schemes on unstructured meshes, in:
+27th Aerospace Sciences Meeting, p. 366. doi:10.2514/6.1989-366.
+Bezanson, J., Edelman, A., Karpinski, S., Shah, V.B., 2017. Julia: A fresh approach to numerical computing.
+SIAM Review 59, 65–98. doi:10.1137/141000671.
+Bezgin, D.A., Buhendwa, A.B., Adams, N.A., 2023. JAX-Fluids: A fully-differentiable high-order computational fluid dynamics solver for compressible two-phase flows. Computer Physics Communications 282,
+108527. doi:10.1016/j.cpc.2022.108527.
+Bradbury, J., Frostig, R., Hawkins, P., Johnson, M.J., Leary, C., Maclaurin, D., Necula, G., Paszke, A., VanderPlas, J., Wanderman-Milne, S., Zhang, Q., 2018. JAX: composable transformations of Python+NumPy
+programs. URL: http://github.com/jax-ml/jax.
+Brunton, S.L., Noack, B.R., Koumoutsakos, P., 2020. Machine learning for fluid mechanics. Annual Review
+of Fluid Mechanics 52, 477–508. doi:10.1146/annurev-fluid-010719-060214.
+Du, P., Li, Y., Xu, M., Wang, J.X., 2026. Difvm: A vectorized graph-based finite volume solver for
+differentiable cfd on unstructured meshes. arXiv preprint arXiv:2603.15920 .
+Duraisamy, K., Iaccarino, G., Xiao, H., 2019. Turbulence modeling in the age of data. Annual review of fluid
+mechanics 51, 357–377.
+Economon, T.D., Palacios, F., Copeland, S.R., Lukaczyk, T.W., Alonso, J.J., 2016. SU2: An open-source
+suite for multiphysics simulation and design. AIAA Journal 54, 828–846. doi:10.2514/1.J053813.
+Fan, X., Liu, X.Y., Wang, M., Wang, J.X., 2026. Diff-FlowFSI: A GPU-optimized differentiable CFD
+platform for high-fidelity turbulence and FSI simulations. Computer Methods in Applied Mechanics and
+Engineering 448, 118455. doi:10.1016/j.cma.2025.118455.
+Fan, X., Wang, J.X., 2024. Differentiable hybrid neural modeling for fluid-structure interaction. Journal of
+Computational Physics 496, 112584. doi:10.1016/j.jcp.2023.112584.
+Franz, A., Wei, H., Guastoni, L., Thuerey, N., 2025. PICT – a differentiable, GPU-accelerated multi-block
+PISO solver for simulation-coupled learning tasks in fluid dynamics. arXiv preprint arXiv:2505.16992
+doi:10.48550/arXiv.2505.16992.
+Holl, P., Koltun, V., Thuerey, N., 2020. Learning to control PDEs with differentiable physics. International
+Conference on Learning Representations (ICLR) .
+Ismail, F., Roe, P.L., 2009. Affordable, entropy-consistent Euler flux functions II: Entropy production at
+shocks. Journal of Computational Physics 228, 5410–5436. doi:10.1016/j.jcp.2009.04.021.
+9
+
+Karniadakis, G.E., Kevrekidis, I.G., Lu, L., Perdikaris, P., Wang, S., Yang, L., 2021. Physics-informed
+machine learning. Nature Reviews Physics 3, 422–440. doi:10.1038/s42254-021-00314-5.
+Kochkov, D., Smith, J.A., Alieva, A., Wang, Q., Brenner, M.P., Hoyer, S., 2021. Machine learning–accelerated
+computational fluid dynamics. Proceedings of the National Academy of Sciences 118, e2101784118.
+doi:10.1073/pnas.2101784118.
+Lax, P.D., Liu, X.D., 1998. Solution of two-dimensional Riemann problems of gas dynamics by positive
+schemes. SIAM Journal on Scientific Computing 19, 319–340. doi:10.1137/S1064827595291819.
+List, B., Chen, L.W., Thuerey, N., 2022. Learned turbulence modelling with differentiable fluid solvers:
+physics-based loss functions and optimisation horizons. Journal of Fluid Mechanics 949, A25. doi:10.1017/
+jfm.2022.738.
+Mitusch, S., Funke, S., Dokken, J., 2019. dolfin-adjoint 2018.1: automated adjoints for FEniCS and Firedrake.
+Journal of Open Source Software 4, 1292. doi:10.21105/joss.01292.
+Pant, S., Corsini, C., Baker, C., Hsia, T.Y., Pennati, G., Vignon-Clementel, I.E., 2017. Inverse problems
+in reduced order models of cardiovascular haemodynamics: aspects of data assimilation and heart rate
+variability. Journal of The Royal Society Interface 14, 20160513. doi:10.1098/rsif.2016.0513.
+Paszke, A., Gross, S., Massa, F., Lerer, A., Bradbury, J., Chanan, G., Killeen, T., Lin, Z., Gimelshein, N.,
+Antiga, L., et al., 2019. PyTorch: An imperative style, high-performance deep learning library. Advances
+in Neural Information Processing Systems 32.
+Pfaff, T., Fortunato, M., Sanchez-Gonzalez, A., Battaglia, P., 2021. Learning mesh-based simulation with
+graph networks, in: International Conference on Learning Representations (ICLR).
+Roe, P.L., 1981. Approximate Riemann solvers, parameter vectors, and difference schemes. Journal of
+Computational Physics 43, 357–372. doi:10.1016/0021-9991(81)90128-5.
+de Romémont, G., Renac, F., Chinesta, F., Nunez, J., Gueyffier, D., 2025. Data-driven adaptive gradient
+recovery for unstructured finite volume computations. arXiv preprint arXiv:2507.16571 .
+de Romémont, G., Renac, F., Nunez, J., Gueyffier, D., Chinesta, F., 2026. A data-driven learned discretization
+approach in finite volume schemes for hyperbolic conservation laws and varying boundary conditions.
+Computers & Fluids , 106978.
+Sapienza, F., Bolibar, J., Schäfer, F., Groenke, B., Pal, A., Boussange, V., Heimbach, P., Hooker, G., Pérez,
+F., Persson, P.O., et al., 2024. Differentiable programming for differential equations: A review. arXiv
+preprint arXiv:2406.09699 doi:10.48550/arXiv.2406.09699.
+Shewchuk, J.R., 1996. Triangle: Engineering a 2D quality mesh generator and Delaunay triangulator, in:
+Applied Computational Geometry Towards Geometric Engineering. Springer, pp. 203–222. doi:10.1007/
+BFb0014497.
+Tadmor, E., 1987. The numerical viscosity of entropy stable schemes for systems of conservation laws. I.
+Mathematics of Computation 49, 91–103. doi:10.1090/S0025-5718-1987-0890255-3.
+Tadmor, E., 2003. Entropy stability theory for difference approximations of nonlinear conservation laws and
+related time-dependent problems. Acta Numerica 12, 451–512. doi:10.1017/S0962492902000156.
+Um, K., Brand, R., Fei, Y.R., Holl, P., Thuerey, N., 2020. Solver-in-the-loop: Learning from differentiable
+physics to interact with iterative PDE-solvers. Advances in Neural Information Processing Systems 33,
+6111–6122.
+Venkatakrishnan, V., 1993. On the accuracy of limiters and convergence to steady state solutions, in: 31st
+Aerospace Sciences Meeting, p. 880. doi:10.2514/6.1993-880.
+10
+
+Weymouth, G.D., Font, B., 2024. WaterLily.jl: A differentiable and backend-agnostic Julia solver to simulate
+incompressible viscous flow and dynamic bodies. arXiv preprint arXiv:2407.16032 doi:10.48550/arXiv.
+2407.16032.
+Woodward, P., Colella, P., 1984. The numerical simulation of two-dimensional fluid flow with strong shocks.
+Journal of Computational Physics 54, 115–173. doi:10.1016/0021-9991(84)90142-6.
+Wu, J., Xiao, H., Sun, R., Wang, Q., 2019. Reynolds-averaged Navier–Stokes equations with explicit
+data-driven Reynolds stress closure can be ill-conditioned. Journal of Fluid Mechanics 869, 553–586.
+doi:10.1017/jfm.2019.205.
+
+11
+

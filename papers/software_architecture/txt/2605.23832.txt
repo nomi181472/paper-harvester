@@ -1,0 +1,1152 @@
+SFG-ROS: A Resource-Aware Framework for
+Dense Multi-Agent Perception
+
+arXiv:2605.23832v1 [cs.RO] 22 May 2026
+
+Constantin Blessing, Elias Geiger, Jakob Häringer,
+Dennis Grewe, Markus Enzweiler
+Institute for Intelligent Systems, Faculty of Computer Sciences and
+Engineering, Esslingen University of Applied Sciences, Esslingen am
+Neckar, 73732, Baden-Württemberg, Germany.
+*Corresponding author(s). E-mail(s):
+constantin.blessing@hs-esslingen.de;
+Contributing authors: elias.geiger@hs-esslingen.de;
+jakob.haeringer@hs-esslingen.de; dennis.grewe@hs-esslingen.de;
+markus.enzweiler@hs-esslingen.de;
+Abstract
+Deploying heterogeneous multi-agent robot fleets for collaborative perception
+requires robust data exchange and scalable software architectures. However,
+standard ROS 2 implementations often suffer from network saturation, namespace collisions, and severe computational overhead when distributing dense
+sensor streams across devices. To address these bottlenecks, we present SFGROS, a resource-aware multi-agent software framework designed for dynamic
+fleet deployments. SFG-ROS addresses these challenges through three primary
+contributions. First, schema-driven traffic routing isolates high-frequency intraagent traffic from the global network using a programmatic fully qualified name
+schema and targeted Fast DDS routing. Second, an on-demand centralized
+decoding pipeline automatically offloads high-bandwidth sensor data decompression, eliminating redundant processing across local consumer nodes. Finally,
+a hardware-agnostic container pipeline dynamically adapts to heterogeneous
+accelerators, seamlessly bridging development environments with zero-touch,
+field-ready execution. We evaluate the framework using a fleet of wheeled and
+legged robots equipped with LiDAR and stereo depth cameras. Experimental results show SFG-ROS bounds network traffic to O(1) and, by replacing
+redundant decompression with lightweight IPC, reduces the per-subscriber CPU
+scaling penalty by 72.3% versus standard ROS 2, all while maintaining low
+
+1
+
+latency. Finally, we publish SFG-ROS under a permissive license, available via
+iis-esslingen.github.io/sfg-ros.
+Keywords: Multi-Agent Systems, Robotics, Robot Operating System, Smart Factory
+
+1 Introduction
+Industry 4.0 has driven the development of dynamic manufacturing facilities. Traditional mass production, characterized by rigid assembly lines and static material flow,
+is increasingly being augmented or replaced by highly flexible concepts such as matrix
+production [1]. Pushing this paradigm further, the vision of Smart Factory Grids (SFG)
+[2] proposes dynamically distributed production networks composed of specialized,
+autonomous cyber-physical systems. The SFG vision aims to enable highly resilient,
+flexible manufacturing for low-quantity rapid prototyping with minimal setup times.
+In this context, heterogeneous mobile robots – spanning wheeled, legged, aerial,
+and more recently humanoid platforms [3] – serve as the connective tissue of the SFG,
+enabling material flow, automated facility inspection, and cooperative maintenance
+necessary for distributed production. To function effectively, these heterogeneous
+robots (constituting the multi-agent system) must operate not as isolated entities,
+but as a collaborative fleet capable of sharing high-bandwidth sensor data, dynamic
+state information, and task-level intentions in real time. While these smart factory
+deployments serve as our primary motivating use case, the fundamental challenge of
+coordinating such fleets is universal to any multi-agent robotic system.
+Accordingly, facilitating collaborative tasks requires a robust software foundation
+that governs hardware abstraction, task execution, and inter-process communication.
+While the Robot Operating System 2 (ROS 2) [4] is the standard robotics framework,
+its default configuration limits deployments on resource-constrained robot compute
+units (edge devices) in dense, multi-agent networks. Specifically, decentralized discovery requires a fully-connected graph, causing network-saturating packet storms as
+fleets scale [5]. Furthermore, sharing dense sensor streams like images overwhelms
+default UDP buffers [5]; mitigating this via image_transport compression merely
+shifts the bottleneck, exhausting CPU resources through redundant decompression
+across local subscribers. Finally, heterogeneous hardware (e.g., ARM, CUDA, ROCm)
+creates significant deployment friction. To address these bottlenecks, we derive four
+core requirements for an edge-assisted, multi-agent framework against which existing
+solutions are evaluated:
+1. Traffic and Namespace Scalability: Prevent network saturation and namespace
+collisions by ensuring high-frequency local operations do not congest the global
+network, while preserving reliable inter-agent communication.
+2. Resource-Efficient Perception: Minimize compute and bandwidth overhead
+by eliminating redundant sensor processing on devices and avoiding continuous
+multicast discovery storms.
+
+2
+
+3. Platform-Agnostic Portability: Ensure reproducible, zero-touch deployment
+across heterogeneous hardware architectures to seamlessly bridge development and
+production environments.
+4. Fleet-Wide Observability: Enable unified multi-agent coordination by seamlessly aggregating distributed state data, synchronizing spatial reference frames,
+and providing coherent temporal visualization.
+
+2 Related Work
+This section reviews prior work across three key areas: multi-agent ROS 2 frameworks,
+edge/cloud robotics offloading, and deployment and virtualization.
+
+2.1 Multi-Agent ROS 2 Frameworks
+Several frameworks address the complexities of coordinating multiple ROS 2 agents.
+Open-RMF [6] is widely utilized to facilitate interoperability and task-level traffic
+management across heterogeneous fleets. However, it primarily operates at the orchestration layer to achieve unified coordination (Requirement 4). It does not inherently
+resolve the low-level middleware bottlenecks associated with decentralized discovery
+storms and namespace collisions, falling short of the strict traffic isolation needed for
+network scalability (Requirement 1). Similarly, RoboFleet [7] addresses communication
+overhead by bridging distributed ROS networks over WebSockets. While effective for
+wide-area monitoring, it requires protocol translation and introduces a central point
+of failure by utilizing a single-server architecture for dense, high-frequency multi-agent
+perception sharing.
+
+2.2 Edge/Cloud Robotics Offloading
+The computational burden of dense multi-agent perception has driven the development of various offloading frameworks. FogROS 2 [8], for instance, extends the ROS
+2 ecosystem by enabling the seamless migration of compute-heavy nodes to external
+edge or cloud servers. While cloud offloading circumvents edge-compute limitations,
+it inherently relies on persistent, high-bandwidth external links. Furthermore, the
+geographical sparsity of cloud servers can induce latency boundaries unsuitable for collaborative perception systems that require continuous, data-intensive sensor streams.
+Consequently, it fails to provide the localized, resource-efficient perception (Requirement 2) necessary to eliminate redundant onboard processing without offloading data
+across volatile networks.
+
+2.3 Deployment & Virtualization
+Transitioning ROS 2 applications from development to production across diverse
+robotic hardware necessitates robust virtualization. Given the heavy reliance of ROS
+2 on specific OS-level dependencies and hardware drivers, lightweight containerization
+(e.g. Docker) has emerged as the practical standard [4, 9, 10]. Solutions leveraging
+Kubernetes, such as KubeROS [11], bring cloud-native orchestration to robotic fleets
+but often introduce management and resource overhead per agent (e.g. a kubelet
+3
+
+node agent) that is prohibitive for severely constrained edge platforms. Conversely,
+vendor-specific solutions like NVIDIA Isaac ROS [12] provide highly optimized, containerized deployments with deep hardware acceleration. However, these solutions
+inherently lock deployments into a single hardware ecosystem (e.g. CUDA), failing
+to meet the platform-agnostic portability (Requirement 3) necessary for zero-touch
+deployment across a heterogeneous fleet containing various devices and competing
+hardware accelerators.
+
+3 Contributions
+We introduce SFG-ROS, a novel ROS 2-based multi-agent software framework
+designed to fulfill the core requirements established in Section 1 for resourceconstrained collaborative perception and fleet coordination. Our primary contributions
+are:
+1. Schema-Driven Traffic Routing: A topology-enforcing communication architecture that utilizes a programmatic fully qualified name schema and targeted
+communication routing to isolate intra-agent from inter-agent traffic, fulfilling the
+need for traffic and namespace scalability (Requirement 1).
+2. On-Demand Stream Decompression: A dynamic agent discovery and centralized data decoding pipeline that significantly reduces network and computational overhead by selectively decompressing sensor streams on demand, enabling
+resource-efficient perception (Requirement 2).
+3. Accelerator-Aware Virtualization: A hardware-agnostic container deployment
+strategy that dynamically adapts to heterogeneous accelerators for a seamless
+transition from development to deployment, ensuring platform-agnostic portability
+(Requirement 3).
+4. Spatiotemporal Synchronization & Visualization: A suite of multi-agent
+visualization and planning tools, including a visualizer bridge and a proxy-frame
+external ground truth synchronizer, which together provide fleet-wide observability
+(Requirement 4).
+The remainder of this paper is structured as follows: Section 4 details the proposed SFG-ROS architecture and implementation. Section 5 presents the experimental
+evaluation. Finally, Section 6 concludes the paper and outlines directions for future
+work.
+
+4 Architecture & Implementation
+The proposed framework aims to transform conceptual multi-agent coordination into
+a high-performance, reproducible software stack. Our primary objective is to mitigate
+the inherent overhead of ROS 2 discovery and data transport in dense sensor environments without sacrificing the middleware’s modularity and flexibility. To achieve this,
+we introduce a “global-compressed, local-raw” architectural paradigm, as illustrated in
+Figure 1. Under this paradigm, high-bandwidth data is strictly encapsulated and compressed for inter-agent transport across a global bridge domain, while internal device
+
+4
+
+Agent 1
+
+Agent N
+
+Application
+Node Network
+
+...
+AgentDecoder
+
+AgentDiscoverer
+
+AgentDecoder
+
+AgentDiscoverer
+
+Nodes
+AgentStatusProvider
+
+SFG-ROS
+
+Pipeline
+
+Agent
+Software Stack
+
+AgentStatusProvider
+
+Agent
+Software Stack
+
+Router
+»
+
+«
+
+Router
+»
+
+«
+
+Inter-Agent Traffic
+
+Fig. 1 The SFG-ROS architecture comprised of the underlying pipeline and dedicated inter-agent
+communication nodes. A dedicated router bridges raw intra-agent (gray arrows) and compressed
+inter-agent (red arrows) traffic based on our topologically enforced communication scheme
+
+processing within the local domain remains raw, transparent, and computationally
+efficient.
+In the following subsections the implementation of this architecture in alignment
+with the core contributions from Section 3, progressing from the foundational routing
+schema and data exchange pipelines to deployment strategies and fleet visualization
+tools, will be detailed.
+
+4.1 Communication Topology & Naming Convention
+By default, ROS 2 agents rely on the Data Distribution Service (DDS), a decentralized middleware specification, to automatically discover one another on a local
+network and to exchange data through topics, services, and actions [4]. To minimize
+network interference and namespace collisions in our multi-agent setup – in accordance with Requirement 1 – we employ Fast DDS by eProsima [13] as our middleware
+implementation alongside a two-layered communication isolation approach.
+First, each agent is assigned a unique ROS domain ID to ensure that DDS network traffic is segregated between agents on the DDS layer itself. While this is an
+effective measure to prevent accidental cross-agent talk, it prohibits all communication between agents, even desired one necessary for collaborative tasks. Therefore, to
+facilitate cross-agent communication, each agent makes use of a middleware routing
+mechanism (implemented here via a Fast DDS Router [14]) that selectively routes
+middleware traffic between the agent’s domain and a shared, global domain based on
+the communication’s fully qualified name (FQN).
+Formally, let Di ̸= 0 denote the agent’s local domain for a specific agent i, D0 = 0
+the global domain, and Fforward the set of all possible FQNs that satisfy the forwarding
+rules outlined in Table 1. The routing policy π for a given message m published on a
+
+5
+
+Table 1 DDS router Forwarding Rules. Note that the FQN prefixes for the
+forwarding rules follow the ROS 2 DDS mapping convention (e.g. rt/ for topics)
+Forwarding Rule
+
+Participating Domains
+
+Description
+
+rt/tf
+rt/tf_static
+rt/global/*
+rq/global/*
+rr/global/*
+
+..
+.
+Di /D0
+..
+.
+
+Transform topic
+Static transform topic
+Global topics
+Global service requests
+Global service responses
+
+topic with FQN f is enforced as a piecewise mapping
+
+(
+π (m, f ) =
+
+Di ↔ D0
+Di
+
+iff ∈ Fforward
+otherwise
+
+(1)
+
+As seen in Table 1 and defined by the policy π , a given DDS router forwards
+messages bidirectionally between the dedicated agent’s domain Di and the domain
+D0 , transforming the latter into a global bridge domain that acts as the hub for crossagent communication. Note that for transform topics, appropriate frame prefixing is
+required to prevent TF frame ID clashes.
+Second, to guarantee that developers comply with these routing rules, we implement a purpose-built, code-enforced FQN naming convention. We define a valid FQN
+as an ordered tuple T = (s, a, c, d, r), constructed from individual segments:
+
+• s ∈ S is the mandatory scope segment.
+• a ∈ A ∪ {∅} is the optional agent segment.
+• c ∈ C ∪ {∅} is the optional component segment.
+• d ∈ D ∪ {∅} is the optional data stream segment.
+• r ∈ R is the mandatory resource segment.
+To bridge these formal sets with the software implementation, the instantiation of
+T is managed by a RosFqnBuilder class utilizing the builder pattern. Rather than
+relying on error-prone manual string concatenation, the builder is supplied with programmatic representations of the tuple segments. The sets S , C , D, and R are defined
+in the codebase via corresponding enumerations containing standardized values, such
+as Lidar or LocomotionController in the case of set C . In contrast, the agent set
+A is resolved dynamically at runtime: the builder defaults to a sanitized version of
+the operating system’s hostname, which can be explicitly overridden by setting the
+SFG_AGENT_NAME environment variable.
+To maintain flexibility, the implementation provides two extension mechanisms for
+the enumeration-backed sets C , D, and R. First, an optional suffix can be appended
+to a given enumeration value to provide additional granularity (e.g. differentiating
+between a front and a rear camera). Second, an escape hatch is available via a dedicated
+Custom enumeration value. This allows developers to assign an arbitrary string to a
+segment to accommodate novel use cases, provided the resulting string remains a valid
+ROS FQN. The set S strictly encompasses the two distinct values Local and Global.
+6
+
+AgentHeartbeat|Custom
+RobotDescription|Custom
+All&~(RobotDescription|AgentHeartbeat)
+
+/
+
+<scope>
+
+<agent>
+
+<component>
+
+<stream>
+
+<resource>
+
+Required
+
+Optional
+
+Optional
+
+Optional
+
+Required
+
+enum value
+
+$SFG_AGENT_NAME
+or hostname
+
+enum value + suffix
+or escape hatch
+
+enum value + suffix
+or escape hatch
+
+enum value + suffix
+or escape hatch
+
+Fig. 2 Structural syntax of the programmatic FQN schema. The paths leading into the mandatory
+<resource> segment are annotated with their bitwise constraints, dictating which resource types are
+permitted based on the preceding segment of the FQN
+
+Ultimately, the construction of the valid ROS 2 FQN from T is achieved by the
+builder automatically concatenating the resolved tuple elements using standard ROS
+namespace separators. The structural syntax and dependency paths of this schema
+are illustrated in Figure 2.
+
+4.2 Dynamic Discovery & Agent Lifecycle
+Ensuring traffic and namespace scalability (Requirement 1) necessitates going beyond
+the ROS 2-native discovery mechanisms (multicast UDP). Therefore, we deploy a
+standardized set of lifecycle management nodes that serve as the fundamental baseline
+for every agent in the multi-agent system.
+The AgentStatusProvider node broadcasts AgentHeartbeat messages on the
+globally routed topic "/global/agent_heartbeat" at periodic intervals, defaulting
+to 1s during agent startup and 5s during steady state operation in our implementation. Simultaneously, it provides a global service "/global/<agent>/get_metadata"
+that allows other agents to query its specific hardware configuration, such as available
+sensors.
+
+rx heartbeat
+/ tx metadata request
+
+Pending Metadata
+
+rx metadata reply
+/ tx discovered event
+/ start keepalive timer
+
+rx heartbeat
+
+Unknown
+
+keepalive timer expired
+/ tx lost event
+/ erase from cache
+
+Active
+
+rx heartbeat
+/ reset keepalive timer
+
+Fig. 3 The internal lifecycle state machine of the AgentDiscoverer node for a given remote agent,
+using standard UML syntax (Event/Action). The node leverages asynchronous ROS 2 service futures
+and timers to track agents and prevent redundant metadata queries, exposing the resulting state to
+the local domain via discovery events
+
+7
+
+The AgentDiscoverer node acts as a centralized abstraction layer on top of
+the raw heartbeats. By subscribing to the global heartbeat, it maintains an active
+cache of the fleet and fires agent discovery events via the locally scoped topic
+"/local/<agent>/agent_discovery_event". This approach strictly bounds complex
+discovery logic and asynchronous service calls to a single node per agent, shielding local
+consumer nodes from network-level state management. The internal lifecycle state
+machine for tracking a remote agent, modeled as a Deterministic Finite Automaton,
+is illustrated in Figure 3.
+
+4.3 Efficient Sensor Data Exchange
+For Requirement 2, i.e., efficiently sharing dense, high-frequency camera data, such as
+depth or color images, compression is required. To ensure compatibility with thirdparty camera drivers, we leverage the standard ROS 2 image_transport interface. For
+color imagery, we utilize the FFmpeg plugin by [15] to enable hardware-accelerated
+H.264 encoding. FFmpeg’s broad selection of image codecs enables the utilization
+of platform-specific hardware accelerators (e.g. NVENC/NVDEC) without requiring
+modifications to application-level code.
+Because standard video codecs introduce artifacting that corrupts radiometric
+depth data [16, 17], and the available, lossless PNG compression is comparatively slow,
+we backported the Fast Lossless Depth Video, RVL compression algorithm [18] from
+later ROS 2 distributions to our Humble-based stack. Furthermore, all sensor streams
+enforce best effort quality of service (QoS) reliability profiles to prevent stale data
+buildup and retransmission induced latency spikes.
+A significant bottleneck inherent to the standard image_transport architecture
+arises when multiple consumer nodes residing on the same device simultaneously
+subscribe to a single remote compressed image stream. By default, this triggers
+independent, redundant decompression steps for every subscriber, leading to severe
+computational overhead. To mitigate this, we implemented an AgentDecoder node
+that acts as a centralized, dynamic proxy for decoding, reducing the decoding overhead
+per physical device.
+Let S be the set of subscribers to a specific compressed sensor stream r. In a base
+ROS 2 architecture, the total computational cost of decompression cbase (r) on a single
+device scales linearly with the number of subscribers, i.e.
+
+cbase (r) =
+
+|S|
+X
+
+
+cnet (r) + cdec (r) ,
+
+(2)
+
+i=1
+
+where cnet (r) is the network protocol overhead and cdec (r) is the CPU cost of e.g.
+decoding H.264 or RVL frames. By introducing the AgentDecoder, the decompression
+operation is decoupled from the consumers. The cost model simplifies to
+
+cproposed (r) = cnet (r) + cdec (r) +
+
+|S|
+X
+i=1
+
+8
+
+cipc (r),
+
+(3)
+
+where cipc ≪ cdec represents the cost of inter-process communication (IPC). This
+decoupling reduces the per-subscriber computational penalty to strictly IPC overhead,
+resulting in a flatter linear scaling curve for CPU utilization while maintaining O(1)
+network bandwidth.
+graph events (subscription added/removed)
+discovered/lost event
+(internal tracking)
+
+AgentDecoder
+
+AgentDiscoverer
+
+on-demand load/unload (services)
+
+Global Domain
+
+.../image_compressed
+
+Local Domain
+
+Republisher
+
+.../image_raw
+
+(FFmpeg/RVL decompression)
+.../camera_info
+
+.../camera_info
+
+Relay
+..
+.
+ROS 2 Component Container
+
+SLAM
+
+2D Object Detection
+..
+.
+
+Fig. 4 Architecture of the dynamic, centralized decoding pipeline. The AgentDecoder registers available remote agents via discovery events but relies on ROS 2 graph events to monitor local domain
+demand
+
+As illustrated in Figure 4, the AgentDecoder subscribes to local agent discovery
+events. Upon discovering a new agent, it registers the agent’s metadata but defers
+the instantiation of any decompression pipelines. Instead, the AgentDecoder actively
+monitors ROS 2 graph events to track local subscriptions. When a local consumer node
+subscribes to a specific decoded or relayed topic associated with a known active agent,
+the AgentDecoder leverages ROS 2 composition_interfaces to dynamically load the
+required components directly into a shared ROS 2 component container. Consequently,
+when all local subscribers for a specific topic disconnect, the AgentDecoder automatically unloads the corresponding component, ensuring deterministic, demand-driven
+resource reclamation and preventing wasted compute on unutilized data streams.
+This architecture manages the on-demand decompression of images and the relaying of CameraInfo topics respectively, and can be extended to other compressed
+sensor streams. By utilizing composable nodes within a unified container process, we
+minimize operating system context-switching and lay the groundwork for zero-copy
+intra-process communication available in future ROS 2 distributions.
+
+4.4 Deployment & Development Pipeline
+To ensure reproducibility across heterogeneous hardware – ranging from NVIDIA
+Jetson-based robots to ARM-based PC Handhelds – we implement a layered,
+containerized deployment strategy depicted in Figure 5.
+
+9
+
+Container Orchestration
+post_start_command
+
+(3)
+
+layering
+
+Application Layer
+agent-specific dependencies
+(2)
+
+Intermediate Adapter Layer
+ROS 2 Humble, FastDDS, FFmpeg, RVL, etc.
+(1)
+
+Local
+Domain
+
+Hardware Dependent Base Layer
+dynamic base image selection
+
+Global
+Domain
+
+External ROS 2
+Network
+
+initialize_command
+
+Agent Software Stack Container
+
+Systemd Service
+
+DDS Router
+Container
+
+starts
+creates
+
+starts and attaches
+to agent container
+
+VS Code Dev-Container
+
+Linux Host System
+heterogeneous hardware with diverse hardware accelerators (CUDA, ROCm, etc.)
+
+Fig. 5 Overview of the dual-container deployment and development architecture. A modular, threelayer agent container adapts to heterogeneous Linux host hardware, while a dedicated DDS router
+container bridges isolated agent communications with the external ROS 2 network. The stack can be
+started either via VS Code or a systemd service for automatic startup
+
+The software stack is built upon a modular, multi-stage Dockerfile architecture. We
+employ a dynamic base image selection process that detects the host’s hardware accelerators (e.g. CUDA for NVIDIA, ROCm for AMD, etc.) during the build process. The
+architecture is composed of three distinct layers, namely (1) the hardware-dependent
+base layer, (2) the intermediate adapter layer establishing a common functional
+baseline including ROS 2 Humble, FFmpeg, RVL decompression, etc., and (3) the
+application layer encompassing agent-level dependencies and the agent’s software stack
+via colcon workspace mounting.
+Deployment on the physical agent is managed via a dual-container orchestration
+using Docker Compose. The first container encapsulates the agent software stack using
+the aforementioned architecture, while the second runs the dedicated DDS router
+instance mentioned in Section 4.1. For deployment, we provide systemd service integration, enabling the entire stack to initialize automatically upon agent power-on.
+Lastly, the environment is integrated with VS Code through specialized dev-container
+configurations, providing:
+
+• Tooling: Preconfigured IntelliSense for the colcon workspace, alongside standardized formatting for C++, Python, and CMake.
+• Debugging: Integrated debugging profiles for both C++ and Python nodes with
+full CLI argument forwarding.
+• Lifecycle Hooks: Agent-specific commands such as the initialize_command
+executed during dev-container setup which handles persistent host-to-container
+configurations, such as establishing NTP-based time synchronization, configuring
+firewalls, and generating the aforementioned systemd service. To maintain flexibility,
+all hooks support custom user extensions via dedicated extension scripts.
+
+10
+
+4.5 Specialized Tooling
+To complement the core framework and deployment architecture, we have developed a
+suite of specialized tools designed for visualization and coordination (Requirement 4).
+The standard ROS 2 visualization tools such as RViz [19] often struggle with
+the spatiotemporal complexity and historical logging of dense, multi-agent networks.
+Conversely, high-performance visualization frameworks like the Rerun data viewer [20]
+do not feature native ROS 2 integration.
+Addressing this, we implement a bridge for the Rerun data viewer, designed with
+an RViz-like graphical user interface to dynamically add visualizers, configure QoS
+profiles, and tune visualizer-specific parameters at runtime. The architecture relies on
+pluginlib to decouple the core bridge logic from message-specific handling, supporting the creation of custom visualizer plugins for both standard and non-standard ROS
+2 messages. Notably, the plugin interface natively supports ROS 2 message filtering
+and synchronization. This allows developers to easily create complex visualizers that
+fuse multiple dependent topics, such as precisely synchronizing Image streams with
+their respective CameraInfo for accurate 3D depth map projection, requiring solely
+the implementation of a unified data-mapping callback.
+Vicon Tracking System
+
+object_to_frame_id_mapping:
+agent_x_markers:
+marker_frame_id:
+agent_x/markers
+base_frame_id:
+agent_x/base
+
+tracked object ID:
+agent_x_markers
+
+Vicon ROS 2 Receiver
+map
+
+publishes
+Tmap→agent_x/base
+(1)
+
+×
+
+breaks
+hierarchy
+
+base
+
+(2)
+(3)
+
+publishes
+Tmap→agent_x_markers
+agent_x_markers
+
+Vicon Bridge
+
+Tmap→agent_x_markers
+
+looks up Tagent_x/markers→
+T agent_x/base
+
+map
+
+computes
+Tmap→agent_x/base
+
+base
+
+×
+
+name
+mismatch
+wheels
+
+markers
+
+markers
+
+camera
+
+camera
+
+Robot Description
+
+Robot Description
+frame prefix: agent_x
+
+wheels
+
+fl fr rl rr
+
+frame prefix: agent_x
+
+fl fr rl rr
+
+Fig. 6 Comparison of TF tree integration for Vicon motion capture data, contrasting the official
+Vicon ROS 2 Receiver (left) with our Vicon Bridge (right)
+
+While the Rerun bridge provides temporal, visual logging, experimental evaluation
+as well as perception itself requires precise pose information. In our specific use-case we
+leverage a Vicon Vero 2.2 [21] camera system using the Vicon Tracker 4.4 [22] software
+for external agent localization via reflective markers placed on the agents themselves.
+11
+
+While Vicon officially endorses the Vicon ROS 2 Receiver [23], it proved unsuitable for
+our application due to two limitations: (1) It rigidly maps Vicon tracked object IDs to
+ROS 2 TF frame IDs with no remapping mechanism in place, and (2) it is incompatible
+with robot descriptions whose root does not equal the tracked object itself, resulting
+in violation of the single root requirement for ROS 2 TF trees. Therefore, we propose
+Vicon Bridge that solves both issues by (1) allowing for an arbitrary mapping between
+Vicon object IDs and ROS 2 TF frame IDs, and (2) employing a frame-via-proxyframe-publication mechanism.
+Figure 6 contrasts both approaches: As a direct consequence of the first limitation, the official receiver produces a name mismatch between the published frame
+agent_x_markers and the target frame agent_1/markers. Furthermore, even if this
+naming conflict were resolved, the aforementioned root discrepancy inherently breaks
+the TF hierarchy, since agent_x’s accompanying robot description is rooted at base,
+not at markers.
+In contrast, our Vicon Bridge’s frame-via-proxy-frame-publication mechanism publishes the desired transform Tmap→agent x/base , resolving both issues. It achieves this by
+(1) looking up the transform Tagent x/markers→agent x/base followed by (2) computing the
+transform
+
+Tmap→agent x/base = Tmap→agent x markers · Tagent x/markers→agent x/base
+
+(4)
+
+and (3) concluding with the subsequent publication of the result.
+
+Fig. 7 User interface of the multi-agent trajectory planner, featuring a scene graph hierarchy (left),
+an interactive 3D viewport (center), and a property inspector (right)
+
+12
+
+Lastly, to translate synchronized perception and localization into collaborative
+action, the ecosystem features a multi-agent trajectory planner for SE(3) pose-based
+navigation. The planner operates on a scene graph, encompassing scene objects, and
+an associated editor featuring a scene hierarchy, a 3D viewport as well as a scene object
+inspector depicted in Figure 7. The latter also includes undo/redo functionality as well
+as YAML-based scene serialization. Mathematically, the planner models a trajectory
+T as an ordered set of N waypoints T = {(pi , ti )}N
+i=1 where each waypoint consists
+of an SE(3) spatial pose pi and a corresponding temporal offset ti ∈ R≥0 . To streamline waypoint orientation, the planner offers automated alignment heuristics, allowing
+poses to automatically align with the previous or next waypoint. While the current
+iteration relies on piecewise polyline interpolation, future development will integrate
+centripetal Catmull-Rom splines [24] to generate smooth, kinematically feasible paths.
+For execution, the trajectory inspector allows the direct publishing of trajectories to
+a configurable ROS 2 action server.
+
+5 Experimental Evaluation
+We evaluate the efficiency and scalability of SFG-ROS by benchmarking our architecture against a standard ROS 2 decentralized deployment. We define and focus on
+three key evaluation metrics:
+
+• Bandwidth & Resource Optimization: We measure CPU utilization and
+network bandwidth on a camera-data-consuming agent as the number of local
+subscribers increases, to assess the AgentDecoder’s efficacy.
+• System Dynamics & Discovery: We evaluate network scalability of the fleet
+by measuring discovery time and network traffic as the number of agents scales, to
+quantify the benefits of isolating inter- and intra-agent traffic.
+• Latency Overhead: We measure glass-to-glass latency from initial camera capture by an edge agent to visual rendering on a remote consumer agent and the
+subscription-to-first-frame latency incurred by on-demand resource allocation, to
+assess the delay introduced by AgentDecoder instantiation.
+
+5.1 Experimental Setup
+The multi-agent testbed consists of a heterogeneous deployment bridging edge
+robotics, a fleet of single-board computers, a mobile teleoperation device, and a highperformance base station. The primary edge agent is a Unitree Go2 legged robot
+equipped with an NVIDIA Jetson Orin NX (16GB) compute unit and a USB-C connected Intel RealSense D435 camera. For bandwidth and resource optimization, we
+utilize a workstation as a base station featuring an AMD Ryzen Threadripper 7970X,
+128GB DDR5 RAM, and an NVIDIA RTX 6000 Ada GPU. For system dynamics and
+discovery, we deploy a cluster of Raspberry Pi 5 agents. For latency overhead, a Steam
+Deck OLED acts as a secondary mobile consumer agent.
+The edge robots and the Raspberry Pi fleet connect wirelessly to a quad-band
+WiFi 6E access point, while the base station interfaces with the access point over a
+10Gbit wired backbone. Camera streams are encoded using the hardware-accelerated
+
+13
+
+Table 2 Hardware-accelerated
+H.264 Encoder Settings for
+RealSense D435
+Parameter
+
+Value
+
+Resolution
+Framerate
+Bitrate
+GOP Size
+Encoder
+
+640 × 360
+30fps
+4Mbps (CBR)
+30 frames
+h264_nvmpi
+
+h264_nvmpi encoder via [15] on the Jetson (see Table 2 for details), while decoding
+on the workstation and Steam Deck OLED relies on a software-based pipeline.
+For reproducibility, all evaluations were conducted in an indoor lab environment.
+During the tests, the Unitree Go2 remained stationary, capturing a static scene.
+Specific measurement configurations were established for each evaluation metric:
+• Bandwidth & Resource Optimization: The workstation acted as the consuming
+agent. Metrics were captured via psutil and iptables, computing the mean and
+variance across 120 samples taken at single-second intervals per scaling iteration.
+• System Dynamics & Discovery: The Raspberry Pi clusters served as the fleet of
+agents, each executing 10 publisher and 10 subscriber nodes (demo_nodes_cpp) to
+simulate a baseline ROS 2 network. We scale the fleet size progressively, capturing
+120 samples per configuration. Prior to each run, all nodes are stopped and the
+agents sit idle. A central orchestrator broadcasts a simultaneous TCP start signal
+that immediately executes the ROS 2 launch sequence across the fleet. Discovery
+time is logged from this start signal until all peers are resolved - evaluated via ROS
+graph polling in the standard ROS 2 baseline, and via AgentDiscoverer discovery
+events in SFG-ROS. Concurrently, network traffic is quantified using iptables to
+isolate and record peer-specific ingress bytes during the discovery window.
+• Latency Overhead: The Steam Deck OLED served as the consumer, rendering the
+camera feed of the edge agent. Glass-to-glass latency was measured as the temporal
+offset between the activation of a flashing LED positioned in front of the camera
+and its subsequent detection on the display via a phototransistor. Subscriptionto-first-frame latency was measured by blanking an initially illuminated display at
+the moment of subscription (triggering AgentDecoder instantiation) and measuring the duration until the first frame of a continuously lit LED was rendered, as
+detected by the phototransistor. Both metrics were recorded over 120 samples using
+an oscilloscope.
+
+5.2 Bandwidth & Resource Optimization
+A primary bottleneck in default ROS 2 implementations is the redundant processing
+and network transmission when multiple local consumers subscribe to a remote compressed sensor stream. Therefore, we evaluate the computational and network overhead
+on the consumer device as the number of local subscribers scales from 1 to 10.
+
+14
+
+80
+SFG-ROS (CPU)
+
+70
+
+70
+
+SFG-ROS (Net)
+
+60
+50
+
+ROS 2
+
+(CPU)
+
+ROS 2
+
+(Net)
+
+60
+50
+
+40
+
+40
+
+30
+
+30
+
+20
+
+20
+
+10
+
+10
+
+0
+
+1
+
+2
+
+3
+
+4
+5
+6
+7
+Number of Local Subscribers
+
+8
+
+9
+
+0
+10
+
+Network Bandwidth (Mbps)
+
+CPU Utilization (%)
+
+80
+
+Fig. 8 Comparison of CPU utilization and network bandwidth scaling between SFG-ROS and standard ROS 2. CPU utilization is measured such that 100% represents the full saturation of a single
+logical CPU core. Shaded regions denote ±1 standard deviation
+
+As depicted in Figure 8, standard ROS 2 exhibits an O(|S|) linear increase in
+both CPU utilization and network bandwidth. Specifically, an overhead equivalent
+to 6.5% of a single logical CPU core is added for every additional local subscriber
+due to redundant decompression. Conversely, by deploying the AgentDecoder, SFGROS completely decouples and bounds the network bandwidth to a constant O(1)
+cost (approx. 4Mbps), regardless of subscriber count. While overall CPU utilization
+remains O(|S|) due to local data distribution, the linear growth factor is drastically
+flattened. As a result, the per-subscriber CPU penalty is reduced to 1.8% – a 72.3%
+reduction in scaling overhead.
+
+5.3 System Dynamics & Discovery
+To assess performance in dense deployments, we evaluate both discovery time and
+network traffic as the number of agents scales from 2 to 6.
+Figure 9 presents both metrics captured via the testing scenario outlined in Subsection 5.1. Standard ROS 2 relies on multicast UDP discovery, which induces packet
+storms as node count increases, effectively delaying application-level readiness to up
+to 40s and consuming up to 13.6MB of network traffic at 6 agents. In contrast, by
+segregating inter- and intra-agent traffic, SFG-ROS maintains a nearly constant discovery time of 0.8s to 2.9s across scaling iterations and additionally exhibits 1.8 orders
+of magnitude lower network traffic at the maximum evaluated fleet size.
+
+5.4 Latency Overhead
+We assess the latency introduced by the framework across two dimensions: the steadystate glass-to-glass delay and the one-time cost of on-demand decoder instantiation.
+Figure 10 (left) illustrates the incurred overhead in glass-to-glass latency measured between the sensor stream from the edge agent to the Steam Deck OLED.
+15
+
+Discovery Time (s)
+
+30
+
+1
+
+SFG-ROS (Time)
+SFG-ROS (Net)
+
+20
+
+ROS 2
+
+(Time)
+
+ROS 2
+
+(Net)
+
+0.1
+0.01
+
+10
+0
+
+2
+
+3
+
+4
+Number of Agents
+
+5
+
+6
+
+Network Traffic (MB)
+
+10
+
+40
+
+0.001
+
+Fig. 9 Fleet discovery metrics across a scaling number of agents. Solid violins map to linear discovery
+time; dotted violins map to log-scale network traffic. Each distribution is fit to the 120 independent
+samples taken per configuration
+
+1.5
+
+Overhead
+
+Latency (s)
+
+Latency (ms)
+
+150
+100
+50
+0
+
+ROS 2
+
+Overhead
+
+1
+0.5
+0
+
+SFG-ROS
+
+ROS 2
+
+SFG-ROS
+
+Fig. 10 Latency Overhead. Glass-to-glass latency (left) and subscription-to-first-frame latency
+(right) comparisons between SFG-ROS and standard ROS 2. Error bars denote ±1 standard deviation
+
+Standard ROS 2 transports data directly to the consumer node, yielding a baseline
+latency of 118.3ms. SFG-ROS introduces a localized relay step (republication via the
+AgentDecoder) and consequently adds a latency overhead of 2.6ms.
+Additionally, Figure 10 (right) illustrates the subscription-to-first-frame latency
+on the Steam Deck OLED while the edge agent is already discovered. Standard ROS
+2 relies solely on native endpoint matching, resulting in a mean latency of 570ms.
+In contrast, on demand decoder instantiation by SFG-ROS via the AgentDecoder
+increases the mean latency to 1095ms, multiplying initial setup latency by a factor of
+approximately 1.9.
+
+6 Conclusion and Future Work
+We presented the resource-aware, edge-assisted multi-agent software framework SFGROS designed to enable robust collaborative perception for heterogeneous robotic
+
+16
+
+fleets. Our topology-enforcing communication architecture leverages a programmatic
+FQN schema alongside targeted DDS routing to overcome the scalability and resource
+bottlenecks of default ROS 2 deployments. Coupled with the AgentDecoder – an ondemand, centralized stream decoding pipeline – this approach significantly reduces
+redundant computational and network overhead on resource-constrained edge devices.
+Furthermore, our hardware-agnostic container deployment strategy and specialized
+spatiotemporal synchronization tools, such as the Vicon Bridge, establish a reproducible and zero-touch foundation from development to field execution. To foster
+further research and community adoption, the SFG-ROS software package is published
+under a permissive license and is publicly available via iis-esslingen.github.io/sfg-ros.
+While SFG-ROS successfully establishes a robust foundation for multi-agent perception, deploying these systems at greater scale introduces lingering operational
+challenges. First, while our schema-driven DDS routing effectively isolates local traffic,
+the underlying DDS protocol still maintains inherent transport and discovery overheads when bridged across volatile, high-density wireless networks. As fleet sizes grow,
+the underlying middleware must become more inherently resilient to intermittent
+connectivity and edge-network topologies. Second, while our modular container architecture successfully abstracts heterogeneous hardware, executing agents via mounted
+colcon workspaces remains a development-centric paradigm. Managing raw source
+code across a fleet lacks the robust versioning and immutability required for reliable, over-the-air production updates. Accordingly, our future work will focus on the
+following areas:
+
+• Middleware Optimization: Evaluate non DDS-based middlewares (e.g. Eclipse
+Zenoh) and their native routing capabilities as an alternative to assess potential
+latency reductions and bandwidth optimizations in dense, multi-agent communication topologies.
+• Automated Deployment Pipelines: Integrate a CI/CD pipeline for automated
+colcon package building and publishing to a custom Debian repository. This will
+enable an apt-based deployment model within the container’s application layer,
+decoupling source builds from the production runtime while utilizing workspace
+overlays for development.
+
+Declarations
+Author Contributions
+Constantin Blessing conceptualized and developed the SFG-ROS framework, conducted the evaluations for Subsections 5.2 and 5.3, and wrote the main manuscript.
+Elias Geiger led the practical validation – including deployment on the Steam Deck
+OLED – and designed and executed the latency evaluation. All authors reviewed the
+manuscript, provided feedback, and contributed to the refinement of the paper.
+
+Funding
+Funded by Deutsche Forschungsgemeinschaft (DFG, German Research Foundation) Projectnumber 528745080 (FIP 68).
+17
+
+Competing Interests
+The authors have no competing interests to declare that are relevant to the content
+of this article.
+
+Data Availability
+No datasets were generated or analyzed.
+
+Code Availability
+Code available via iis-esslingen.github.io/sfg-ros.
+
+References
+[1] Mohr, J., Schmidtke, N., Behrendt, F.: Design of matrix production systems:
+New demands on factory planning methods. Procedia Computer Science 232,
+1972–1981 (2024) https://doi.org/10.1016/j.procs.2024.02.019 . 5th International
+Conference on Industry 4.0 and Smart Manufacturing (ISM 2023)
+[2] Esslingen University of Applied Sciences: Smart Factory Grids. Accessed:
+2026-03-27
+(2024).
+https://www.hs-esslingen.de/en/research/projects/
+smart-factory-grids-dfg-forschungsimpuls
+[3] Malik, A.A., Masood, T., Brem, A.: Intelligent humanoid robots in manufacturing. In: Companion Proceedings of the 2024 ACM/IEEE International Conference
+on Human-Robot Interaction. HRI Companion ’24, pp. 20–27. Association for
+Computing Machinery, New York, NY, USA (2024). https://doi.org/10.1145/
+3610978.3640765
+[4] Macenski, S., Foote, T., Gerkey, B., Lalancette, C., Woodall, W.: Robot Operating System 2: Design, architecture, and uses in the wild. Science Robotics 7(66),
+6074 (2022) https://doi.org/10.1126/scirobotics.abm6074
+[5] ROS Core Team: 2023-09 ROS 2 RMW Alternate. Open Robotics. Accessed:
+2026-03-27
+(2023).
+https://discourse.openrobotics.org/uploads/short-url/
+o9ihvSjCwB8LkzRklpKdeesRTDi.pdf
+[6] Open Robotics: Open-RMF: Open Robotics Middleware Framework. Accessed:
+2026-03-25 (2021). https://www.open-rmf.org/
+[7] Sikand, K.S., Zartman, L., Rabiee, S., Biswas, J.: Robofleet: Open source communication and management for fleets of autonomous robots. In: 2021 IEEE/RSJ
+International Conference on Intelligent Robots and Systems (IROS), pp. 406–412
+(2021). IEEE
+[8] Ichnowski, J., Chen, K., Dharmarajan, K., Adebola, S., Danielczuk, M., MayoralVilches, V., Jha, N., Zhan, H., LLontop, E., Xu, D., et al.: FogROS2: An adaptive
+18
+
+platform for cloud and fog robotics using ROS 2. In: 2023 IEEE International
+Conference on Robotics and Automation (ICRA), pp. 5493–5500 (2023). IEEE
+[9] Open Robotics: Deployment Guidelines — ROS 2 Documentation: Humble
+documentation. Accessed: 2026-03-31 (2026). https://docs.ros.org/en/humble/
+Tutorials/Advanced/Security/Deployment-Guidelines.html
+[10] Lim, J.M., Kim, K.W., Choi, B.W., Delgado, R.: A docker-enabled real-time
+framework for robotic applications in heterogeneous ros 2 environments. Processes
+14(5) (2026) https://doi.org/10.3390/pr14050804
+[11] Zhang, Y., Wurll, C., Hein, B.: KubeROS: A unified platform for automated
+and scalable deployment of ROS 2-based multi-robot applications. In: 2023 IEEE
+International Conference on Robotics and Automation (ICRA), pp. 9097–9103
+(2023). IEEE
+[12] NVIDIA Corporation: NVIDIA Isaac ROS: Hardware-Accelerated Packages for
+ROS 2 Developers. Accessed: 2026-03-25 (2021). https://developer.nvidia.com/
+isaac/ros
+[13] eProsima: Fast DDS. Versions: 2.6.2 (ROS 2), 3.2.2 (DDS Router) (2026). https:
+//github.com/eProsima/Fast-DDS
+[14] eProsima: DDS Router. Version: 3.2.0 (2026). https://github.com/eProsima/
+DDS-Router
+[15] Pfrommer, B.: ROS 2 Image Transport for FFmpeg/Libav. Version: 3.0.2. https:
+//github.com/ros-misc-utilities/ffmpeg image transport
+[16] Merkle, P., Morvan, Y., Smolic, A., Farin, D., Müller, K., de With, P.H.N.,
+Wiegand, T.: The effects of multiview depth video compression on multiview rendering. Signal Processing: Image Communication 24(1), 73–88 (2009) https://doi.
+org/10.1016/j.image.2008.10.010 . Special issue on advances in three-dimensional
+television and video
+[17] Tech, G., Chen, Y., Müller, K., Ohm, J.-R., Vetro, A., Wang, Y.-K.: Overview
+of the multiview and 3D extensions of high efficiency video coding. IEEE Transactions on Circuits and Systems for Video Technology 26(1), 35–49 (2016)
+https://doi.org/10.1109/TCSVT.2015.2477935
+[18] Wilson, A.D.: Fast lossless depth image compression. In: Proceedings of the 2017
+ACM International Conference on Interactive Surfaces and Spaces. ISS ’17, pp.
+100–105. Association for Computing Machinery, New York, NY, USA (2017).
+https://doi.org/10.1145/3132272.3134144
+[19] Kam, H.R., Lee, S.-H., Park, T., Kim, C.-H.: RViz: a toolkit for real domain data
+visualization. Telecommunication Systems 60(2), 337–345 (2015)
+
+19
+
+[20] Rerun Development Team: Rerun: A Visualization SDK for Multimodal Data.
+Rerun Technologies AB, Online. Version: 0.25.1 (2024). https://www.rerun.io
+[21] Vicon Motion Systems: Vicon Vero Camera for Motion Capture. Accessed: 20263-18. https://www.vicon.com/hardware/cameras/vero/
+[22] Vicon Motion Systems: Vicon Tracker 4.4 documentation. Accessed: 2026-3-18.
+https://help.vicon.com/space/Tracker44
+[23] OPT4SMART group: Vicon Receiver for ROS 2. Version: 1.0.2. https://github.
+com/OPT4SMART/ros2-vicon-receiver
+[24] Barry, P.J., Goldman, R.N.: A recursive evaluation algorithm for a class of
+Catmull-Rom splines. ACM SIGGRAPH Computer Graphics 22(4), 199–204
+(1988)
+
+Author Biographies
+Constantin Blessing received his M.Sc. degree in applied
+computer science from the Esslingen University of Applied
+Sciences, Esslingen am Neckar, Germany, in 2023, where
+he is currently working toward his Ph.D. degree in computer science supervised by Markus Enzweiler. His research
+focuses on collaborative task accomplishment and perception
+by multi-agent systems in smart factory environments.
+
+Elias Geiger Elias Geiger is a bachelor’s student in Technical Computer Science at Esslingen University. His academic
+interests focus on robotics, embedded systems, and the application of computer science methods to intelligent systems.
+
+20
+
+Jakob Häringer received his M.Sc. degree in applied computer science from the Esslingen University of Applied
+Sciences, Esslingen am Neckar, Germany, in 2023, where he
+is currently working toward his Ph.D. degree in computer
+science supervised by Markus Enzweiler. His research focuses
+on robotic manipulation in smart factory environments,
+specifically the use of Vision-Language-Action models for the
+handling of uncommon objects.
+
+Dennis Grewe received his Ph.D. degree in computer science from the University of Koblenz, Koblenz, Germany, in
+2021. From 2019 to 2023, he was a Research Engineer with
+Robert Bosch GmbH. Since September 2024, he has been a
+Full Professor of Distributed Systems and Software Testing
+with the Esslingen University of Applied Sciences, Esslingen am Neckar, Germany. His research interests include
+network protocols and architectures to support computing on network infrastructures, including principles from
+software-defined, agentic, and data-oriented networking for
+distributed systems.
+Markus Enzweiler received his M.Sc. degree in computer
+science from the University of Ulm, Ulm, Germany, in 2005,
+and his Ph.D. degree in computer science from the University of Heidelberg, Heidelberg, Germany, in 2011. In 2002
+and 2003, he was a Visiting Student Researcher with the
+Centre for Vision Research, York University, Toronto, ON,
+Canada. From 2010 to 2020, he has been with Mercedes-Benz
+Research and Development, Stuttgart, Germany, focusing
+on camera- and LiDAR-based scene understanding for selfdriving cars. Since 2021, he has been a Full Professor of
+Computer Science at Esslingen University of Applied Sciences, Esslingen am Neckar, Germany, where he founded and
+heads the Institute for Intelligent Systems.
+
+21
+

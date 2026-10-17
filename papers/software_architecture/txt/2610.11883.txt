@@ -1,0 +1,1346 @@
+legoESM: a modular, differentiable, multiscale, AI-ready Earth
+system model built with AI agents
+Pierre Gentine1,2,10,∗ , Dhruv Balwada2,3 , Aytaç Paçal4,5 , Linnia Hawkins1,2 , Alistair
+Adcroft6 , Hang Fan1,2 , Jianing Fang1,2 , Aya Lahlou1,2 , Kara D. Lamb1,2 , David M.
+Lawrence7 , Julien Le Sommer8 , Joseph Mouallem6 , Juan Nathaniel1,2 , Duncan
+Watson-Parris9 , and Veronika Eyring4,5
+
+arXiv:2610.11883v1 [physics.ao-ph] 8 Oct 2026
+
+1
+
+Department of Earth and Environmental Engineering, Columbia University, New York, NY, USA
+Learning the Earth with Artificial Intelligence and Physics (LEAP) NSF Science and Technology Center,
+Columbia University, New York, NY, USA
+3
+Lamont–Doherty Earth Observatory, Columbia University, Palisades, NY, USA
+4
+University of Tübingen, connAIx Research School for Applied AI, Heilbronn, Germany
+5
+University of Tübingen, Tübingen AI Center, Tübingen, Germany
+6
+Program in Atmospheric and Oceanic Sciences, Princeton University, Princeton, NJ, USA
+7
+NSF National Center for Atmospheric Research, Boulder, CO, USA
+8
+Institut des Géosciences de l’Environnement (IGE), Université Grenoble Alpes, CNRS, IRD, Grenoble
+INP, Grenoble, France
+9
+Scripps Institution of Oceanography and Halıcıoğlu Data Science Institute, University of California San
+Diego, La Jolla, CA, USA
+10
+École Normale Supérieure – PSL, 45 rue d’Ulm, Paris, France
+11
+Celest.Science, Paris, France
+∗
+Corresponding author: pg2328@columbia.edu
+
+2
+
+Abstract
+Earth system models (ESMs) have grown tremendously in realism, yet key uncertainties persist
+in the climate response to greenhouse-gas forcing, particularly due to cloud radiative feedbacks.
+In addition, their software architecture was not designed for accelerator hardware or modern artificial intelligence (AI). Here we present legoESM, a composable, differentiable, multiscale ESM
+written in JAX. It builds on decades of community-developed parameterizations and numerical
+methods, recast in a unified framework by AI coding agents under a human-specified scientific
+contract and verified through benchmarking. Dynamical cores, physics schemes, grids, complexity levels and components are swappable like building blocks, and can use conventional physics
+or machine-learned emulators. A single code base spans metre-scale large-eddy simulation to
+global simulations and weather to climate. End-to-end differentiability enables gradient-based
+calibration, variational data assimilation and online training. legoESM ’s modular architecture
+enables systematic evaluation of diverse model variants to explore structural uncertainty and test
+hypotheses. legoESM produces realistic simulations across scales, reduces land-surface temperature bias through gradient-based calibration, and scales efficiently on GPUs to kilometer-scale
+simulations. It offers an open, community infrastructure for hypothesis testing, research and
+teaching in Earth sciences and a template for multiscale physical systems.
+
+Introduction
+Earth system models (ESMs) have improved substantially over recent decades, both in their fidelity
+with respect to the observed climate and in the breadth of processes they represent 1–6 . Yet,
+important biases persist 7,8 and the uncertainty in the response of the climate system to greenhousegas forcing remains large, with equilibrium climate sensitivity still being uncertain at the ∼50%
+
+level 9 . Projections of rainfall extremes 10 , of ocean heat uptake, and of the strength of the land
+carbon sink 11,12 differ substantially between models and are often inconsistent across different
+regions of the world. Further, ESMs have to a large extent not embraced the data revolution: only
+a fraction of the wealth of observations and observational products (satellite retrievals, reanalyses)
+is currently being used for model calibration, largely because of limitation in the capability of those
+models to tune parameters with current sampling methods.
+Three developments could, in principle, reduce these uncertainties. First, machine learning (ML)
+has been used to emulate or replace empirical parameterizations such as deep convection 13–16 or
+ocean mesoscale eddies 17–20 , improving key processes such as rainfall extremes and ocean eddy
+fluxes, and demonstrably reducing systematic errors, such as in cloud cover, precipitation and
+circulation 21–23 . Yet, because ESMs are typically written in Fortran or C, ML components are
+coupled through one-way bridges that feed a neural-network prediction into the physics model 24 . As
+a result, online training, that is, learning through the model’s own evolution, is generally impossible,
+and the resulting hybrid systems are prone to instability 15 and cannot be further tuned against
+observations. Second, as models have grown in complexity, many modeling centers have adopted
+automated methods to tune and calibrate uncertain parameters 22,25,26 . However, conventional
+physics-based models generally do not provide an adjoint: that is, the gradient of model outputs
+with respect to these parameters is not available. Calibration must therefore rely on derivativefree approaches, such as Monte Carlo or ensemble methods 27–29 . Because these methods require
+many model evaluations, their computational cost grows rapidly as the number of parameters
+increases. Third, only a handful of models or components have been ported to modern hardware,
+such as graphics processing units (GPUs) 30,31 , and this remains the exception rather than the
+norm. This has limited the ability to go to higher resolution to better resolve key processes such as
+deep convection 32,33 or to run models on other platforms, such as the cloud, further limiting ESM
+accessibility.
+In parallel, weather forecasting has recently witnessed a (second) revolution (after the first: data
+assimilation): data-driven models trained on decades of reanalysis now rival or surpass physicsbased forecasts and run at a fraction of the computational cost of physics-based models 34–38 . Yet,
+purely learned AI weather models tend to drift and can lose physical realism at long lead times 39 ,
+and on their own they do not provide the conservative, multi-component interpretable system that
+climate projection requires. More fundamentally, machine-learning emulators, even if skillful and
+fast, mainly reproduce input–output relationships without representing the physical mechanisms
+that generate them. This data-driven revolution has, moreover, so far largely been confined to the
+atmosphere, where decades of reanalysis provide abundant training data. Yet, the sparser ocean
+and land records make comparable data-driven fidelity much harder to achieve, although AI ocean
+emulators are now emerging 40,41 . More broadly, ESMs are not merely predictive tools but also research tools: their capacity for hypothesis testing and mechanistic attribution is central to scientific
+progress. Preserving that capability while gaining the computational and optimization advantages
+of differentiable, ML-enhanced methods is a central motivation for process-based, differentiable
+ESMs.
+In addition, and related to hypothesis testing, climate science has had a long tradition of using a
+hierarchy of models, spanning idealized to complex configurations 42–44 . Such a hierarchy has been
+fundamental to building physical understanding of the climate system. Modern ESMs can themselves span a wide range of resolutions, timescales, and configurations, yet moving systematically
+across levels of complexity often requires substantial changes in model configuration or even the use
+of different modeling systems. A more modular framework could make these transitions easier and
+more controlled, enabling hypotheses and counterfactuals to be tested consistently across scales
+and levels of complexity.
+2
+
+Finally, most current ESMs are written in compiled languages (Fortran, C/C++) that are less
+widely used across the broader scientific community than Python, which can limit adoption by
+researchers from other disciplines and by downstream users, leading to slow model evolution. The
+recent weather AI revolution has demonstrated that it is not only model performance that drives
+widespread adoption, but also ease of use 45 .
+The confluence of large-scale datasets, GPU-accelerated computing, and differentiable programming frameworks capable of scaling gradient-based optimization enabled the machine-learning revolution. Earth system science is now positioned to leverage the same convergence, but doing so requires ESMs written in modern, automatically differentiable languages that can natively use GPUs
+and other emerging architectures, support gradient-based optimization, and interface directly with
+machine learning.
+As such, we argue that a modern ESM should be (i) easy to use, and ideally written in Python,
+the lingua franca of modern data science, yet with high performance; (ii) hardware-agnostic, running on any of central processing units (CPUs), graphics processing units (GPUs) and tensor
+processing units (TPUs) as accelerators keep evolving; (iii) composable, so that different numerical
+methods, physical parameterizations or entire modules (for example the whole atmosphere) can be
+swapped, combined and trained jointly for controlled experiments and hypothesis testing; (iv) able
+to integrate ML seamlessly, whether by replacing a single parameterization or an entire component (for example swapping the whole atmosphere for a neural network, as in recent AI weather
+models 34–38,46 ), which requires the code to be end-to-end differentiable; (v) solvable on many or
+adaptive grids tailored to the problem at hand; and (vi) able to run across spatial and temporal
+scales.
+A growing ecosystem of differentiable models has begun to demonstrate the benefits of parts
+of these ideas, though so far this has been for one component or one spatial or temporal scale
+at a time. For the atmosphere, differentiable dynamical cores and intermediate-complexity models such as the JAX Circulation Model 47 , the neural general circulation model NeuralGCM 46
+and SpeedyWeather.jl 48 have demonstrated the use of gradients for calibration or online learning. For the ocean, JAX and automatic-differentiation efforts, from Veros 49,50 to FESOM-JAX 51 ,
+are bringing the same capability to state estimation, e.g., for data assimilation. More broadly,
+DJ4Earth 52 uses compiler-level program transformations to make several Julia models (ShallowWaters.jl, SpeedyWeather.jl, Oceananigans.jl and DJUICE.jl) differentiable and performance-portable,
+although these components are not yet coupled and differentiability has been demonstrated for each
+component individually. For the land surface and hydrology, differentiable models such as DifferLand 53 , JAX-CanVeg 54 and differentiable process-based hydrology models 55 have demonstrated
+that they can be used to train physical parameters or neural components end to end against observations, building on the broader concept of differentiable programming in the geosciences 55–57 .
+Yet, at present, no unifying infrastructure exists that addresses all of those needs for the entire
+Earth system, rather than a targeted treatment of one piece in isolation.
+Here, we present legoESM, a novel differentiable and composable modeling infrastructure for
+weather and climate science. Rather than a single ESM, it is an open, modular framework in which
+differentiable bricks of individual processes or full Earth components can be assembled, coupled
+and benchmarked to address diverse scientific questions or hypotheses. This modeling ecosystem
+is conceived as an evolving, agile, community-based infrastructure to test ideas and hypotheses,
+with clear ML-inspired metrics, across weather and climate (Fig. 1a). Distinctively, legoESM was
+developed almost entirely from the ground up using AI coding agents—autonomous software agents
+that implement, test, and revise code in response to a human-authored scientific specification and
+based on clear benchmarks. To ensure that agent-generated code remains physically consistent and
+scientifically faithful, development is constrained by explicit contracts, which specify the required
+3
+
+interfaces, physical invariants, units, and expected behaviour of individual components. Implementations were further evaluated using faithfulness oracles (trusted reference solutions) for physical
+processes and systematic benchmarks against analytical solutions, established test cases and reference datasets. This approach allowed AI agents considerable autonomy in software implementation
+while keeping the scientific requirements and criteria for correctness under human control. legoESM
+is intended to change how we conduct research and teach weather and climate science through its
+ease of use, flexibility, and agility.
+
+A model assembled from interchangeable bricks
+Conventional ESMs remain relatively rigid. Although components such as dynamical cores and grids
+can often be exchanged within established modelling frameworks 58,59 , parameterizations and their
+interactions have evolved together over decades, making it difficult to modify or replace individual
+components without substantial effort elsewhere in the model. Moreover, obtaining a well-calibrated
+and physically credible simulation after such changes can be costly and time-consuming 25,26,28 .
+legoESM aims to reduce these barriers through a modular, differentiable architecture in which
+alternative schemes and hypotheses can be exchanged and tested, and new model configurations
+could potentially be rapidly calibrated and evaluated.
+Written in Python with JAX 60 (a differentiable machine-learning library) mostly by AI coding
+agents, legoESM is assembled from interchangeable bricks (Fig. 1c) at levels ranging from individual parameterizations to entire model components. For example, the atmosphere can range
+from a fully physical to a fully machine-learned (emulated) component, as in recent AI weather
+models 34–36,46 . Differentiability allows access to the model gradients (with respect to parameters
+or variables) at numerical precision and seamless interoperability and training between physics and
+ML, with end-to-end optimization 55,56 . The atmosphere, ocean, land, and sea ice are independent
+and composable packages. Each package can run on its own, so a single command yields a working
+ocean or atmosphere model, and the same code allows composing components as a fully coupled
+system (e.g., ocean-atmosphere) without modification through a differentiable coupler. All of those
+packages build on one shared foundation (the core) composed of grids, differentiable operators,
+thermodynamics and time integration, and depend on that substrate but not on each other. A
+scheme, a grid or an entire component can therefore be swapped seamlessly (Methods), and the
+composed model can be optimized end-to-end in any configuration, unlike standard ESMs.
+Writing the model in JAX enables two key properties: the same code runs natively on any
+current hardware (CPUs, GPUs and TPUs), and will be able to compile to accelerators that do not
+yet exist without any rewriting, sidestepping the multi-year multi-person effort of porting a legacy
+model to new hardware. Second, the entire model is differentiable: the gradient of any output with
+respect to any parameter or variable is obtained automatically, with no hand-written adjoint. This
+enables efficient gradient-based optimization of any set of variables or parameters, as well as native
+data assimilation (shipped for the atmosphere in this first version, see below).
+The model configuration is defined through three axes that can vary independently: (i) the
+numerical grid; (ii) the model complexity; and (iii) the set of physics schemes or machine-learning
+emulation (Fig. 1b). A grid is first chosen: legoESM supports cubed-sphere (FV3-style, with a
+duo-grid treatment of panel edges) 61–63 , latitude–longitude 64 , Gaussian/spectral 65,66 , unstructured
+Voronoi (Model for Prediction Across Scales, MPAS) 67–69 and NEMO-style tripolar 70,71 grids, as
+well as doubly periodic Cartesian planes for large-eddy and cloud-resolving simulations. The model
+complexity is flexible, spanning a ladder of physical complexity, from shallow-water to hydrostatic
+to nonhydrostatic atmospheres, and from a prescribed sea surface temperature (SST) to a slab to
+4
+
+a full three-dimensional ocean, and a single framework ranges from metre-scale turbulence to the
+entire Earth circulation (Supplementary Figs. S1–S3 and S5 for shallow water, S4 for a hydrostatic
+baroclinic wave, S9–S11 for nonhydrostatic large-eddy and cloud-resolving simulations, S13 for an
+atmosphere over prescribed SST and S14–S18 for the three-dimensional ocean). The physics are
+additive and composable: each process computes its tendency from the same model state and the
+tendencies are summed, so a parameterization can be added or removed cleanly (Supplementary
+Information §3). Mass is conserved by construction, and energy and momentum are tracked with
+explicit budget closure. legoESM currently offers more than 160 selectable parameterizations, with
+tens of convection, turbulence and microphysics choices (Extended Data Tables 1–10), and any
+module or Earth component can be exchanged for a machine-learned alternative (e.g., a spherical
+Fourier neural operator (SFNO) emulation of the entire atmosphere), giving a continuous ladder
+from fully physical to fully AI based instantiation of the model. Full equations and numerics
+are presented in Supplementary Information §1, and the source is openly available at https:
+//github.com/climate-federation/legoESM.
+Development by AI agents under a scientific contract. legoESM was built through a
+human–agent workflow that we summarize here (details in Methods). We, human scientists, first
+wrote, with an agentic coding environment, a global plan and a specification (a project “constitution”) stating the vision of the model (composable, swappable, differentiable) and the model
+requirements (e.g., conserved quantities and unit consistency). Throughout, we, humans, dictated
+the scientific logic and the agents implemented and reviewed the code. We used coding agents
+built on independent large-language-model (LLM) families (Claude, Anthropic; Codex, OpenAI;
+and GLM, Zhipu AI), with clear rules to limit duplication. Shared physical constants and core
+routines (for example, thermodynamics) were centralized in the core package (the model substrate)
+and never re-derived elsewhere. For the hardest problems, such as multi-node scaling, grid-imprint
+artifacts at cubed-sphere panel edges, and faithful high-resolution ocean and atmosphere-only simulations, we used a persistent-iteration (“Ralph”) loop 72 , which re-ran an agent on the same task
+and fed test and diagnostic results back at each cycle until a target criterion was met, so that the
+agent did not stop prematurely. We note also that agents not only coded but also leveraged a vast
+array of benchmarks, from the published literature to open-source datasets and codes, and were
+used to assess visual and physical realism (based on the published literature) and to relate biases
+to physical processes. This use of the multi-modal capabilities of LLMs therefore went well beyond
+code generation, to building, testing and validating a new model.
+The AI agents rapidly produced code of good quality, yet also generated hallucinations, which
+were at times subtle. Because credible climate simulation requires accurate code, every component was validated along a ladder of increasing complexity. First, every substantial piece of code
+was reviewed by at least one adversarial code-review agent built on an LLM family (Codex, OpenAI) trained separately from that of the main coding agent (Claude). The review often found
+subtle errors or incorrect judgments, or challenged the choices made by the coding agent, which
+accelerated convergence and reduced defects. Second, the agents wrote unit tests covering most
+of the code, testing the accuracy and physical realism of small portions of code (several of them
+are available in the code repository). Third, physical equations were tested in asymptotic singlephysics cases against well-known theoretical behaviour, such as convergence at the design order
+under Courant–Friedrichs–Lewy (CFL)-controlled refinement (Supplementary Figs. S24 and S25).
+Finally, components were tested with several interacting processes switched on, against increasingly
+stringent, larger-scale benchmarks, from dynamical-core tests of rising complexity (detailed below)
+to full atmosphere-only and ocean-only integrations compared against established models such as
+
+5
+
+a One differentiable code base across scales
+high-resolution simulations supply training targets for ML components, which then run in the global model
+
+Large-eddy
+
+Cloud-resolving
+
+Regional / weather
+
+Global Earth system
+
+turbulence,
+boundary layers
+
+deep convection,
+clouds, microphysics
+
+fronts, storms,
+weather regimes
+
+atmosphere · ocean
+land · sea ice
+
+Δx ≈ 1–100 m
+seconds–days
+
+Δx ≈ 1–10 km
+days–months
+
+Δx ≈ 10–100 km
+days–seasons
+
+Δx ≈ 25–200 km
+weather–centuries
+
+increasing spatial scale and simulation length: weather → seasonal → centennial
+
+b Composable along three independent axes
+GRID
+
+cubed sphere
+
+lat–lon
+
+Gaussian / spectral
+
+MPAS Voronoi
+
+tripolar (eORCA)
+
+COMPLEXITY
+
+shallow water
+
+hydrostatic
+
+nonhydrostatic
+
+slab ocean
+
+3-D ocean
+
+PHYSICS / ML
+
+radiation
+
+convection
+
+microphysics
+
+turbulence
+
+ML emulator
+
+swap
+
+more complex
+
+swap
+
+one choice per axis, a few lines of configuration → compose into one model
+
+c A federation of independently installable packages on one differentiable core
+atmosphere
+
+ocean
+
+land
+
+sea ice
+
+coupler
+
+ml
+
+tools
+
+legoesm-core
+constants · thermodynamics · grids and differentiable operators · time integration · parallel halo exchange and reductions · runtime (CPU / GPU / TPU)
+
+exact end-to-end gradients (jax.grad) through the assembled model
+
+Fig. 1: legoESM: one differentiable code base, composable across scales. a, The same code
+runs from metre-scale large-eddy simulation, through cloud-resolving and regional configurations, to
+the global Earth system, spanning weather to centennial timescales. High-resolution configurations
+supply training targets for machine-learned components, which are then deployed in the global
+model (red dashed arrow). b, Any configuration is assembled by choosing independently along
+three axes: the numerical grid, the level of complexity, and the set of physics schemes or machinelearned emulators. Complexity runs along a ladder of increasing realism, while physics tendencies
+are additive to machine precision, so processes can be switched on and off freely. c, The selected
+components assemble into one model, a federation of independently installable packages that share
+the legoesm-core substrate and depend on it rather than on each other. Because the whole stack
+is a single differentiable program, exact gradients propagate through the assembled model and
+identical code runs on CPU, GPU and TPU. Package contents and the full scheme inventory are
+given in Methods and Extended Data Tables 1–10.
+
+6
+
+the ICON ESM 58 , the Nucleus for European Modelling of the Ocean (NEMO) model 70 and the
+GFDL FV3 dynamical core 61,62 . When available, a code “oracle”, i.e., a trusted reference implementation (typically the original Fortran or C/C++ code), was used as the target, with agreement
+required within numerical tolerances rather than bit for bit, because differentiability and hardware
+portability imposed a different code structure and, in places, smoother formulations.
+For the atmosphere, large-eddy simulations were validated, and the code corrected, against oracles based on the MicroHH 73 large-eddy simulation code in the canonical GABLS1 stable boundary
+layer 74 , neutral Ekman layer 75 , Wangara diurnal cycle 76 , and DYCOMS-II 77 and RICO 78 cloudtopped boundary-layer cases, swapping all subgrid-scale turbulence options (the constant-coefficient
+Smagorinsky closure 79 and its scale-dependent dynamic variant 80,81 ) and all microphysics options 82
+(Supplementary Figs. S9–S12). The cloud-resolving configuration followed the design of the System for Atmospheric Modeling (SAM) cloud-resolving model (CRM) 83 , and tested against this
+model and validated on multiple cases, including the RCEMIP 84 protocol, with our different microphysics schemes. The global atmospheric model and its various grids were validated through a
+suite of dycore benchmarks of increasing complexity: first shallow-water cases (Williamson cases 1,
+2, 5 and 6 85 , Supplementary Figs. S1–S3 and S5; the Galewsky barotropic instability 86 ; and colliding modons 87 ), then three-dimensional hydrostatic and non-hydrostatic cases (including the
+Jablonowski–Williamson baroclinic wave 88 , Supplementary Fig. S4, and the Held–Suarez test 89 ),
+and finally radiative–convective equilibrium (RCE; Supplementary Figs. S7, S8 and S11) and AMIP
+(Supplementary Fig. S13) experiments. For these benchmarks, the model had to be faithful to
+the known reference solution and give consistent results across grid types. This was generally
+reached within a few persistent-iteration cycles, except for the cubed sphere (aimed to replicate
+the FV3 duo-grid 61–63 ), on which subtle edge gradient defects produced artifacts along the cubepanel boundaries. Removing them was challenging even with the original FV3 code as an oracle,
+but a newer generation of coding agent, combined with adversarial review and persistent-iteration
+(Ralph) loops, ultimately removed these artifacts (Supplementary Fig. S4c).
+The ocean followed a different validation strategy, as fewer clear benchmarks existed than for the
+atmosphere. Beyond unit tests and adversarial review, idealized asymptotic tests verified, for both
+the ocean and the atmosphere, that the operators (many of which were shared between the two)
+reproduced their analytic targets: vector-invariant (Burgers) advection (Supplementary Fig. S24a),
+Laplacian viscous decay with the expected k 2 scaling (Supplementary Fig. S24b), the Coriolis tendency (Supplementary Fig. S24c), and undamped and damped inertial oscillations (Supplementary
+Fig. S24d,e), while finite-volume transport and gravity-wave terms converged at their design orders
+under CFL-controlled refinement in both the atmosphere (Supplementary Fig. S25a) and the ocean
+(Supplementary Fig. S25b). Idealized and then realistic ocean cases were then run against oceanmodel oracles (NEMO 70 , MITgcm 90 and Oceananigans 91 ) on latitude–longitude, cubed-sphere,
+unstructured (MPAS/Voronoi 92 and Finite-volumE Sea ice–Ocean Model (FESOM)-type 93 ) and
+NEMO-style tripolar grids (Supplementary Figs. S14–S17). In an idealized basin twin experiment,
+legoESM stayed within 5 × 10−3 ◦ C (r.m.s.) of NEMO 5.0.2 in sea-surface temperature after one
+year (Supplementary Fig. S15). Even with an oracle’s source in hand, validation did not reduce to
+line-by-line comparison: the codebases decomposed the equations differently, and tendencies matching the oracle to 3–4 digits over the interior could still hide order-one errors in a few critical cells
+(e.g., topography-adjacent faces controlling the form stress that sets circumpolar transport). These
+residuals were instead exposed by comparing term-by-term budgets, integrated over dynamically
+relevant regions at identical model states, against the oracle’s native trend diagnostics, which amplified what pointwise metrics hid and localized the responsible discretization. This iteration revealed
+missing processes (freshwater runoff), stability-motivated coefficient substitutions, and boundaryadjacent stencil differences that were successively corrected to obtain faithful simulations.
+7
+
+Validation of the land component was less direct, as many of its processes are biological and represented by empirical relationships rather than first-principles equations, and hence lacked benchmark cases. Soil water flow (Richards’ equation) and soil heat diffusion were checked for mass and
+energy conservation and physically consistent behavior, using agent-based diagnostics and visual
+inspection. Simulated fluxes were then evaluated against eddy-covariance measurements at several
+flux-tower sites and at the global scale, including the seasonality of the turbulent heat fluxes by
+biome, the global pattern of latent heat flux, and the zonal distribution of gross primary productivity (Supplementary Figs. S19–S22). Evaluation criteria were met within only a few iterations,
+with the exception of soil evaporation where high biases desiccated soil. Therefore, a modernized
+soil-evaporation parameterization was implemented. The surface parameters were then calibrated
+by gradient descent at eddy-covariance sites (Fig. 2; described in the section on composability and
+differentiable calibration below). Finally, the initial pools of the dynamic carbon model, based on
+DifferLand 53 , were estimated either through an analytical linearized solution or by differentiable
+optimization, with comparable results (Supplementary Fig. S23). Comparing the pools with observational estimates revealed, for example, too little soil carbon in northern high-latitude soils 94 ,
+and the agents iterated on the parameters and structure of the carbon model until the initial pools
+were realistic.
+The resulting modeling infrastructure, developed over 9 months, comprised about 620,000 lines
+of model code in the packages, about 824,000 lines of tests, through which automated continuous
+integration enforced the physical contracts (Methods), and about 555,000 lines of simulation and
+analysis scripts.
+Two features of this workflow mattered as much as the end result. First, code generation was fast:
+with agents handling implementation and testing, adding a new parameterization or dynamical core
+(historically a months-to-a-year undertaking in an established model) shrank to days, compressing
+the development cycle between a scientific idea or hypothesis and a tested, benchmarked implementation. Second, human experts in the loop were critical. They set the scope and strategy at
+all stages of the project, and without supervision the agents tended to diverge, coding unneeded
+or even unintended features or spending compute on irrelevant items, and often losing track of
+the ultimate objective. Human input was needed for physical choices and for setting main project
+directions, for example deciding which reference solution or oracle a component should reproduce,
+which parameterizations to include, the overall architecture of the model, or whether to keep or
+replace a simple parameterization with a more complex one based on human-defined objective, or
+requesting denial experiments that remove a single process to assess its effect on the result. This
+back-and-forth between the agents’ questions and the scientists’ responses or hypotheses reduced
+the overall speed, but in our opinion largely improved the quality and clarified the scope of the
+end software. Our workflow was therefore closer to recent multi-agent “co-scientist” systems, in
+which scientists specify goals and steer agents that generate and test hypotheses 95 , than to a fully
+autonomous research pipeline.
+
+Many grids, one set of equations
+A central design choice in legoESM is that the governing equations can be solved on different grids
+tailored to best suit the problem. In the atmosphere, legoESM provides shallow-water, hydrostatic
+primitive-equation and nonhydrostatic compressible-Euler dynamics on four global grid families:
+the cubed sphere 61–63 , latitude–longitude finite-volume grids 64 , Gaussian/spectral transforms 65,66
+and unstructured Voronoi (MPAS) meshes 67–69 , together with a doubly periodic Cartesian plane on
+which the nonhydrostatic core runs large-eddy and cloud-resolving simulations. The same physics
+8
+
+therefore runs through a controlled hierarchy of dynamical cores and grids. The ocean solves
+the Boussinesq hydrostatic primitive equations 96 ; nonhydrostatic effects are negligible at basin-toglobal scales, so no nonhydrostatic ocean core has been included yet. The ocean equations run
+on the latitude–longitude, cubed-sphere, MPAS/Voronoi and tripolar grids. Production simulations use the latitude–longitude C-grid, in its curvilinear form on the eORCA1 tripole mesh 70,71 .
+The MPAS, cubed-sphere and spectral ocean configurations serve idealized and benchmark experiments. The specific discretizations, transport operators and their community lineages are listed
+in Supplementary Table S1. As an illustration, the same shallow-water equations solved on the
+cubed-sphere, lat–lon, icosahedral and spectral grids give near-identical (within numerical bounds)
+solutions across all four discretizations, including flow over an isolated mountain (Williamson 5)
+and the propagating Rossby–Haurwitz wave (Williamson 6) 85 (Supplementary Figs. S1, S3 and S5),
+and the cubed-sphere C-D core reproduces the Jablonowski–Williamson baroclinic wave 88 (Supplementary Fig. S4). Removing a residual grid imprint at cube-panel boundaries, visible only on the
+meridional wind and not in error norms, was one of the problems for which the persistent-iteration
+(Ralph) loop described above proved essential, leading to the implementation of the duo-grid treatment 63 that eliminates it (Supplementary Fig. S4c). Our advection schemes across all grids (dycores) were validated against a substantial suite of dycore benchmarks, given in Supplementary
+Information §2, ensuring that the formulations were numerically sound across all cases.
+While many of the grids, numerical schemes and parameterizations can be used as composable
+elements, legoESM’s ocean component builds on the community’s knowledge and provides recipes
+that closely shadow the combinations in existing production models, reproducing their numerical
+schemes and, where verified against the reference model’s own output, their trajectories. A NEMO
+shadow recipe is certified statement by statement against NEMO 5.0.2 on its idealized test cases,
+and shadow recipes exist for Veros and Oceananigans, so that a legoESM configuration can be
+pinned to a trusted production model before its components are swapped.
+
+Composability and differentiable multiscale calibration
+Swapping physical schemes or model components to assess their impact has been a long-standing
+scientific need. Although many contemporary ESMs have adopted increasingly modular software
+architectures, most process representations remain tightly coupled to other model components,
+reflecting in part technical debt accumulated over decades of development. Exchanging such components therefore still requires source-code modifications and careful bookkeeping. In legoESM,
+all model components follow a common tensor-in/tendency-out interface, taking the model state
+as input and returning a tendency. This standardized interface allows individual process representations, or larger parts of the system (e.g., the entire atmosphere), to be exchanged without
+modifying the rest of the model.
+We illustrate this capability along with legoESM multiscale capability with atmospheric turbulence and deep-convection parameterizations (Supplementary Figs. S6–S8), which govern turbulent
+exchange in the lower atmosphere and much of tropical rainfall, respectively, and remain important
+sources of uncertainty and error in climate models. Nine turbulence and ten convection schemes
+(Extended Data Tables 4 and 2) are first run unchanged in single-column configurations: the turbulence schemes are evaluated against reference turbulent cases in legoESM large-eddy simulation
+mode, while the convection schemes are evaluated in radiative–convective equilibrium (RCE) at
+three sea-surface temperatures (295, 300 and 305 K) against legoESM cloud-resolving simulations
+of the same cases. All experiments therefore use the same model infrastructure, which can itself operate in large-eddy or cloud-resolving configurations, conserving other exactly similar components
+9
+
+(e.g., radiation scheme or microphysics). The schemes exhibit clear differences in skill (Supplementary Information §3), enabling controlled comparisons of their off-the-shelf performance. All
+ten convection schemes reach a statistically steady equilibrium, but their errors against the cloudresolving temperature and humidity profiles differ by up to a factor of about seven, from the
+eddy-diffusivity/mass-flux (EDMF) scheme, which is closest to the reference, to the Kuo and deepconvective-adjustment schemes (Supplementary Figs. S7 and S8). Once implemented, switching
+among schemes requires only a one-line configuration change. We then calibrate the parameters of
+each turbulence and convection scheme against the corresponding large-eddy and cloud-resolving
+reference high-resolution simulations; a single parameter set per scheme is optimized jointly across
+all cases for generality. Comparing default and calibrated performance (Supplementary Fig. S6 for
+the turbulence closures against LES and Supplementary Figs. S7 and S8 for the convection schemes
+before and after calibration) demonstrates how legoESM’s differentiable infrastructure complements
+its modular design: process representations can not only be interchanged and compared under
+consistent conditions, but also systematically optimized against reference data. Because differentiability is built into legoESM, parameter or initial-condition calibration becomes a gradient-based
+optimization problem 55,56 . Gradients propagated through the model via jax.grad allow parameters to be optimized directly against data using modern gradient-based methods 97,98 , rather than
+derivative-free searches 25,27 , which are nonetheless still available. The benefit of calibration differs
+strongly between convection schemes (Supplementary Fig. S7a). The Tiedtke scheme improves
+about threefold (joint score from about 8.2 to 2.8), rising from the lower half of the ranking to
+third, whereas most schemes change little; for the mass-flux and Zhang–McFarlane schemes the
+jointly tuned parameters even score slightly worse than the defaults and differ between optimization seeds, a reminder that fitting one parameter set to several climates is a non-convex compromise
+(see below). Even after calibration, skill depends on the climate: the Kuo, Zhang–McFarlane and
+deep-convective-adjustment schemes degrade markedly as the surface warms from 295 to 305 K,
+whereas EDMF improves (Supplementary Fig. S7b). A scheme that performs well in the presentday tropics therefore need not remain skillful in a warmer climate, which is precisely the regime
+that matters for projections, and legoESM makes such cross-climate tests a routine part of scheme
+evaluation.
+We further extend this approach to the global land surface by tuning per-plant-functional-type
+surface parameters globally by gradient descent against ERA5 99 mean-annual skin temperature
+and MODIS albedo (Fig. 2). We reduce the global mean warm temperature bias from +1.09 to
++0.30 K while keeping the surface albedo essentially unbiased (+0.002 to +0.004), with the largest
+improvements over the previously too-warm arid and semi-arid land. This is the same machinery
+that was used to calibrate turbulent- and convection-scheme parameters against the high-resolution
+references, and that we also used to adjust a cloud-fraction critical-relative-humidity threshold using
+gradients of the top-of-atmosphere shortwave and longwave fluxes so that the planetary albedo
+falls in its observed ∼30% range, and to estimate the initial land-carbon pools (Supplementary
+Fig. S23; see the development section above). The same gradient-based strategy can also replace
+an entire component: a classical physics suite, a column neural network, or a full AI emulation,
+such as spherical neural operator 100 for the atmosphere (a learned dynamical core) can be swapped,
+which is demonstrated for the WeatherBench AI-weather model intercomparison (Supplementary
+Information §3), and the ocean can run as a prescribed sea surface, a simple single or multi-layer
+slab, or a full three-dimensional model, all from one driver. The differentiable parallelization layer
+makes this workable at scale. Exact reverse-mode gradients flow through distributed halo exchange
+(via a custom adjoint that swaps send/receive ranks) and through the global reductions used by
+the mass-conservation fixers (Methods).
+The same adjoint capability also underpins variational data assimilation, which is natively en10
+
+abled in the model through differentiability. A three-dimensional variational (3D-Var) analysis is
+implemented for the atmosphere: the analysis increment is obtained by differentiating the observation operator and the background term through the model, and it extends to 4D-Var through
+the differentiable time-stepping kernel, with no separately coded adjoint model. Single-observation
+experiments for both 3D-Var and 4D-Var, including the upstream propagation of the analysis increment that only 4D-Var recovers, are shown in Supplementary Figs. S26 and S27 (Supplementary
+Information §10), demonstrating faithful 3D- and 4D-Var capability of the model for weather to
+climate data assimilation.
+Accessibility to gradients is also useful for diagnostics and process understanding, legoESM
+makes it natural to pose questions that are challenging in conventional models, for example one
+can ask which processes a given bias is most sensitive to. The gradient of any scalar diagnostic J
+(a global-mean radiative imbalance, a regional precipitation bias, a measure of tropical variability)
+with respect to every internal parameter and boundary input is obtained in a single reverse pass,
+at a cost essentially independent of the number of parameters; ranking those sensitivities attributes
+the diagnostic to the processes that control it, where the brute-force equivalent would demand
+thousands of perturbed parameter integrations 101–103 . This shifts the emphasis from solely using
+the model for predictive skill to also using the model as a tool for understanding.
+We note that these gradients are exact for the discretized model, but they are not always useful
+for calibration. For chaotic, autoregressive dynamics, gradients through long integrations can vanish
+or explode 104 , and implicit solvers, iterative fixers and threshold-like physics can make them noisy
+or ill-conditioned, although probabilistic or ensemble formulations can mitigate many of these
+issues. There can also be a trade-off between forward accuracy and the stability of the reverse pass;
+NeuralGCM, for instance, builds on a comparatively simple spectral dynamical core 46 . legoESM
+does not remove these limitations, but it lets users check gradients (for example, against finite
+differences) and choose, for each application, the grid, dynamical core, rollout length and loss (for
+example, time-averaged or ensemble statistics) that best balance forward fidelity against gradient
+quality.
+
+Bridging scales and the model hierarchy
+Weather and climate processes span an enormous range of scales, from turbulent eddies at metre
+scale to circulations spanning the entire planet. Traditionally, different scales and regimes have
+often required distinct model configurations and representations of unresolved processes. legoESM
+instead provides a modular, swappable framework designed to facilitate experimentation across a
+range of spatial scales and resolutions. At sufficiently high resolution, the framework can support
+large-eddy and cloud-resolving configurations 79 , while retaining the flexibility to reuse, adapt, or
+replace physical parameterizations as appropriate. This enables systematic investigation of which
+parameterizations and process representations remain applicable across scales, which require retuning, and which must be reformulated or replaced as processes become explicitly resolved 82 .
+The model is validated across scales: first as large-eddy simulation against reference cases and
+against reference codes (MicroHH 73 ), reproducing the expected mean profiles and turbulence structure (Supplementary Figs. S9 and S10). Enlarging the domain and adding moist physics turns
+the model into a cloud-resolving model tested in radiative–convective equilibrium 84 and against
+the SAM model 83 , and the model can spontaneously organize convection into clusters (“selfaggregation”; Supplementary Fig. S11). The warm-rain microphysics closely matches a particlebased (super-droplet) reference 106,107 (Supplementary Fig. S12). Microphysics schemes were additionally checked against their original Fortran or C implementations, used as oracles for the
+11
+
+Fig. 2: Differentiability: gradient-based calibration of the land surface. Per-plantfunctional-type surface parameters are tuned by gradient descent through the differentiable land
+model against ERA5 99 mean-annual fields, with physical bounds imposed by differentiable (sigmoid) transforms. Top: skin temperature. Starting from CLM5 105 default parameters (b), the
+global mean warm bias against ERA5 (a) falls from +1.09 to +0.30 K after tuning (c), with the
+largest gains over arid and semi-arid land. Bottom: surface albedo (d–f) stays essentially unbiased
+through the calibration (+0.002 to +0.004), confirming that the temperature fit is not bought at
+the cost of the radiative surface state. Gradients are obtained by reverse-mode differentiation of
+the land model at the global scale, per plant functional type; experimental set-up is in Methods
+and Supplementary Information §6.
+
+12
+
+code translation, following a systematic LLM-based translation and verification strategy 108 and a
+systematic approach to microphysics-scheme development 82 . At the global scale, the atmosphere
+runs idealized cases ranging from shallow water (Supplementary Figs. S1–S3 and S5), 3D RCEs
+coupled to ocean or land, Held–Suarez 89 or prescribed-ocean (Atmospheric Model Intercomparison
+Project, AMIP-style) simulations on any grid (Supplementary Fig. S13), and is evaluated with
+ClimateEval, which builds on ESMValTool 109,110 , along with agents investigating the physical realism of the model (e.g., stability, mean annual precipitation, mean top of the atmosphere radiation
+fluxes...), and forced three-dimensional ocean integrations (Ocean Model Intercomparison Project,
+OMIP-style; Fig. 3 and Supplementary Figs. S14–S18) and offline land integrations (Supplementary
+Figs. S19–S22) were compared to reference models (next section). Some established frameworks already span large-eddy to global scales 59 ; spanning a metre-scale eddy to a global simulation within
+one differentiable code base is, to our knowledge, not available in existing frameworks, and allows
+systematic hypothesis testing and facilitates model parameter tuning using more realistic fine-scale
+models as training data for the coarser-resolution parameterized or learned scheme 82 .
+
+Global simulations against established models
+A stringent test of the framework is whether its component, built from the same composable elements, can reproduce a mature model on a complex grid, such as an operational ocean model. For
+this case, the three-dimensional Boussinesq ocean uses a split-explicit baroclinic/barotropic solver 96
+with K-profile parameterization (KPP) vertical mixing 111 and Gent–McWilliams/Redi (GM–Redi)
+eddy parameterization 112,113 , and runs on all supported grids. Figure 3 compares forced legoESM
+ocean integrations against NEMO 70 on two of the most demanding meshes: the NEMO-style tripolar (eORCA) grid, whose folded northern boundary is a classic source of numerical artifacts, and
+the unstructured MPAS/Voronoi icosahedral grid. On both grids the simulated sea-surface temperature closely tracks NEMO (Fig. 3a): zonal-mean differences stay within about ±0.3 ◦ C between
+60◦ S and 60◦ N, and the largest departures (up to ∼0.9 ◦ C) are confined to the Antarctic margin
+(Fig. 3b). Zonal-mean sea-surface salinity agrees to within a few hundredths of a psu outside the
+polar regions, and the mixed layer is somewhat deeper than in NEMO at northern mid-latitudes.
+The two legoESM configurations differ from each other far less than either differs from NEMO,
+so the residual differences reflect model formulation, relative to NEMO, rather than the choice of
+grid (Supplementary Fig. S16). A centennial spin-up library, an Atlantic meridional overturning
+circulation (AMOC) tracker, conservation diagnostics, and a peer-comparison fidelity harness support quantitative model intercomparison (Supplementary Information §5), and the same code runs
+eddy-permitting global configurations on 15-km MPAS and FESOM2 93 meshes (Supplementary
+Fig. S17). That an agent-built ocean reproduces a mature community model on geometrically
+awkward grids is a strong test of the framework. Similar comparative tests have also been done
+on simpler configurations that are representative of different aspects of the global circulation at
+different resolution, e.g. the DINO 114 .
+The same drivers run the standard uncoupled CMIP6 protocols 1 end to end. In atmosphereonly (AMIP) mode, the atmosphere with an interactive land surface are integrated over the CMIP6
+historical period (1979–2014) with sea-surface temperatures and sea ice concentrations prescribed
+from observations and with transient CMIP6 solar, greenhouse-gas, ozone, tropospheric aerosol and
+volcanic forcing. The AMIP simulation is initialized from ERA5 99 and written as CMOR-compliant
+output that ESMValTool 109,110 ingests with the recipes used for CMIP6 models. The simulation is
+evaluated with ClimateEval 115 : it reproduces the observed large-scale patterns of near-surface temperature, precipitation, water vapour and cloud cover, with a global-mean cold bias and a too-weak
+13
+
+shortwave cloud radiative effect as the main biases (Supplementary Fig. S13) without calibration.
+We leave the full calibration of AMIP runs for future work as it is bound to computing availability.
+In ocean-only (OMIP) mode, the three-dimensional ocean is driven by prescribed surface fluxes
+and tracks NEMO, as shown above. In land-only mode (LMIP-style, following the land-only experiments of the Land Surface, Snow and Soil Moisture Model Intercomparison Project), the land
+model is forced offline by CRU-JRA v2.5 reanalysis meteorology on a 2◦ grid at an hourly timestep
+over 1985–2014, in a two-leaf canopy biophysics-only configuration. It demonstrates comparable
+fidelity to a CLM5 satellite-phenology simulation 105 driven by identical forcing, surface data and
+leaf-area index (Supplementary Figs. S20–S22). All three are described, with their forcing and
+evaluation metrics, in Supplementary Information §§4–6. They all demonstrate physically realistic
+behaviour, with the remaining biases documented there.
+
+(a) Sea-surface temperature: tripolar, MPAS/Voronoi and NEMO, and differences from NEMO
+
+(b) Zonal means (top) and zonal-mean differences (bottom) of SST, SSS and mixed-layer depth
+
+Fig. 3: A global ocean validated against NEMO on complex grids. (a) Sea-surface temperature from forced legoESM ocean integrations on the NEMO-style tripolar (eORCA) grid and on the
+unstructured MPAS/Voronoi icosahedral grid, from NEMO, and the differences tripolar−NEMO
+and MPAS−NEMO (colour limits: 1st–99th percentiles of the cells common to all three grids).
+(b) Zonal means of sea-surface temperature, sea-surface salinity and mixed-layer depth (top) and
+their differences (bottom; tripolar−NEMO, MPAS−NEMO and tripolar−MPAS), computed on the
+common cells. The two legoESM grids agree with each other much more closely than either does
+with NEMO. Maps of salinity and mixed-layer depth, the idealized benchmark suite, a NEMO twin
+experiment and eddy-permitting configurations are in Supplementary Figs. S14–S17.
+
+14
+
+Performance and scalability
+Writing legoESM in JAX enabled flexible portability; identical code runs unmodified on a laptop
+and on distributed multi-node high-performance computing systems, at single or double precision.
+A configuration can therefore be developed and tested on a laptop and run at production scale, and
+prototyping is fast enough to be scientifically useful: a 2.8° dry Held–Suarez integration completes
+four simulated years in under an hour on an eight-core laptop, and in under six minutes on a
+single A100 GPU. At production scale, a single A100 GPU runs the ∼20-km lat–lon atmosphere
+7.2× faster than a full 128-core CPU node. Because the two architectures differ, such comparisons
+are best normalized by energy or allocation cost; using nominal thermal design powers (400 W
+for one A100 and 2 × 280 W for the two CPUs of a node), this corresponds to roughly a tenfold
+advantage per unit of nominal processor power. Laptop-GPU speed-ups are given in Supplementary
+Information §7.
+To further improve the scaling on CPUs and GPUs, we used agents to tune distributed scaling on
+MPI and multi GPUs for all grids, for the atmosphere and ocean. As much as possible, operators
+were shared between the ocean and atmosphere. Two algorithmic changes found with agentic
+optimization dominated the gains: parallelizing the correlated-k radiation over its g-points led to
+a ∼6× speed up on the radiation kernel and a split-explicit barotropic ocean solver was iterated
+on to avoid the global-reduction latency wall of the implicit solver, being up to 1.65× faster at 64
+ranks. At production resolutions on the DKRZ Levante system the model uses added hardware
+efficiently (Fig. 4): the ∼5-km lat–lon atmosphere retains roughly 75% parallel efficiency from 4 to
+128 A100 GPUs at single precision, and the ORCA12-class tripolar ocean scales close to ideal up to
+64 GPUs. Node for node (four A100 GPUs versus 128 CPU cores), the GPU partition is roughly
+an order of magnitude faster for the atmosphere, although, as noted above, such node-to-node
+comparisons do not account for differences in cost or energy use. Strong scaling is limited by the
+work available per device, not by total problem size, and a GPU needs a much larger subdomain
+than a CPU core to stay saturated: on the unstructured MPAS and FESOM2 meshes, speed-up
+flattens once the per-GPU subdomain becomes small and halo exchange can no longer be hidden
+behind computation (Fig. 4b,d,e). Documented limits remain (Supplementary Information §7):
+spectral transforms are communication-bound and admit no domain-decomposed path, and the
+structured grids outperform the unstructured MPAS core in per-cell throughput, as expected from
+their memory-access patterns. For context, a GPU-optimized hydrostatic ocean dynamical core
+(Oceananigans) simulates about a decade of near-global ocean per wall-clock day at 8-km resolution
+on 64 A100 GPUs 116 ; a like-for-like comparison with the legoESM ocean, at matched resolution,
+time step and hardware, is left for future work.
+The throughput reported in Fig. 4 is for forward model steps only; critically, reverse-mode differentiability is preserved: gradients flow correctly through MPI halo exchange and global sum
+reductions, verified against single-rank references to machine precision (Methods). A full gradient step for a dry dynamical core costs only 5.4x a forward step on a single GPU, and gradient
+checkpointing cuts peak memory effectively (from 8.0 to 0.73 GB) at no measurable wall-clock cost,
+making end-to-end gradients practical for short rollouts on a single device.
+
+Accessibility, reproducibility and physical consistency
+legoESM is written in Python so that it can reach the broadest group of users, as Python is the
+language most widely used by students, early-career researchers and scientists in adjacent disciplines. The model is modular and composable by construction, so that specific parameterizations or
+
+15
+
+Fig. 4: Strong scaling of the atmosphere and ocean at production resolution. Wallclock time per model step as a function of the number of devices on the DKRZ Levante system
+(A100-80GB GPUs, four per node, NCCL communication, blue; AMD EPYC 7763 Milan CPU
+ranks, 128 per node, gloo communication, orange) at single (thick lines) and double (thin lines)
+precision; dashed lines show ideal scaling anchored at the first point. Atmosphere: a, lat–lon grid
+at 4096 × 8192 (∼5 km) and 2048 × 4096, 26 levels; b, MPAS icosahedral mesh (subdivision levels
+9 and 10, 26 levels). Ocean: c, ORCA12-class tripolar grid (3072 × 4352, 75 levels; GPU only); d,
+MPAS Voronoi mesh (2.6 million cells, 40 levels); e, FESOM2 FORCA20 mesh (2.1 million nodes,
+70 levels; double precision). Structured grids follow the ideal line to large device counts, whereas
+the unstructured meshes roll off once per-device work is too small to amortize the halo exchange.
+Single-device throughput and laptop-GPU speed-ups are in Supplementary Information §7.
+
+16
+
+hypotheses can be tested in isolation or coupled to specific components, and an entire experiment is
+typically defined in a few lines of readable code (selecting a grid, a complexity rung, a set of physics
+schemes and a forcing; Supplementary Information §8). The model runs without modification or
+manual compilation on hardware ranging from laptops to supercomputers, which is essential for a
+genuine community model with global reach, for both research and education. It is also designed
+for fast prototyping of new ideas or hypotheses, whether by coding directly or by delegating the
+implementation to agents, which greatly shortens the model development cycle. As coding agents
+mature, we expect writing model code by hand to become increasingly the exception, shifting the
+scientist’s role towards specifying, testing and interpreting. Finally, to make results reproducible,
+every run automatically records a manifest of everything needed to repeat it (the fully resolved
+configuration, a checksum of the model state, the git commit and the library versions), so that a
+simulation can be re-run with a single command and reproduced bit for bit on the same hardware
+and software stack.
+
+Conclusion
+We present legoESM, a novel modelling framework for the Earth system made of composable,
+differentiable building blocks. legoESM shows that a single, high-level, differentiable code base
+can span the ESM hierarchy, from large-eddy and cloud-resolving simulation to global atmosphere
+and ocean simulations, while remaining composable enough to swap dynamical cores, grids, physics
+schemes and complexity levels as interchangeable bricks, and differentiable end-to-end to calibrate
+variables, physical parameters, and train embedded neural networks by gradient descent through the
+model. Concretely, the architecture makes practical several things that are challenging or impossible
+in a conventional model: differentiating a whole-model back to the parameter or input that controls
+it (end-to-end sensitivity and attribution); training an embedded neural component online, through
+the model’s own evolution rather than on offline single-step tendencies; and, although not new in
+itself, running models across scales from a large-eddy column to a global simulation within the
+same differentiable code, which facilitates clean cross-scale comparison. These capabilities, rather
+than any single simulation, are the novelty we wish to demonstrate.
+Two points deserve attention. First, treating differentiability and composability as architectural
+building blocks, rather than features added onto an existing model, makes the hierarchy continuous
+and the model flexible. Any of the parameterizations or component can be coupled to other parts
+of the system based on either physics or AI and, importantly, trained in tandem. Second, the
+model was built largely by AI agents, but its trustworthiness rested on a human-authored scientific
+definition, choices and validation. We found adversarial agent review and persistent iteration loops
+essential precisely for the problems where physical intuition is hard to encode, such as resolving
+grid-imprint artifacts at cubed-sphere edges (Supplementary Fig. S4c). A key aspect of the model
+concerns the role of benchmarks. Agentic development of legoESM was possible only because the
+community has, over decades, distilled its understanding into open, well-posed benchmark cases
+and datasets, from the standard dynamical-core tests to intercomparison projects. These were used
+to give the agents unambiguous targets against which the model could be checked, and iteratively
+corrected. Such benchmarks remain sparse for some components, notably the land surface, sea ice,
+biogeochemistry and the coupled system, where fewer well-posed, openly shared reference cases
+exist. Community efforts to create and share such baselines would directly benefit agent-assisted
+model development.
+We believe that legoESM represents a shift in computational science: while a model’s source
+code was once the primary repository of physical understanding, in an agentic workflow the code
+17
+
+becomes comparatively inexpensive to regenerate, and it is the tests, benchmarks and reference
+datasets, the accumulated work of the whole community, as well as the methodology to reach the
+final model, that increasingly encode what we know and that must be curated and preserved most
+carefully. This is an important point for the weather and climate community in the future and likely
+requires a community effort to fully exploit the potential. Finally, legoESM builds on the immense
+body of physical understanding encoded in community models developed over decades (from the
+parameterizations of the Community Earth System Model 3 , the ocean physics of NEMO 70 , the
+dynamical cores pioneered at GFDL, and many others), repackaged in a modern, differentiable
+composable and swappable infrastructure. This paper is a demonstration of the potential of this
+new type of architecture rather than a finished ESM. The model as of now is not as complex
+as established operational models. The framework is not meant to be finished but rather to be
+an agile, evolving infrastructure for and by the community. This raises governance questions for
+a federated framework: a core team can curate, test and integrate contributions into a common
+reference version, or users can fork the code and adapt it for their own purposes, which requires
+less long-term maintenance but makes it harder to integrate and evaluate improvements across the
+framework. A combination, in which contributions that pass the shared benchmark and contract
+tests are merged into a reference version, seems most promising.
+Two caveats apply. Gradient-based calibration allows data assimilation, initial state estimation
+and optimal parameter tuning to reduce model bias and errors, but it does not remove structural
+error in physics-based parameterizations. A well-tuned simulation can therefore still carry substantial biases due to its inherent model structure. The flexibility of the model nonetheless allows
+replacing defaulting structures with pure machine learning models with many degrees of freedom
+and see whether those can address the biases. Moreover, gradients through long rollouts of chaotic
+dynamics can become noisy or explode 104 , so calibration windows, time-averaged losses or ensemble
+statistics must be chosen with care to address those issues. Further, the model capability to swap
+parameterization and to use gradients for sensitivity can be used to pinpoint sources of biases.
+We expect that this will become an important strategy in the future to refine parameterizations.
+While the differentiable coupler makes assembling components straightforward, we anticipate the
+same hard coupled-system problems that challenge established models, such as spurious deep-water
+formation in the Labrador Sea, drift in the Atlantic meridional overturning circulation 117 , or biases
+in tropical interannual variability 8,118 that are likely to remain difficult to resolve. However, the
+capacity to calibrate parts of the model much faster should enable more rapid testing of solutions
+for coupled model problems. Such differentiable, AI-ready infrastructure is a concrete step toward the hybrid ESMs that are increasingly seen as a route to sharper, more actionable climate
+projections 32 . By making the full coupled system transparent, with common coding and inlinedocumentation standards set from the outset, easy to differentiate and easy to run on modern
+hardware, we hope to lower the barrier to experimentation and to invite the community to build
+on and contribute to it.
+To make the modelling framework usable and verifiable by the community, we include a set of
+curated reference configurations, idealized dynamical-core tests, radiative–convective equilibrium,
+and test cases (from large-eddy simulations to single column models) as well as AMIP, OMIP and
+LMIP and cross-reference, so that a student or a new group can reproduce a well known baseline
+before modifying it. As such, legoESM is intended as an open, evolving research and educational
+tool, for theoretical insight, hypothesis testing and clean counterfactual experiments, and, in time
+and with sustained community contributions, potentially evolving towards a full-fledged weather
+and climate model.
+Finally, our modelling strategy aims to be a template that can extend beyond weather and
+climate. The design choices underlying legoESM (composability, differentiability, hardware porta18
+
+bility, and agent-assisted development under a human-defined scientific contract) are responses to
+structural challenges shared by many multiscale physical systems: astrophysics, materials science,
+plasma physics, fluid dynamics, and neurosciences. Those systems all couple processes across vastly
+different scales, all benefit from gradient-based inverse methods, and all face the same tension between legacy code and modern accelerators. A composable, differentiable, agent-built framework
+in which domain scientists specify the governing logic, conserved quantities and criteria while AI
+agents write and mechanically verify the implementation offers a template for simulation-based
+science more broadly, wherever physical models are complex and data are abundant.
+
+Methods
+The complete governing equations and numerical methods of all components are given in Supplementary
+Information §1; this section summarises the computational implementation. End-to-end differentiability,
+conservation and stable-shape (non-retracing) JAX execution are treated throughout as hard constraints.
+
+Agentic development methodology
+legoESM was implemented by large-language-model coding agents in an agentic coding environment under
+a human-authored specification. Most of the code was written by Claude (Anthropic; the Fable, Opus and
+Sonnet model families) driving edits, test execution and debugging, and a second agent based on Codex
+(OpenAI), a separately trained LLM family, performed adversarial review of every substantial change; GLM
+(Zhipu AI) was used for part of the implementation. A human-maintained specification fixed the conserved
+quantities, sign and unit conventions, valid scheme sets, reference literature and per-component acceptance
+criteria, and domain scientists reviewed and adjudicated the scientific choices at each step (expert-in-theloop). For hard, slowly-converging problems (multi-node scaling; cube-edge grid artifacts) the persistentiteration loop described in the main text 72 was used; community agent-skill libraries (agent-skills 119 ,
+superpowers 120 ) were used in the final hardening stages to reach production-level code quality and to surface
+subtle bugs. Agents also iteratively improved weak and strong CPU and GPU scaling, including multinode MPI and multi-GPU performance, on the NSF NCAR Derecho and DKRZ Levante supercomputers.
+Physical contracts were enforced mechanically throughout development by continuous-integration tripwires
+(see Verification harness below).
+
+Use-case configurations. The convection sweep (Supplementary Information §3) ran each scheme,
+
+unchanged, in the 40-level single-column model to a statistically steady radiative–convective equilibrium at
+sea-surface temperatures of 295, 300 and 305 K and scored the equilibrated temperature and water-vapour
+profiles against cloud-resolving simulations of the same cases, aggregated into a joint score over the three
+cases. One parameter set per scheme was then calibrated jointly across the three cases by gradient descent,
+repeated with two random seeds. The land calibration (Fig. 2) optimized per-plant-functional-type soilwater and surface parameters by gradient descent (Adam 97 ) against ERA5 99 annual-mean skin temperature,
+with physical bounds imposed by sigmoid transforms and gradients taken through the differentiable land
+integration. Ocean comparisons (Fig. 3) integrated the three-dimensional ocean on MPAS/Voronoi and
+tripolar grids against NEMO 70 .
+
+JAX implementation and differentiability. All components are pure-functional JAX, integrated
+in time with lax.scan and using jnp.where/lax.cond for data-dependent branching so that the program
+is differentiable and JIT-compilable. State objects and fields are registered as pytrees, so jit, grad, vmap
+and scan apply through the whole coupled model. Implementation details that preserve differentiability and
+avoid recompilation (for example, static feature gates, a non-donating time-stepping kernel for use inside
+gradient computations, and time-varying forcings passed as explicit traced arguments) are documented with
+the code.
+
+19
+
+Differentiable distributed execution. Distributed runs use initialize_distributed to build
+
+the MPI topology, then scatter to rank-local tiles, step, and gather only for I/O. Halo exchange uses a
+four-dimensional path that sends all vertical levels in one message per neighbour. Reverse-mode gradients
+flow through communication: every sendrecv is wrapped in a custom vector–Jacobian product that swaps
+source and destination ranks in the backward pass, and the mass-conservation fixers differentiate through
+allreduce(SUM). Only summation reductions are AD-safe; max/min/allgather are restricted to diagnostics. Multi-rank results are verified against single-rank references to ∼10−9 , and gradients are checked the
+same way.
+
+Verification harness. The human-authored specification was enforced by mechanical tripwires in con-
+
+tinuous integration: physical constants could come only from a central registry; saturation curves could
+come only from the shared thermodynamics module; every scheme factory had to raise on an unknown selection rather than silently default; and additive physics composition was asserted to machine precision. Each
+physics module declared a contract (units, signs, conserved quantities, differentiability, reference, idealized
+test), and a self-test proved each tripwire to be non-vacuous. Dynamical cores were gated on the standard
+sphere test set 85,88,89 ; spatial/grid artifacts additionally required visual regression because error norms are
+necessary but not sufficient. Substantial changes additionally passed an adversarial code-review agent.
+
+Configurations for the figures. Shallow-water tests used cubed-sphere C36, lat–lon 72×144, icosahe-
+
+dral level-5 and spectral T21 grids (Supplementary Information §2). RCE convection sweeps (Supplementary
+Information §3) used the single-column model with shared physics at sea-surface temperatures of 295, 300 and
+305 K. LES and CRM cases used the nonhydrostatic plane core, the latter following the RCEMIP RCE300
+protocol 84 (Supplementary Information §4). Ocean comparisons (Fig. 3) used MPAS/Voronoi (icosahedral)
+and tripolar (eORCA) grids against NEMO 70 . Single-device throughput and speed-ups were measured on
+a consumer-class RTX GPU, and strong scaling (Fig. 4) on the DKRZ Levante system with four NVIDIA
+A100-80GB GPUs or two 64-core AMD EPYC 7763 CPUs per node (Supplementary Information §7). Full
+settings are in Supplementary Information §1–§10.
+
+Data availability
+The ERA5 reanalysis is available from the Copernicus Climate Data Store. NEMO reference output
+and the idealized-test, LES, CRM and OMIP datasets used for the figures are available from the
+authors and via the model repository.
+
+Code availability
+legoESM is open source (MIT licence) and under active development at https://github.com/
+climate-federation/legoESM. A separate, version-frozen companion repository (legoESM v1.0),
+archived on Zenodo with a citable DOI on acceptance, contains the notebooks, configurations and
+reference data needed to reproduce every figure and experiment in this paper, so that the results
+remain reproducible independently of the evolving model code.
+
+Acknowledgements
+We thank Owen Hughes and Christiane Jablonowski for valuable discussions and Owen Hughes
+for pointing us to several atmospheric dycore benchmarks we did not have. legoESM builds on
+parameterizations and numerical methods developed over decades by the broader climate modelling community, including contributions from the CESM, GFDL, ECMWF, NCAR, CICE and
+NEMO development teams, and we gratefully acknowledge that heritage (Extended Data Tables 1–10). We also thank the CMIP community for the forcing datasets used in the atmosphere-,
+20
+
+ocean- and land-only simulations. This work was supported in part by the U.S. National Science
+Foundation Science and Technology Center “Learning the Earth with Artificial Intelligence and
+Physics” (LEAP) award #2019625-STC, and by the European Research Council (ERC) Synergy
+Grant “Understanding and Modelling the Earth System with Machine Learning” (USMILE) under the European Union’s Horizon 2020 research and innovation programme (grant agreement No.
+855187). V.E. and A.P. were supported by the Deutsche Forschungsgemeinschaft (DFG, German
+Research Foundation) through the Gottfried Wilhelm Leibniz Prize awarded to Veronika Eyring
+(reference no. EY 22/2-1). legoESM was developed with the assistance of AI coding agents (Claude,
+Codex and GLM) operating under a human-authored scientific specification, and made use of the
+open-source agent-skills (https://github.com/addyosmani/agent-skills) and superpowers
+(https://github.com/obra/superpowers) libraries. This work used resources of the Deutsches
+Klimarechenzentrum (DKRZ), granted by its Scientific Steering Committee (WLA) under project
+ID no. 1596. D.M.L. is supported by the NSF National Center for Atmospheric Research, which is
+a major facility sponsored by the U.S. National Science Foundation under Cooperative Agreement
+No. 1852977.
+
+Author contributions
+P.G. conceived the scientific vision, led the project, specified the scientific contract and wrote the
+paper. V.E. co-shaped the scientific vision and helped guide the modelling and evaluation approach.
+D.B., L.H. and A.P. led the OMIP, LMIP and AMIP developments and simulations, respectively.
+P.G., D.B., L.H., A.P., A.A., J.F., A.L., K.D.L., D.M.L., J.L.S., J.M., D.W.-P. and V.E. contributed
+to model design, component development, validation and analysis across the atmosphere, ocean,
+land, sea ice, coupler, machine-learning and high-performance-computing subsystems. All authors
+discussed the results and edited the manuscript.
+
+Competing interests
+The authors declare no competing interests.
+
+Extended Data
+legoESM re-implements, within a single differentiable framework, numerical methods and parameterizations developed by the weather, climate, ocean and machine-learning communities over many
+decades. Extended Data Tables 1–10 credit the principal schemes available in each component
+together with their community lineage; the lists are representative rather than exhaustive.
+Extended Data Table 1 | Radiation schemes and community lineage.
+Scheme
+
+Description
+
+Community lineage
+
+Gray (Frierson)
+
+Two-stream gray radiation with tunable
+optical depth
+128 LW + 112 SW g-points; full gas optics
+
+Frierson et al. (2006, JAS)
+
+RRTMGP
+correlated-k
+
+Pincus et al. (2019, JAMES); Mlawer et al.
+(1997, JGR); jax-rrtmgp (Parker, WatsonParris, Nathaniel)
+
+Extended Data Table 2 | Convection schemes and community lineage.
+
+21
+
+Scheme
+
+Description
+
+Community lineage
+Betts & Miller (1986, QJRMS); Frierson
+(2007, JAS)
+Bechtold et al. (2001, QJRMS); ECMWF
+IFS lineage
+Tiedtke (1989, MWR); ECHAM lineage
+
+Kain–Fritsch
+
+Relaxation to reference profile with
+CAPE trigger
+Mass-flux deep/shallow with CAPE closure
+Mass-flux with moisture-convergence
+closure
+Mass-flux with dilute CAPE closure
+
+Zhang–McFarlane
+
+CAPE-based mass-flux with downdrafts
+
+Emanuel
+
+Spectral mass-flux with sub-cloud quasiequilibrium
+Moisture-convergence closure
+Column instability removal by T /q mixing
+Entraining–detraining bulk plume sharing the updraft core of the mass-flux
+family
+Eddy-diffusivity/mass-flux unified BL–
+shallow
+
+Simplified
+Miller
+Bechtold
+
+Betts–
+
+Tiedtke
+
+Kuo
+Deep convective adjustment
+Unified mass-flux
+
+EDMF
+
+Kain & Fritsch (1990/1993,
+JAS);
+WRF/NCAR
+Zhang & McFarlane (1995, Atmos.–Ocean);
+CESM/CAM
+Emanuel (1991, JAS); MIT lineage
+Kuo (1965/1974, JAS)
+Manabe et al. (1965, MWR)
+Tiedtke (1989, MWR); Bechtold et al. (2001,
+QJRMS) lineage
+Siebesma et al.
+(2007,
+ECMWF/Siebesma lineage
+
+JAS);
+
+Extended Data Table 3 | Microphysics schemes and community lineage.
+Scheme
+
+Description
+
+Community lineage
+
+Kessler
+
+Kessler (1969)
+
+Sundqvist large-scale
+condensation
+Morrison
+doublemoment
+Seifert–Beheng
+
+Warm-rain autoconversion, accretion,
+evaporation
+Prognostic cloud water with diagnostic
+precipitation
+Two-moment ice–liquid with five hydrometeor categories
+Two-moment warm + ice microphysics
+
+Thompson
+
+Mixed-phase with aerosol-aware option
+
+Predicted
+Particle
+Properties (P3)
+Fast Spectral Bin Microphysics (SBM)
+
+Two-moment ice–liquid with predicted
+particle properties for ice phase
+Fast SBM scheme
+
+Lagrangian
+superdroplet microphysics
+
+Monte-Carlo super-droplet microphysics
+
+Sundqvist et al.
+(1989,
+MWR);
+ECMWF/ECHAM lineage
+Morrison et al. (2005, JAS); NCAR/WRF
+Seifert & Beheng (2006, Meteorol. Atmos.
+Phys.)
+Thompson et al.
+(2008, MWR);
+WRF/NOAA
+Morrison & Milbrandt (2015); NCAR/WRF
+Hebrew University Cloud Model (HUCM);
+WRF fast-SBM (Khain et al. 2010); Shpund
+et al. (2019)
+Shima et al. (2009, QJRMS); PySDM (Bartman et al. 2022); ERF
+
+Extended Data Table 4 | Boundary-layer turbulence schemes.
+
+22
+
+Scheme
+
+Description
+
+Community lineage
+
+Louis
+Holtslag–Boville
+
+First-order stability-dependent K(Ri)
+Nonlocal countergradient transport
+
+YSU
+
+Nonlocal K-profile with explicit entrainment
+Prognostic TKE with diagnostic length
+scale
+Eddy-diffusivity/mass-flux
+unified
+boundary layer–shallow convection
+Level-2.5 TKE closure with improved
+mixing length
+Assumed-PDF higher-order closure
+Higher-order closure (simplified)
+Diagnostic eddy viscosity for LES/CRM
+(constant-coefficient
+and
+scaledependent dynamic)
+
+Louis (1979, Boundary-Layer Meteorol.)
+Holtslag & Boville (1993, J. Climate);
+NCAR/CESM
+Hong et al. (2006, MWR); WRF/Yonsei
+
+TKE 1.5-order
+EDMF
+MYNN 2.5
+CLUBB
+CLUBB-lite
+Smagorinsky
+
+Mellor & Yamada (1982, Rev. Geophys.)
+Siebesma et al.
+(2007,
+JAS);
+ECMWF/Siebesma lineage
+Nakanishi & Niino (2009, J. Meteorol. Soc.
+Jpn); WRF/NOAA
+Golaz et al. (2002, JAS); CESM/E3SM
+Golaz et al. (2002, JAS); CESM/E3SM
+Smagorinsky (1963, MWR); Germano et al.
+(1991); Porté-Agel et al. (2000)
+
+Extended Data Table 5 | Gravity-wave drag schemes.
+Scheme
+
+Description
+
+Community lineage
+
+Lindzen
+
+Orographic and convective gravity-wave
+breaking
+Doppler-spread non-orographic GWD
+Orographic wave breaking with saturation
+Sponge-layer damping
+
+Lindzen (1981, JGR)
+
+Hines
+McFarlane
+Rayleigh
+
+Hines (1997, JAS); ECHAM/DLR
+McFarlane (1987, JAS); CESM/CCCma
+Standard implementation
+
+Extended Data Table 6 | Ocean physics parameterizations.
+Scheme
+
+Description
+
+Community lineage
+
+KPP
+
+K-profile parameterization for the surface boundary layer
+Isopycnal eddy transport with skew flux
+Along-isopycnal tracer diffusion
+Flow-dependent GM coefficient
+
+Large et al.
+(1994, Rev.
+Geophys.);
+NCAR/CESM/MOM
+Gent & McWilliams (1990, JPO)
+Redi (1982, JPO)
+Visbeck et al. (1997, JPO)
+
+Abyssal tidal dissipation parameterization
+Free-surface sub-cycling
+
+Jayne & St Laurent (2001, GRL)
+
+Gent–McWilliams
+Redi diffusion
+Visbeck
+adaptive
+GM
+Jayne–St
+Laurent
+tidal mixing
+Split-explicit
+barotropic
+
+Shchepetkin & McWilliams (2005, Ocean
+Model.)
+
+Extended Data Table 7 | Land-surface and carbon-cycle schemes.
+Scheme
+
+Description
+
+Community lineage
+
+Slab energy balance
+
+Single-layer energy balance with bucket
+hydrology
+Mixed-form Picard solver with six retention curves
+Six-pool
+carbon
+cycle
+(labile/foliage/root/wood/litter/SOM)
+C3 biochemical model with stomatal
+conductance
+
+Manabe (1969, MWR)
+
+Multi-layer Richards
+DALEC carbon
+Farquhar photosynthesis
+
+Extended Data Table 8 | Sea-ice schemes.
+
+23
+
+van Genuchten (1980, SSSAJ); CLM/CESM
+lineage
+Williams et al. (2005, Global Change Biol.)
+Farquhar et al. (1980, Planta); Medlyn et al.
+(2011, Global Change Biol.)
+
+Scheme
+
+Description
+
+Community lineage
+
+Zero-layer thermodynamics
+EVP/mEVP rheology
+Multi-category ITD
+
+Semtner zero-layer ice–ocean heat balance
+Elastic–viscous–plastic ice dynamics
+
+Semtner (1976, JPO)
+
+Ice-thickness distribution with linear
+remapping
+
+Hunke & Dukowicz (1997, JPO); Bouillon et
+al. (2013); CICE lineage
+Lipscomb (2001, JGR); CICE/CESM
+
+Extended Data Table 9 | Coupler and surface-flux schemes.
+Scheme
+
+Description
+
+Community lineage
+
+COARE 3.0 bulk
+fluxes
+Large & Yeager bulk
+fluxes
+Briegleb
+ocean
+albedo
+
+State-of-the-art air–sea bulk-flux algorithm
+Alternative bulk flux for climate-model
+coupling
+Zenith-angle-dependent ocean surface
+albedo
+
+Fairall et al. (2003, J. Climate)
+Large & Yeager (2004, NCAR Tech. Note);
+CESM
+Briegleb et al. (1986); Briegleb (1992)
+
+Extended Data Table 10 | Machine learning and data assimilation.
+Scheme
+
+Description
+
+Community lineage
+
+SFNO
+(spherical
+FNO)
+NeuralGCM
+coupling
+4D-Var DA
+
+Spherical Fourier neural operator for
+learned dynamics on the sphere
+Learned atmospheric emulator coupled
+to legoESM physics and ocean
+Incremental variational assimilation
+with exact adjoint from reverse-mode
+AD
+
+Bonev et al. (2023, ICML); Pathak et al.
+(2022), FourCastNet
+Kochkov et al. (2024, Nature)
+Courtier et al. (1994, QJRMS)
+
+References
+[1] V. Eyring, S. Bony, G. A. Meehl, C. A. Senior, B. Stevens, R. J. Stouffer, and K. E. Taylor.
+Overview of the Coupled Model Intercomparison Project Phase 6 (CMIP6) experimental
+design and organization. Geoscientific Model Development, 9:1937–1958, 2016. doi: 10.5194/
+gmd-9-1937-2016.
+[2] IPCC. Climate Change 2021: The Physical Science Basis. Contribution of Working Group I to
+the Sixth Assessment Report of the Intergovernmental Panel on Climate Change. Cambridge
+University Press, 2021. doi: 10.1017/9781009157896.
+[3] G. Danabasoglu, J.-F. Lamarque, J. Bacmeister, et al. The Community Earth System Model
+Version 2 (CESM2). Journal of Advances in Modeling Earth Systems, 12:e2019MS001916,
+2020. doi: 10.1029/2019MS001916.
+[4] O. Boucher, J. Servonnat, A. L. Albright, et al. Presentation and evaluation of the
+IPSL-CM6A-LR climate model. Journal of Advances in Modeling Earth Systems, 12:
+e2019MS002010, 2020. doi: 10.1029/2019MS002010.
+[5] A. A. Sellar, C. G. Jones, J. P. Mulcahy, et al. UKESM1: Description and evaluation of the
+U.K. Earth system model. Journal of Advances in Modeling Earth Systems, 11:4513–4558,
+2019. doi: 10.1029/2019MS001739.
+
+24
+
+[6] ECMWF. IFS documentation CY48R1. European Centre for Medium-Range Weather Forecasts, Reading, UK, 2023.
+[7] V. Eyring, N.P. Gillett, K.M. Achuta Rao, R. Barimalala, M. Barreiro Parrillo, N. Bellouin,
+C. Cassou, P.J. Durack, Y. Kosaka, S. McGregor, S. Min, O. Morgenstern, and Y. Sun. Human Influence on the Climate System. In V. Masson-Delmotte, P. Zhai, A. Pirani, S.L. Connors, C. Péan, S. Berger, N. Caud, Y. Chen, L. Goldfarb, M.I. Gomis, M. Huang, K. Leitzell,
+E. Lonnoy, J.B.R. Matthews, T.K. Maycock, T. Waterfield, O. Yelekçi, R. Yu, and B. Zhou,
+editors, Climate Change 2021: The Physical Science Basis. Contribution of Working Group
+I to the Sixth Assessment Report of the Intergovernmental Panel on Climate Change, pages
+423–552. Cambridge University Press, Cambridge, United Kingdom and New York, NY, USA,
+2021. doi: 10.1017/9781009157896.005.
+[8] F. Brown, S. Bischof, B. Pearson, A. Sengupta, P. Bonnet, et al. Fresh eyes on CMIP model
+biases: diagnosing biases across CMIP generations and implications for CMIP7. EGUsphere
+[preprint], 2026.
+[9] S. C. Sherwood, M. J. Webb, J. D. Annan, K. C. Armour, P. M. Forster, J. C. Hargreaves,
+G. Hegerl, S. A. Klein, K. D. Marvel, E. J. Rohling, et al. An assessment of Earth’s climate
+sensitivity using multiple lines of evidence. Reviews of Geophysics, 58(4):e2019RG000678,
+2020. doi: 10.1029/2019RG000678.
+[10] P. A. O’Gorman. Precipitation extremes under climate change. Current Climate Change
+Reports, 1:49–59, 2015. doi: 10.1007/s40641-015-0009-3.
+[11] V. K. Arora, A. Katavouta, R. G. Williams, C. D. Jones, V. Brovkin, P. Friedlingstein, et al.
+Carbon–concentration and carbon–climate feedbacks in CMIP6 models and their comparison
+to CMIP5 models. Biogeosciences, 17:4173–4222, 2020. doi: 10.5194/bg-17-4173-2020.
+[12] P. Friedlingstein, M. O’Sullivan, M. W. Jones, R. M. Andrew, et al. Global carbon budget
+2022. Earth System Science Data, 14:4811–4900, 2022. doi: 10.5194/essd-14-4811-2022.
+[13] P. Gentine, M. Pritchard, S. Rasp, G. Reinaudi, and G. Yacalis. Could machine learning
+break the convection parameterization deadlock? Geophysical Research Letters, 45:5742–
+5751, 2018. doi: 10.1029/2018GL078202.
+[14] S. Rasp, M. S. Pritchard, and P. Gentine. Deep learning to represent subgrid processes in
+climate models. Proceedings of the National Academy of Sciences, 115:9684–9689, 2018. doi:
+10.1073/pnas.1810286115.
+[15] N. D. Brenowitz and C. S. Bretherton. Prognostic validation of a neural network unified
+physics parameterization. Geophysical Research Letters, 45:6289–6298, 2018. doi: 10.1029/
+2018GL078510.
+[16] J. Yuval and P. A. O’Gorman. Stable machine-learning parameterization of subgrid processes
+for climate modeling at a range of resolutions. Nature Communications, 11:3295, 2020. doi:
+10.1038/s41467-020-17142-3.
+[17] T. Bolton and L. Zanna. Applications of deep learning to ocean data inference and subgrid
+parameterization. Journal of Advances in Modeling Earth Systems, 11:376–399, 2019. doi:
+10.1029/2018MS001472.
+25
+

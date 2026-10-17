@@ -1,0 +1,960 @@
+The Base Measure Problem and its Solution
+
+Alexey Radul
+Google Reseach
+
+arXiv:2010.09647v2 [cs.PL] 10 Dec 2020
+
+Abstract
+Probabilistic programming systems generally
+compute with probability density functions,
+leaving the base measure of each such function implicit. This mostly works, but creates problems when densities with respect to
+different base measures are accidentally combined or compared. Mistakes also happen
+when computing volume corrections for continuous changes of variables, which in general
+depend on the support measure. We motivate and clarify the problem in the context of
+a composable library of probability distributions and bijective transformations. We solve
+the problem by standardizing on Hausdorff
+measure as a base, and deriving formulas for
+comparing and combining mixed-dimension
+densities, as well as updating densities with
+respect to Hausdorff measure under diffeomorphic transformations. We also propose a
+software architecture that implements these
+formulas efficiently in the common case. We
+hope that by adopting our solution, probabilistic programming systems can become
+more robust and general, and make a broader
+class of models accessible to practitioners.
+
+1
+
+Introduction
+
+Suppose we are designing a composable library of software to represent probability distributions and transformations thereof which, following The TFP Team
+(2019), we will call “bijectors”. TensorFlow Probability (The TFP Team, 2019) and PyTorch Distributions (Paszke et al., 2019) are such libraries in their
+own right, targeting the probabilistic machine learning space. General-purpose probabilistic programming languages such as Stan (Carpenter et al., 2017),
+
+Boris Alexeev
+Google Research
+
+BLOG (Li and Russell, 2013), Anglican (Tolpin et al.,
+2016), or Venture (Mansinghka et al., 2014) must of necessity also include such libraries, to implement their
+primitive distributions and deterministic functions.
+Suppose furthermore that we are designing this library
+to operate on explicitly vector-valued probability distributions.1 This is the case for TensorFlow Probability and PyTorch Distributions, for instance, to take
+advantage of vectorized hardware; and studying the
+general case is instructive even for a scalar design.
+In this setting, it’s conventional to represent a probability distribution P as a function p : Rn → R computing the probability density of P at points in Rn ,
+together with a sampler x ∼ s() drawing random variates x ∈ Rn distributed according to P . Given a map
+f : Rn → Rn , the pushforward f P is then sampled as
+x0 ∼ f (s()), and its density is computed as
+f p(x0 ) =
+
+1
+p(x), for x = f −1 (x0 ).
+| det(Jfx )|
+
+(1)
+
+The Jacobian-determinant correction 1/| det(Jfx )| accounts for the possibility that f changes the volume of
+an infinitesimal volume element near x. The Jacobian
+determinant can be computed by forming the Jacobian
+of f , for example with automatic differentiation; but
+for many functions f , it’s available more efficiently.
+Thus a conventional choice is to package such f , together with their inverse f −1 , in a Bijector class with
+a method for computing said Jacobian determinant.
+This conventional architecture admits a serious bug.
+We name this bug the Base Measure Problem, because
+it consists of neglecting the base measure with respect
+to which we are computing densities. Our contributions answer these questions:
+• What’s the problem? We give a clear and intuitive example of the Base Measure Problem in Section 2;
+• How common is it? We briefly survey several areas where the Base Measure Problem recurs in
+1
+
+No distinction need be made for our purposes between
+vectors, matrices, tuples, or other structures, as long as
+joint distributions over non-trivial powers of R are in scope.
+
+The Base Measure Problem and its Solution
+
+different guises in Section 3;
+• What’s the right answer? We propose a more nuanced standard base measure in Section 4, and
+derive complete density manipulation formulas for
+that choice using standard results; and
+• How do we fix our software? We detail common
+special cases of our formulas in Section 5, as well
+as how to arrange a software library to optimize
+them.
+We stress that while we do propose to explicitly represent information about measures, all the information
+we will need will be local to a single point (the point
+itself and various directional derivatives thereat), and
+thus require no symbolic algebra to compute with.
+
+2
+
+Motivating Example
+
+Consider the uniform distribution P on the unit circle
+in R2 . The natural probability density function to
+write down for this is
+(
+p(x, y) =
+
+1
+2π
+
+0
+
+when x2 + y 2 = 1,
+otherwise.
+
+Of course, if we were sticklers we would note that the
+base measure implied by the type of the samples is
+Lebesgue measure on R2 ; and with respect to this base
+measure the density of P is +∞ on points on the unit
+circle. But that’s clearly less helpful to our users than
+1/2π, and 1/2π is a density for P , just with respect
+to2 Lebesgue measure along the circle. So let’s wing it
+and go with that.
+Now, a user looking at a density computed for a sample has no way to know which base measure we meant,
+so we have created an instance of the base measure
+problem. To see how it bites us, let f be a somewhat contrived non-isotropic scaling of R2 , given by
+f (x, y) = (2x, 20y). What happens when we try to
+compose our uniform distribution P with our nonisotropic scaling f ? The sampler is fine, but the conventional density rule (1) gives
+1
+p(f −1 (x0 , y 0 ))
+40
+(
+1
+when (x0 /2)2 + (y 0 /20)2 = 1,
+= 80π
+0
+otherwise.
+
+f pbad (x0 , y 0 ) =
+
+Now we have definitely made a mistake. First of all,
+f pbad doesn’t integrate to 1, because the perimeter
+2
+
+Technically, the density function is the Radon–
+Nikodym derivative of our probability measure with respect to the base measure.
+
+Figure 1: 3000 samples from the uniform distribution
+on the unit circle (blue), and the same samples scaled
+non-isotropically by 2x along the x axis and 20x along
+the y axis (orange). The transformed distribution is
+clearly not uniform, even though the original distribution is, and the Jacobian of the transformation is
+constant over R2 .
+of the ellipse (x0 /2)2 + (y 0 /20)2 = 1 is approximately
+81.28, which is considerably less than 80π ≈ 251.32.
+Second, as we can see by drawing a few samples and
+plotting them in Figure 1, the true distribution f p isn’t
+uniform! It’s clearly denser near (0, 20) than (2, 0).3
+2.1
+
+What went wrong?
+
+The problem is that when computing the volume
+change induced by the change of variables f , we forgot
+that the base measure for P wasn’t Lebesgue on R2 .
+It’s actually Lebesgue along the circle, and f changes
+arc length differently at different points. Indeed, locally near the point (x, y), the circle is the line in the
+direction (−y, x). The directional derivative of f is
+(−2y, 20x), and
+p the change in arclength that f induces
+is therefore 4y 2 + 400x2 . Hence the correct density
+is
+p
+f pgood (x0 , y 0 ) = 1/2π y 02 /100 + 100x02
+when (x0 /2)2 + (y 0 /20)2 = 1, and
+0 otherwise.
+
+3
+
+How common is this problem?
+
+While we chose to introduce the base measure problem
+on a continuous example, it actually occurs most often
+3
+
+With respect to arc length as the base measure.
+
+Alexey Radul, Boris Alexeev
+
+when transforming discrete distributions embedded in
+Rn . The density function of, say, the Bernoulli distribution is 1/2 at 0 or 1 and 0 elsewhere, but this
+is a density with respect to counting measure, not
+Lebesgue measure on R. Therefore, when transforming this distribution with a bijector, we should not
+apply any Jacobian correction, because all bijections
+are counting-volume-preserving.
+The same problem also shows up when dealing with
+distributions on symmetric matrices, such as the
+Wishart or LKJ distributions. The k × k symmetric matrices occupy a lower-dimensional sub-manifold
+of Rk×k , and the density of the Wishart distribution
+is with respect to Lebesgue measure on that submanifold rather than all of Rk×k . Bijections will in general
+change the volume under that measure differently than
+the volume under Lebesgue measure on Rk×k .
+Sometimes changes of variables occur in the inference
+algorithm rather than the model. For example, the
+Jacobian of the deterministic transformation h in the
+reversible-jump MCMC framework (Green and Hastie,
+2009) is due to interpreting h as a change of variables.
+One must therefore compute this density correction
+with respect to the proper base measure whenever
+jumping between submanifolds of Rn . For example,
+such jumps would occur in model selection involving a
+model with a latent von Mises-Fisher-distributed random variable (which is defined on the unit sphere).
+
+a universal base measure for probability densities.
+Specifically, for P a distribution on a d-dimensional
+manifold M embedded in Rn , let’s define the density
+to be with respect to the d-dimensional Hausdorff measure H d . We propose d-Hausdorff measure because it
+provides a coherent definition for “d-dimensional volume” of a surface embedded in Rn , even when the
+surface is curved.4 We scale H d to agree with the
+standard volume of straight surfaces, and thus with
+Lebesgue measure when d = n. We begin with fixeddimension distributions for simplicity, and briefly address mixed-dimension distributions in Section 4.2.
+4.1
+
+Manifolds of dimension d
+
+What do we need to represent about a sample x besides
+its density p(x) in order to compute in this scheme?
+Clearly we need to represent d; but, as the example
+of the unit circle shows, that’s not enough to transform densities correctly. Recall that our scaling transformation had a constant Jacobian when viewed as
+a function from R2 to R2 , but we have to apply a
+position-dependent correction to account for its effect
+on the unit circle density. The additional thing we
+need to represent is the tangent space of M at the
+sample point x. Notably, we do not need to computationally represent any non-local information about M
+or P —just the tangent space at x, its dimensionality
+d, and the density p(x).
+
+The same problem can also show up without any
+changes of variables at all. It suffices to compare the
+density of different points under the same distribution, or the density of the same point under different
+distributions. For instance, the Indian GPA problem
+discussed in e.g. Wu et al. (2018) boils down to treating a density under counting measure as comparable to
+a density under Lebesgue measure on R, even though
+the former represents an infinitely larger mass of probability. This incarnation of the base measure problem
+is more widely studied in the literature, albeit without
+a name. Our solution smoothly covers this scenario,
+as we will see in Section 4.3.
+
+Let us now formalize what we are actually trying to
+compute and how we can compute it.
+
+4
+
+Theorem 1. Consider
+
+What’s the right answer?
+
+The root of the base measure problem is that we didn’t
+want to compute with measures directly, but lost the
+base measure when representing probability distributions with densities. It’s not actually possible to infer
+the correct base measure from the data type representing the sample: a point on the unit circle in R2 is
+represented with two floating-point numbers, but using Lebesgue measure on R2 as the base is not helpful.
+We propose standardizing on Hausdorff measure as
+
+Definition 1. Given a probability distribution P over
+any space Ω, and any function f : Ω → Ω0 , the pushforward distribution f P is the measure
+f P (S) = P (f −1 (S))
+for all events S ⊂ Ω0 for which f −1 (S) is measurable
+in Ω.
+The sampler for f P is just to apply f to a sample from
+P . We seek a tractable density function for f P , and
+fortunately the following theorem gives it to us for nice
+f.
+
+• A probability distribution P over a d-dimensional
+manifold M in Rn ,
+• with density p with respect to d-dimensional Hausdorff measure H d ;
+4
+
+We propose standardizing at all in order to minimize
+the amount of information carried by the base measure,
+so it can be as implicit as possible. The only degree of
+freedom in Hausdorff measure is the dimension, and that
+is unavoidable.
+
+The Base Measure Problem and its Solution
+
+f
+x
+
+M
+δv1
+
+f (x)
+δv00
+
+δv0
+
+fM
+
+δv10
+Figure 2: Change of local 2-volume under a transformation from R3 to R3 . On the left, the small parallelogram
+with sides δv0 and δv1 is tangent to M at x and forms a volume element. On the right, f takes M to f M, x to
+f (x), and the volume element to the small parallelogram tangent to f M at f (x) with sides δv00 and δv10 . When
+computing the density at f (x) of the pushforward distribution f P supported on f M, we have to correct for the
+change in volume of this parallelogram, but we have to disregard any stretching or compression f may do in the
+perpendicular direction. Theorem 1 formalizes this for arbitrary dimensions.
+• a diffeomorphism f : Rn → (f Rn ⊆ Rm ); and
+• a point x ∈ M.
+• Let vi be an arbitrary basis for the tangent space
+to M at x, and pack it into a d-by-n matrix V .
+Then
+1. The pushforward f P is supported on the pushforward manifold f M in Rm .
+2. The directional derivatives vi0 = df (x+εvi )/dε are
+a basis for the tangent space to f M at f (x). Let
+us pack them into a d-by-m matrix V 0 .
+3. The density f p of f P with respect to H d at x0 =
+f (x) is
+p
+det(V V T )
+0
+.
+(2)
+f p(x ) = p(x) p
+det(V 0 V 0T )
+Claims 1 and 2 are standard, and give us the rule for
+propagating a basis for the tangent space at x to x0 .
+Claim 3 amounts to a restatement in probability terms
+of standard notions of change of volume. The intuition
+is that the relevant volume is volume in the tangent
+space to M at x (see Figure 2). We choose as a volume element a small parallelepiped: centered at x and
+5
+with sides δv
+pi for δ → 0. The volume of this eld
+T
+ement is δ
+det(V V ). The function f transforms
+this volume element to the parallelepiped with center x0 and sides δvi0 . Therefore,
+the volume
+correction
+p
+p
+we are looking for is det(V 0 V 0T )/ det(V V T ). We
+reproduce a formal proof of Claim 3 in Appendix A.
+5
+
+Since the vi are vectors in the tangent space to M
+at x, it would be more natural to let x be the vertex of
+the parallelepiped. However, we want to end up with a
+neighborhood of x, so we shift the parallelepiped to have
+x in the center.
+
+As an aside, Theorem 1 applies without modification
+to discrete spaces: d = 0, 0-Hausdorff measure is, up to
+scaling, identical with the usual counting measure, and
+we are free to define all functions of a discrete domain
+to be vacuously diffeomorphic. The matrices V and
+V 0 have zero rows, and we recover the standard result
+that f p(x0 ) = p(x) for p a probability mass function
+on a discrete space.
+Observe that the inputs required for Theorem 1 are
+all local: the point x, a basis vi for the tangent space
+to M at x, the density p(x) of P at x, and the ability to compute the value and directional derivatives
+of f at x. We do not need any non-local information
+about P, M, or f , except that f is invertible. Observe also that the outputs given by Theorem 1 give
+enough information about f P at x0 = f (x) to apply
+the same theorem again with a new diffeomorphism
+g : Rm → (gRm ⊆ Rk ). We invite the interested
+reader to verify that pushing distributions forward by
+Theorem 1 commutes with function composition, that
+is, the double pushforward g(f P ) computes the same
+densities as a single pushforward by the composition
+(g ◦ f )P . This equivalence lends itself to modularity
+in software, permitting, for example, the distribution
+g(f P ) to be represented taking advantage of special
+structure in f or g, without requiring the user to derive that special structure for g ◦ f .
+4.2
+
+Mixed-dimension manifolds
+
+Theorem 1 has given us a formula for transforming
+densities of probability distributions on d-dimensional
+manifolds embedded in Rn , and justifies standardizing on d-dimensional Hausdorff measure as a universal
+base measure for densities of such distributions.
+The results generalize directly to finite unions of manifolds, of potentially different dimensions. Namely, let
+P be a sum of measures Pj on manifolds Mj of di-
+
+Alexey Radul, Boris Alexeev
+
+mensions dj , where without loss of generality we require that the intersection of any Mj and Mk have
+strictly lower dimension than at least one of dj and
+dk . In this situation, we use the sum of the corresponding Hausdorff measures H dj on those manifolds as the
+base measure. Then the density p(x) representing P is
+given by the density pj (x) of the Pj corresponding to
+the lowest-dimensional manifold Mj that x is on. If
+in addition to Mj , x is on manifolds of higher dimension, any densities pj 0 corresponding to measures on
+those higher-dimensional manifolds become zero with
+respect to H dj .
+If x occurs on multiple support manifolds of minimal
+dimension, then by assumption x is part of a lowerdimensional intersection, whose total mass under P
+is necessarily zero. We are therefore formally free to
+assign whatever probability density
+Pwe wish to x. We
+conjecture that reporting the sum {j|dj minimal} Pj (x)
+will follow the principle of least surprise, but are prepared to be corrected by future experience in probabilistic programming.
+4.3
+
+In the common case where dx = dy , this of course
+reduces to p(y)/p(x); but in the general case, (4) becomes
+
+p(y)/p(x) when dy = dx ;
+
+
+
+
+
+0
+when dy > dx , p(y) < ∞,
+
+
+
+
+and p(x) > 0;
+RatP (y, x) =
+
+∞
+when dy < dx , p(x) < ∞,
+
+
+
+
+
+and p(y) > 0;
+
+
+
+undefined otherwise.
+Note that in the “otherwise” case, the limit (3) may
+well exist, but the quantities dx , dy , p(x), and p(y)
+do not suffice to determine it; so for computational
+purposes, we throw up our hands and say “undefined”.
+Summation is more subtle, because it is not dimensionless. Let us define the two-output function
+P (Bxδ ) + P (Byδ )
+,
+δ→0
+Cδ d
+
+SumP (x, y) = d, lim
+
+(5)
+
+where d is chosen to make the limit finite and positive.7
+Then, using the same notation for dx and dy , we derive
+
+Multiple points
+
+When doing probabilistic inference, we concern ourselves with more than just one point x. We must compare the probability densities of different points to assess which are the best (and by how much), and we
+must add the probability densities of different points
+to form an empirical mixture. In MCMC we do the
+former when computing the acceptance ratio; and in
+SMC and likelihood weighting we do both when we
+resample or form the self-normalizing estimate of the
+evidence. These comparisons and additions are a priori vulnerable to the base measure problem; so to fix
+them, let us derive measure-aware formulas.
+
+
+dx , p(x) + p(y) when dx = dy ;
+
+
+
+
+
+dx , p(x)
+when dx < dy , p(y) < ∞,
+
+
+
+
+and p(x) > 0;
+SumP (y, x) =
+
+d
+,
+p(y)
+when
+dx > dy , p(x) < ∞,
+y
+
+
+
+
+
+and p(y) > 0;
+
+
+
+undefined
+otherwise.
+
+When computing a probability density ratio p(y)/p(x),
+we are actually computing the limiting ratio of finite
+probability masses
+
+For completeness, we mention multiplying probabilities, even though it is straightforward:
+
+RatP (y, x) = lim P (Byδ )/P (Bxδ ),
+
+ProdP (x, y) = dx + dy , p(x)p(y).
+
+δ→0
+
+(3)
+
+where Bxδ denotes the radius-δ ball about x.6 As δ
+becomes small, P (Bxδ ) becomes Cp(x)δ dx , where dx is
+the (Hausdorff) dimension of the support of P at x,
+and C is a constant that depends on the metric but
+not on δ or x. Our limit is therefore
+RatP (y, x) = lim δ dy −dx p(y)/p(x).
+δ→0
+
+6
+
+Again, we let the “otherwise” case be “undefined”, because while there may still be a d for which the limit
+in (5) exists, we cannot compute it from just dx , dy ,
+p(x), and p(y).
+
+(4)
+
+For this to be well-defined, x and y must live in a single
+metric space. For purposes of computational probability,
+it suffices to assume we are operating in a disjoint sum of
+as many copies of Rn , for as many values of n, as needed.
+We use the Euclidean distance as a metric within each Rn ,
+and posit that the distance between points in different Rn
+is infinite.
+
+Note that to compute any of RatP , SumP , or ProdP ,
+the only information we need about the measure P is
+local: the density p(·) and support dimension d(·) at
+the points x and y. The support dimension d tells us
+which Hausdorff measure H d serves as the base measure for the density p(·), and that’s enough to add,
+multiply, and divide, even when P spans manifolds of
+many dimensionalities in different places. This d is the
+number of basis vectors spaning the tangent space required to compute volume corrections per Section 4.1;
+but for RatP , SumP , and ProdP we do not actually
+need the basis itself.
+7
+
+This d is unique when it exists.
+
+The Base Measure Problem and its Solution
+
+5
+
+How do we fix the software?
+
+We discuss how to adjust current probabilistic programming software to fix the base measure problem.
+The largest change is needed to enable correct changes
+of variables (Section 5.1); given that, updating common inference algorithms is a local adjustment, which
+we explicate for completeness in Section 5.2.
+5.1
+
+Correct changes of variables
+
+Correctly updating densities under changes of variables requires two new architectural features of probabilistic programming software: First, querying a probability distribution P at a point x must produce a local
+measure, which includes the density p(x), the local dimension dx , and a representation of the tangent space
+at x to the support manifold M. Second, changes
+of variable induced by deterministic transformations
+must take the tangent space into account. The current
+standard architecture can be seen as the specialization
+of the above to the case when the dimension d is fixed,
+and the support manifold M is the entire host space
+Rn .
+To elaborate, we know from Section 4.1 that to compute the density of a pushforward f P at a point x0 with
+respect to d-Hausdorff measure it suffices to compute
+• The preimage point x = f −1 (x0 );
+• The density p(x) of P at x;
+• A basis vi for the tangent space to the support M
+of P at x;
+• The directional derivatives vi0 of f at x in directions vi , forming a basis for the tangent space at
+x0 to the support of f P ; and
+p
+p
+det(V V T )/ det(V 0 V 0T )
+• The correction term
+from (2).
+• For composition, we also need to return the pushforward tangent basis vi0
+At first glance this may seem prohibitively expensive:
+even if we have an automatic differentiation system
+ready to hand that lets us compute the needful directional derivatives of f , do we really have to do that,
+and then perform two full matrix multiplies and determinants, for every probability density evaluation?
+Fortunately, there are several special cases we can take
+advantage of to save work, and to recover the performance of the conventional architecture when it gives
+the correct answer:
+
+• If our distribution P is actually discrete, the tangent space is 0-dimensional, V V T is the 0x0 matrix, and its determinant is vacuously 1.
+• If P is supported on all of Rn , the tangent space
+is also Rn , andpwe may take vi to be the standard
+basis, so the det(V V T ) term is unity and we
+need not explicitly compute it.
+• If in addition f maps Rn to Rn and not to Rm
+for m > n, then the matrix V 0 is the Jacobian of
+f at x and itself has a determinant. We can save
+a matrix p
+multiply and a square root because in
+this case det(V 0 V 0T ) = | det V 0 |. This is where
+we recover the conventional Jacobian-determinant
+correction to probability densities.
+• Distributions on structured-sparse matrices, such
+as lower-triangular matrices, are supported on
+manifolds with axis-aligned tangent spaces. In
+such a case, we need only keep track of a mask
+representing the present dimensions, taking the
+basis
+p vi to be a subset of the standard basis. The
+det(V V T ) term again disappears,pthough if f
+does not preserve the sparsity, the det(V 0 V 0T )
+term may need to be computed.
+• If in addition f is a univariate transformation applied coordinate-wise, the sparse structure will be preserved, and the correction will
+just
+p be the product
+Q ∂of partial derivatives of f ,
+f (x), with i here ranging
+det(V 0 V 0T ) = i ∂x
+i
+over the dimensions present in the manifold but
+not the others.
+• Finally, simplices and symmetric matrices may
+also merit special treatment, because the basis vi
+can again be implicit.
+This list of special cases suggests ad-hoc polymorphism
+as a representation strategy. Specifically, a typical
+probabilistic programming system probably already
+has a Bijector class (hierarchy) for representing transformations f . To implement this strategy for volume
+corrections, we can add a TangentSpace class hierarchy
+for the tangent space to M at x. This second hierarchy can have dedicated classes for efficient cases, such
+as the zero space tangent to a discrete support, the full
+space tangent to an n-dimensional support in Rn , and
+so on. To take advantage of special cases based both
+on the tangent space and the bijector, we can define
+the density correction function with two-argument dispatch, or a Visitor-like pattern (Gamma et al., 1995)
+to emulate it in languages where only single-argument
+dispatch is available.
+When working with distributions on high-dimensional
+spaces, or with large batches of distributions, we ex-
+
+Alexey Radul, Boris Alexeev
+
+pect the cost of the dispatch to be small compared
+with the cost of the linear algebra the dispatch avoids.
+Further, on a tracing platform like JAX (Bradbury
+et al., 2019), TensorFlow (Abadi et al., 2015), or
+TorchScript (PyTorch Contributors, 2018), the dispatch only occurs once during tracing, avoiding repeated linear algebra during execution.
+5.2
+
+Measure-aware inference algorithms
+
+Once a probabilistic programming system correctly
+propagates local measures per Section 5.1, defending
+standard inference algorithms against the base measure problem is just a matter of using the formulas
+from Section 4.3 for operations that compare or combine probability densities. We note again that only
+the density and local dimension are needed here; the
+tangent basis is only used for changing variables.
+We spell out two standard inference algorithms explicitly. To resample in SMC, just throw out particles of non-minimally-dimensioned weights, as in Algorithm 1. In the one-stage case this reduces to the
+dimensionality-aware likelihood weighting algorithm of
+Wu et al. (2018).
+Algorithm 1 Measure-aware resampling for SMC
+Input: Particles pj , dimensioned weights (dj , wj )
+Input: Desired number of new particles N .
+Compute d = min dj .
+if All wj = 0 where dj = d then
+Error: The resampling is undefined.
+end if
+if Any wj = +∞ where dj > d then
+Error: The resampling is undefined.
+end if
+for i = 1 to N do
+Sample index ki ∈ {j|dj = d} proportional to wj .
+Output pki .
+end for
+Return
+Dimensioned self-normalization estimate
+P
+(d, j|dj =d wj ).
+To compute the Metropolis-Hastings acceptance or rejection for MCMC, just compare the target density
+dimension-major, as in Algorithm 2. Note that the
+proposed state y must live on a same-dimension manifold as the current state x, otherwise the proposal
+q is not reversible. This can be arranged with the
+usual reversible-jump MCMC technique from Green
+and Hastie (2009). However, for general probabilitic
+programs π, x and y may yield differently-dimensioned
+likelihoods, and M-H must account for this.
+For example, in the much-discussed Indian GPA problem (see Wu et al. (2018) for one restatement), we
+
+Algorithm 2 Measure-aware Metropolis-Hastings
+Input: Target π(·), proposal q(·|·), current state x
+Sample proposed state y ∼ q(·|x).
+Evaluate dimensioned probabilities
+(dx , px ) = π(x)
+(dy , py ) = π(y)
+if dy > dx then
+if px 6= 0 and py < +∞ then
+Reject: dx , px dominates dy , py .
+else
+Error: The comparison is undefined.
+end if
+end if
+if dy < dx then
+if py 6= 0 and px < +∞ then
+Accept: dy , py dominates dx , px .
+else
+Error: The comparison is undefined.
+end if
+end if
+Sample u uniformly between 0 and 1.
+p q(x|y)
+Accept if u < pxy q(y|x) , else Reject.
+
+might do MCMC on a boolean latent variable modeling whether a student is American or Indian. The
+dimensioned likelihood of the observed GPA of 4.0 for
+an American student would be something like (0, 0.1),
+indicating a point-mass of size 0.1 at the maximum
+GPA that American high schools report. Similarly,
+the dimensioned likelihood of a 4.0 GPA for an Indian
+student would be (1, 0.1), being the density of a scalar
+continuous uniform distribution of GPAs between 0
+and 10. Algorithm 2 would then correctly accept every proposal to change the latent from “Indian” to
+“Ameican”, and reject every proposal to change back.
+
+6
+
+Related Work
+
+Broadly, all general-purpose probabilistic programming systems are related to the present work, in that
+they must either produce incorrect results when the
+base measure problem arises (Warfield, 2020; The Venture Team, 2017), avoid the problem entirely, or somehow solve it. Three specific systems are worth mentioning:
+Stan (Carpenter et al., 2017) is an example of a system that avoids the base measure problem. There are
+two places in a Stan model where the base measure
+problem might occur: in the automatic unconstraining transformations and in applying densities to transformed parameters. The former Stan can get right because both the base measure and unconstraining transformation are implied by the type of the parameter be-
+
+The Base Measure Problem and its Solution
+
+ing unconstrained. The base measure problem occurs,
+in a sense, but the remedy is both local and internal to
+the implementation of Stan. The latter Stan pushes on
+the user: if a user writes a Stan model with a parameter x and a transformed parameter f (x), and wishes to
+code a density on f (x) that corresponds to the pushforward of some known density p(x), then that user
+must think about base measures and partial derivatives themselves. Stan does not help; but then again,
+it also does not claim it would help, so Stan doesn’t
+compute anything visibly “incorrect”.
+BLOG discusses addressing the base measure problem
+(not by that name) in Wu et al. (2018). Relative to the
+present work, that treatment is simpler in two ways:
+they only discuss scalar random variables, where every tangent space is either R or the zero vector space;
+and they do not explicitly discuss transformations of
+random variables.
+Some cases of the base measure problem are addressed
+by Hakaru’s disintegration transform (Narayanan and
+Shan, 2020), which generalizes density and also needs
+correct base measures. Hakaru defines a restricted
+language of base measures with respect to which it
+can symbolically compute (unnormalized) disintegrations of s-finite measures. As this restricted set includes discrete-continuous mixtures, it is sufficient to
+correctly handle the Indian GPA problem; but for the
+present example of the unit circle, it would need a
+richer notion of constraints and their tangent or normal spaces (Narayanan, 2020).
+For example, the following model of the ellipse example from Section 2 is expressible in the system from
+(Narayanan and Shan, 2020) but gives an incorrect
+disintegration:
+x ~ lebesgue
+y ~ lebesgue
+observe x**2 + y**2 = 1
+return (2*x, 20*y)
+The issue is that the constraint restricts the distribution to a lower-dimensional manifold M, and the
+tangent space to that manifold is not taken into account when applying the Jacobian correction due to
+the transformation f (x, y) = (2x, 20y). This tangent
+space could be recovered, since it is perpendicular to
+the gradient of the constraint, so we hope that this
+manifestation of the base measure problem will be relatively easy to fix in Hakaru.
+There is also a line of work on formal semantics
+of probabilistic programming languages, for example
+Borgström et al. (2013) and Staton et al. (2016). That
+work taken on its own terms is generally not vulnerable to the base measure problem at all, because the
+
+semantics are invariably in given terms of measures,
+not densities. The present work can be viewed as a
+bridge to implementation, providing a complete and
+efficient local representation of a measure.
+
+7
+
+Future Work
+
+A common thread in the above related work is to address base measures dimension-wise. In other words,
+reduce to the scalar-oriented setting and track one
+“discrete or R” bit per scalar random variable. This
+is appealing because no explicit tangent spaces are
+needed, since they are all either trivial or R. A vectorvalued distribution P on a d-dimensional manifold embedded in Rn can then be modeled as n deterministic scalar functions fi from d scalar random variables.
+Computing the density of P involves constraining the
+outputs of the fi one by one, with a density correction
+given by the derivative of fi as appropriate. After d
+irredundant constraints, the remaining distribution is
+discrete, and no further derivatives are needed.
+It would be interesting to work out whether the preceding strategy actually works. The difficulty we predict is that, even if a joint function f is invertible as a
+vector-valued function, its coordinates fi may not be
+invertible individually. In this case, treating them separately seems to require explicitly manipulating their
+preimages, which may be non-trivial discrete sets. For
+example, if we represent a distribution on the unit circle as a distribution on [0, 2π) followed by the functions
+(sin ·, cos ·) then the preimage of sin doesn’t actually
+give us a unique point at which to evaluate its derivative; whereas the preimage of cos, while no longer contributing a derivative per se, is still needed to identify
+the correct branch of sin.
+
+8
+
+Conclusion
+
+We have named the Base Measure Problem and provided a solution to it. Implementing the solution in
+probabilistic programming systems should cause negligible loss of performance for cases that were already
+correctly handled, and expand the set of models in
+which the system can compute correct probability densities. Implementation does carry a code complexity
+cost, but that cost is minimized by using two-argument
+dispatch, or emulating it with a Visitor pattern. Despite correctly accounting for measures, no non-local
+information is required.
+
+9
+
+Acknowledgments
+
+The authors thank Srinivas Vasudevan, Wynn Vonnegut, and Praveen Narayanan for enlightening discus-
+
+Alexey Radul, Boris Alexeev
+
+sion. The authors also thank the anonymous reviewers
+for valuable constructive criticism.
+References
+Abadi, M., Agarwal, A., Barham, P., Brevdo, E.,
+Chen, Z., Citro, C., Corrado, G. S., Davis, A., Dean,
+J., Devin, M., Ghemawat, S., Goodfellow, I., Harp,
+A., Irving, G., Isard, M., Jia, Y., Jozefowicz, R.,
+Kaiser, L., Kudlur, M., Levenberg, J., Mané, D.,
+Monga, R., Moore, S., Murray, D., Olah, C., Schuster, M., Shlens, J., Steiner, B., Sutskever, I., Talwar, K., Tucker, P., Vanhoucke, V., Vasudevan, V.,
+Viégas, F., Vinyals, O., Warden, P., Wattenberg,
+M., Wicke, M., Yu, Y., and Zheng, X. (2015). TensorFlow: Large-scale machine learning on heterogeneous systems. Software available from tensorflow.org.
+Borgström, J., Gordon, A., Greenberg, M., Margetson,
+J., and Van Gael, J. (2013). Measure transformer
+semantics for bayesian machine learning. Logical
+Methods in Computer Science, 9(3).
+Bradbury, J., Frostig, R., Hawkins, P., Johnson, M.,
+Leary, C., Maclaurin, D., and Wanderman-Milne, S.
+(2017–2019). JAX. Specifically the vmap functionality.
+Carpenter, B., Gelman, A., Hoffman, M. D., Lee, D.,
+Goodrich, B., Betancourt, M., Brubaker, M., Guo,
+J., Li, P., and Riddell, A. (2017). Stan: A probabilistic programming language. Journal of statistical
+software, 76(1).
+Gamma, E., Helm, R., Johnson, R., and Vlissides,
+J. (1995). Design Patterns: Elements of Reusable
+Object-Oriented Software. Addison Wesley.
+Green, P. J. and Hastie, D. I. (2009). Reversible jump
+mcmc. Genetics, 155(3):1391–1403.
+Li, L. and Russell, S. J. (2013). The blog language
+reference. tech. rep., Technical Report UCB/EECS2013–51.
+Mansinghka, V., Selsam, D., and Perov, Y. (2014).
+Venture: a higher-order probabilistic programming
+platform with programmable inference.
+arXiv
+preprint arXiv:1404.0099.
+Narayanan, P. (2020). Personal communication.
+
+PyTorch Contributors (2018). Torch script.
+Staton, S., Yang, H., Wood, F., Heunen, C., and Kammar, O. (2016). Semantics for probabilistic programming. Proceedings of the 31st Annual ACM/IEEE
+Symposium on Logic in Computer Science.
+The TFP Team (2018–2019). TensorFlow Probability.
+The Venture Team (2017). Venture suffers from the
+base measure problem. Personal communication.
+Tolpin, D., van de Meent, J.-W., Yang, H., and Wood,
+F. (2016). Design and implementation of probabilistic programming language anglican. In Proceedings
+of the 28th Symposium on the Implementation and
+Application of Functional Programming Languages,
+IFL 2016, New York, NY, USA. Association for
+Computing Machinery.
+Warfield, R. (2020). Tensorflow probability issue
+#761: Incorrect probabilities after transforming a
+quantizeddistribution.
+Wu, Y., Srivastava, S., Hay, N., Du, S. S., and Russell,
+S. (2018). Discrete-continuous mixtures in probabilistic programming: Generalized semantics and
+inference algorithms. In International Conference
+on Machine Learning.
+
+A
+
+Proof of Theorem 1, Claim 3
+
+To prove Theorem 1, Claim 3 formally, we go through
+the measures P and f P , starting with the following
+lemma. The only technical trick is to enlarge our parallelepipeds to open sets in Rn and Rm , so that measuring them with P and f P captures all the mass near
+x and x0 , respectively, despite any curvature of M or
+f M. Then we will note that in the limit the only
+thing we care about is the projections of those open
+sets back to the respective tangent spaces, which are
+the parallelepipeds we started with.
+Lemma 1. Let P , M, p, x, vi , and V be as in
+the statement of Theorem 1. Let GV be the dparallelepiped with center x and sides vi , and let GV +
+be any n-parallelepiped centered at x with section GV .
+Let GδV and GδV + be GV and GV + , respectively, scaled
+by δ about x. Then the density p of P with respect to
+d-dimensional Hausdorff measure is given by
+
+Narayanan, P. and Shan, C.-c. (2020). Symbolic disintegration with a variety of base measures. ACM
+Trans. Program. Lang. Syst., 42(2).
+
+1
+lim P (GδV + )/δ d .
+p(x) = p
+det(V V T ) δ→0
+
+Paszke, A., Gross, S., Massa, F., Lerer, A., Bradbury,
+J., Chanan, G., Killeen, T., Lin, Z., Gimelshein,
+N., Antiga, L., et al. (2019). Pytorch: An imperative style, high-performance deep learning library.
+In Advances in Neural Information Processing Systems, pages 8026–8037.
+
+Proof of lemma. The definition of p being a density
+for P with respect to H d is that for all measurable
+subsets B ⊂ Rn ,
+Z
+P (B) =
+p dH d .
+B
+
+The Base Measure Problem and its Solution
+
+P is only supported on M, so we may take the integral
+on the right to be over the intersection B ∩ M. We
+choose for B the neighborhood GδV + .
+As GδV + becomes sufficiently small, we may assume p
+is constant on GδV + ∩ M, so
+P (GδV + ) ≈ p(x)H d (GδV + ∩ M).
+As δ → 0, M near x approaches its tangent space, so
+GδV + ∩ M becomes GδV . The right-hand term becomes
+the d-dimensional Hausdorff measure of GδV , which
+given our choice of scaling for the Hausdorff
+measure
+p
+is just the volume thereof, namely δ d det(V V T ).
+Proof of Claim 3. Let GV 0 be the d-parallelepiped in
+Rm with center x0 and sides vi0 . Let GV 0 + be any
+m-parallelepiped in Rm with section GV 0 centered at
+x0 . Let GδV 0 + be GV 0 + scaled by δ about x0 . By the
+lemma, we have
+1
+lim f P (GδV 0 + )/δ d .
+f p(x0 ) = p
+det(V 0 V 0T ) δ→0
+The preimage f −1 (GδV 0 + ) approaches an nparallelepiped centered at x with section GδV .
+This is because the basis vectors vi0 forming V 0 are the
+directional derivatives of f in the directions given by
+the basis vectors vi forming V . In directions normal
+to M, we just need the derivatives of f to be finite.
+We may thus apply the lemma again to write
+lim f P (GδV 0 + )/δ d = lim P (f −1 (GδV 0 + ))/δ d
+δ→0
+q
+= det(V V T )p(x),
+
+δ→0
+
+giving the desired result.
+

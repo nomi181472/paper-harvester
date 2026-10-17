@@ -1,0 +1,1286 @@
+(Preprint) AAS 23-303
+
+PRELIMINARY DESIGN OF THE
+DRAGONFLY NAVIGATION FILTER
+
+arXiv:2307.13513v2 [cs.RO] 2 Aug 2023
+
+Ben Schilling*, Timothy G. McGee†, Ryan Mitch*, and Ryan Watson*
+Dragonfly is scheduled to begin exploring Titan by 2034 using a series of multi-kilometer
+surface flights. This paper outlines the preliminary design of the navigation filter for the
+Dragonfly Mobility subsystem. The software architecture and filter formulation for lidar,
+visual odometry, pressure sensors, and redundant IMUs are described in detail. Special
+discussion is given to developments to achieve multi-kilometer surface flights, including
+optimizing sequential image baselines, modeling correlating image processing errors, and an
+efficient approximation to the Simultaneous Localization and Mapping (SLAM) problem.
+
+INTRODUCTION
+Dragonfly will investigate prebiotic chemistry and habitability on Saturn’s largest moon, Titan, in the mid2030s.1, 2 Successful exploration of Titan will require a series of multi-kilometer surface flights to access
+materials in locations with diverse geological histories.3, 4 This paper highlights the preliminary design of
+the navigation (nav) filter for the Mobility subsystem, which is responsible for the guidance, navigation,
+and control (GNC) of the relocatable rotorcraft. In addition to operating autonomously, navigating on
+Titan presents several unique challenges. First, no external infrastructure or orbital assets are available for
+navigation. Surface maps constructed from Cassini flybys are too coarse for navigating near the surface,
+and the presence of diverse terrain and unknown topography require robust algorithms with limited a priori
+knowledge.5 Further, there are no external attitude references (e.g. stars) near the Titan surface, nor does a
+useful magnetic field exist, precluding the use of external sensors for attitude knowledge.
+Since high resolution maps of the Titan surface are not available, Dragonfly leverages visual inertial
+odometry (VIO), where an inertial measurement unit (IMU) and sequential images are used to estimate
+how far the vehicle has traveled. VIO has been successfully flown on NASA’s MER-DIMES and Ingenuity
+missions.6, 7 One limitation of VIO is the lack of observability of the absolute vehicle position, causing
+position errors to accumulate over time. On Dragonfly the impact of accumulated error is mitigated by
+periodically saving an image for future navigation.4 The saved images, or "breadcrumbs", are used to navigate
+back to the take-off site, or to a pre-scouted landing site using the leapfrog approach.4, 8, 9 When revisiting
+breadcrumbs, the nav filter must fuse correlated position measurements, a variation of the Simultaneous
+Localization and Mapping (SLAM) problem.10, 11 The traditional SLAM formulation of maintaining many
+landmarks (i.e. breadcrumbs) in the filter state and updating landmarks during revisits is intractable on the
+flight processor selected for Dragonfly, serving as motivation for an efficient and robust approximation to the
+SLAM formulation.
+This paper focuses on design challenges related to long distance traverse navigation on Titan. The entry,
+descent, first flight, and landing (EDL) sequence offers different challenges for navigation including large
+initial attitude errors with respect to gravity and high angular rates throughout the parachute descent phase.
+Navigation for EDL is achieved using the same nav filter described in this paper and will be the topic of a
+future paper. The organization of this paper follows as: the Background section discusses material relevant to
+the Dragonfly mission and nav filter design; the Design section outlines the preliminary design, including the
+* Johns Hopkins Applied Physics Laboratory, 11100 Johns Hopkins Road Laurel, MD 20723
+† Point Mass Technologies, Pittsburgh, PA
+
+1
+
+architecture, state space, and measurement models; the Results section illustrates performance from a high
+fidelity Titan simulation, and finally the Conclusion section summarizes results and highlights future work.
+BACKGROUND
+The Dragonfly relocatable lander, illustrated in Figure 1, is equipped with two IMUs, two pressure sensors,
+one lidar, and one navigation camera (NavCam). The sensor rates and measurement types are listed in Table 1.
+Further details of the baseline sensor specifications are captured in Table 5 of the Results section.
+
+Sensor
+
+Rate (Hz)
+
+Measurement
+
+IMU (x2)
+Pressure (x2)
+Lidar
+NavCam/ETS
+
+200
+10
+5-10*
+1
+
+∆V,∆θ
+Absolute pressure
+X,Y,Z point
+Position displacement
+
+Table 1: Dragonfly sensor suite
+
+Figure 1: Dragonfly relocatable rotorcraft
+The NavCam images are processed by the Electro-optical Terrain Sensing (ETS) module, which correlates
+two images to generate a lateral position displacement measurement for the nav filter.8, 12 The two NavCam
+images are referred to as the current image and reference image. The current image is always the most recent
+image captured by the NavCam, while the reference image used for correlation can be one of several types
+as listed in Table 2. For recent reference images still in view of the current image, the position and velocity
+errors in the nav filter are highly correlated. This position displacement measurement provides observability
+into velocity. Online breadcrumbs are periodically saved when one of two thresholds are crossed. The first
+threshold defines the maximum lateral distance scaled by the altitude from the last breadcrumb location. This
+threshold can also be viewed as a maximum angular or pixel offset in the camera. The second threshold type
+is based on a maximum scale variation defined as a maximum vertical distance over the altitude from the last
+breadcrumb. When an online breadcrumb is saved, the position, attitude, height above ground level (AGL),
+and covariance are saved in a database along with the image to allow the vehicle to retrace the path on the
+same flight. Following a flight, a subset of online breadcrumbs are converted into historic breadcrumbs for
+the next flight, which allows the vehicle to retrace segments of the previous flight. Details of this process
+are covered in the Design section. The terminal breadcrumb distinction is given to images containing the
+landing site, where the landing site position relative to the breadcrumb image position is known to high
+accuracy. Figure 2 illustrates the primary Mobility flight types including a Scout, where the vehicle scouts a
+Modality
+
+Reference Image
+
+Velocimetry
+Online Breadcrumb
+Historic Breadcrumb
+Terminal Breadcrumb
+
+Still in NavCam FOV
+Captured earlier on current flight
+Captured during a previous flight
+Captured on current/previous flight and contains landing site
+Table 2: ETS Measurement Modalities
+
+new candidate landing zone then returns to the take-off site, and a Leapfrog, where the vehicle scouts a new
+candidate landing zone then lands at a site that was previously scouted.
+* The lidar runs at higher rates during hazard detection scans, but only a subset of data is used by the nav filter
+
+2
+
+Figure 2: Mobility CONOPS and flight types
+Coordinate Frames
+Several coordinate frames are utilized by the navigation formulation. The Titan-Centered Inertial (TCI)
+frame is the inertial reference frame for Titan, similar to Earth-Centered Inertial.13 The Titan-Centered Titan
+Fixed (TCTF) is the rotating frame, with the Z-axis aligned with Titan rotation. The North-East-Down (NED)
+frame is a local tangent frame where north points to the Titan spin vector (i.e. true North), down is aligned
+with plumb bob gravity, and east completes the right hand triad. The NED frame rotates with Titan, with the
+origin at the take-off position. The primary navigation frame is the Take-off Frame (TOF), where the origin
+is also at the take-off position, but the frame is aligned with the estimated north, east, and down directions.
+The TOF contains errors with respect to NED due to initial attitude errors, but by definition, does not include
+absolute position errors due to absolute heading error. This nuance is further discussed in the Design section.
+The Dragonfly body frame uses the forward-right-down (FRD) convention. Finally, there are instrument
+frames for both IMUs, the lidar, and NavCam.
+DESIGN
+Architecture
+The Mobility Guidance, Navigation, and Control (MGNC) flight software application contains rate loops
+of 100 Hz, 10 Hz, and 1 Hz. As illustrated in Figure 3, the navigation algorithm is split between the 100
+Hz task (IMU propagation) and 10 Hz task (Kalman filter). The 100 Hz task includes two Navigators and
+IMU fault detection logic. Each Navigator propagates the vehicle pose14, 15 using data from a single IMU.
+Fusing data from both IMUs into a single nav state was not pursued since the IMUs are not synchronized
+to a common clock, complicating the need to precisely time align inertial data.* Instead, one Navigator is
+considered the primary, and the other the backup. Only the state from the primary Navigator is used for
+navigation. The IMU fault detection uses parity checking on integrated rate and integrated acceleration to
+identify a bad gyro or accelerometer, respectively. The Navigators and IMU fault detection logic run at 100
+Hz using buffered sensor data at the higher IMU output rate of 200 Hz.
+The Extended Kalman Filter (EKF) executes at 10 Hz and estimates the error in the inertial state from the
+primary Navigator using pressure, lidar, and post-processed NavCam data. The filter design adheres to several
+* This capability may be reevaluated in the future to address specific double IMU fault scenarios but is not covered by the baseline
+design.
+
+3
+
+best practices, including bias modeling, factorization, underweighting, and order invariant measurement
+processing.16 Alternative architectures for redundant IMUs were considered, including running two Kalman
+filters in parallel, one for each Navigator, or estimating two sets of position, velocity, and orientation error
+states in a single filter. The architecture baselined for Dragonfly minimizes the total number of states
+and doesn’t require a second filter. The MGNC flight code, including the nav filter, is implemented in
+Simulink/Matlab, where the algorithm is exported to C code to run on the BAE RAD750 flight processor.
+
+Figure 3: Navigation block diagram
+Dynamics
+There are several motivations to navigate in a local tangent plane fixed to the surface. First, there are no
+external inertial attitude references on the Titan surface (e.g. stars), nor do navigation maps exist for landmark
+identification or absolute position fixes. Further, the primary sensing modalities on Dragonfly use the Titan
+surface (i.e. lidar and NavCam), simplifying the measurement models when cast in a surface fixed frame.
+Finally, flight command generation and path planning to surface-fixed landing sites is more intuitive in a local
+tangent plane than a time variant inertial frame. The dynamics for the TOF follow as:17
+h
+i
+tof
+b
+b
+Ṙtof
+= Rtof
+ωb|tof
+
+×
+
+ṙ tof = v tof
+
+(1)
+
+
+tof tci
+v̇ tof = Rtci
+a − 2ω × v tof − ω × ω × r0tof
+
+
+
+b
+where Rtof
+is the TOF to body frame direction cosine matrix (DCM), and r tof and v tof are the position and
+velocity in the TOF, respectively, and [·]× is the skew symmetric operator. The dynamics are mechanized
+using quaternions but DCMs are presented to simplify the measurement model discussion.
+
+State Space
+The EKF state space is listed in Table 3. The baseline state vector contains 47 total states including position,
+velocity, attitude error, altitude, instrument biases, ground slope, global heading errors, and augmented
+position states. The position and velocity states are those of the primary IMU. Multiplicative attitude error
+states are cast in the reference frame instead of the body frame used by many attitude Multiplicative Extended
+Kalman Filter (MEKFs).16, 18, 19 This error definition has the drawback of a non-intuitive interpretation
+of attitude error covariance, but offers several benefits for the nav filter. Attitude errors defined in the
+reference frame do not rotate when the vehicle changes orientation, meaning attitude errors are approximately
+constant between the two images used for velocimetry (modulo small errors from gyro propagation). This
+formulation facilitates partial state augmentation by not requiring attitude augmentation for velocimetry. A
+
+4
+
+secondary benefit is consistency between attitude error and global heading error definitions, where the latter
+are intuitively defined in the reference frame i.e. relative to true north. Finally, computational savings can be
+achieved when propagating the covariance due to fewer non-zero entries in the state transition matrix.20 The
+primary motivation for including attitude states in the filter is large initial attitude errors during EDL. For
+surface flights, where the initial attitude can be precisely aligned, a formulation without attitude states was
+considered but this approach results in suboptimal performance and would be more challenging to properly
+tune.
+Separate global heading errors states are used to facilitate processing breadcrumb measurements. Prior to
+each flight, the initial heading is estimated from the gyro using a process known as gyrocompassing,21 which
+serves as the only absolute heading information on Titan. However, when historic breadcrumbs are observed,
+absolute heading knowledge can be improved since historic breadcrumbs intrinsically contain information
+from gyrocompassing on a previous (independent) flight. Navigating in the TOF, which is aligned with the
+estimated NED frame at take-off, prevents the need to update all breadcrumb positions, which are saved in an
+offline database, every time a historic breadcrumb measurement is processed. Instead, the filter updates the
+two states, γ1 and γ2 , which represent heading error relative to true north on the previous and current flights
+(i.e. angles between TOF1 and TOF2 and NED frames). Heading error accumulated within a flight is tracked
+in ψ and is small (< 0.2◦ 3σ) relative to the initial heading error from gyrocompassing. While the two global
+heading error states could be combined into a single relative error state, two states are currently baselined to
+simplify bookkeeping between flights.
+The framework uses partial state augmentation to address image processing measurement delays of ∼900
+msec and avoid buffering and reprocessing high rate IMU and sensor data.22 To reduce the overall state size,
+only the position vector is augmented at the image times since attitude errors relative to gravity are small (<
+0.2◦ ). Given the high quality IMU, the growth in attitude errors between images is relatively small, and the
+additional error from not augmenting attitude has been shown to be acceptable. There are five position vectors
+in the state corresponding to the vehicle position at different images: the current image, two recent images in
+a first-in-first-out (FIFO) buffer for velocimetry, the most recent online breadcrumb referenced by ETS, and
+the most recent historic breadcrumb referenced by ETS. The motivation for maintaining two reference images
+and six filter states for velocimetry measurements is discussed in a later section. Instead of augmenting the
+position vector at every image (i.e. SLAM), the nav filter only maintains a single position vector for the
+most recent online and historic breadcrumb referenced by ETS. The details of how the breadcrumb states are
+maintained is also discussed in a later section.
+The ETS image selection algorithm uses the 3D position estimate to select the optimal reference image
+for correlation.8 Vertical position errors are dominated by pressure sensor measurement error and model
+uncertainty relating pressure and altitude. The pressure gradient uncertainty on Titan is expected to be reduced
+to 2.5% (3σ) after 1-2 Titan days of science observation. Assuming a linear model, a pressure gradient error
+acts as a scale factor error, manifesting as a vertical position bias that is a function of altitude (e.g. 10 m
+error at 400 m cruise altitude). Reducing the relative vertical position error between flights is critical to
+ensure the ETS algorithm selects an image that will generate a strong correlation. Estimating the atmospheric
+scale height error δH reduces the relative vertical position error across flights to maximize correlation scores.
+Ignoring modeling error would also introduce large vertical position errors during high-altitude atmospheric
+profiling flights (e.g. 50 m error at 2000 m AGL).
+The nav filter also estimates the ground surface normal vector. This estimate is used by the ETS module’s
+correlation algorithm to warp the current image into the reference image frame assuming a planar surface
+and pinhole camera model. Knowledge of the ground slope is also used during terminal descent to allow
+lidar altimetry to better estimate vertical velocity. The Mobility Flight Mode Manager (FMM), responsible
+for executing the flight command and contingency response within Mobility, can also use ground slope
+knowledge to determine when the vehicle is approaching a dune crest.5
+The vast majority of states are modeled as First-Order Gauss Markov (FOGM) processes or static states
+with no dynamics. States with these dynamical properties are exploited in the mechanization to reduce CPU
+utilization on the flight hardware.16 Additional states to model gravity errors are not currently baselined.
+
+5
+
+Gravity variations near the Dragonfly EDL site are expected to be on the order of 40 µg.23 The need for
+explicit gravity error states will be revisited after the flight IMU is selected.
+Variable
+
+Size
+
+Description
+
+Units
+
+Frame
+
+Model
+
+r
+v
+ψ
+ρ
+d
+baA
+baB
+bgA
+bgB
+bpA
+bpB
+bET S
+δH
+n
+γ2
+γ1
+r (tc )
+r (tr1 )
+r (tr2 )
+r (tOBC )
+r (tHBC )
+
+3
+3
+3
+1
+1
+3
+3
+3
+3
+1
+1
+2
+1
+2
+1
+1
+3
+3
+3
+3
+3
+
+Primary IMU position
+Primary IMU velocity
+Orientation error
+Range to current image
+Perpendicular ground distance
+IMU A Accelerometer bias
+IMU B Accelerometer bias
+IMU A Gyro bias
+IMU B Gyro bias
+Pressure altimeter A bias
+Pressure altimeter B bias
+ETS Velocimetry Bias
+Atmospheric scale height error
+Ground surface normal
+Global heading error in TOF2
+Global heading error in TOF1
+IMU position at current image
+IMU position at FIFO image #1
+IMU position at FIFO image #2
+IMU position at OBC image
+IMU position at HBC image
+
+m
+m/s
+rad
+m
+m
+m/s2
+m/s2
+rad/s
+rad/s
+Pa
+Pa
+m
+m
+rad
+rad
+m
+m
+m
+m
+m
+
+TOF
+TOF
+TOF
+IMU
+IMU
+IMU
+IMU
+TOF or CAM
+TOF
+TOF
+TOF
+TOF
+TOF
+TOF
+TOF
+TOF
+
+Navigation Equations
+Navigation Equations
+Navigation Equations
+FOGM
+FOGM
+FOGM
+FOGM
+FOGM
+FOGM
+FOGM
+FOGM
+FOGM
+FOGM
+FOGM
+Static
+Static
+Static
+Static
+Static
+Static
+Static
+
+Table 3: Kalman Filter State Space
+
+Models
+Gyrocompassing Initializing the nav filter prior to each flight is critical for optimal navigation performance
+and mission success. Accurate heading initialization ensures the vehicle flies in the desired direction and
+revisits historic breadcrumbs. Initialization also minimizes inertial navigation drift during the initial climb
+by properly accounting for correlations between attitude and IMU errors.24 The vehicle tilt (i.e. pitch and
+roll) can be initialized within several seconds using zero position and/or zero velocity pseudo-measurements,
+but the cross correlations between tilt and accelerometer biases can take several minutes to reach steady-state
+depending on the FOGM bias time constant and magnitude of the bias relative to gravity. However, the
+required initialization time is dominated by estimating the vehicle heading from the gyro, a process known
+as gyrocompassing.21 Assuming the vehicle is static on the surface, the gyro senses Titan rotation relative to
+the inertial frame. The measurement model uses the following relationships of the rate in the NED frame ω n ,
+which is a function of latitude ϕ:
+
+  
+
+0
+Ω cos ϕ
+b
+ = Rbn Rimu
+0
+ω n = RTn CT F  0  = 
+ω imu
+Ω
+−Ω sin ϕ
+
+(2)
+
+where Ω is the magnitude of Titan rotation. Expanding Eq. 2 into estimated (ˆ·) and error (δ·) quantities and
+linearizing results illustrates that the angular rate error in the NED frame is a combination of the attitude error
+and gyro error, as show in Eq. 4.
+
+6
+
+y=0
+b
+ŷ = ω̂east = R̂bn R̂imu
+ω̂ imu + η
+
+z = y − ŷ ≃ Hδx + η
+
+
+H=
+
+
+b
+ω̂ n + δω n = I + [ψ]× R̂bn R̂imu
+ω̂ imu + δω imu
+b
+δω n ≈ [ψ]× R̂bn ω̂ b + R̂bn R̂imu
+δω imu
+
+(3)
+
+(4)
+
+b
+It is assumed in Eq. 4 that the error in R̂imu
+can be ignored. With rate-integrating gyros, the observed rates
+are computed by accumulating ∆θ for a fixed amount of time and dividing by the accumulation time. The
+Kalman filter can separate heading error from gyro error as the IMU rotates in the inertial frame. With the
+slow rotation of Titan (∼0.94◦ /hr), however, it takes ∼16x longer to achieve the same heading accuracy as it
+would on Earth. The linearized measurement model for redundant IMUs follows as:
+
+b
+z = 0 − ω̂east = Hδx + η = − [ω̂ n ]× ψ + R̂bn R̂imu
+bgA + η
+
+(5)
+
+√
+Rate measurements from both IMUs are included to reduce the heading error by 2 for a given initialization
+time. Dragonfly will explore latitudes near Selk Crater1 (ϕ ∼7.0◦ ) so the formulation does not account for
+singularities encountered near the poles.
+Backup IMU Biases Biases of the backup IMU are estimated to improve performance if the primary
+IMU fails. The primary IMU biases are only partially observable during surface initialization from the zero
+position and gyrocompassing measurement models because the vehicle remains at a single orientation. Full
+observability into the primary IMU biases is achieved in flight, from pressure and velocimetry measurements
+taken over multiple orientations being fused with propagated IMU data. Data from the backup IMU is
+not fused into the nav state so these biases are not observable through the dynamical model. Instead,
+observability into the backup IMU biases is achieved by leveraging redundant information provided by
+two IMUs. The redundant gyro formulation proposed by Pittelkau25 has been implemented successfully
+on JHU/APL missions in the past (e.g., Parker Solar Probe26 ). The proposed formulation extends this model
+to the accelerometers and for the case where the redundant information is provided by separate IMUs that are
+not precisely time aligned.
+The angular rates and accelerations in the body frame (i.e., ω b , and ab , respectively) can be expressed as:
+ob = R̃† oimu
+
+(6)
+
+where oimu is the observed angular rates or accelerations in the IMU frame (i.e, oimu ∈ {ω imu , aimu })
+ b
+T
+b
+and R̃† is the pseudo-inverse of the sensor-to-body transformation, R̃ = RimuA
+. Given R̃,
+RimuB
+there exists a null-space, N = Null(R̃), such that a second observation equation for the angular rates and
+accelerations can be constructed as
+
+0 + δonull = N̂ T ôimu + δoimu .
+
+(7)
+
+Given Eq. 7, the null-space measurement model is presented in Eq. 8, where b is a vector of the accelerometer
+or gyro biases, σ is set via the vendor-specified noise characterization for the IMU and τo scales the observation
+noise by the amount of time the observations were accumulated before applying the measurement. The
+accumulation time τo is selected such that differences in integrated quantities due to relative timing jitter
+between the IMUs is sufficiently small.
+
+7
+
+
+y = N̂ T ôimu + b + η
+R = τo σ 2 I6x6
+
+(8)
+
+Figure 4 illustrates observability of the backup accelerometer biases with (blue) and without (black) the nullspace measurement model. The accelerometer bias time constant is set to the flight time (∼ 30 minutes) and
+the process noise is scaled such that the steady-state markov process is aligned with the vendor specification.
+The solid lines represent the true accelerometer bias error and the dashed lines are the 3σ bounds. Early
+observability in the Z axis is due to the IMU vertical axis being roughly aligned with the gravity vector.
+Increased observability of the X and Y axes around 200 seconds and 1200 seconds come from the vehicle
+pitching forward to accelerate at cruise altitude and the vehicle turning around to return to the take-off
+location, respectively. This formulation effectively bootstraps observability of the backup IMU biases to those
+of the primary IMU. Full observability of the primary biases (via the dynamics) is transferred to the backup
+biases through the null-space model, ensuring the backup IMU is primed for navigation in contingency
+scenarios.
+
+Figure 4: Observability of the backup accelerometer biases with (blue) and without (black) the null-space
+measurements. Solid lines represent the EKF error and dashed lines represent the EKF uncertainty.
+Pressure Dragonfly is equipped with two pressure sensors to facilitate flying constant pressure altitudes
+and conserving energy. The pressure sensors measure total pressure PT :
+PT = P S + P D
+
+(9)
+
+where PS and PD are static and dynamic pressure, respectively. Static pressure can be expanded using the
+
+8
+
+exponential pressure model:
+PS = P0 exp(
+
+h−h0
+H
+
+)
+
+(10)
+
+where P0 and h0 are the reference pressure and reference height, respectively, and h and H are the height
+and scale height, respectively. The height and reference height are expanded as:
+q
+2
+2
+2
+h = (x0 + x) + (y0 + y) + (z0 + z)
+(11)
+q
+(12)
+h0 = x20 + y02 + z02
+where r0 = [x0 y0 z0 ] is the position of the TOF origin with respect to Titan center in the TOF frame.
+Dynamic pressure is expanded as:
+1 2
+PD = ρvrel
+Cp (α, β)
+(13)
+2
+where ρ is atmospheric density, vrel is the wind relative velocity magnitude, and Cp is the coefficient of
+pressure, which is a function of vehicle angle of attack (α) and sideslip (β). The linearized dynamic pressure
+error follows as:
+
+
+
+1
+∂Cp
+∂Cp
+2
+2
+2
+δPD ≈
+δρv̂rel Ĉp + 2ρ̂v̂rel δvrel Ĉp + ρ̂v̂rel δCp + ρ̂v̂rel Ĉp
+δα +
+δβ
+(14)
+2
+∂α
+∂β
+The first term in Eq. 14 represents error in atmospheric density, the second term represents error in wind
+relative velocity, the third term represents error in the coefficient of pressure function, and the final term
+represents indexing into the coefficient of pressure function at the wrong location due to sideslip and angle of
+attack errors. Note the dynamic pressure error is eliminated when Cp = 0. Since the Mobility CONOP only
+requires altitude knowledge from the pressure sensors, dynamic pressure errors are considered a nuisance and
+the desire is to minimize their magnitude by design. The pressure port, where the pressure is sensed and the
+∂C ∂C
+Cp function is defined, was selected to minimize Cp and the ∂αp ∂βp terms. This design alleviates the need
+for a dynamic pressure calibration table and additional filter states to track wind relative knowledge. Until
+the Cp model has been validated via wind tunnel testing, the navigation algorithm assumes that the dynamic
+pressure error can be simplified and modeled using a FOGM process:
+δPD ≈ bp
+
+(15)
+
+where bp soaks up modeling errors from neglecting small Cp contributions at a subset of wind relative
+orientations. The assumptions and model will be revisited after collecting pressure sensor data in a wind
+tunnel in 2023. Finally, the measurement model for pressure altimeter A can be formed:
+h−h0
+1 2
+y = PT = PS + PD = P0 exp( H ) + ρvrel
+Cp (α, β) + η
+2
+h−h0
+y = P exp( H ) +b + η
+
+pA
+
+0
+
+pA
+
+(16)
+(17)
+
+Measurements from both pressure sensors are processed to reduce vertical position errors. The
+√ reference
+pressure P0 is calibrated during pre-flight and can be modeled as a random walk of 0.002 mbar/ s, resulting
+in an altitude reference that can walk up to ∼1.5 m (3σ) over a 30 minute flight. The random walk error is
+considered negligible and therefore not tracked by the nav filter throughout the flight. Since the two pressure
+sensors share a common pressure port the measurement errors between sensors could be correlated; modeling
+this correlation in the nav filter will be investigated after collecting wind tunnel data.
+Lidar The Ocellus lidar developed by Goddard Space Flight Center (GSFC) is used for hazard detection
+and altimetry. The nav filter uses altimetry for AGL knowledge and vertical velocity knowledge during
+landing, while ETS uses altimetry to convert pixel shifts into lateral displacements. Table 4 enumerates the
+three operational modes for the 15◦ field of view (FOV) lidar. The primary mode for surface flights is pyramid
+mode, where the lidar measures the 3D point along five line of sights (LOS) in the instrument frame. The
++X and +Y LOSs represent +7.5◦ forward of boresight and +7.5◦ right of boresight, respectively. Altimetry
+
+9
+
+Mode
+
+Rate (Hz)
+
+Line of Sight Measurements
+
+Flight Segments
+
+Pyramid
+Altimetry
+Scanning*
+
+5
+10
+120,000
+
+Boresight, +Y, -Y, +X, -X
+Boresight
+Boresight, +Y, -Y
+
+15 m - 400 m
+400 m - 2000 m
+Hazard detection scans
+
+Table 4: Lidar Modes
+
+mode is baselined for high altitude surface flights and initializing the nav filter on the parachute during EDL.
+The high rate scanning mode is used for hazard detection operations. The unit vector of the 3D lidar point
+in the TOF frame is:
+lldr
+||lldr ||
+T
+lz
+
+b
+l̄tof = Rbtof Rldr
+
+(18)
+
+
+lldr = lx
+
+(19)
+
+ly
+
+b
+and Rldr
+is the instrument to body frame DCM. The measurement model assumes the ground is planar and
+follows as:
+
+d
++η
+l̄tof · n̄tof
+h
+iT
+p
+n̄tof = nn ne
+1 − n2n − n2e
+y=
+
+d˙ = −v
+
+tof
+
+tof
+
+· n̄
+
++w
+
+(20)
+(21)
+(22)
+
+where ntof is the ground surface normal in the TOF. The ground surface normal is modeled as a random
+√
+walk in distance. The FOGM power spectral density is set by assuming a max slope change (e.g. 5◦ / 100
+m) and the time constant is scaled to force the steady-state process to a max slope value. In altimetry mode,
+the ground slope is only observable from lander motion, specifically along-track knowledge from forward
+flight or pitching, and cross-track knowledge from banking or rolling. Observability of these states increases
+in pyramid and scanning modes as the lidar directly measures points off boresight, thus reducing sensitivity
+to lander dynamics.
+Sequential range measurements contain information about vehicle velocity but the information quality is
+limited by the validity of the ground model. For applications where a high fidelity ground model or digital
+elevation model (DEM) is available, it is possible to robustly extract velocity knowledge from sequential
+ranging. A ground model isn’t available for Titan so the proposed formulation accepts that the planar
+assumption doesn’t hold over dune crests5 and prevents lidar measurements from corrupting other states by
+ignoring sensitivities in the measurement model (for attitude in Eq. 20) and dynamical model (for velocity in
+Eq. 22). However, at lower altitudes, when the planar ground model is valid, the vertical velocity partials are
+included in the state transition matrix. These terms allow the nav filter to extract vertical velocity knowledge
+from sequential ranging. Figure 5 illustrates the vertical velocity uncertainty as a function of altitude for a
+nominal landing† . The steady-state vertical velocity error is driven by IMU performance and pressure sensor
+measurement error for the majority of the flight. Nine cases were run where the measurement noise in Eq. 20
+was varied between 10 - 50 cm 1σ and the altitude where the lidar was fused into the inertial state (i.e. partial
+derivatives enabled) beginning at 30, 45, and 60 m. In all cases the lidar is not used below 15 m due to
+concerns of brown out and scattering, causing the vertical velocity error to increase from inertial propagation.
+Figure 5 shows the lidar can reduce the vertical velocity errors by 50% or more during the final descent to
+landing. Higher order ground models (e.g. quadratic) will be investigated in the future.
+Velocimetry ETS measures the lateral displacement of the camera in the reference image frame:
+* The nav filter only receives a subset of data in scanning mode.
+† 1 m/s descent from 70 m - 20 m, gradually ramping down to 0.4 m/s by 10 m
+
+10
+
+Figure 5: Lidar influence on vertical velocity knowledge during terminal descent to landing. The nine cases
+illustrate sensitivity to noise and altitude where the lidar is fused into the inertial nav state.
+
+
+
+ 
+
+tof 1
+tof 2
+tof 1
+b
+tof 2
+b
+tof 1
+b
+∆cc = Rbc Rtof
+(t
+)
+R
+(γ
+,
+γ
+)
+r
+(t
+)
++
+R
+(t
+)
+c
+−
+r
+(t
+)
++
+R
+(t
+)
+c
+(23)
+1 2
+c
+c
+r
+r
+1 r
+tof 2
+b
+b
+where · (tr ) and · (tc ) are quantities at the reference and current image times, respectively, cb is the NavCam
+position in the body frame, and Rbc is the body to NavCam DCM. When the reference and current image
+tof 1
+are from the same flight the term representing errors between the two TOF disappears i.e. Rtof
+2 = I. For
+simplicity the TOF number (e.g. tof 2) is dropped for the remaining velocimetry discussion. Expanding
+Eq. 23 into estimated and error quantities and linearizing results in:
+
+δ∆c
+
+c
+
+b
+≈ R̂bc R̂tof
+(tr )
+
+
+
+
+δr tof (tc ) − δr tof (tr )
+
+
+ 
+ 
+ 
+
++ R̂btof (tr ) ĉb × ψ (tr ) − R̂btof (tc ) ĉb × ψ (tc ) + ĉtof (tc ) − ĉtof (tr ) × ψ (tr )
+
+
+ 
+
++ R̂btof (tc ) δcb − R̂btof (tr ) δcb + ĉtof (tc ) − ĉtof (tr ) × ξ
+(24)
+where ctof is the NavCam position in the TOF and ξ is the IMU-NavCam misalignment vector. The five
+terms in Eq. 24 represent errors in IMU lateral displacement, errors in relative orientation between the two
+images, errors in the TOF to body frames, and finally errors due to IMU-NavCam misalignments. The IMUNavCam alignments are expected to be calibrated prior to launch and assumed to remain sufficiently tight
+to safely ignore misalignments. For surface flights the pitch and roll errors are sufficiently small (< 0.2◦ )
+to ignore sensitivities to tilt errors, but the sensitivity to heading error is required to make the formulation
+
+11
+
+consistent with receiving a relative measurement. Since attitude errors are approximately equal across images
+times for velocimetry, we assume ψ (tr ) ≈ ψ (t) in order to not require attitude augmentation at the image
+times. The velocimetry measurement model follows as:
+b
+y = R̂bc R̂tof
+(tr )
+
+
+
+
+ 
+
+ĉtof (tc ) − ĉtof (tr ) + ĉtof (tc ) − ĉtof (tr ) × ψ (t) + b̂ET S +η
+
+(25)
+
+where bET S and η are the ETS bias and zero-mean white noise, respectively. The formulation assumes
+η represents random, uncorrelated errors in the image processing. Correlated measurement errors can be
+modeled using additional state augmentation,27 but for simplicity they are assumed to be small. However,
+errors in the image homography, dominated by imprecise knowledge of the terrain slope, can lead to correlated
+measurement errors, which are tracked in bET S . The FOGM time constant is selected to be commensurate
+with how long ETS correlates to a single reference image, a function of altitude, lateral velocity, and NavCam
+FOV. This allows the nav filter to properly compensate for correlated errors induced by nonplanar terrain. The
+next section discusses how the image separation distances are selected and how many velocimetry reference
+image states are tracked by the nav filter and ETS.
+Velocimetry Trade Space Optimizing the image separation distances for velocimetry is necessary to minimize
+the accumulated position error over the flight. The optimization involves a trade between increasing distance,
+and thus time, between images, leading to improved velocity knowledge, at the expense of increasing the
+velocimetry measurement error. Homography errors due to nonplanar terrain are exacerbated by correlating
+two images over longer baselines. To characterize this effect an offline image processing analysis was run
+to see how far the baselines could be extended before homography errors begin to dominate the random,
+uncorrelated image processing errors. Next, a linear covariance analysis was run using only pressure, lidar,
+and velocimetry measurements to characterize the trade between image separation distance and measurement
+error. The third parameter in the trade is the number of reference image states to maintain in the filter for
+velocimetry measurements. Assuming forward flight at constant velocity v0 , the separation distance between
+the reference and current image grows monotonically from v0 ∆t to Dmax , the maximum lateral distance
+allowed by the correlation algorithm. If only a single reference image is used the baseline will restart at v0 ∆t
+every time a new reference image is saved. However, if two reference images are maintained, the baseline
+only drops to 21 Dmax . Replacing measurements at shorter baselines with longer baselines, at the expense of
+increasing the state space, can ultimately improve the traverse navigation performance.
+For the linear covariance reference trajectory, the vehicle climbs to 400 m using a flight path angle of
+20◦ and traverses ∼1 km at ∼10 m/s, before descending to 100 m to scout a new candidate landing zone.
+Figure 6 illustrates the accumulated lateral position error in the TOF as a function of distance flown for
+each case. The dashed lines depict how measurement noise (0.5-1 pixel 1σ) and separation distance (5 10%) impact the accumulated position error using a single reference image. The solid lines depict the same
+configuration but when two reference images are maintained for velocimetry. The results indicate similar
+performance if the image baseline is increased by 2x at the expense of increasing the measurement error by
+2x. However, increasing the number of reference images from one to two illustrates performance can be
+dramatically improved using an additional three states in the nav filter.
+Breadcrumbs When the vehicle turns around and begins retracing the flight path, the ETS algorithm
+will select online breadcrumbs for correlation. When the vehicle flies out of range of the current online
+breadcrumb and finds the next online breadcrumb in the database, the filter must update the state and covariance
+for the current online breadcrumb position being tracked in the filter. Multiple approximations were explored
+for this step and the current implementation is discussed below. First, the position estimate for the breadcrumb
+is set to the saved position in the database. The update of the covariance presents a larger challenge to prevent
+collapse of the vehicle position covariance. If the new breadcrumb position covariance is merely set to the
+saved position covariance in the database, and all cross covariance terms are zeroed, the filter will treat each
+new breadcrumb as an independent measurement. This causes the vehicle position covariance to rapidly
+collapse over several breadcrumbs because it doesn’t account for the high correlation between the position
+errors of sequential breadcrumbs. A covariance update approach was developed to preserve as much cross
+
+12
+
+Figure 6: TOF lateral position error as a function of lateral distance flown for different configurations of
+image processing measurement error, image separation distance D, and number of reference image states
+maintained by the filter.
+
+correlation information between the breadcrumb and vehicle positions as possible. This algorithm is applied
+separately along the north, east and down position components since a closed form solution was calculated
+for a single axis at a time.
+The covariance update is based on the following simplified problem. Consider an initial covariance matrix
+for two variables:
+
+−
+
+
+
+P =
+
+a 0
+0 b
+
+
+(26)
+
+The goal is to define a linear measurement of the form:
+y = [h1 h2 ] x + η
+
+(27)
+
+η ∼ N (0, Ref f )
+
+(28)
+
+such that after applying this measurement model to the standard Kalman filter covariance update equation,
+the updated covariance becomes:
+"
++
+
+P =
+
+af
+af +bf −c
+2
+
+af +bf −c
+2
+
+#
+
+bf
+
+Applying the Kalman Filter update equation to Eqs. 26 and 28 yields:
+
+13
+
+(29)
+
+
+P+ = 
+
+
+
+ah2
+a 1 − z1
+−abh1 h2
+z
+
+−abh1 h2
+ z 2
+bh
+b 1 − z2
+
+
+(30)
+
+
+
+S = ah21 + bh22 + Ref f
+
+(31)
+
+It is assumed that a, bf and c are known. These correspond to the vehicle position covariance for the given
+axis, the new breadcrumb covariance along that axis, and the cross-correlations between the breadcrumb and
+vehicle positions along the axis. The problem is to solve for b, h1 , h2 and Ref f . In this formulation, af is set
+to a value slightly less than a. The values cannot be equal because of mathematical constraints, but setting
+them close accounts for the fact that switching to a new breadcrumb before receiving the measurement to it
+does not change the knowledge of the current vehicle position. Under this formulation, z can also be chosen
+arbitrarily and is set to a large parameterized number. Setting Eqs. 29 and 30 equal allows the desired values
+to be solved:
+
+r
+
+(af + bf − c)2
+b = bf +
+4(a − af )
+r
+(b − bf )z
+h2 =
+b2
+
+h1 =
+
+(a − af )z
+a2
+
+Ref f = z − ah21 − bh22
+
+(32)
+(33)
+
+This process is applied three times to the filter, once for each position direction, to update the covariance of
+the newly loaded online or historic breadcrumb. When applying the measurement model for the covariance
+update for each axis in the actual filter, the H matrix is 1xNstates and the calculated h1 and h2 values are put
+into the indices corresponding the vehicle position and the breadcrumb position for that axis. Although this
+approach is an approximate heuristic, it has shown good performance in preventing covariance collapse and
+maintaining the relative position errors between the vehicle position and breadcrumb positions.
+After the pseudo measurement is run, the breadcrumb measurement is processed using a similar model
+as Eqs. 23-25. For breadcrumbs the bET S term is not included as the bias corresponds to terrain induced
+errors in the images used for velocimetry, which won’t necessarily align with the image geometry used for
+the breadcrumb correlation. Further, for historic breadcrumbs, the term representing errors between the two
+TOFs is expanded:
+tof 1
+tof 1
+ned
+Rtof
+2 (γ1 , γ2 ) = Rned (γ1 ) Rtof 2 (γ2 ) = R3 (γ1 ) R3 (−γ2 )
+
+(34)
+
+where R3 is a rotation about the z axis. This term, and the associated sensitivities in the measurement model,
+is the mechanism to improve absolute heading knowledge by processing historic breadcrumb measurements.
+Mapping Breadcrumbs Between Flights
+Since all online breadcrumb positions are defined relative to the takeoff location, breadcrumbs from
+previous flights that are promoted to historic breadcrumbs must be updated relative to the new takeoff
+location. This is done by saving the estimated landing position and covariance at the end of the flight.
+The curvature of Titan will also lead to slight variations in the true NED frame at each new takeoff location
+(∼5 km resulting in changes of ∼0.1◦ ). The rotation matrix between the true NED directions at takeoff and
+landing can be calculated and used to apply an additional correction.
+tof 2
+The position of the ith breadcrumb in the TOF of the next flight, rbc
+is updated by subtracting off the
+i
+tof 1
+tof 1
+landing location in the original TOF, r
+(tf ) from each breadcrumb location in the original frame, rbc
+i
+and then rotating the point into the new NED frame at the landing site:
+
+14
+
+
+
+tof 2
+tof 2
+tof 1
+tof 1
+rbc
+=
+R
+r
+−
+r
+(t
+)
+f
+tof
+1
+bc
+i
+i
+
+(35)
+
+Updating the covariance of each breadcrumb requires an approximation because the cross covariance of all
+of the breadcrumbs to the landing position is not saved in the filter. This approximation starts by calculating
+the covariance of the final online breadcrumb from the previous flight relative to vehicle position at landing
+and adding the approximate covariance between the final breadcrumb position and the the breadcrumb being
+updated, ∆P. This total covariance is then rotated into a frame corresponding to NED at the new location.
+
+T
+Pnbc2 = Rnn12 Hrel Pn1 (tf )Hrel
++ ∆P Rnn12 T
+(36)
+where P n1 (tf ) is the full covariance matrix at the landing time, Hrel is a matrix of size 3 x Nstates , with the
+identity matrix in the indices corresponding to the current online breadcrumb position in the filter, a negative
+identify matrix in the vehicle position vector indices, and zeros elsewhere. This corresponds to calculating
+the position of the final breadcrumb relative to the landing site. The relative covariance between the ith and
+j th breadcrumb and breadcrumb saved in the filter is approximated as:
+
+
+|Pbci [1, 1] − Pbcj [1, 1]|
+0
+0
+
+0
+|Pbci [2, 2] − Pbcj [2, 2]|
+0
+∆P = 
+(37)
+0
+0
+|Pbci [3, 3] − Pbcj [3, 3]|
+where Pbci [k, k] is element [k,k] in the 3x3 position covariance of the ith breadcrumb saved in the database
+and bcf corresponds to breadcrumb loaded into the filter at landing. This approximation produces reasonable
+results because the breadcrumbs are dropped in sequential fashion and the positions defined in a frame
+unaffected by heading uncertainties as previously described. Only breadcrumbs along the flight path of the
+next flight are converted into historic breadcrumbs. The heading of the online breadcrumbs is also used to
+down select the number of breadcrumbs. When there are both inbound and outbound breadcrumbs available,
+images with the same orientation that they will be viewed on the next flight are chosen. This is done to
+improve image processing performance.
+RESULTS
+This section highlights sample navigation results from a high fidelity closed loop simulation. Table 5 lists
+the relevant navigation sensor parameters used for simulation. The simulation includes full image rendering
+using the Rendering and Camera Emulator (RCE)28 and surrogate Titan terrain using a DEM of the Namib
+desert.9 All simulations include ETS/image processing and closed loop guidance and control.
+Gyrocompassing
+A Monte Carlo simulation was run to characterize the gyrocompassing performance using the model
+described in the Design section. The initial heading error was drawn from a normal distribution with zero
+mean and standard deviation of 2◦ , a conservative worst-case initial heading error following EDL. 500 cases
+were run using parameters outlined in Table 5 and the navigation filter was configured to process data from
+both IMUs. Figure 7 illustrates heading error as a function of time for all cases, showing consistent errors
+between the empirical Monte Carlo error (green) and filter uncertainty (red). The baseline CONOP is to
+gyrocompass for 60 minutes, allowing the filter to squeeze heading error to less than 1◦ (3σ).
+Leapfrog
+A Monte Carlo of the Scout and Leapfrog were run to characterize the performance of long distance
+traverse navigation. The initial heading error was drawn from a normal distribution with zero mean and
+standard deviation of 0.4◦ for both the Scout and Leapfrog flights, representing conservative initial heading
+errors after gyrocompassing completes, leading to initial relative heading errors between the two flights
+of ∼1.7◦ (3σ). The root sum square (RSS) of the lateral position errors for 10 of the Leapfrog cases are
+illustrated in Figure 8. The colors represent lateral errors in different frames including NED (black), TOF
+
+15
+
+Sensor Parameter
+
+Specification (1σ)
+
+Accel bias
+Accel scale factor
+Accel velocity random walk
+Accel acceleration random walk
+Accel white noise
+Accel misalignment
+Gyro bias
+Gyro scale factor
+Gyro angle random walk
+Gyro rate random walk
+Gyro white noise
+Gyro misalignment
+Lidar white noise
+Lidar pointing
+Pressure white noise
+Pressure CFD model error
+
+40 µg
+120 PPM
+√
+0.2 mm/s/√ hr
+0.05 µg/ hr
+0.198 mm/s
+0.03◦ per axis
+0.005◦ /hr
+40 PPM
+√
+0.005 ◦ / hr
+0.017◦ /hr
+0.75 µrad
+0.03◦
+2 cm
+0.05◦
+2.7 mbar
+6.67%
+
+Table 5: Simulation setup for navigation performance analysis
+
+Figure 7: Heading initialization using 2 IMUs
+
+16
+
+(blue), and the breadcrumb relative error (red). When traversing down range the position errors are composed
+of error due to absolute heading error, which scales linearly with lateral distance, and random walk error from
+VIO. Lateral errors in the NED frame represent absolute (i.e. total) position error, while errors in the TOF
+represent only the random walk component (by definition, the TOF does not contain position error due to
+global heading errors). Finally, and most important for Dragonfly, are the breadcrumb relative errors depicted
+in red. These errors are also in the NED frame but are relative to the historic breadcrumb in the nav filter.
+The breadcrumb relative errors are dominated by relative heading error between flights and a random walk
+between breadcrumbs. The breadcrumb relative errors remain small as the vehicle retraces the climb and
+cruise segments of the Scout flight but begin growing after losing historic breadcrumbs when the vehicle
+flies over the landing site. After scouting a new candidate landing zone the vehicle turns around and flies
+back towards the landing site causing the breadcrumb relative errors to decrease. Finally, when the vehicle
+descends and reaches the terminal breadcrumb the breadcrumb relative errors are small enough to ensure
+the reference image selected by ETS will contain sufficient image overlap to produce a valid correlation and
+displacement measurement. The breadcrumb relative errors are reduced to < 5 m after processing one or
+more historic breadcrumb measurements to enable precision landings.
+
+Figure 8: Lateral position errors in NED (black), TOF (blue), and relative to the historic BC in the nav filter
+(red).
+
+CONCLUSION
+The preliminary design of the Dragonfly navigation filter has been developed and demonstrated to robustly
+navigate the vehicle over multiple kilometer flights in a high fidelity Titan simulation. While the Dragonfly
+mission is unique, several contributions are applicable to the broader inertial navigation, VIO, and TRN
+fields including a new architecture for redundant IMUs, improving global heading and position knowledge
+by revisiting images after re-initializing the filter on the surface, and a robust approximation to the SLAM
+formulation. Several updates and optimizations are underway to improve the nav filter including porting the
+EKF to the UDU implementation,16 modeling correlated pressure sensor measurements, reducing the nav
+filter update rate to 1 Hz, and a higher fidelity terrain model. An alternate breadcrumb model is also being
+explored to better preserve cross covariance information with all the filter states. Filter updates to support
+image processing updates are also expected in the next phase, such as using processing multiple image patches
+
+17
+
+or ingesting the displacement measurement directly in pixels.
+ACKNOWLEDGMENT
+The authors wish to acknowledge those who improved the design and implementation through discussion,
+review, test, and debug: Benjamin Villac, Nishant Mehta, Jinho Kim, Steve Jenkins, Ike Witte, Sam Bibelhauser,
+Carolyn Sawyer, Jason Stipes, Rebecca Foust, Lev Rodovskiy, Corinne Lippe, and Lindsey Marinello. The
+authors also acknowledge colleagues at the University of Central Florida, Mike Kinzel and Wayne Farrell,
+for generating Cp data, and Dragonfly mission architect, Ralph Lorenz.
+REFERENCES
+[1] J. W. Barnes, E. P. Turtle, M. G. Trainer, R. D. Lorenz, S. M. MacKenzie, W. B. Brinckerhoff, M. L.
+Cable, C. M. Ernst, C. Freissinet, K. P. Hand, et al., “Science goals and objectives for the Dragonfly
+Titan rotorcraft relocatable lander,” The Planetary Science Journal, Vol. 2, No. 4, 2021, p. 130.
+[2] R. D. Lorenz, Saturn’s Moon Titan; Owners’ Workshop Manual. Haynes, 2020.
+[3] R. D. Lorenz, E. P. Turtle, J. W. Barnes, M. G. Trainer, D. S. Adams, K. E. Hibbard, C. Z. Sheldon,
+K. Zacny, P. N. Peplowski, D. J. Lawrence, et al., “Dragonfly: A rotorcraft lander concept for scientific
+exploration at Titan,” Johns Hopkins APL Technical Digest, Vol. 34, No. 3, 2018, p. 14.
+[4] T. G. McGee, D. Adams, K. Hibbard, E. Turtle, R. Lorenz, F. Amzajerdian, and J. Langelaan,
+“Guidance, Navigation, and Control for Exploration of Titan with the Dragonfly Rotorcraft Lander,”
+2018 AIAA Guidance, Navigation, and Control Conference, 2018, p. 1330.
+[5] R. D. Lorenz, S. M. MacKenzie, C. D. Neish, A. L. Gall, E. P. Turtle, J. W. Barnes, M. G. Trainer,
+A. Werynski, J. Hedgepeth, and E. Karkoschka, “Selection and Characteristics of the Dragonfly
+Landing Site near Selk Crater, Titan,” The Planetary Science Journal, Vol. 2, feb 2021, p. 24,
+10.3847/PSJ/abd08f.
+[6] Y. Cheng, A. Johnson, and L. Matthies, “MER-DIMES : a planetary landing application of computer
+vision,” 2005, 2014/37440.
+[7] D. S. Bayard, “Vision-Based Navigation for the NASA Mars Helicopter,” AIAA Scitech 2019 Forum,
+2019.
+[8] I. R. Witte, D. L. Bekker, M. H. Chen, T. B. Criss, S. N. Jenkins, N. L. Mehta, C. A. Sawyer, J. A.
+Stipes, and J. R. Thomas, “No GPS? No Problem! Exploring the Dunes of Titan with Dragonfly Using
+Visual Odometry,” AIAA Scitech 2019 Forum, 2019, p. 1177.
+[9] B. Schilling, B. Villac, and D. Adams, “Preliminary Surface Navigation Analysis for the Dragonfly
+Mission,” AAS/AIAA Astrodynamics Specialist Conference, 2019.
+[10] R. Smith, M. Self, and P. Cheeseman, “Estimating uncertain spatial relationships in robotics,”
+Autonomous robot vehicles, pp. 167–193, Springer, 1990.
+[11] P. Moutarlier and R. Chatila, “Incremental free-space modelling from uncertain data by an autonomous
+mobile robot,” Workshop on Geometric Reasoning for Perception and Action, Springer, 1991, pp. 200–
+213.
+[12] S. Jenkins, S. Bibelhauser, N. L. Mehta, J. Thomas, and I. R. Witte, “Preliminary Flight Testing of
+Dragonfly’s Electro-optical Terrain Sensing Function,” 3rd Space Imaging Workshop, 2022.
+[13] B. Archinal, C. Acton, M. A’Hearn, et al., “Report of the IAU Working Group on Cartographic
+Coordinates and Rotational Elements: 2015.,” Celest Mech Dyn Astr, Vol. 130, No. 22, 2018.
+[14] P. Savage, “Strapdown Inertial Navigation Integration Algorithm Design Part 1: Attitude Algorithms,”
+Guidance, Control, and Dynamics, Vol. 21, No. 1, 1998, p. 130.
+[15] P. Savage, “Strapdown Inertial Navigation Integration Algorithm Design Part 2: Velocity and Position
+Algorithms,” Guidance, Control, and Dynamics, Vol. 21, No. 1, 1998, p. 208.
+[16] J. Carpenter and C. D’Souza, “Navigation Filter Best Practices,” NASA/TP–2018–219822, 2018.
+[17] R. M. Rogers, Applied Mathematics in Integrated Navigation Systems. American Institute of
+Aeronautics and Astronautics, Inc., 2007.
+[18] P. Martin and E. Salaün, “Generalized multiplicative extended kalman filter for aided attitude and
+heading reference system,” AIAA Guidance, Navigation, and Control Conference, 2010, p. 8300.
+[19] F. L. Markley and J. L. Crassidis, Fundamentals of Spacecraft Attitude Determination and Control.
+Springer, 1986.
+[20] R. Zanetti et al., “Absolute Navigation Performance of the Orion Exploration Flight Test 1,” Guidance,
+Control, and Dynamics, Vol. 40, No. 5, 2017.
+[21] P. G. Savage et al., Strapdown analytics, Vol. 2. Strapdown Associates Maple Plain, MN, 2000.
+
+18
+
+[22] D. S. Bayard, “Reduced-Order Kalman Filtering with Relative Measurements,” Guidance, Control, and
+Dynamics, Vol. 32, No. 2, 2009.
+[23] D. Durante, D. Hemingway, P. Racioppa, L. Iess, and D. Stevenson, “Titan’s gravity
+field and interior structure after Cassini,” Icarus, Vol. 326, 2019, pp. 123–132,
+https://doi.org/10.1016/j.icarus.2019.03.003.
+[24] H. W. Park, J. G. Lee, and C. G. Park, “Covariance Analysis of Strapdown INS Considering
+Gyrocompass Characteristics,” IEEE Transactions on Aerospace and Electronic Systems, Vol. 3, No. 1,
+1995.
+[25] M. E. Pittelkau, “Calibration and Attitude Determination with Redundant Inertial Measurement Units,”
+Guidance, Control, and Dynamics, Vol. 28, No. 4, 2005.
+[26] J. Kinnison, R. Vaughan, P. Hill, N. Raouafi, Y. Guo, and N. Pinkine, “Parker solar probe: a mission to
+touch the sun,” 2020 IEEE Aerospace Conference, IEEE, 2020, pp. 1–14.
+[27] A. I. Mourikis and S. I. Roumeliotis, “On the Treatment of Relative-Pose Measurements for Mobile
+Robot Localization,” Proceedings of the 2006 IEEE International Conference on Robotics and
+Automation, 2006.
+[28] C. A. Sawyer and N. L. Mehta, “Rendering the Titan environment for Dragonfly,” 2nd RPI Space
+Imaging Workshop, 2019.
+
+19
+

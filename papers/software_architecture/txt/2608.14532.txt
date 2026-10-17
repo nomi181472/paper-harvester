@@ -1,0 +1,1460 @@
+Trust Without Boundaries: An Architectural
+Analysis of Satellite Flight Software
+Jack Vanlyssel∗ , Gruia-Catalin Roman∗ , Kendra Cook‡ , Sazzadur Rahaman† , Afsah Anwar∗
+∗ Department of Computer Science, University of New Mexico, Albuquerque, NM, USA
+† Department of Computer Science, University of Arizona, Tucson, AZ, USA
+
+arXiv:2608.14532v1 [cs.CR] 14 Aug 2026
+
+‡ Science Applications International Corporation (SAIC)
+
+Abstract—As spacecraft become more software-driven and
+interconnected, onboard flight software is an increasingly important security boundary. Popular flight software architectures
+often treat onboard components as trusted peers, simplifying
+integration while limiting internal isolation and access control.
+We analyze NASA’s Core Flight System (cFS) to examine how
+authority, identity, communication, observability, and persistence
+are distributed across onboard components. Using NASA’s flightrepresentative NOS3 simulator, we validate these weaknesses
+through five experiments implemented with a malicious onboard
+component that abuses legitimate architectural privileges. We
+then compare cFS with other modular flight software frameworks
+to identify recurring trust assumptions and architectural weaknesses. Our results show that a single compromised component
+can exploit broadly shared authority in ways that are difficult
+to distinguish from legitimate behavior. We conclude with architectural implications and discuss mechanisms for strengthening
+internal trust boundaries in future flight software systems.
+
+I. I NTRODUCTION
+The space industry is projected to exceed one trillion dollars
+by 2032 [1]. Satellites have become essential infrastructure
+supporting telecommunications, Earth observation, scientific
+experimentation, navigation, and defense [2], [3], [4], [5], [6],
+[7], [8], [9]. To meet growing demands for rapid deployment,
+modern spacecraft increasingly rely on modular, componentbased flight software frameworks. In this context, a component
+is a modular software unit that encapsulates a particular
+capability and interacts with the rest of the system through
+defined interfaces [10]. These frameworks decompose spacecraft functionality into separately developed components that
+implement spacecraft functions such as navigation, telemetry
+processing, or hardware control. These components then communicate through shared messaging infrastructure and system
+services. This architectural model improves maintainability
+and flexibility while enabling increasingly complex software
+stacks to be assembled from reusable components.
+We argue that shared software services, while improving
+development efficiency, also create implicit trust relationships among onboard applications through common messaging
+infrastructure, system services, and runtime environments.
+Security therefore depends not only on preventing initial
+component compromise, but also on constraining the authority
+of components in case preventative measures fail. Yet existing
+satellite security research has largely focused on external
+
+attacks, communication vulnerabilities, ground-segment compromise, and implementation flaws [11], [12], [13], [14], [15],
+[16], [17], [18], [19], paying comparatively little attention to
+whether flight software architectures themselves enforce security boundaries. This gap is important because a compromised
+component may abuse legitimately granted authority without exploiting an additional vulnerability, potentially evading
+code review and defenses focused on initial compromise or
+implementation-level flaws.
+To address this gap, we analyze the architecture of NASA’s
+core Flight System (cFS), the most prolific open-source flight
+software framework [20], as a representative example of
+modern component-based flight software. Because no single
+architectural mechanism determines whether a component
+is meaningfully constrained, we examine cFS through five
+complementary, security-focused ”views”: execution, identity,
+communication, observability, and persistence. Together, these
+views capture how authority is granted to a component, how
+it is exercised across the system, whether its actions can
+be attributed, and whether its effects survive recovery resets.
+This allows us to examine how the architecture as a whole
+establishes, propagates, and limits capabilities among onboard
+components.
+To evaluate the practical consequences of the architectural
+weaknesses we identify, we implement a malicious onboard
+component in NASA’s Operational Simulator for Space Systems (NOS3). We use this implementation to test whether
+these weaknesses can be exercised in a flight-representative
+mission environment. After confirming the weaknesses, we
+apply a targeted analysis to other open-source flight software
+frameworks to determine whether similar trust assumptions
+and architectural weaknesses extend beyond cFS.
+Our results show that cFS grants onboard components
+broad authority through shared execution, unrestricted intercomponent communication, and limited identity- and policybased enforcement. As a result, the architecture provides few
+effective mechanisms for containing a compromised component once execution begins. Our comparative analysis further
+indicates that these weaknesses are not unique to cFS: other
+open-source flight software frameworks exhibit similar reliance on shared services, trusted components, and weak internal isolation. Together, these findings suggest that the absence
+of enforceable trust boundaries is a broader architectural issue
+
+FSW
+Power
+System
+
+File
+Manager
+
+Camera
+
+Shared Framework
+Communication
+System APIs
+Files
+
+Critical
+Resources
+
+Fig. 1: Architectural trust relationships in modular flight
+software can allow low-privilege components to influence
+security-critical services beyond their intended responsibilities.
+
+in modern modular flight software that must be addressed.
+Contributions. This paper makes the following contributions:
+• A systematic analysis of architectural weaknesses in cFS.
+We develop and apply a framework for analyzing trust in
+component-based flight software across execution, identity,
+communication, observability, and persistence. Using this
+framework, we identify where cFS fails to establish enforceable trust boundaries and characterize the security
+consequences of those weaknesses.
+• An experimental evaluation of architectural trust assumptions. We experimentally validate the identified architectural
+weaknesses in NASA’s NOS3 simulator and demonstrate
+system-wide influence using only architecturally permitted
+mechanisms.
+• A comparative analysis of open-source flight software. We
+apply our framework to additional open-source flight software architectures to determine whether the trust assumptions and enforcement weaknesses identified in cFS recur
+across contemporary component-based frameworks.
+• Architectural design implications. Based on our findings,
+we discuss mechanisms needed to establish enforceable
+trust boundaries in future flight software systems, including
+identity propagation, policy enforcement, and mandatory
+logging.
+II. BACKGROUND & R ELATED W ORK
+A. Flight Software Background
+Flight software has traditionally been designed around strict
+requirements for reliability, deterministic execution, resource
+efficiency, and fault tolerance. Frameworks such as cFS support these goals through shared services for communication,
+timing, event reporting, data management, and hardware ac-
+
+cess, reducing duplication and simplifying mission development. These architectures typically assume that onboard
+applications cooperate as trusted parts of a single software
+stack rather than operate as mutually untrusted elements. As a
+result, mechanisms used in general-purpose systems to enforce
+strong internal security boundaries may be absent, optional,
+or outside the framework itself, allowing a compromised
+component to exercise substantial authority through otherwise
+legitimate interfaces.
+Table I summarizes the most prominent publicly documented, open-source flight software considered in this work.
+Despite differences in implementation, these frameworks share
+recurring architectural features, including component abstractions, standardized inter-component interfaces, a shared communication infrastructure, and support for mission-specific and
+third-party software [21]. These features are security-relevant
+because they determine how components communicate, access
+shared services, exercise authority, and interact with missioncritical resources, making the underlying architecture central
+to evaluating isolation, privilege boundaries, observability, and
+fault containment.
+TABLE I: Prominent Open-source Flight Software available
+today [21].
+Platform
+cFS
+F′
+NanoSat MO
+COrDeT-C2
+KubOS
+
+Org.
+NASA
+NASA
+ESA
+ESA
+Kubos
+
+Mission Adoption
+40+ NASA Missions
+Mars Helicopter, Mars Rover, CubeSats
+OPS-SAT, PhiSat
+CHEOPS Telescope
+limited public flight evidence
+
+B. Related Work
+Satellite security research has largely focused on external
+communication links and ground system compromise [32],
+[33], [34], typically treating the flight software stack as a
+trusted environment. Consequently, the security implications
+of trust abuse have received limited attention. To make this
+gap explicit, we review prior work and organize it based on
+the attack surface it examines.
+External Communication and RF-Side Attacks. The largest
+body of prior work models adversaries operating outside the
+spacecraft, targeting radio-frequency links and protocol-level
+communication surfaces. This includes spoofing and jamming
+attacks [11], [12], [13], broadcast storms and large scale
+denial-of-service against satellite constellations [14], [15],
+[16], and replay and injection attacks [22], [35], [23]. These
+works largely ignore the flight software stack and assume
+insecurity stems from communication protocol exploits.
+Ground Segment and Infrastructure Compromise. A second class of work examines adversaries who pivot through
+terrestrial infrastructure, including ground stations, mission
+control software, and satellite network service providers. Representative incidents include broadband network compromise
+and mission control abuse [17], [18] and user-terminal exploitation [24]. These works also largely ignore the flight soft-
+
+Research Area
+
+Representative Focus
+
+Limitation Relative to This Work
+
+Related Works
+
+Comms and RF-side
+attacks
+Ground-segment
+compromise
+Software vulnerabilities
+Software security
+mechanisms
+
+RF links, spoofing, jamming,
+replay
+Ground stations, network
+infrastructure
+Memory corruption, malicious apps
+OS isolation, interface and message
+security
+
+Assumes trusted onboard software.
+
+[11], [14], [22], [23]
+
+Focuses on offboard compromise.
+
+[17], [18], [24]
+
+Targets implementation flaws.
+Examines individual mechanisms.
+
+[19], [25], [26]
+[27], [28], [29], [30], [31]
+
+This work
+
+Architectural trust relationships
+
+—
+
+—
+
+TABLE II: Relationship between prior flight-software security research and this work.
+
+ware stack and assume insecurity stems from compromising
+ground-side control infrastructure.
+Onboard Software and Flight-Software Security. Recent
+work has demonstrated how implementation flaws in onboard
+software can lead to system compromise. Donchev et al. [19]
+exploit a buffer overflow in a custom flight application to
+execute shellcode on the underlying operating system. Hansen
+et al. [25] demonstrate ransomware by modifying a filemanagement component, while Willbold et al. [26] show
+that insecure telecommand interfaces, memory vulnerabilities,
+and unsafe update mechanisms can enable arbitrary code
+execution. These studies demonstrate the consequences of
+conventional software vulnerabilities but do not examine the
+broader trust relationships established by the flight-software
+architecture.
+Other work examines specific security-relevant mechanisms
+within flight-software architectures. Boehm et al. [27] identify
+weaknesses in F’ external interfaces and recommend command
+authentication, link encryption, and secure defaults. Schalk et
+al. [28], [29] demonstrate attacks against the cFS Software
+Communication Bus and propose bus-level detection and mitigation. Furgala et al. [30] port cFS to seL4 to strengthen
+operating-system isolation, while McAmis et al. [31] show
+that compromised peripherals can manipulate data and timing
+in cFS-based systems. These efforts strengthen or evaluate
+individual interfaces and mechanisms, but do not analyze
+how trust and authority propagate across the flight-software
+architecture as a whole.
+Research Gap. Taken together, these works identify vulnerabilities across flight software, including weaknesses in
+the Software Bus, operating system, peripheral interfaces, and
+external communication paths. As summarized in Table II,
+however, prior studies primarily evaluate individual attack
+surfaces and defensive mechanisms in isolation. Consequently,
+it remains unclear whether these vulnerabilities stem from
+implementation flaws or from architectural trust assumptions
+that span the flight software stack. This work addresses that
+gap by evaluating the trust relationships that determine the
+authority available to an onboard component and the extent of
+its influence over the rest of the system.
+
+III. A PPROACH AND T HREAT M ODEL
+To determine whether modern flight software architectures
+provide enforceable trust boundaries between onboard software components, we combine architectural analysis, experimental validation, and comparative analysis, as summarized
+in Figure 2.
+A. High-level Approach
+Objective 1: Characterize Architectural Trust. We systematically decompose NASA’s core Flight System (cFS)
+into its principal architectural elements of execution, identity,
+communication, observability, and persistence to determine
+whether the architecture enforces least privilege and isolation
+between onboard components. This analysis is derived from
+publicly available documentation, source code, startup configurations, and reference mission deployments [36], [37], [38],
+[39], [40], [41], [42], [43], [44].
+Objective 2: Validate Architectural Behavior. We experimentally evaluate whether a compromised cFS application can
+use legitimate framework mechanisms to produce securityrelevant effects outside its intended role in NASA’s NOS3
+flight-representative environment.
+Objective 3: Assess Generality. Finally, we examine other
+open-source flight software using our framework to determine
+whether the architectural trust assumptions identified in cFS
+recur across contemporary flight software or are an implementation issue in a single framework.
+B. Threat Model
+We assume that an adversary has introduced malicious code
+into one component of an otherwise correctly functioning
+flight software system. The code may originate from a compromised dependency, malicious update, insider action, or another
+compromise mechanism. Because this study focuses on the
+architectural consequences of a compromised component, the
+initial compromise mechanism is outside its scope.
+Attacker objective. The attacker’s general objective is to
+use the compromised component’s legitimate access to affect
+resources, applications, or operations outside its intended role.
+The specific objective and success condition evaluated by each
+attack are defined in Section V.
+Attacker capabilities. The attacker can write malicious code
+that executes within the legitimately assigned context of a
+
+cFS Architectural Analysis
+Execution
+
+Source
+Code
+
+Documents
+
+Sources
+
+Experimental Validation
+
+Identification
+
+Identity
+Spoofing
+
+Communication
+
+Unauthorized
+Commanding
+
+Observation
+
+Audit
+Evasion
+
+Persistence
+
+Persistent
+Compromise
+
+Architecture Views
+
+FSW Comparison
+
+cFS
+
+Lifecycle
+Override
+
+Trust Abuse Primitives
+
+Simulation
+
+F Prime
+
+Shared
+Weakness
+
+Confirmed Weakness
+
+NMF
+
+KubOS
+
+Fig. 2: We organize our efforts into three steps: First, we perform a systematic analysis of flight software architectures. Next,
+we develop proof-of-concept attacks to understand the violations of established security expectations. Finally, we measure the
+generalizability of our findings to other flight software frameworks.
+
+component. The attacker may invoke services, access resources, and use communication mechanisms ordinarily available to that component. The attacker does not exploit additional implementation vulnerabilities, modify the operating
+system or flight software framework, bypass enforced controls,
+or obtain privileges beyond those assigned to the compromised
+component.
+Under this model, we examine whether the flight software
+architecture meaningfully constrains a compromised component after it has begun executing.
+IV. A RCHITECTURE A NALYSIS
+Architectural Analysis Methodology.
+For a software architecture to provide a meaningful security boundary, it must limit what each component can do,
+identify which component performed an action, control how
+components interact with the rest of the system, record enough
+information to investigate security incidents, and ensure that
+unauthorized changes do not survive recovery. These requirements follow established principles of least privilege, mediated
+access, accountability, and trusted recovery [45], [46], [47].
+Based on these requirements, we organize our analysis into
+five security-focused ”architectural views” [48]. Each view
+addresses a distinct question about whether the flight software
+establishes and enforces boundaries around an executing component:
+1) Execution view: Where does a component run, and what
+privileges and resources does it receive?
+2) Identity view: Does the system assign a distinct identity
+to each component and preserve that identity across
+interactions?
+3) Communication view: How can components interact
+with other components and shared services, and are those
+interactions subject to enforceable policy checks?
+4) Observability view: Are component actions recorded in
+a way that allows them to be detected and attributed?
+5) Persistence view: Which component-controlled effects
+survive restart, and does recovery return the system to a
+trusted state?
+For each architectural view, we first review framework
+documentation and API references to identify the major
+components, interfaces, and intended security behavior. We
+then inspect the corresponding source code, startup scripts,
+
+and reference mission configurations to determine how those
+mechanisms are implemented, what capabilities are available
+to onboard applications, and whether restrictions are enforced
+in practice or depend on trusted behavior or mission-specific
+configuration [49], [39], [38], [50], [51], [44]. We organize the
+resulting findings according to the five architectural views and
+corroborate them across documentation, implementation, and
+configuration evidence. Findings central to our conclusions are
+subsequently tested in Section V.
+A. Execution View
+In cFS, components are typically implemented as a flight
+application (e.g., camera app.c) together with a collection of
+supporting source files and, when required, a hardware device
+driver. Applications serve as the primary units of execution and
+resource allocation. The execution view therefore determines
+how these applications are created, scheduled, and granted access to system resources. The Core Flight Executive (cFE) acts
+as the central runtime environment, loading and coordinating
+independently developed applications.
+The cFE provides five core services: Executive Services
+(ES) manages application lifecycle and execution state;
+the Software Bus (SB) provides inter-application messaging; Event Services (EVS) records ground-visible application
+events; Table Services (TBL) manages dynamically loadable
+configuration data; and Time Services (TIME) maintains and
+distributes spacecraft time.
+To determine what authority an onboard component receives, we examine its execution environment. Specifically,
+we analyze how cFE creates applications, how the underlying
+operating system runs and isolates them, and which system
+services and resources they can access.
+(1) Instantiation: Applications are instantiated at boot by
+ES through startup scripts that specify which binaries to load
+and execute. ES dynamically loads each listed binary and
+creates a corresponding OS thread. This process performs no
+cryptographic verification, provenance checking, or privilege
+assignment. Any referenced binary is therefore automatically
+executed as a trusted system component.
+(2) Execution: Once instantiated, all applications, including core services, execute as OS-level tasks within a single
+shared address space. cFS provides no process isolation, memory protection, or privilege separation between components.
+
+Startup entries provide no mechanism for enforcing execution
+boundaries. As a result, core services and the components they
+manage operate under identical runtime conditions.
+(3) Authority: Applications interact with cFE through the
+standard cfe.h interface, which provides access to messaging, command handling, event reporting, and time synchronization and is required for normal operation. This interface
+also exposes privileged lifecycle, configuration, and systemmanagement functions, enabling applications to invoke cFE
+services ranging from routine messaging to terminating or
+restarting other components, as illustrated in Table III. As a
+result, all applications are granted broad, system-wide authority over both system resources and application lifecycles, with
+no architectural mechanism for enforcing least privilege or
+hierarchical control.
+Service
+ES
+SB
+EVS
+TBL
+TIME
+
+Representative API
+CFE_ES_RestartApp()
+CFE_SB_TransmitMsg()
+CFE_EVS_SendEvent()
+CFE_TBL_GetAddress()
+CFE_TIME_SetTime()
+
+Architectural Authority
+Restart applications
+Transmit internal packets
+Down-link event string
+Obtain pointer to config
+Modify system time
+
+TABLE III: Powerful cFE API calls accessible to all apps.
+Together, these mechanisms place all core services and
+mission applications within a single execution domain. Applications are loaded without integrity or provenance checks,
+execute without isolation, and inherit broad system authority
+through mandatory interfaces. As a result, cFS provides no
+meaningful internal trust boundaries among components. Once
+instantiated, each application operates as peer tasks within
+a shared address space and receives broad access to system
+services and resources, leaving no meaningful mechanism for
+enforcing least privilege between components.
+B. Identity View
+Least privilege enforcement requires that system actions be
+attributable to executing entities. Thus, we examine how cFS
+assigns and maintains execution identity.
+Identity Within cFE: At startup, ES initializes a global
+registry that binds each application and its corresponding
+OS thread to a unique Application Identifier (AppID). Each
+application is associated with exactly one AppID, which serves
+as the unit of lifecycle management and control within ES.
+This binding is accessible through ES interfaces and remains
+fixed for the lifetime of the application instance. As a result,
+cFE maintains a centralized and consistent internal identity.
+Identity Outside cFE: AppIDs are not propagated beyond
+cFE. As a result, inter-application actions are decoupled from
+execution identity, allowing any application to issue commands, publish telemetry, or access shared services without
+identity-based restriction. Although cFS assigns each application a distinct AppID within cFE, that identity is not preserved
+across messaging and shared-service interactions, preventing
+reliable authentication, authorization, and attribution.
+C. Communication View
+System coordination depends on the exchange of commands
+and telemetry across components and trust boundaries. The
+
+communication view therefore determines whether interactions
+are authenticated, authorized, and attributable.
+Internal Messaging and Device Access: The Software Bus
+(SB) provides the primary communication substrate in cFS,
+routing commands and telemetry among applications based
+on Message Identifiers (MIDs). As observed in other works,
+the SB performs only minimal syntactic validation and does
+not authenticate message producers, authorize publications
+or subscriptions, or enforce trust relationships between communicating applications [36], [28], [29]. Consequently, any
+application capable of publishing a syntactically valid message
+can influence subscribed components or device drivers.
+Because the Software Bus does not preserve sender identity, downstream services cannot verify message provenance
+or enforce sender-specific authorization. The Software Bus
+therefore places internal communication within a single trust
+domain: rather than limiting authority between components,
+it allows one component’s authority to propagate through
+legitimate communication paths and affect otherwise unrelated
+parts of the system.
+External Messaging: Previous work has demonstrated that
+unsecured cFS configurations concentrate external command
+validation at the Command Ingest (CI) application. Once CI
+forwards a command onto the Software Bus, the architecture
+provides no general mechanism for authenticating its origin or
+enforcing sender-specific authorization [28], [29].
+Although cFS has a cryptography component that can provide link-layer authentication and integrity protection, it operates only on explicitly routed traffic and does not bind onboard
+component identity or enforce communication policy. It also
+does not extend to the software bus’s internal communication,
+only operating around the radio interface. Consequently, it can
+secure external transport but provides no internal protections.
+These mechanisms provide no meaningful security for communications within the architecture. As a result, applications
+can communicate with components, services, and devices
+through the Software Bus without sender authentication or enforceable policy checks, allowing their authority to propagate
+throughout the system.
+D. Observability View
+After deployment, operators have no direct visibility into
+onboard storage, memory, and runtime state. Detection and attribution of anomalous behavior then depend largely on downlinked telemetry and logs. cFS provides three primary logging
+mechanisms—system, performance, and event logs—which
+together determine whether component activity can be observed, attributed, and trusted.
+System and Performance Logs: ES maintains diagnostic
+and performance logs that record string messages and timing
+markers from calling applications. These logs are opt-in and
+capture limited diagnostic information such as when apps start
+and when they crash. They do not record compromise indicators such as inter-application messaging, device access, or file
+activity. In addition, they are not automatically downlinked to
+operators and can be cleared through exposed interfaces.
+
+Event Logs: EVS maintains an event log that applications
+populate using EVS functions. Unlike system and performance
+logs, events embed the sender’s AppID, inheriting cFE’s
+stronger identity semantics. Unlike system and performance
+logs, events include explicit AppID attribution and event metadata. EVS stores events locally in memory and automatically
+downlinks logs to operators, providing greater visibility than
+ES logging.
+Consistent with the broad authority granted to applications
+in the execution model, EVS exposes commandable filtering
+and suppression mechanisms that allow events to be selectively
+discarded before logging or transmission according to rules
+defined by any application. EVS interfaces also permit callers
+to emit events under arbitrary AppIDs and erase local logs,
+further weakening the visibility and attribution guarantees on
+which operators rely.
+Consequently, because logging is incomplete, applicationcontrolled, and susceptible to suppression, erasure, and identity
+spoofing, cFS does not provide a mandatory audit trail that
+reliably detects and attributes component actions.
+E. Persistence View
+If a satellite is compromised, as a last line of defense,
+operators can rely on resets to restore a known-good state.
+The effectiveness of these measures depends on whether
+reinitialization can restore a trusted baseline.
+cFS preserves deployment state across power cycles and
+processor resets. Startup scripts stored in non-volatile memory
+are automatically replayed at boot, causing all listed binaries
+to relaunch without operator validation. As shown in Section
+IV-A, ES also exposes lifecycle management interfaces, such
+as CFE_ES_RestartApp(), that allow applications to control restart behaviors programmatically
+In addition to executable persistence, cFS provides a Critical
+Data Store (CDS) that can be used to preserve application
+memory across resets. Applications are free to register, modify, and restore CDS blocks through ES interfaces, allowing
+internal application state to persist indefinitely.
+These mechanisms weaken reset-based recovery because
+cFS may reload compromised code, configuration, or CDS
+state without independent verification. Consequently, a restart
+cannot guarantee restoration to a known-good state.
+Cross-View Findings. Based on our analysis, cFS places onboard applications within a shared trust domain. Applications
+execute with broad authority that is difficult to attribute. As
+illustrated in Figure 3, these weaknesses reinforce one another:
+a compromised application can use legitimate interfaces to
+affect unrelated components, obscure its actions, and resume
+operation after restart. The resulting risks are therefore architectural, arising from the assumption that onboard applications
+will behave correctly.
+V. E XPERIMENTAL VALIDATION OF A RCHITECTURAL
+P REDICTIONS
+The preceding analysis identifies capabilities and control
+pathways available to onboard applications from cFS documentation, source code, and reference configurations. Static
+
+Execution
+
+Identity
+
+Shared address space
+No isolation
+Unverified Loading
+Broad privilege
+
+No Identity Propagation
+No Sender Binding
+No Identity Authorization
+Spoofable Attribution
+
+Architectural
+Weaknesses
+
+Communication
+
+Persistence
+
+No Authentication
+No Access Control
+Open Publishing
+No Provenance
+
+Untrusted State
+Unverified Restore
+Reset ≠ Recovery
+Persistent Compromise
+
+Observability
+Voluntary Logging
+Suppressible Logs
+Limited Visibility
+No Audit Trail
+
+Fig. 3: Architectural analysis dimensions and the recurring
+properties that weaken internal trust boundaries across execution, identity, communication, observability, and persistence.
+
+evidence alone, however, does not establish whether these
+capabilities remain usable in an integrated flight environment,
+where mission configuration, runtime checks, ownership rules,
+or receiver-side validation may impose additional constraints.
+We therefore experimentally test whether the identified weaknesses remain exploitable in practice.
+A. Experimental Platform
+We evaluate cFS using NASA’s NOS3, a flightrepresentative virtual spacecraft environment publicly released
+through NASA’s GitHub repository [40]. NOS3 integrates
+flight software and a ground station with software models
+of spacecraft hardware, including radios, thrusters, power
+systems, cameras, and navigation sensors. Although these
+models replace physical devices, NOS3 preserves the software
+architecture, application privileges, messaging interfaces, and
+trust relationships relevant to our analysis, allowing us to test
+whether identified weaknesses remain usable across component and device boundaries.
+B. Methodology
+Under the threat model in Section III, we implement a
+normally integrated cFS application that exercises five representative trust-abuse primitives using only documented interfaces and existing application privileges. Each primitive is
+command-activated for experimental control, with a defined
+technical objective and observable success condition. An experiment succeeds when the application produces the specified
+effect outside its intended role without modifying the target or
+framework or obtaining additional privileges.
+We also assess the breadth of exposure across the 18
+operational components in the default NOS3 configuration,
+spanning imaging, sensing, navigation, communication, security, and onboard data processing. For each component, we
+determine whether its normal interfaces or resources satisfy the
+preconditions for one or more validated primitives. We verify
+execution and target effects using system logs, telemetry,
+
+Attacker Foothold
+
+cFS Mechanism
+
+Weakness Exploited
+
+Compromised
+Application
+
+Executive
+Services
+Event Services/
+Software Bus
+
+Weak
+Isolation
+No Auth.
+Attribution
+No Mandatory
+Authorization
+No Protected
+Audit
+Incomplete
+Trusted Recovery
+
+Software Bus
+Event Services/
+Telemetry
+CDS/
+Persistent State
+
+Demonstrated Effect
+Lifecycle
+Override
+Identity
+Spoofing
+Unauthorized
+Commanding
+Audit
+Evasion
+Persistent
+Compromise
+
+Fig. 4: Experimental validation pathways from attacker foothold to cFS mechanism, architectural weakness, and demonstrated
+effect. Each row shows how a compromised application uses a legitimate framework mechanism to produce an effect outside
+its intended mission role.
+
+command responses, application state, and deviations from
+normal component behavior.
+C. Experiments
+Figure 4 summarizes the five experiments, each testing
+whether a normally integrated application can affect resources
+outside its intended role.
+(1) Peer Lifecycle Override. The attacker seeks to disrupt
+mission operation or disable a component that could interfere
+with malicious activity. Our experimental application used
+Executive Services to delete, restart, and reload an unrelated
+mission application. Telemetry, ES status, and expected output
+confirmed the state change. Because the application neither
+owned nor supervised the target and required no additional
+privileges, the experiment demonstrates cross-application lifecycle control through legitimate interfaces.
+(2) Sender Identity Discontinuity. The attacker seeks to
+impersonate a trusted application or conceal the source of an
+action. In one mode, the application transmits a command
+with an arbitrary message ID, function code, and payload,
+while the receiver receives no authenticated producer identity.
+In another, it uses another application’s AppID to emit a
+telemetry event attributed to that application. Thus, packet
+metadata and AppIDs do not reliably identify the originating
+application.
+(3) Unauthorized Command Propagation. The attacker
+seeks to manipulate spacecraft or device state outside the
+compromised application’s mission role. The experimental
+application published a valid command for an unrelated device
+through the Software Bus, which accepted the command and
+changed state. This confirms that authorization depended on
+packet format and routing rather than authenticated sender
+identity or application-specific permissions.
+(4) Operator-View Equivalence. The attacker seeks to
+perform an unauthorized action without revealing its originating application. We compared the same device command
+issued by the intended controller and by the experimental
+application. Both produced the same observable effect, while
+available EVS, ES, performance, telemetry, Software Bus,
+command-response, and ground-station data did not reliably
+
+distinguish their origins. The experimental application could
+further obscure attribution by suppressing, altering, or assigning misleading identities to event reports.
+(5) Compromise Replay After Reset. The attacker seeks
+to preserve malicious influence across a processor reset without requiring another external command. The experimental
+application stored attacker-controlled state, used it to alter
+runtime behavior, and issued a processor reset. After restart,
+it recovered the state and automatically resumed the altered
+behavior without further attacker input. This demonstrates that
+component-controlled persistent state can reactivate compromised behavior during normal initialization.
+D. Validation Results
+All five primitives produced their predicted security-relevant
+effects while operating as normally integrated cFS applications, confirming that the capabilities identified by static
+analysis remain reachable in an integrated flight configuration.
+Once an application was compromised, legitimate framework
+mechanisms were used to extend its influence beyond the
+intended component boundary.
+Across the 18 operational components, every application
+was susceptible to at least one of the evaluated attacks
+(Table IV). Not every primitive was applicable to every
+component: some applications do not control an associated
+device or lack the specific interface or resource required by a
+given attack. In these cases, the absence of an exploitable path
+reflects the component’s functionality rather than an architectural security boundary. Where the necessary attack surface
+was present, the corresponding primitive succeeded. We do
+not claim that every component supports every primitive or
+that all mission configurations expose identical paths. Rather,
+we found that components performing diverse mission functions depend on the same shared architectural assumptions,
+making trust-enabled attacks possible when the corresponding
+preconditions are present.
+VI. G ENERALIZABILITY
+To determine if similar architectural issues are generalizable across different modular frameworks, we examine four
+additional open-source flight software projects. For each, we
+
+TABLE IV: Systemic Architectural Trust Exposure Across
+Flight Components.
+
+Recurring weaknesses. Like cFS, F´ typically lacks strong
+isolation between components in the same deployment, authenticated attribution of component actions, mandatory auComponents Affected by at Least One Attack Class.
+thorization at service boundaries, protected auditing, and
+ArduCam, CryptoLib, ADCS, CSS, EPS, FSS, IMU, MAG, PiCam framework-level recovery to a known-good state.
+Radio, RW, ST, Thruster, Torquer, MGR, GNSS, OnAIR, SYN
+
+B. KubOS
+assess how software components are instantiated, communicate, establish identity, and whether the architecture provides
+enforceable mechanisms for least privilege and isolation. This
+comparison focuses on documented architectural properties,
+supplemented by targeted source-code inspection, rather than
+a full source-level audit of each framework.
+A. F Prime
+F Prime (F´) is a component-based flight software framework in which software components are connected through
+strongly typed communication ports defined as part of the
+system architecture [52], [53]. These connections are typically
+fixed when the flight software is built. Components can
+communicate either by directly invoking another component or
+by placing requests into a queue for later execution, depending
+on the type of communication port [54], [53].
+1) Architectural Trust Assessment:
+Execution: Components may use independent threads and
+queues, but components within one deployment typically
+share the same process, memory, and operating-system
+privileges [53], [55], [56]. Strong isolation requires separate
+deployments and externally enforced process or platform
+boundaries [55].
+• Identity: F´ assigns identifiers to components for connecting them and routing messages, but these identifiers
+do not securely verify which component performed an
+action [57], [58], [53]. When multiple components run in
+the same process, the system can generally identify the
+process responsible but cannot reliably attribute the action
+to a specific component [55], [56].
+• Communication: Typed ports and topology connections
+restrict intended communication, while command opcodes
+are routed through a command dispatcher [53], [58]. The
+reviewed framework does not provide mandatory per-call
+authorization, authenticated component channels, or cryptographic protection in its standard communications protocol [55], [56], [59].
+• Observability: F´ provides events, telemetry, command
+responses, health monitoring, and configurable event filtering [60]. However, it does not document a mandatory
+tamper-resistant audit trail or unforgeable component attribution [60], [55].
+• F´ Persistence: F´ reloads parameter values explicitly saved
+to its parameter database and checks uploaded files for
+corruption, but whole-system verification and restoration to
+a known-good software state are left to the deployment
+platform [61], [62].
+•
+
+KubOS is a Linux-based flight platform in which mission
+applications and services run as independent processes. Services are selected at build time, and applications run directly or
+through scheduling services. Components primarily communicate through GraphQL over HTTP, while the communications
+framework routes ground-originated GraphQL and UDP traffic
+internally [63], [64], [65], [66].
+1) Architectural Trust Assessment:
+• Execution: Applications run as separate Linux processes,
+but least-privilege controls and exclusive service-mediated
+device access are deployment-dependent [63], [67], [68],
+[69].
+• KubOS Identity: KubOS assigns processes operatingsystem identities, including process and user IDs, but its
+documented service interface does not preserve that identity
+across requests, limiting reliable attribution and identitybased authorization of shared services [70], [65], [71].
+• Communication: Configuration, GraphQL schemas, and
+packet routing mediate communication, but mandatory authentication, authorization, message integrity, and replay
+protection are not documented [65], [71], [66].
+• Observability: KubOS centralizes logs, monitoring, and
+telemetry, but does not document trusted caller attribution
+or tamper-evident auditing [72], [70], [73], [74].
+• KubOS Persistence: KubOS detects boot failures and kernel corruption and can restore current, previous, or base
+operating-system images; however, its user-data partition
+survives recovery, so user-controlled files and configuration
+are not necessarily returned to a known-good state [75], [76],
+[65].
+Recurring weaknesses. KubOS provides stronger process
+separation than cFS, but still shares its lack of preserved caller
+identity, mandatory service authorization, tamper-resistant auditing, and complete recovery of security-relevant persistent
+state.
+C. NanoSat MO Framework
+The NanoSat MO Framework (NMF) deploys flight functionality as separate applications, each executed in its own
+operating-system process. Applications access platform, monitoring, archival, discovery, and software-management services
+through a shared Supervisor and may also provide services
+to one another. The installed application set defines the deployment, while the Apps Launcher starts and manages each
+process [77], [78], [79].
+1) Architectural Trust Assessment:
+• Execution: Applications run in separate processes, optionally under distinct users, but sandboxing and resource
+confinement are not mandatory [79], [80].
+
+TABLE V: Recurring architectural weaknesses across the evaluated flight-software frameworks. “Yes” indicates that the
+weakness is present; “Partial” indicates partial or deployment-dependent mitigation.
+Framework
+
+Weak
+Isolation
+
+No Authenticated
+Attribution
+
+No Mandatory
+Authorization
+
+No Protected
+Audit
+
+Incomplete
+Trusted Recovery
+
+cFS
+F′
+KubOS
+NMF
+CORDET-C2
+
+Yes
+Yes
+Partial
+Partial
+Yes
+
+Yes
+Yes
+Yes
+Yes
+Yes
+
+Yes
+Yes
+Yes
+Yes
+Yes
+
+Yes
+Yes
+Yes
+Yes
+Yes
+
+Yes
+Yes
+Partial
+Yes
+Yes
+
+NMF Identity: NMF can launch applications under configured operating-system users and registers each application
+as a named service provider, but the reviewed documentation
+does not establish that this identity is authenticated and
+preserved across service requests [80], [78], [77].
+• Communication: Applications access services through the
+NanoSat MO Connector and Directory, but mandatory authorization, sender authentication, and message integrity are
+not documented [78], [77].
+• NMF Observability: The NMF Supervisor associates application output with the launched application, and some
+service operations are stored in a central archive, providing
+useful operational visibility without establishing a complete,
+tamper-resistant record of all component actions [79], [81],
+[82].
+• Persistence: Application packages and archived state persist
+across restarts, while signature enforcement, verified boot,
+rollback protection, and known-good recovery are not documented [83], [79], [80].
+Recurring weaknesses. NMF provides process-level separation but, like cFS, does not establish mandatory confinement,
+authenticated attribution across service requests, authorization
+enforcement, protected auditing, or trusted recovery.
+•
+
+D. CORDET-C2
+CORDET-C2 is a C-based service-oriented flight software
+framework in which applications exchange commands and
+reports through framework-defined interfaces. A system may
+consist of multiple CORDET applications running on the same
+or different computers and communicating through external
+middleware [84], [85].
+1) Architectural Trust Assessment:
+• Execution: CORDET components are scheduler-invoked
+passive objects. Within an individual CORDET application,
+components share an execution environment without documented component-level isolation [84, Sec. 22.1].
+• Identity: Components and packets use numeric identifiers
+for routing and management, but these are logical rather
+than authenticated identities [84, Secs. 6.2 and 10.1.3].
+• Communication: CORDET mediates commands and reports and performs framework-defined lifecycle and acceptance checks, while packet representation and additional
+integrity checks are application-defined. Sender authentication, ACLs, and cryptographic integrity are not documented
+
+as framework-level mechanisms [84, Secs. 10 and 16][84,
+Secs. 9 and 16].
+• Observability: Registries and error/status reporting provide
+operational visibility; mission implementations may add
+event and FDIR mechanisms, but protected attribution and
+tamper-resistant auditing are not documented as frameworklevel mechanisms [84, Secs. 15, 20, and 23][86], [87].
+• CORDET-C2 Persistence: CORDET-C2 primarily maintains volatile command and report state and delegates application reset behavior to mission-specific code, so trusted
+restoration of executable software, configuration, and persistent mission state remains outside the framework’s guarantees [84].
+Recurring weaknesses. CORDET-C2 closely resembles cFS
+in its shared execution environment, logical rather than authenticated identities, lack of mandatory authorization, unprotected
+operational records, and application-defined recovery.
+E. Summary
+Across cFS, F´, KubOS, NMF, and CORDET-C2, componentization does not guarantee strong security isolation.
+Shared-process frameworks lack component-level boundaries,
+while process-based frameworks depend on deploymentspecific privilege and confinement controls. Across both models, identifiers, communication checks, logging, and persistence mechanisms support operation but generally do not provide authenticated identity, mandatory authorization, trusted
+attribution, or guaranteed recovery to a known-good state.
+These controls are therefore more robust when enforced
+consistently by the framework or protocol rather than delegated to individual applications, consistent with Saltzer and
+Schroeder’s principles of least privilege and complete mediation [45].
+VII. D ISCUSSION
+Our analysis identifies recurring weaknesses in flightsoftware architectures that assume components will behave according to their intended roles. Prior work has introduced important security improvements, including authenticated communication, OS-level isolation, capability-based access control, protected logging, secure boot, and authenticated updates.
+These mechanisms address specific portions of the attack
+surface, but they do not collectively constrain the authority of a
+compromised onboard component across framework services,
+
+Before
+
+After
+Component
+
+Component
+
+Authenticated
+Identity
+
+Core Software
+Services
+
+Policy
+Enforcement
+
+Optional Audit
+
+Core Software
+Services
+
+Untrusted
+Recovery
+
+Verified Audit
+Trusted
+Recovery
+
+Fig. 5: Recommended security architecture in which authenticated identity and policy enforcement isolate components
+from core software services, while verified auditing and trusted
+recovery detect misuse and restore the system when necessary.
+
+inter-component communication, hardware interfaces, and persistent state. Our findings identify where these protections
+remain incomplete and provide an architectural basis for
+extending and integrating existing defenses.
+A. Architectural Remediation
+Authenticated identity and policy enforcement. Existing mechanisms protect communication links and message
+provenance [88], but do not consistently bind internal operations to the application that initiated them. Building on
+these mechanisms, flight-software frameworks should preserve
+authenticated application identity across messages, services,
+hardware access, and persistent-state changes, then enforce
+authorization policies based on that identity.
+Isolation and bounded authority. Prior work demonstrates
+OS-level partitioning and capability-based access control [89],
+[30], [90], providing mechanisms that can form the basis for
+stronger component isolation. Our findings indicate that isolation must also constrain application-specific authority over
+flight-software resources. Frameworks should therefore combine isolation with distinct credentials, resource restrictions,
+narrow interfaces, and capabilities limited to each component’s
+required messages, services, devices, and persistent objects.
+Tamper-resistant accountability. Prior work supports protected logging and telemetry-based anomaly detection [91],
+[92], [93], but these mechanisms do not necessarily provide
+mandatory attribution for security-sensitive operations across
+the flight-software architecture. Frameworks should extend
+these approaches with trusted audit points at framework,
+scheduler, communication, and hardware-access boundaries
+that record the authenticated requester, resource, action, and
+outcome in tamper-resistant logs.
+Trusted recovery and protected state. Prior work demonstrates secure boot, authenticated updates, rollback, and data
+
+recovery [91], [94], [95], [96], establishing important mechanisms for restoring software integrity. Our findings show
+that recovery must also account for security-relevant persistent
+state controlled by compromised components. Frameworks
+should therefore recover from an independently trusted baseline that verifies both security-relevant software and persistent
+state before normal operation resumes.
+Taken together, these recommendations do not replace existing flight-software security mechanisms; they show how prior
+approaches can be extended and integrated to address the architectural weaknesses exposed by our analysis. Existing work
+provides many of the necessary building blocks, but those
+mechanisms must operate as part of a coherent architecture
+that constrains component authority across system boundaries.
+Development, testing, and certification remain necessary, but
+they should not be the only safeguards against a component
+exceeding its intended role. The flight-software architecture
+should itself constrain unauthorized actions, preserve reliable
+evidence of violations, protect security-relevant state, and
+provide a trusted path to recovery.
+B. Limitations
+Construct Validity. This work evaluates cFS more deeply
+than the other frameworks. The cross-framework comparison
+relies on published documentation, API references, maintained
+repositories, and targeted source inspection rather than equivalent experiments or comprehensive source audits. Consequently, differences in documentation quality and analysis
+depth may affect the consistency of the comparison. Undocumented mission-specific controls may also provide stronger
+boundaries than those identified here.
+External Validity. The experiments were conducted in
+NOS3, which preserves the cFS application model, Software
+Bus interactions, and relevant APIs but does not reproduce
+every processor, timing, hardware-protection, communication,
+or recovery property of an operational spacecraft. The threat
+model further assumes that malicious code has already entered
+an integrated component. The results therefore characterize
+post-compromise capabilities and containment within the evaluated environment, rather than the likelihood or mechanism of
+initial compromise.
+VIII. C ONCLUSION
+Our results suggest that many previously identified flight
+software weaknesses are manifestations of a common underlying property: architectures establish trust implicitly and
+provide few mechanisms to enforce, constrain, or revoke it
+once components begin executing. By modeling trust across
+execution, identity, communication, observability, and persistence, we provide a systematic framework for reasoning about
+these behaviors and their security consequences. Meaningful
+security cannot be achieved through incremental hardening
+alone. Security-critical guarantees should be enforced by the
+architecture itself rather than delegated to individual implementations or added later through mission-specific patches.
+As satellites continue to support critical infrastructure for
+
+communication, navigation, and defense, establishing secureby-construction flight software architectures is no longer optional. We hope that this work motivates a broader reevaluation
+of trust, governance, and security in next-generation space
+systems.
+
+R EFERENCES
+[1] Space Foundation. (2025, Jul.) The space report 2025 q2. Accessed:
+2026-02-05. [Online]. Available: https://www.spacefoundation.org/2025
+/07/22/the-space-report-2025-q2/
+[2] T. Pultarova, “Starlink satellites: Facts, tracking and impact on astronomy,” https://www.space.com/spacex-starlink-satellites.html, June 2025,
+accessed: 2025-06-04.
+[3] N. Tieby, J. Khoury, and E. Bou-Harb, “Characterizing and analyzing leo
+satellite cyber landscape: A starlink case study,” in Proceedings of the
+2024 IEEE International Conference on Communications (ICC), 2024,
+pp. 1352–1357.
+[4] I. M. Siddique, “Small satellites: Revolutionizing space exploration and
+earth observation,” European Journal of Advances in Engineering and
+Technology, vol. 11, no. 3, pp. 118–124, Mar. 2024.
+[5] J. R. Kopacz, R. Herschitz, and J. Roney, “Small satellites an overview
+and assessment,” Acta Astronautica, vol. 170, pp. 93–105, 2020.
+[Online]. Available: https://www.sciencedirect.com/science/article/pii/
+S0094576520300540
+[6] NanoAvionics, “Small satellites 101,” https://nanoavionics.com/small-s
+atellites-101/, May 2025, accessed: 2025-06-04.
+[7] Peter Kogut, “Small satellites: Technology that democratizes space,” ht
+tps://eos.com/blog/small-satellites/, December 2024, accessed: 202506-04.
+[8] M. N. Sweeting, “Modern small satellites-changing the economics of
+space,” Proceedings of the IEEE, vol. 106, pp. 343–361, 3 2018.
+[9] Y. Song, D. Gnyawali, and L. Qian, “From early curiosity to space
+wide web: The emergence of the small satellite innovation ecosystem,”
+Research Policy, vol. 53, no. 2, p. 104932, 2024. [Online]. Available:
+https://www.sciencedirect.com/science/article/pii/S0048733323002160
+[10] Object Management Group, “Omg unified modeling language
+(omg uml), version 2.5.1,” Object Management Group,
+Tech. Rep. formal/2017-12-05, Dec. 2017. [Online]. Available:
+https://www.omg.org/spec/UML/2.5.1/PDF
+[11] G. Oligeri, S. Sciancalepore, and R. Di Pietro, “Gnss spoofing detection
+via opportunistic iridium signals,” in Proceedings of the 13th ACM
+Conference on Security and Privacy in Wireless and Mobile Networks,
+2020, pp. 42–52.
+[12] E. Salkield, M. Szakály, J. Smailes, S. Köhler, S. Birnbach,
+M. Strohmeier, and I. Martinovic, “Satellite spoofing from a to z:
+On the requirements of satellite downlink overshadowing attacks,” in
+Proceedings of the 16th ACM Conference on Security and Privacy in
+Wireless and Mobile Networks, ser. WiSec ’23. New York, NY, USA:
+Association for Computing Machinery, 2023, p. 341–352. [Online].
+Available: https://doi.org/10.1145/3558482.3590190
+[13] U. Planta, J. Rederlechner, G. Marra, and A. Abbasi, “Let me do it
+for you: On the feasibility of inter-satellite friendly jamming,” in 2024
+Security for Space Systems (3S), 2024, pp. 1–6.
+[14] G. Giuliari, T. Ciussani, A. Perrig, and A. Singla, “{ICARUS}: Attacking low earth orbit satellite networks,” in 2021 USENIX Annual
+Technical Conference (USENIX ATC 21), 2021, pp. 317–331.
+[15] S. Yoon, M. Kang, and J.-Y. Choi, “Security attacks against the
+availability of low earth orbit satellite networks,” in Proceedings of
+the 2023 12th International Conference on Networks, Communication
+and Computing, ser. ICNCC ’23. New York, NY, USA: Association
+for Computing Machinery, 2024, p. 64–69. [Online]. Available:
+https://doi.org/10.1145/3638837.3638847
+[16] W. Liu, Y. Li, H. Li, Y. Chen, Y. Wang, J. Lan, J. Wu, Q. Wu, J. Liu,
+and Z. Lai, “The dark side of scale: Insecurity of direct-to-cell satellite
+mega-constellations,” in 2024 IEEE Symposium on Security and Privacy
+(SP), 2024, pp. 445–464.
+[17] Viasat, Inc., “Ka-sat network cyber attack overview,” https://www.vias
+at.com/perspectives/corporate/2022/ka-sat-network-cyber-attack-overv
+iew/, Mar. 2022, accessed: 2025-06-02.
+[18] S. Peters, “Noaa blames china in hack, breaks disclosure rules,”
+Nov. 2014, dark Reading. Accessed: 2025-06-02. [Online]. Available:
+https://www.darkreading.com/cyberattacks-data-breaches/noaa-blame
+s-china-in-hack-breaks-disclosure-rules
+[19] M. Donchev and D. Smyth, “Evaluating an effective ransomware
+infection vector in low earth orbit satellites,” 2024. [Online]. Available:
+https://arxiv.org/abs/2412.04601
+[20] NASA Goddard Engineering and Technology Directorate. (2026, Feb.)
+core flight system (cfs). Page last updated February 17, 2026. [Online].
+Available: https://etd.gsfc.nasa.gov/capabilities/capabilities-listing/cfs/
+
+[21] D. J. F. Miranda, M. Ferreira, F. Kucinskis, and D. McComas, “A
+comparative survey on flight software frameworks for ‘new space’
+nanosatellite missions,” Journal of Aerospace Technology and Management, vol. 11, p. e4619, 2019.
+[22] J. Pavur, D. Moser, M. Strohmeier, V. Lenders, and I. Martinovic, “A
+tale of sea and sky on the security of maritime vsat communications,”
+in 2020 IEEE Symposium on Security and Privacy (SP). IEEE, 2020,
+pp. 1384–1400.
+[23] W. Liu, Z. Lai, Q. Wu, H. Li, Y. Weng, W. Liu, Q. Zhang, J. Li, Y. Li,
+and J. Liu, “Mind the location leakage in leo direct-to-cell satellite
+networks,” in 2025 IEEE Symposium on Security and Privacy (SP),
+2025, pp. 1064–1080.
+[24] J. Smailes, E. Salkield, S. Köhler, S. Birnbach, and I. Martinovic,
+“Dishing out dos: How to disable and secure the starlink user terminal,”
+2023. [Online]. Available: https://arxiv.org/abs/2303.00582
+[25] P. Hansen, W. C. Henry, M. G. Reith, R. Thummala, and G. Falco,
+“Guarding the galaxy: Satellite ransomware and countermeasures,” in
+2024 IEEE Aerospace Conference, 2024, pp. 1–6.
+[26] J. Willbold, M. Schloegel, M. Vögele, M. Gerhardt, T. Holz, and
+A. Abbasi, “Space odyssey: An experimental software security analysis
+of satellites,” in 2023 IEEE Symposium on Security and Privacy (SP),
+2023, pp. 1–19.
+[27] M. Boehm, S. Doran, and A. Viswanathan, “Adversarial assessment of
+the f prime flight software framework: Findings and recommendations,”
+in Proceedings of the Small Satellite Conference (SmallSat). Logan,
+UT, USA: Utah State University, 2024.
+[28] A. Schalk, L. Brodnik, and D. Brown, “Analysis of vulnerabilities in
+satellite software bus network architecture,” in MILCOM 2022 - 2022
+IEEE Military Communications Conference (MILCOM), 2022, pp. 350–
+355.
+[29] A. Schalk and D. Brown, “Detection and mitigation of vulnerabilities
+in space network software bus architectures,” in 2023 IEEE Aerospace
+Conference, 2023, pp. 1–10.
+[30] J. Furgala, S. Jero, A. Lin, and R. Skowyra, “Porting nasa’s core
+flight system to the formally verified sel4 microkernel,” in Workshop
+on Security of Space and Satellite Systems (SpaceSec), San Diego, CA,
+USA, Feb. 2026.
+[31] R. McAmis, C. Willison, R. Skowyra, and S. Mergendahl, “The
+compromised satellite peripheral dilemma,” in Proceedings of the
+Workshop on the Security of Space and Satellite Systems (SpaceSec),
+San Diego, CA, USA, Feb. 2026. [Online]. Available: https:
+//doi.org/10.14722/spacesec.2026.23045
+[32] M. Kang, S. Park, and Y. Lee, “A survey on satellite communication
+system security,” Sensors, vol. 24, no. 9, 2024. [Online]. Available:
+https://www.mdpi.com/1424-8220/24/9/2897
+[33] P. Tedeschi, S. Sciancalepore, and R. Di Pietro, “Satellite-based
+communications security: A survey of threats, solutions, and research
+challenges,” Computer Networks, vol. 216, p. 109246, 2022. [Online].
+Available: https://www.sciencedirect.com/science/article/pii/S1389128
+62200319X
+[34] S. Jero, J. Furgala, M. A. Heller, B. Nahill, S. Mergendahl, and
+R. Skowyra, “Securing the satellite software stack,” in Workshop on
+Security of Space and Satellite Systems (SpaceSec), San Diego, CA,
+USA, Mar. 2024.
+[35] K. Yuvraj and A. K. Das, “Eliminating software defined radio dependency in satellite security research: A software based attack model,” in
+2025 IEEE Space, Aerospace and Defence Conference (SPACE), 2025,
+pp. 1–5.
+[36] NASA, Core Flight Executive Application Developers Guide, National
+Aeronautics and Space Administration, 2025, cFE Application
+Developers Guide. [Online]. Available: https://github.com/nasa/cFE/bl
+ob/gh-pages/cfe-appdevelopersguide.pdf
+[37] ——, Core Flight Executive Users Guide, National Aeronautics and
+Space Administration, 2025, generated by Doxygen 1.9.1. [Online].
+Available: https://github.com/nasa/cFE/blob/gh-pages/cfe-usersguide.pd
+f
+[38] NASA Goddard Engineering and Technology Directorate, “core Flight
+System (cFS),” https://etd.gsfc.nasa.gov/capabilities/core-flight-system/,
+NASA, 2025, accessed on Jan 26, 2026.
+[39] NASA Jet Propulsion Laboratory, “F Prime (F´) Software Framework,”
+https://fprime.jpl.nasa.gov/, 2025, accessed: 2026-01-31.
+[40] NASA, “Nasa’s operational simulator for small satellites (nos3) github,”
+accessed: 2025-06-05. [Online]. Available: https://github.com/nasa/nos3
+
+[41] J. Michel, C.-L. Jaggi, and M. Welcklen, “FS: F′ flight software
+repository (picamera application),” https://github.com/FP- Mission/F
+S/tree/dev/App/PiCamera, 2021, accessed: 2026-02-04.
+[42] NASA Independent Test Capability, “Arducam mini cfs application,”
+https://github.com/nasa-itc/arducam, 2025, gitHub repository. Accessed:
+2026-02-04.
+[43] “cpu1 cfe es startup.scr,” https://github.com/nasa/nos3/blob/main/c
+fg/nos3 defs/cpu1 cfe es startup.scr, 2025, nOS3 cFS startup script
+defining application load order.
+[44] “Fsw configs,” https://github.com/nasa/nos3/tree/main/cfg, 2025, nOS3
+config file for F prime and cFS.
+[45] J. Saltzer and M. Schroeder, “The protection of information in computer
+systems,” Proceedings of the IEEE, vol. 63, no. 9, pp. 1278–1308, 1975.
+[46] Joint Task Force, “Security and privacy controls for information systems
+and organizations,” National Institute of Standards and Technology,
+Tech. Rep. NIST Special Publication 800-53 Revision 5, Sep. 2020.
+[Online]. Available: https://doi.org/10.6028/NIST.SP.800-53r5
+[47] R. Ross, V. Pillitteri, R. Graubart, D. Bodeau, and R. McQuaid,
+“Developing cyber-resilient systems: A systems security engineering
+approach,” National Institute of Standards and Technology, Tech. Rep.
+NIST Special Publication 800-160, Volume 2, Revision 1, Dec. 2021.
+[Online]. Available: https://doi.org/10.6028/NIST.SP.800-160v2r1
+[48] P. Clements, “Comparing the sei’s views and beyond approach for
+documenting software architectures with ansi/ieee 1471-2000,” Software
+Engineering Institute, Carnegie Mellon University, Pittsburgh, PA, Technical Note CMU/SEI-2005-TN-017, Jul. 2005.
+[49] NASA Goddard Space Flight Center, “Core Flight System (cFS),” https:
+//github.com/nasa/cFS, 2026, accessed January 2026.
+[50] L. Hall, “Commercial space: Nasa has an app for that,” https://www.
+nasa.gov/technology/tech-transfer-spinoffs/commercial-space-nasa-h
+as-an-app-for-that/, Feb. 2023, nASA Spinoff Publication, Accessed
+January 2026.
+[51] D. Werner, “Nasa to roll out major update to core flight software,”
+SpaceNews, February 10 2025. [Online]. Available: https://spacenews.
+com/nasa-to-roll-out-major-update-to-core-flight-software/
+[52] NASA F Prime Project, “F Prime release v4.2.2,” GitHub release, https:
+//github.com/nasa/fprime/releases/tag/v4.2.2, Apr. 2026, released Apr.
+24, 2026; accessed Jul. 22, 2026.
+[53] F Prime Project, NASA Jet Propulsion Laboratory, “Core constructs:
+Ports, components, and topologies,” https://fprime.jpl.nasa.gov/latest
+/docs/user-manual/overview/03-port-comp-top/, 2026, F Prime v4.2.2
+documentation; accessed Jul. 22, 2026.
+[54] ——, “Constructing the F' topology,” https://fprime.jpl.nasa.gov/latest
+/docs/user-manual/framework/building-topology/, 2026, F Prime v4.2.2
+documentation; accessed Jul. 22, 2026.
+[55] ——, “F' on multi-core systems,” https://fprime.jpl.nasa.gov/latest/d
+ocs/user- manual/framework/run- multi- core/, 2026, F Prime v4.2.2
+documentation; accessed Jul. 22, 2026.
+[56] ——, “Operating system abstraction layer (OSAL),” https://fprime.jpl
+.nasa.gov/latest/Os/docs/sdd/, 2026, F Prime v4.2.2 documentation;
+accessed Jul. 22, 2026.
+[57] ——, “FPP JSON dictionary specification,” https://fprime.jpl.nasa.gov/la
+test/docs/reference/fpp-json-dict/, 2026, F Prime v4.2.2 documentation;
+accessed Jul. 22, 2026.
+[58] ——, “Svc::CmdDispatcher component,” https://fprime.jpl.nasa.gov/late
+st/Svc/CmdDispatcher/docs/sdd/, 2026, F Prime v4.2.2 documentation;
+accessed Jul. 22, 2026.
+[59] ——, “The F Prime communications protocol,” https://fprime.jpl.nasa.
+gov/devel/Svc/FprimeProtocol/docs/sdd/, 2026, accessed Jul. 22, 2026.
+[60] ——, “Svc::EventManager component,” https://fprime.jpl.nasa.gov/late
+st/Svc/EventManager/docs/sdd/, 2026, F Prime v4.2.2 documentation;
+accessed Jul. 22, 2026.
+[61] ——, “Svc::PrmDb component,” https://fprime.jpl.nasa.gov/devel/Svc/
+PrmDb/docs/sdd/, 2026, accessed Jul. 22, 2026.
+[62] ——, “Svc::FileUplink component,” https://fprime.jpl.nasa.gov/latest/S
+vc/FileUplink/docs/sdd/, 2026, F Prime v4.2.2 documentation; accessed
+Jul. 22, 2026.
+[63] Kubos Corporation, “KubOS design,” Kubos 1.21.0+13 documentation,
+preserved by the KubOS Preservation Group, https://kubos-preservat
+ion-group.github.io/kubos/kubos-design.html, 2022, accessed July 22,
+2026.
+[64] ——, “KubOS ecosystem,” Kubos 1.21.0+13 documentation, preserved
+by the KubOS Preservation Group, https://kubos-preservation-group.git
+hub.io/kubos/ecosystem/index.html, 2022, accessed July 22, 2026.
+
+[65] ——, “Configuring services in KubOS,” Kubos 1.21.0+13 documentation, preserved by the KubOS Preservation Group, https://kubos-prese
+rvation-group.github.io/kubos/ecosystem/services/service-config.html,
+2022, accessed July 22, 2026.
+[66] ——, “Communications service framework,” Kubos 1.21.0+13 documentation, preserved by the KubOS Preservation Group, https://kubos-p
+reservation-group.github.io/kubos/ecosystem/services/comms-framewo
+rk.html, 2022, accessed July 22, 2026.
+[67] ——, “Kubos applications service,” Kubos 1.21.0+13 documentation,
+preserved by the KubOS Preservation Group, https://kubos-preservatio
+n-group.github.io/kubos/ecosystem/services/app-service.html, 2022,
+accessed July 22, 2026.
+[68] ——, “Hardware services,” Kubos 1.21.0+13 documentation, preserved
+by the KubOS Preservation Group, https://kubos-preservation-group
+.github.io/kubos/ecosystem/services/hardware- services.html, 2022,
+accessed July 22, 2026.
+[69] ——, “Kubos mission development,” Kubos 1.21.0+13 documentation,
+preserved by the KubOS Preservation Group, https://kubos-preservatio
+n-group.github.io/kubos/mission-dev/index.html, 2022, accessed July
+22, 2026.
+[70] ——, “Process monitoring,” Kubos 1.21.0+13 documentation, preserved
+by the KubOS Preservation Group, https://kubos-preservation-group.g
+ithub.io/kubos/ecosystem/linux-docs/monitoring.html, 2022, accessed
+July 22, 2026.
+[71] ——, “GraphQL,” Kubos 1.21.0+13 documentation, preserved by the
+KubOS Preservation Group, https://kubos-preservation-group.github.io
+/kubos/ecosystem/services/graphql.html, 2022, accessed July 22, 2026.
+[72] ——, “Logging,” Kubos 1.21.0+13 documentation, preserved by the
+KubOS Preservation Group, https://kubos- preservation- group.githu
+b.io/kubos/ecosystem/linux-docs/logging.html, 2022, accessed July 22,
+2026.
+[73] ——, “Monitor service,” Kubos 1.21.0+13 documentation, preserved by
+the KubOS Preservation Group, https://kubos-preservation-group.git
+hub.io/kubos/ecosystem/services/monitor-service.html, 2022, accessed
+July 22, 2026.
+[74] ——, “Telemetry database service,” Kubos 1.21.0+13 documentation,
+preserved by the KubOS Preservation Group, https://kubos-preservatio
+n-group.github.io/kubos/ecosystem/services/telemetry-db.html, 2022,
+accessed July 22, 2026.
+[75] ——, “Kubos linux recovery architecture,” Kubos 1.21.0+13 documentation, preserved by the KubOS Preservation Group, https://kubos-pre
+servation-group.github.io/kubos/ecosystem/linux-docs/kubos-linux-rec
+overy.html, 2022, accessed July 22, 2026.
+[76] ——, “Upgrading kubos linux,” Kubos 1.21.0+13 documentation, preserved by the KubOS Preservation Group, https://kubos-preservation-g
+roup.github.io/kubos/ecosystem/linux-docs/kubos-linux-upgrade.html,
+2022, accessed July 22, 2026.
+[77] C. Coelho, O. Koudelka, and M. Merri, “NanoSat MO Framework:
+Achieving on-board software portability,” in SpaceOps 2016 Conference.
+American Institute of Aeronautics and Astronautics, May 2016, AIAA
+Paper 2016-2624. [Online]. Available: https://doi.org/10.2514/6.2016-2
+624
+[78] European Space Agency, “Taking a look at the main class,” NanoSat
+MO Framework 2.1.0-SNAPSHOT documentation, https://nanosat- m
+o-framework.readthedocs.io/en/latest/apps/main.html, 2021, part of
+“Developing your first NMF App”; revision af1a09f8; accessed July
+22, 2026.
+[79] ——, “Software Management services implementation,” README in
+the NanoSat MO Framework Release 4.0 source tree, https://github.c
+om/esa/nanosat-mo-framework/blob/release-4.0/core/mo-services-impl/
+nmf-services-sm/README.md, 2025, accessed July 22, 2026.
+[80] C. Coelho, “AppsLauncherManager.java,” Source file in the NanoSat
+MO Framework Release 4.0 source tree, https://github.com/esa/nanos
+at-mo-framework/blob/release-4.0/core/mo-services-impl/nmf-service
+s-sm/src/main/java/esa/mo/sm/impl/provider/AppsLauncherManager.ja
+va, 2025, file copyright 2021 European Space Agency, European Space
+Operations Centre; accessed July 22, 2026.
+[81] European Space Agency, “AppsLauncherProviderServiceImpl.java,”
+Source file in the NanoSat MO Framework Release 4.0 source tree,
+https://github.com/esa/nanosat-mo-framework/blob/release-4.0/core/
+mo-services-impl/nmf-services-sm/src/main/java/esa/mo/sm/impl/provi
+der/AppsLauncherProviderServiceImpl.java, 2025, file copyright 2021
+European Space Agency, European Space Operations Centre; accessed
+July 22, 2026.
+
+[82] ——, “NanoSat MO Framework source-code repository, release 4.0,”
+GitHub repository, https://github.com/esa/nanosat-mo-framework/tree/
+release-4.0, Jun. 2025, release tag release-4.0, commit 897403a;
+released June 22, 2025; accessed July 22, 2026.
+[83] ——, “Deploying your NMF app in the SDK,” NanoSat MO Framework
+2.1.0-SNAPSHOT documentation, https://nanosat-mo-framework.readt
+hedocs.io/en/latest/apps/packaging.html, 2021, revision af1a09f8;
+accessed July 22, 2026.
+[84] A. Pasetti, The CORDET Framework: User Manual, P&P Software
+GmbH, 2023, issue 3.0; included in the CORDET Framework C2
+Implementation release v1.2.0; accessed July 22, 2026. [Online].
+Available: https://github.com/pnp-software/cordetfw/blob/v1.2.0/doc/u
+m/UserManual.tex
+[85] P&P Software GmbH, “CORDET Framework: C implementation of a
+software framework for service-oriented applications with PUS support,”
+GitHub repository, release v1.2.0, Sep. 2023, released September 2,
+2023; commit 7cc6f81; accessed July 22, 2026. [Online]. Available:
+https://github.com/pnp-software/cordetfw/releases/tag/v1.2.0
+[86] V. Cechticky, R. Ottensamer, and A. Pasetti, “Flight software
+development for the CHEOPS instrument with the CORDET
+framework,” in DAta Systems in Aerospace: Proceedings of the
+Conference Held 19–21 May 2015 in Barcelona, Spain, ser. ESA
+Special Publication, L. Ouwehand, Ed., vol. 732. European Space
+Agency, Sep. 2015, p. 43, dASIA 2015, Article 43. [Online]. Available:
+https://pnp-software.com/Publications/Dasia2015 CordetFramework C
+echtickyOttensamerPasetti.pdf
+[87] R. Ottensamer, A. Luntzer, C. Reimers, F. Kerschbaum, M. Mecina,
+P. Löschl, and R. Ferstl, “Open-source instrument flight software for
+CHEOPS,” Poster presented at AMICSA & DSP 2016, Jun. 2016,
+gothenburg, Sweden, June 15, 2016; accessed July 22, 2026. [Online].
+Available: https://indico.esa.int/event/102/contributions/37/
+[88] E. Esiner, U. Tefek, D. Mashima, B. Chen, Z. Kalbarczyk, and D. M.
+Nicol, “Message authentication and provenance verification for industrial
+control systems,” ACM Transactions on Cyber-Physical Systems, vol. 7,
+no. 4, pp. 24:1–24:28, Oct. 2023.
+[89] J. Windsor, K. Eckstein, P. Mendham, and T. Pareaud, “Time and space
+partitioning security components for spacecraft flight software,” in 2011
+IEEE/AIAA 30th Digital Avionics Systems Conference, 2011, pp. 8A5–
+1–8A5–14.
+[90] M. G. Dodson, “Capability-based access control for cyber physical
+systems,” University of Cambridge, Computer Laboratory, Tech.
+Rep. UCAM-CL-TR-963, Oct. 2021. [Online]. Available: https:
+//www.cl.cam.ac.uk/techreports/UCAM-CL-TR-963.pdf
+[91] B. Bailey, “Cybersecurity protections for spacecraft: A threat-based
+approach,” The Aerospace Corporation, Tech. Rep. TOR-2021-01333REV A, Apr. 2021. [Online]. Available: https://aerospace.org/sites/defa
+ult/files/2022-07/DistroA-TOR-2021-01333-Cybersecurity%20Protect
+ions%20for%20Spacecraft--A%20Threat%20Based%20Approach.pdf
+[92] The Aerospace Corporation, “Space threat and risk detection and
+reporting: Detection and reporting system (DARS),” The Aerospace
+Corporation, Fact Sheet OTR202500085, Nov. 2024. [Online]. Available:
+https://aerospace.org/sites/default/files/2024-11/Detection%20and%20
+Reporting%20System%20%28DARS%29.pdf
+[93] L. Ferretti, F. Longo, G. Merlino, M. Colajanni, A. Puliafito, and
+N. Tapas, “Verifiable and auditable authorizations for smart industries
+and industrial internet-of-things,” Journal of Information Security and
+Applications, vol. 59, p. 102848, 2021.
+[94] The Aerospace Corporation, “SPARTA countermeasure CM0014:
+Secure boot,” 2022, accessed: 2026-07-28. [Online]. Available:
+https://sparta.aerospace.org/countermeasures/CM0014
+[95] H. Li, V. Novruzov, N. Singh, L. Wu, M. Rostami, and A.-R. Sadeghi,
+“AegisSat: Securing AI-enabled SoC FPGA satellite platforms,” Paper
+presented at the 2025 Security for Space Systems (3S) Conference, Nov.
+2025. [Online]. Available: https://security4space.esa.int/2025/papers/46/
+[96] K. Yang, H. Wang, H. Zhu, and L. Sun, “An effective intrusion-resilient
+mechanism for programmable logic controllers against data tampering
+attacks,” Computers in Industry, vol. 138, p. 103613, 2022.
+

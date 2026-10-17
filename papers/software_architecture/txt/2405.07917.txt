@@ -1,0 +1,1304 @@
+High-level Stream Processing: A Complementary
+Analysis of Fault Recovery
+Adriano Vogel1*, Sören Henning1 , Esteban Perez-Wohlfeil2 ,
+Otmar Ertl2 , Rick Rabiser3
+
+arXiv:2405.07917v1 [cs.DC] 13 May 2024
+
+1 JKU/Dynatrace Co-Innovation Lab, LIT CPS Lab, Johannes Kepler
+
+University Linz, Linz, Austria.
+2 Dynatrace Research, Linz, Austria.
+3 LIT CPS Lab, Johannes Kepler University Linz, Linz, Austria.
+
+Abstract
+Parallel computing is very important to accelerate the performance of software
+systems. Additionally, considering that a recurring challenge is to process high
+data volumes continuously, stream processing emerged as a paradigm and software
+architectural style. Several software systems rely on stream processing to deliver
+scalable performance, whereas open-source frameworks provide coding abstraction and high-level parallel computing. Although stream processing’s performance
+is being extensively studied, the measurement of fault tolerance–a key abstraction
+offered by stream processing frameworks–has still not been adequately measured
+with comprehensive testbeds. In this work, we extend the previous fault recovery
+measurements with an exploratory analysis of the configuration space, additional experimental measurements, and analysis of improvement opportunities.
+We focus on robust deployment setups inspired by requirements for near real-time
+analytics of a large cloud observability platform. The results indicate significant
+potential for improving fault recovery and performance. However, these improvements entail grappling with configuration complexities, particularly in identifying
+and selecting the configurations to be fine-tuned and determining the appropriate values for them. Therefore, new abstractions for transparent configuration
+tuning are also needed for large-scale industry setups. We believe that more
+software engineering efforts are needed to provide insights into potential abstractions and how to achieve them. The stream processing community and industry
+practitioners could also benefit from more interactions with the high-level parallel programming community, whose expertise and insights on making parallel
+programming more productive and efficient could be extended.
+Keywords: Abstractions, benchmarking, fault tolerance, stream processing
+
+1
+
+1 Introduction
+Stream processing embodies a computing paradigm and architectural pattern tailored for constructing distributed, event-driven software systems capable of handling
+immense volumes of data with minimal latency [1]. Contemporary stream processing
+paradigms empower software engineers to encapsulate their application’s operational
+logic into abstract, high-level representations within directed acyclic graphs (DAGs).
+This level of abstraction eliminates the need for explicit definition of the physical execution plan and it is facilitated by mature, open-source stream processing frameworks
+like Spark [2], Flink [3], and Kafka Streams [4]. These frameworks support developers in building highly scalable and efficient applications that process continuous data
+streams of massive volume. The frameworks provide high-level APIs and domainspecific languages to define operations such as filtering, transforming, aggregating, and
+merging data streams.
+
+1.1 Research Problem and Motivation
+Large industry companies frequently use and contribute to stream processing frameworks such as Flink, Kafka Streams, or Spark. In contrast to more heavyweight standalone systems such as Flink or Spark, Kafka Streams is a lightweight programming
+library that can easily be integrated into existing applications [5].
+Kafka Streams can provide simplicity and coding productivity to developers to
+write business logic for their stream processing applications without implementing and
+managing the underlying infrastructure. This is mostly due to Kafka Streams’ highlevel API that abstracts away much of the complexity of dealing with Kafka’s lowerlevel APIs. Hence, Kafka Streams’ is particularly interesting for use cases beyond pure
+analytics systems, for example, implementing core business logic in an event-driven
+microservice-based architecture [6, 7].
+Despite the great potential of Kafka Streams, the architecture that is tightly coupled with the Apache Kafka messaging system (or at least its protocols and APIs)
+implies a limited feature set compared to other systems. Moreover, Kafka Streams’
+functional (e.g., fault recovery) and non-functional requirements (e.g., performance)
+are still limited in comparison to its related approaches [8]. Several works have been
+published that evaluate the performance of distributed stream processing frameworks [7, 9, 10] or optimizations [1, 11, 12]. Beyond measuring performance metrics
+such as throughput and latency, fault tolerance stands as a critical requirement for
+continuously operating production systems. Various levels of unpredictable failures can
+occur from the physical infrastructure to software layers [4]. Stream processing systems
+designed for continuous, low-latency processing demand swift recovery mechanisms to
+tolerate and mitigate failures effectively.
+Although fault tolerance guarantees are provided by modern stream processing
+frameworks [13], it is notable that a relevant number of studies reported fault tolerance as challenging for stream processing [9]. In our previous work [8], we provided
+a comprehensive analysis of fault recovery performance, stability, and recovery time
+in a cloud-native environment with modern open-source frameworks (Flink, Kafka
+Streams, and Spark Structured Streaming).
+
+2
+
+A relevant observation from our previous work [8] is that Kafka Streams takes
+longer to recover from failures and presents volatile behavior. For instance, Fig. 1 shows
+a scenario where periodically two random pods executing worker instances (entities
+executing the stream processing applications) are killed (see about the evaluation
+method and deployment setup in Section 3). After failures, Kafka Streams’ partition
+assignment strategy, triggered by rebalances, causes its executions to accumulate more
+lag. This significantly increases event latency. Additionally, following failures, some
+worker instances may be assigned to more partitions or to partitions with accumulated
+records. Then, some workers become overloaded while others are underutilized.
+Kafka Streams ALOS - Application input throughput (reading from kafka)
+600K
+400K
+200K
+
+Kafka Streams ALOS - Latency
+
+5.5
+4.5
+3.5
+2.5
+1.5
+0.5
+
+p50
+p90
+p99
+
+Time (Minutes)
+
+Throughput
+
+300K
+200K
+100K
+0K
+5.5
+4.5
+3.5
+2.5
+1.5
+0.5
+
+Spark Struc Str ALOS Latency
+p50
+p90
+p99
+
+Kafka Streams ALOS - Input Lag
+
+Million records
+Lag
+
+Lag
+
+Flink ALOS - Input Lag
+12M
+8M
+4M
+
+Throughput
+Failure injected
+
+Spark Struc Str ALOS - Application output throughput (written to kafka)
+output (r/s)
+
+Throughput
+
+12M
+8M
+4M
+
+Spark Struc Str ALOS - Input Lag
+
+Million records
+Lag
+
+p50
+p90
+p99
+
+300K
+200K
+100K
+0K
+
+Latency (s)
+
+output (r/s)
+
+Flink ALOS - Latency
+
+5.5
+4.5
+3.5
+2.5
+1.5
+0.5
+
+Spark Struc Str ALOS - Application input throughput (reading from kafka)
+600K
+400K
+200K
+
+Kafka Streams ALOS - Application output throughput (written to kafka)
+
+Throughput
+
+Latency (s)
+
+Latency (s)
+
+output (r/s)
+
+Flink ALOS - Application output throughput (written to kafka)
+300K
+200K
+100K
+0K
+
+Throughput
+Failure injected
+
+Input (r/s)
+
+Throughput
+Failure injected
+
+Input (r/s)
+
+Input (r/s)
+
+Flink ALOS - Application input throughput (reading from kafka)
+600K
+400K
+200K
+
+Time (Minutes)
+
+12M
+8M
+4M
+
+Million records
+
+Time (Minutes)
+
+Fig. 1: Two random pods executing worker instances are killed [8].
+
+Research Problem 1 tackled in this paper is how to improve Kafka Streams’
+fault recovery. During our investigation of the causes of the suboptimal fault recovery
+and rebalancing, we noticed a large configuration space that can be tuned and provide
+improvements. 1 However, it is usually complex for programmers and even system
+experts to understand and tune configurations of such large scale systems. Moreover, it
+is difficult to achieve configurations’ generalization. Therefore, Research Problem 2
+is related to understanding which configurations should be changed, to what values,
+and how this can be made more generic.
+
+1.2 Contributions
+This paper extends the fault recovery measurements with an exploratory analysis
+of the configuration space, experimental measurements, and analysis of improvement
+opportunities for robust deployment setups inspired by requirements for near real-time
+analytics of a cloud observability platform. We provide the following contributions:
+• An extension of our experimental analysis [8], providing a novel analysis of the
+experimental results, an exploratory analysis of the configuration space, and its
+impact on performance and fault recovery capabilities.
+• An extension of our method for automatic detection of failures and recovery [8].
+• Results discussion on fault recovery implications on industry deployments, configurations abstractions, and future research directions.
+1
+
+https://kafka.apache.org/documentation/streams/developer-guide/config-streams.html
+
+3
+
+2 Background and Related Work
+This section introduces the fundamental concepts of modern stream processing
+frameworks, fault tolerance concepts, and overviews the state of the art.
+
+2.1 Distributed Stream Processing
+Stream processing frameworks perform operations such as filterings, transformations,
+or aggregations in near real-time on continuous streams of data [1]. State-of-the-art
+frameworks are designed for high throughput and low-latency processing, while also
+scaling with massive amounts of data [7, 13]. To address these requirements, they run
+in a distributed fashion on commodity hardware, nowadays often in managed cloud
+environments. A key advantage of stream processing frameworks is that they provide
+dataflow models that abstract aspects such as cluster management, state management,
+and time semantics from their users [14]. With such models, engineers describe the
+processing logic in DAGs of processing operators. The frameworks allow the initiation
+of multiple worker instances across various compute nodes with multiple threads, each
+instance handling a distinct portion of the data.
+While the isolated processing of data records remains unaffected by the assignment
+of data portions to worker instances, processing that depends on previous data records,
+such as aggregations, requires state management. Similar to the MapReduce [15] programming model, keys are assigned to records before a stateful operation. This allows
+the stream processing frameworks to route all records with the same key to the same
+instance, where state synchronization among instances can be avoided. When a processing operator modifies the key of a record and a subsequent operator performs a
+stateful operation, the framework divides the dataflow graph into subgraphs that can
+be independently processed by different worker instances. Popular stream processing
+frameworks include Apache Flink [3], Apache Kafka Streams [4], and Apache Spark
+with its Structured Streaming engine [2].
+
+2.2 Fault Tolerance
+Achieving consistency in stream processing has posed a longstanding research challenge, which is partly attributed to the lack of a formal problem specification [4].
+Although executions can be subject to many failures, we expect computing systems
+to produce correct results despite the failures. Such a requirement instigated research
+on fault tolerance, where notable advances achieved in distributed systems are applied
+to stream processing [4].
+In the absence of fault tolerance, stream processing applications would be forced
+to restart data processing from scratch whenever there is a loss due to a failure.
+Given that applications may have varying fault tolerance needs, the stream processing
+domain focuses on different processing semantics that precisely describe how a system
+is affected by failures [13]. The relevant terms to characterize the fault tolerance semantics guarantees are at-most-once semantics (AMOS), at-least-once semantics (ALOS),
+and exactly-once semantics (EOS). Currently, the majority of stream processing applications demand reliable executions with strong semantics guarantees. Thus, AMOS is
+obsolete [13] and we focus on ALOS and EOS.
+4
+
+At-least-once semantics ensure that the system maintains consistent results even
+in the event of failures, preventing data loss. However, during recovery, duplicate
+output may occur as records might be processed more than once [13]. The frequency
+of such duplicates largely depends on the system’s implementation, the type of failure
+encountered, and the timing of the failure during execution. Additionally, handling
+potential duplicates can be accomplished externally, for instance, through downstream
+systems filtering duplicates or database overwrites. With effective implementations,
+the fault tolerance guarantee provided by ALOS can be comparable to EOS.
+Exactly-once semantics refers to the ability of the system to process the records
+exactly once without lost or duplicated results even under failures. Therefore, EOS
+requires additional implementation and has a performance impact on records processing [16]. In this paper, we focus on semantics guarantees regarding the system output
+because this is the most relevant for the majority of use cases and also covers the
+guarantees in the internal state updates. The stream processing frameworks provide
+different recovery semantic guarantees. This is important because the required guarantee varies according to the stream processing application and its use cases. In some
+scenarios, guaranteeing exactly-once can be of paramount importance, e.g., avoiding
+duplicate alerts in an observability platform. In other cases, at-least-once with rarely
+duplicated outputs is not equally detrimental, e.g., an information dashboard that
+receives twice the same CPU metric of a timestamp. Importantly, correct fault recovery is a crucial component of fault tolerance. While fault recovery focuses on restoring
+normal operation after a failure, fault tolerance aims to prevent downtime for high
+availability.
+
+2.3 Related Work
+Although many studies have presented various experimental evaluations of fault
+recovery in stream processing [9], a relevant one is [16]. It dives into the implementation, performance, and efficiency of fault recovery in four state-of-the-art stream
+processing frameworks: Flink, Kafka Streams, Spark Streaming, and Spark Structured Streaming. In addition, they evaluated the behavior of these frameworks under
+different types of failures and settings, including master failure with and without highavailability setups, driver failures for Spark frameworks, worker failure with or without
+exactly-once semantics, and application failures.
+Wang et al. [4] explain Kafka Streams’ processing logic and demonstrate how Kafka
+Streams behaves in practice with large-scale deployments and performance insights
+exhibiting its flexible and low-overhead trade-offs. Wang et al. [17] propose a taxonomy
+of fault tolerance in stream processing. They also propose an evaluation framework
+tailored for fault tolerance, demonstrating experimental results on two representative
+open-source stream processing frameworks.
+The studies mentioned above fail to offer an updated and comprehensive analysis
+of the detrimental faults that may occur in production setups. In this paper, we
+extend our previous work to tackle the research gaps discussed in [8]. We specifically
+concentrate on further analyzing the experimental results, exploring the configuration
+space for potential improvements, and assessing their impact on performance and fault
+recovery capabilities. Section 3 describes our experimental method.
+5
+
+3 Experimental Method
+This section describes our proposed evaluation method and setup.
+
+3.1 Application Benchmark
+ShuffleBench [10] is a benchmark for evaluating the performance of modern stream
+processing frameworks. It focuses on use cases where stream processing frameworks are
+mainly employed for shuffling (i.e., re-distributing) data records to perform state-local
+aggregations, while the actual aggregation logic is considered as a black-box software
+component. ShuffleBench is inspired by requirements for near real-time analytics of
+a large cloud observability platform, but it is highly configurable to allow domainindependent evaluations. It comes as a ready-to-use open-source software2 utilizing
+existing Kubernetes tooling and providing implementations for different state-of-theart stream processing frameworks.
+ShuffleBench adopts and extends the benchmarking framework Theodolite [18] to
+automate the benchmark execution in Kubernetes-based cloud environments. In short,
+data records are read from a messaging system (Kafka in our case), assigned to keys,
+and shuffled such that all records having the same key are forwarded to the same
+worker instance. There, a key-specific custom aggregation is performed and, optionally,
+an output event is created that is then written back to Kafka. We refer to our previous
+work for further details about ShuffleBench [10].
+ShuffleBench has a flexible architecture and supports several parametric configurations. In previous work, we extended ShuffleBench for fault tolerance measurements [8]. Figure 2 provides an overview of ShuffleBench’s benchmark components
+and their extension to fault tolerance, where the metrics are described in Section 3.2.
+We conduct our experimental evaluation in a Kubernetes cluster managed by the Elastic Kubernetes Service of Amazon Web Services with the following pods running in
+dedicated cloud instances: 2 load generators (m6i.xlarge instances), 2 Kafka brokers
+(m6i.2xlarge), a manager node used on Flink and Spark (m6i.large), and 8 pods for
+worker instances with 1 CPU, 3 GB of RAM (running on c5.large instances).
+In our experiments, we set up 20 000 real-time consumers that all have the same
+selectivity, which sums up to 50 %, meaning that each record is forwarded to 0.5 consumers on average. Each consumer emits an output event for every record received. To
+consume and output results, 40 input and output Kafka partitions were used to maintain a suitable parallelism level that minimizes overheads. We run each experiment
+for 125 minutes in such a way that the experiments provide meaningful quantitative
+data, test with recurrent failures injected, and have sufficient time for every subsequent
+recovery.
+ShuffleBench runs on top of stream processing frameworks. In this work, we use
+Kafka Streams (version 3.5) as the stream processing framework. Kafka Streams supports ALOS by default, which is the fault recovery guarantee used in this work. Kafka
+Streams provides fault recovery with its strong integration with Kafka. Kafka acts as
+a messaging layer to safeguard state information. In-memory state stores are associated with a replicated changelog topic within Kafka, which tracks state updates. Kafka
+2
+
+https://github.com/dynatrace-research/ShuffleBench
+
+6
+
+Quality
+
+Throughput
+
+Latency
+
+Scalability
+
+Metric
+
+Processed Records/Bytes
+Per Second
+
+End-to-End
+Event Time
+
+Load Cap./
+Resource D.
+
+Recovery time
+
+Fault recovery
+stability
+
+Resiliency to
+failures
+
+...
+
+Sustainable
+Throughput
+
+End-to-End
+Event Time
+
+Theodolite
+
+Throughput,
+latency
+
+Recurrent
+failures
+
+Pods kills and
+crashes
+
+...
+
+Measurement
+Method
+
+Ad-hoc
+Throughput
+
+ShuffleBench
+Architecture
+
+Fault Tolerance
+
+# consumers
+
+Σ selectivity
+
+...
+
+state size
+
+output rate
+
+frequency
+
+record size
+
+Task Sample
+ShuffleBench
+Load Generator
+
+Fig. 2: Overview of ShuffleBench benchmark components [8].
+
+Streams applications are divided into multiple tasks, where each task is responsible for
+processing a subset of the input data partitions. Whenever a task interacts with the
+store, it maintains a changelog. If a task encounters failure, the system automatically
+restarts it on one of the remaining worker instances. The state stores can be restored
+by replaying their changelog, ensuring data consistency [4]. Kafka Streams’ commit
+interval was set to 2 seconds.
+
+3.2 Metrics
+We collected several metrics of the benchmarking application. The metric to measure
+processing speed is throughput, measured in records processed per time unit and collected every second as a moving average of the last 5 seconds. A higher throughput
+is usually desired in many use cases as it directly maps to the costs for operating
+the stream processing application in elastic cloud environments. We measure input
+throughput which refers to consuming records from the Kafka input topic, and output
+throughput which is the application output written into another Kafka topic. We also
+measure event latency (the lower latency tends to be better) as an average of a 10second window. We show latency percentiles to measure the distribution of event times:
+the median (p50), 90th percentile (p90), and 99th percentile (p99). The latency measurements using the percentiles collected during the runtime are also complemented
+with the median latency from the entire execution. We use the median latency of the
+entire execution because this can provide a complementary view of latency during the
+entire execution. We also measure the consumer lag corresponding to the number of
+records buffered in the input topic.
+The fault recovery on stream processing is measured with the metrics of fault
+recovery performance, and the median fault recovery time. We also show the CPU utilization from the cloud instances that run the worker pods (collected every 2 seconds).
+To enhance visual clarity, the CPU utilization is displayed using a 10-value moving
+window average.
+
+7
+
+3.3 Failure Injection Scenarios
+
+Logical architecture
+
+Figure 3 illustrates the used architecture and the failure scenario. The application
+benchmark (see Section 3.1) runs on a microservice-based architecture provided by
+Kubernetes pods, where the pods are executed on top of virtual machines. The application benchmark logical architecture is executed on worker pod instances,3 which
+in this example with Kafka Streams as the stream processing framework. In perfect execution conditions, the application executes without any disturbance from the
+infrastructure. However, in reality, many entities can fail [4]. Pods kill is the scenario
+considered in this paper, where random pods executing worker instances are deleted,
+which is illustrated in Fig. 3 when a pod is killed at a given moment of the execution.
+
+Deployment architecture
+
+Pod 1
+Worker instance 1
+
+X
+Pod 2
+
+Worker instance 2
+
+Pod N
+
+...
+
+Worker instance N
+
+Fig. 3: High-level view of ShuffleBench’s execution with a pod failure.
+
+It is important to note that when the pods are no longer accessible, both the records
+they were processing and their associated state are lost. Therefore, the frameworks
+have to trigger recovery from such a failure. Deployed with Kubernetes, new pods will
+be created and added to the pool of worker instances within an interval of seconds
+(usually taking from 2 to 10 seconds). We experimented with killing 1, 2, and 4 worker
+pods at once. Such values were determined to simulate simple and critical failure
+scenarios. Such failures are recurrently injected every 12 minutes to evaluate the fault
+recovery stability. This interval was defined for a reasonable recovery time between
+failures and also to avoid unnecessary long executions that would waste resources.
+This work uses experimental scenarios inspired by chaos engineering [19]. Failures
+are injected using Chaos Mesh,4 an open-source chaos engineering platform integrated
+with the Kubernetes deployment.
+3
+The actual mapping varies according to the stream processing framework execution model and
+scheduling.
+4
+https://github.com/chaos-mesh/chaos-mesh
+
+8
+
+3.4 Configuration Space Explored
+Considering the research problems tackled in this work (see Section 1.1) and the large
+configuration space available,5 we are interested in exploring the potential of tuning
+configurations to improve the recovery speed, performance after failures, and avoid the
+demands of additional computing resources. From Kafka Streams’ community, one of
+the configurations mostly tuned in production is adding standby replicas.6 In practice,
+standby replicas demand much more resources. Therefore, we are interested in other
+configurations that can still improve fault recovery without demanding more resources,
+which would still be a comparable approach to other stream processing frameworks.
+Investigating the causes of the performance overhead in Kafka Streams’ rebalance protocol, we noticed that one of the main reasons is that the convergence is too
+slow after failures. The failure of worker instances triggers a rebalance, where then
+the partitions affected by failure are usually unevenly redistributed to the remaining
+instances. After a redistribution, follow-up rebalances are needed to achieve an even
+partition distribution to improve the load balance.7 However, the first Kafka Streams’
+rebalance is only triggered 10 minutes after the failure with the default configurations.
+In our exploratory research and interactions with the community experts, we noted
+that this default period can be changed with the probing.rebalance.interval.ms configuration, which represents the maximum waiting period before initiating a rebalance,
+aimed at verifying the readiness of warm-up replicas for them to be deemed sufficiently
+up to date to tasks reassignment. When a given task needs to be moved to another
+worker instance, a warm-up replica is placed in the destination worker instance before
+it receives a task reassignment. Hence, the worker instance can “warm-up” the state in
+the background without interrupting the active processing, having a smooth transition.
+In this work, we extend the fault recovery measurements with an alternative Kafka
+Streams approach with configuration tuning. Specifically, we evaluate a shorter rebalance interval set to a minimum of 1 minute, and we allow more warm-up replicas up
+to a value equal to the parallelism level (8) used in our experiments. These configurations can in theory speed up the fault recovery by being faster (shorter rebalance
+interval) and more robust rebalances (more warm-up replicas enable more tasks to be
+migrated per rebalance), which can enable an optimal number of partitions distribution to the worker instances available. An optimal distribution can provide a true fault
+recovery with load balance and improve the application performance. We compare
+Kafka Streams with tuning (abbreviated Kafka Streams w/ tuning) to Kafka Streams
+using default executions (referred to as Kafka Streams default).
+Although many other configurations and values could be evaluated, the main goal
+of this work is to measure the potential gains of these configurations in a robust
+benchmarking setup. Moreover, we discuss in Section 6 what can be improved in the
+current and future approaches.
+5
+
+https://kafka.apache.org/documentation/streams/developer-guide/config-streams.html
+The aim is to establish a predetermined number of replicas per store and maintain their synchronization,
+contingent upon a sufficient number of operational worker instances. In the event of task recovery within
+worker instances, priority is assigned to those equipped with standby replicas tailored to the specific task.
+7
+The number of rebalances necessary to achieve even partitions’ distribution can vary significantly.
+6
+
+9
+
+4 Fault Recovery Performance
+This section intends to demonstrate the potential impacts of faults and their recovery
+on the different approaches, Kafka Streams default and Kafka Streams with tuning.
+Figure 4 shows how the executions behave when pods executing worker instances
+are killed (represented by the red line). To have more comprehensive characterizations,
+we present results with three failures that occur periodically every 12 minutes. It is
+also important to note that the plots show different metrics (see y-axis labels) over
+time. When a failure occurs, the worker instance impacted is lost. Then, the Kubernetes infrastructure creates a new pod that is added to the pool of worker instances.
+Moreover, the stream processing frameworks are expected to start scheduling computations to new worker instances. This is done in Kafka Streams by rebalancing and
+assigning partitions to new worker instances.
+Kafka Streams (w/ tuning) execution with 1 pod killed - Application input throughput (reading from kafka)
+Failure injection
+Throughput
+
+200K
+
+Input (r/s)
+
+Input (r/s)
+
+Kafka Streams (default) with 1 pod killed - Application input throughput (reading from kafka)
+400K
+
+200K
+
+0K
+
+0K
+
+Kafka Streams (w/ tuning) execution with 1 pod killed - Total lag in the input topic
+records
+Total lag
+
+5M
+
+p50
+p90
+p99
+
+CPUs utilization (%)
+
+10 2
+80
+60
+40
+20
+
+Kafka Streams (default) with 1 pod killed - Worker nodes CPUs Utilization
+
+Time (Minutes)
+
+5M
+
+Kafka Streams (w/ tuning) execution with 1 pod killed - Application output throughput (written to kafka)
+Throughput
+
+Kafka Streams (w/ tuning) execution with 1 pod killed - Latency
+p50
+p90
+p99
+
+100
+10 1
+10 2
+
+CPUs utilization (%)
+
+Kafka Streams (default) with 1 pod killed - Latency
+10 1
+
+records
+
+10M
+
+200000
+150000
+100000
+50000
+
+seconds (log scale)
+
+Throughput
+
+output (r/s)
+
+Kafka Streams (default) with 1 pod killed - Application output throughput (written to kafka)
+
+200000
+150000
+100000
+50000
+
+seconds (log scale)
+
+output (r/s)
+
+Total lag
+
+Kafka Streams (default) with 1 pod killed - Total lag in the input topic
+10M
+
+100
+
+Failure injection
+Throughput
+
+400K
+
+80
+60
+40
+20
+
+Kafka Streams (w/ tuning) execution with 1 pod killed - Worker nodes CPUs Utilization
+
+Time (Minutes)
+
+Fig. 4: Fault recovery characterization: Random pods executing worker instances are
+killed. Default Kafka Streams (left side) and Kafka Streams w/ tuning (right side).
+
+Comparing the approaches, it is notable in Fig. 4 that the default execution
+achieves a stabler execution in terms of throughput and latency. Moreover, the latency
+seemingly stabilizes quicker in the default approach after the failures. However, the p90
+and p99 latencies do not normalize after the second failure in Kafka Streams default
+execution. For instance, the average latency p90 stabilized after the second failure is
+83.99 milliseconds (ms), while the reference one before the first failure is 60.81 ms
+(32.03% lower). This is due to the known limitation in the rebalancing protocol (see
+Section 1.1). Another aspect of such a limitation can be noted in imbalances in the
+worker nodes’ CPUs utilization after the second failure.
+In contrast, the execution with configuration tuning returns to latencies comparable to the ones before the failure. This is due to the earlier rebalances and optimal
+partition distribution provided with the tuned configurations (shorter rebalance interval and faster task migration). Moreover, evidence supporting the improvements is
+the fact that after the failures the Kafka Streams w/ tuning execution achieves a similar CPUs utilization in the worker nodes, which indicates a balanced assignment of
+partitions and tasks to worker instances.
+
+10
+
+Figure 5 shows the scenario where two random pods executing worker instances are
+killed. We expect this scenario to be more challenging as more workers failing means
+that more state can be lost and more records need to be replayed from the input
+source and reprocessed. Compared to Fig. 4, Fig. 5 shows similar performance, fault
+recovery, and resource consumption observations. However, it is noticeable in Fig. 5
+that Kafka Streams default’s execution already faces significant imbalances after the
+first failure. On the other hand, the Kafka Streams w/ tuning execution recovers after
+failures to a state comparable to the reference. However, the correct recovery comes
+at the expense of slight fluctuations in the first minutes after failures, which is due to
+the rebalances necessary to achieve an optimal distribution of partitions and tasks.
+Kafka Streams (w/ tuning) execution with 2 pods killed - Application input throughput (reading from kafka)
+Failure injection
+Throughput
+
+200K
+
+Input (r/s)
+
+Input (r/s)
+
+Kafka Streams (default) with 2 pods killed - Application input throughput (reading from kafka)
+400K
+
+200K
+
+0K
+
+0K
+
+Kafka Streams (w/ tuning) execution with 2 pods killed - Total lag in the input topic
+records
+Total lag
+
+5M
+
+10 2
+80
+60
+40
+20
+
+Kafka Streams (default) with 2 pods killed - Worker nodes CPUs Utilization
+
+Time (Minutes)
+
+5M
+
+Kafka Streams (w/ tuning) execution with 2 pods killed - Application output throughput (written to kafka)
+Throughput
+
+Kafka Streams (w/ tuning) execution with 2 pods killed - Latency
+p50
+p90
+p99
+
+100
+10 1
+10 2
+
+CPUs utilization (%)
+
+p50
+p90
+p99
+
+records
+
+10M
+
+200000
+150000
+100000
+50000
+
+seconds (log scale)
+
+Throughput
+
+output (r/s)
+
+Kafka Streams (default) with 2 pods killed - Application output throughput (written to kafka)
+
+Kafka Streams (default) with 2 pods killed - Latency
+100
+10 1
+
+CPUs utilization (%)
+
+seconds (log scale)
+
+output (r/s)
+
+Total lag
+
+Kafka Streams (default) with 2 pods killed - Total lag in the input topic
+10M
+
+200000
+150000
+100000
+50000
+
+Failure injection
+Throughput
+
+400K
+
+80
+60
+40
+20
+
+Kafka Streams (w/ tuning) execution with 2 pods killed - Worker nodes CPUs Utilization
+
+Time (Minutes)
+
+Fig. 5: Fault recovery characterization: Two random pods executing worker instances
+are killed. Default Kafka Streams (left side) and Kafka Streams w/ tuning (right side).
+
+Figure 6 shows a scenario of more detrimental failures where four worker pods are
+killed at the same time. Generally, the results from Fig. 6 complement and further support the observations from the scenarios of one and two pods killed. It is also notable
+in Fig. 6 that the Kafka Streams execution with default configurations accumulates
+more lag after failures. Moreover, in terms of output throughput after the failures, the
+default execution has a lower throughput and takes longer to normalize.
+In addition to characterizing the approaches’ fault recovery capabilities, insights
+from the quality of services (QoS) metrics are also relevant. Considering the relevance
+of low latency for stream processing applications, Fig. 7 shows the median latency of
+the representative p90 percentile from the entire executions, where such executions
+were characterized in Figs. 4 to 6. The median latency is shown as it can capture the
+stable latency values after the failure recovery, where we expect such a period to be
+higher than the failure recovery. Therefore, the median latency can provide relevant
+values by leaving out the latency measurements recorded during fault recovery.
+The results from Fig. 7 demonstrate that the median latency can be stable across
+different failures. Moreover, Kafka Streams w/ tuning achieves a significantly lower
+(better) median latency than the default approach with contrasts ranging from 41.38%
+to 52.07%. The executions of Kafka Streams w/ tuning show higher values in the upper
+interquartile range (75% upper quantile), which is due to the slightly longer recoveries
+with very high latencies due to the many rebalances necessary.
+11
+
+Kafka Streams (w/ tuning) execution with 4 pods killed - Application input throughput (reading from kafka)
+Failure injection
+Throughput
+
+200K
+
+Input (r/s)
+
+Input (r/s)
+
+Kafka Streams (default) with 4 pods killed - Application input throughput (reading from kafka)
+400K
+
+Failure injection
+Throughput
+
+400K
+200K
+
+0K
+
+0K
+
+Kafka Streams (w/ tuning) execution with 4 pods killed - Total lag in the input topic
+records
+Total lag
+
+Total lag
+
+Kafka Streams (default) with 4 pods killed - Total lag in the input topic
+10M
+5M
+
+records
+
+10M
+5M
+
+10 2
+80
+60
+40
+20
+
+Kafka Streams (default) with 4 pods killed - Worker nodes CPUs Utilization
+
+Time (Minutes)
+
+Kafka Streams (w/ tuning) execution with 4 pods killed - Latency
+p50
+p90
+p99
+
+100
+10 1
+10 2
+
+CPUs utilization (%)
+
+p50
+p90
+p99
+
+Throughput
+
+200000
+150000
+100000
+50000
+
+seconds (log scale)
+
+Kafka Streams (default) with 4 pods killed - Latency
+100
+
+output (r/s)
+
+Kafka Streams (w/ tuning) execution with 4 pods killed - Application output throughput (written to kafka)
+Throughput
+
+10 1
+
+CPUs utilization (%)
+
+seconds (log scale)
+
+output (r/s)
+
+Kafka Streams (default) with 4 pods killed - Application output throughput (written to kafka)
+200000
+150000
+100000
+50000
+
+Kafka Streams (w/ tuning) execution with 4 pods killed - Worker nodes CPUs Utilization
+
+80
+60
+40
+20
+
+Time (Minutes)
+
+Fig. 6: Fault recovery characterization: Four random pods executing worker instances
+are killed. Default Kafka Streams (left side) and Kafka Streams w/ tuning (right side).
+
+Median latency (ms)
+
+120
+
+225
+
+8020
+
+9934
+
+9895
+
+9938
+
+100
+80
+60
+40
+20
+1 pod kill
+2 pods kill
+Kafka Streams (default)
+Kafka Streams (w/ tuning)
+
+4 pods kill
+Interquartile range
+
+Fig. 7: Median latency of the p90 percentile.
+
+5 Fault Recovery Time
+The precise fault recovery time is another relevant metric. Considering that there is
+a lack of approaches and tools to automate the measurements of fault recovery times
+across many failures, we show a proposed detector in previous work [8]. The detector
+considers the moving average and standard deviation to automatically detect the failure as well as the time to recovery. The detector extracts the expected average and
+standard deviation for both throughput and latency based on the regular processing
+behavior that follows the warm-up period. After the execution warm-up, there is a
+reference time frame before the first failure that is used as stable behavior.
+
+12
+
+kafka_streams_(default)-1-pod-kill
+Reference
+Injection
+Recovery
+
+Throughput (r/s)
+
+150K
+100K
+50K
+0K
+
+Throughput (r/s)
+
+200K
+
+kafka_streams_(default)-2-pods-kill
+Reference
+Injection
+Recovery
+
+150K
+100K
+50K
+0K
+
+Throughput (r/s)
+
+kafka_streams_(default)-4-pods-kill
+Reference
+Injection
+Recovery
+
+250K
+200K
+150K
+100K
+50K
+0K
+
+Throughput (r/s)
+
+kafka_streams_(w_tuning)-1-pods-kill
+Reference
+Injection
+Recovery
+
+150K
+100K
+50K
+0K
+
+Throughput (r/s)
+
+kafka_streams_(w_tuning)-2-pods-kill
+
+250K
+Throughput (r/s)
+
+Reference
+Injection
+Recovery
+
+250K
+200K
+150K
+100K
+50K
+0K
+
+kafka_streams_(w_tuning)-4-pods-kill
+Reference
+Injection
+Recovery
+
+200K
+150K
+100K
+50K
+0K
+
+Time (Minutes)
+
+Fig. 8: Characterization of our approach for automating measurements of fault recovery times. Stable behavior is depicted as square shapes that are references for training.
+Failures are highlighted in red, while recovery detections are highlighted in green.
+
+In short, the detector marks as the point of failure injection the cases where the
+moving average and standard deviation exceed a parameterized threshold value. Afterward, the other points of failure are strictly marked every 12 minutes, which is also a
+parametric value defined according to our experimental method.
+Similarly, the recovery time was detected when the estimators returned within
+the same threshold (15%) for a larger time frame (at least 160 seconds). We expect
+13
+
+700
+600
+500
+400
+300
+200
+100
+
+Recovery time (s)
+
+Recovery time (s)
+
+throughput and latency to stabilize after the recovery time, which should be only
+detected when the execution returns to a normal state. It is important to note that
+our approach for detection failures and their recovery was configured to automate our
+measurements. Considering that it is parametric and customizable, we expect it to
+be also applicable to wider scenarios.8 Moreover, we believe that there are no ground
+truths about these parameter values used. In fact, we focus more on having a formal
+parametric method to automate the measurements that is less arbitrary and avoids
+biased analysis. The values detected can be an estimation of the recovery time that
+we expect to be ascertained with visual inspections in the metrics traces.
+Figure 8 exemplifies the trace of automatically detected failures and their recoveries. For conciseness, we show here only the throughput case. It is notable in Fig. 8
+that the recovery time can vary between recurrent failures, which is mostly due to
+what worker instances are affected, their state w.r.t. the last saved checkpoint, and
+the state size to be restored.
+Our approach to automating fault recovery times allows one to conduct relevant
+measurements and analysis. Figure 9 summarizes the results of the fault recovery
+times exemplified in Fig. 8 with output throughput and latency (p90) as the metrics.
+Moreover, Fig. 9 shows Flink’s (version 1.17) recovery time from our previous work [8],
+where Flink can be seen as the state of the art approach to be used as a baseline.
+Regarding the throughput recovery depicted in Fig. 9a, it is notable that Flink’s
+executions still achieve the fastest recovery in terms of throughput. Moreover, Kafka
+Streams’ executions with tuning can provide slight improvements in the recovery of
+the application’s output throughput, which is relevant to reducing downtimes.
+
+1 2 4 1 2 4 1 2 4
+Pods killed
+
+Kafka Streams (default)
+Kafka Streams (w/ tuning)
+
+700
+600
+500
+400
+300
+200
+100
+1 2 4 1 2 4 1 2 4
+
+Pods killed
+
+Flink
+Median
+
+Kafka Streams (default)
+Kafka Streams (w/ tuning)
+
+(a) Recovery time of the throughput.
+
+Flink
+Median
+
+(b) Recovery time of the latency p90.
+
+Fig. 9: Recovery times identified by our approach across 10 measurements per framework/configurations and pods killed scenarios.
+8
+
+We plan to share the tooling and all the parameters used as supplementary material.
+
+14
+
+The latency recovery is depicted in Fig. 9b where Flink again achieved the fastest
+recovery. In contrast, Kafka Streams’ default executions only fully recovered in the
+12-minute period (before the next subsequent failure was injected) in two cases out of
+30 failures injected. This outcome is mostly due to the slow rebalancing after failures
+causing limited latency recovery (discussed in Section 4). It is important to note
+that the decision of whether a given execution instance is recovered or not is made
+systematically by our automated approach. Moreover, the interpretation of a complete
+fault recovery can vary in other use cases or QoS requirements.
+Figure 9b shows that Kafka Streams’ executions with tuning recovered from
+failures, achieving median recovery times between 300 and 400 seconds. Finally,
+the latency recovery achieved on the execution with tuning evinces Kafka Streams’
+potential for configuration tuning. However, this comes at the expense of significant
+complexity to understand which configurations should be tuned and with what values.
+
+6 Discussion
+The performance gains achieved with the Kafka Streams w/ tuning approach is of
+paramount importance. This is mostly because the fault recovery capabilities impact
+the quality of service and are a criterion for choosing stream processing frameworks.
+However, achieving such gains is conditioned to significant complexities in understanding which configurations should be tuned and with what values, which can be a
+burden for developers. Moreover, these configurations tend to be limited in terms of
+generalizability to other frameworks and deployments.
+Frameworks such as Spark and Flink [20] received improvements in configuration tuning and abstractions for developers [20, 21]. Automatic parameter and
+configuration tuning is possible [11]. However, it is debatable whether the research
+community should continue researching approaches to tune only a unique framework.
+Generalizability is still a challenge with limited use cases of improvements.
+Another potential alternative is prompting large language models (LLMs) to automatically tune configurations [22]. However, we noticed that currently GPT-3.5 and
+industry-grade copilots such as Microsoft’s are still unable to identify the relevant
+configurations to be tuned in Kafka Streams. Our understanding is that many further
+developments are needed before LLMs are integrated and empirically evaluated for
+our concrete scenario. Training such models without previous data but using run-time
+data is another challenge that demands future studies.
+Focusing on high-level abstractions, run-time self-adaptation can also be a potential approach to release programmers from the burden of finding optimal configuration
+values. One direction is to expand what was achieved with dynamic checkpointing
+interval optimizations [23]. However, run-time self-adaptation is still limited in terms
+of which configurations can be dynamically changed at run-time [12]. However, we
+believe that more software engineering efforts are needed to provide insights into potential abstractions and how to achieve them. The research problems tackled in our work
+would also certainly benefit from the intersection with the high-level parallel programming community, whose expertise and insights on making parallel programming more
+productive and efficient could be extended to additional scenarios.
+
+15
+
+7 Conclusions
+Ensuring fault tolerance in data-intensive, event-driven applications is crucial for successful industry deployments. In this paper, we introduced an enhanced evaluation
+methodology alongside fault recovery analysis to further advance this critical aspect.
+Such an analysis was enabled by ShuffleBench’s flexible deployment [10] and extending
+from our previous work [8] the fault recovery analysis.
+Regarding the research problems, Research Problem 1 on improving Kafka
+Streams’ fault recovery was tackled as our results demonstrate significant fault recovery and performance gains. However, achieving such gains comes at the cost of
+complexities regarding what configurations should be tuned and with what values.
+Our perspective is that new or improved abstractions are also needed for transparent
+configuration tuning targeting and measuring large-scale industry setups. Therefore,
+Research Problem 2 necessitates further research and novel approaches to enhance
+the generalizability of configuration tuning and provide abstractions for developers.
+The insights from our experimental results and exploitation of potential fault recovery improvements have also a direct impact on advanced optimizations necessary in
+modern stream processing, such as run-time self-adaptations for auto-scaling. This
+connection arises from the fact that implementing run-time adaptations in distributed
+executions inherently involves fault recovery procedures. Furthermore, we believe that
+our experimental methodology possesses a level of generality that extends its utility beyond our immediate focus. Specifically, it can be applied to evaluating other
+domains demanding fault recovery in distributed systems deployed as microservices
+(e.g., in Kubernetes). This flexibility is primarily from the comprehensive nature of
+our methodology, which includes insights into the use of chaos engineering principles
+in long-running and distributed computing systems.
+We expect the threats to the validity discussed in our previous works [8, 10] to be
+also applicable here. Relevant configurations such as the failure injection on worker
+instances and the number of affected workers were defined based on insights from
+industry deployments. In such deployments, the failure probability of worker instances
+increases due to the deployment of hundreds or thousands of them.
+We believe that future analyses are still needed. Our perspective is that Kafka
+Streams can be an appealing approach for scalability in JVM-based applications. While
+employing Kafka Streams’ standby replicas necessitates additional resources, in the
+future, we intend to assess this deployment in terms of the trade-offs between the
+advantages of fault recovery and the additional resource costs. Moreover, from a highlevel parallel computing perspective, we believe that complementary studies are needed
+also with software engineering methods to measure coding productivity with high-level
+frameworks for scalable stream processing, complementary to what is being done with
+parallel programming interfaces [24]. We also intend to extend our work to measure
+fault recovery for scenarios where exactly-once recovery guarantees are needed.
+Acknowledgements. We would like to thank the Johannes Kepler University Linz
+and Dynatrace for co-funding this research.
+
+16
+
+References
+[1] Hirzel, M., Soulé, R., Schneider, S., Gedik, B., Grimm, R.: A catalog of stream
+processing optimizations. ACM Comput Surv 46(4) (2014)
+[2] Armbrust, M., Das, T., Torres, J., Yavuz, B., Zhu, S., Xin, R., Ghodsi, A., Stoica,
+I., Zaharia, M.: Structured Streaming: A declarative api for real-time applications in Apache Spark. In: Proceedings of the 2018 International Conference on
+Management of Data, pp. 601–613. Association for Computing Machinery, New
+York, NY, USA (2018)
+[3] Carbone, P., Katsifodimos, A., Ewen, S., Markl, V., Haridi, S., Tzoumas, K.:
+Apache Flink: Stream and batch processing in a single engine. Bulletin of the
+IEEE Computer Society Technical Committee on Data Engineering 36(4) (2015)
+[4] Wang, G., Chen, L., Dikshit, A., Gustafson, J., Chen, B., Sax, M.J., Roesler,
+J., Blee-Goldman, S., Cadonna, B., Mehta, A., Madan, V., Rao, J.: Consistency
+and completeness: Rethinking distributed stream processing in Apache Kafka. In:
+SIGMOD/PODS ’21, pp. 2602–2613. Association for Computing Machinery, New
+York, NY, USA (2021)
+[5] Bellemare, A.: Building Event-Driven Microservices. O’Reilly Media, Inc, US
+(2020)
+[6] Katsifodimos, A., Fragkoulis, M.: Operational stream processing: Towards scalable and consistent event-driven applications. In: Advances in Database Technology - 22nd International Conference on Extending Database Technology, pp.
+682–685. OpenProceedings.org, Lisbon (2019)
+[7] Henning, S., Hasselbring, W.: Benchmarking scalability of stream processing
+frameworks deployed as microservices in the cloud. Journal of Systems and
+Software 208, 111879 (2024)
+[8] Vogel, A., Henning, S., Perez-Wohlfeil, E., Ertl, O., Rabiser, R.: A comprehensive
+benchmarking analysis of fault recovery in stream processing frameworks. arXiv
+preprint arXiv:2404.06203 (2024)
+[9] Vogel, A., Henning, S., Ertl, O., Rabiser, R.: A systematic mapping of performance in distributed stream processing systems. In: Euromicro Conference on
+Software Engineering and Advanced Applications, pp. 293–300 (2023). IEEE
+[10] Henning, S., Vogel, A., Leichtfried, M., Ertl, O., Rabiser, R.: Shufflebench:
+A benchmark for large-scale data shuffling operations with distributed stream
+processing frameworks. In: Proceedings of the 15th ACM/SPEC International
+Conference on Performance Engineering, p. 12 (2024). In press
+[11] Herodotou, H., Chen, Y., Lu, J.: A survey on automatic parameter tuning for big
+
+17
+
+data processing systems. ACM Comput Surv 53(2), 1–37 (2020)
+[12] Vogel, A., Griebler, D., Danelutto, M., Fernandes, L.G.: Self-adaptation on
+parallel stream processing: A systematic review. Concurr Comp 34(6) (2022)
+[13] Fragkoulis, M., Carbone, P., Kalavri, V., Katsifodimos, A.: A survey on the
+evolution of stream processing systems. VLDB 33(2), 507–541 (2024)
+[14] Sax, M.J., Wang, G., Weidlich, M., Freytag, J.-C.: Streams and tables: Two sides
+of the same coin. In: International Workshop on Real-Time Business Intelligence
+and Analytics. Association for Computing Machinery, New York, USA (2018)
+[15] Dean, J., Ghemawat, S.: MapReduce: Simplified data processing on large clusters.
+Communications of the ACM 51(1), 107–113 (2008)
+[16] Dongen, G., Poel, D.: A performance analysis of fault recovery in stream
+processing frameworks. IEEE Access 9, 93745–93763 (2021)
+[17] Wang, X., Zhang, C., Fang, J., Zhang, R., Qian, W., Zhou, A.: A comprehensive
+study on fault tolerance in stream processing systems. Front Comput Sci 16(2),
+162603 (2022)
+[18] Henning, S., Hasselbring, W.: A configurable method for benchmarking scalability
+of cloud-native applications. Empirical Software Engineering 27(6) (2022)
+[19] Basiri, A., Behnam, N., Rooij, R., Hochstein, L., Kosewski, L., Reynolds, J.,
+Rosenthal, C.: Chaos engineering. IEEE Software 33(3), 35–41 (2016)
+[20] Guo, Y., Shan, H., Huang, S., Hwang, K., Fan, J., Yu, Z.: GML: efficiently autotuning flink’s configurations via guided machine learning. IEEE Transactions on
+Parallel and Distributed Systems 32(12), 2921–2935 (2021)
+[21] Li, Y., Jiang, H., Shen, Y., Fang, Y., Yang, X., Huang, D., Zhang, X., Zhang,
+W., Zhang, C., Chen, P., et al.: Towards general and efficient online tuning for
+spark. Proceedings of the VLDB Endowment 16(12), 3570–3583 (2023)
+[22] Zhang, B., Liu, Z., Cherry, C., Firat, O.: When Scaling Meets LLM Finetuning: The Effect of Data, Model and Finetuning Method. arXiv preprint
+arXiv:2402.17193 (2024)
+[23] Geldenhuys, M.K., Pfister, B.J., Scheinert, D., Thamsen, L., Kao, O.: Khaos:
+Dynamically optimizing checkpointing for dependable distributed stream processing. In: FedCSIS, pp. 553–561 (2022). IEEE
+[24] Andrade, G., Griebler, D., Santos, R., Danelutto, M., Fernandes, L.G.: Assessing coding metrics for parallel programming of stream processing programs on
+multi-cores. In: Euromicro Conference on Software Engineering and Advanced
+Applications, pp. 291–295 (2021). IEEE
+18
+

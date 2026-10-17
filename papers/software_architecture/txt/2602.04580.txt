@@ -1,0 +1,845 @@
+Prepared for submission to JINST
+
+arXiv:2602.04580v5 [physics.ins-det] 11 Jun 2026
+
+Doberman: a modular and distributed slow control
+system for small- to medium-scale experiments
+
+Jaron Grigat,1 Darryl Masson, Marc Schumann
+Physikalisches Institut, Universität Freiburg, D-79104 Freiburg, Germany
+
+E-mail: jaron.grigat@physik.uni-freiburg.de
+Abstract: We present Doberman (Detector OBsERving and Monitoring ApplicatioN), a lightweight, modular, and open-source slow control system designed for small- to medium-scale physics
+experiments. Doberman addresses the gap between heavyweight industrial SCADA frameworks and
+ad hoc laboratory solutions by providing a flexible software architecture that supports heterogeneous
+instrumentation, distributed deployment, automated control, and robust alarm handling.
+The web-based graphical user interface Doberview provides live and continuously updated
+visualization, configuration, and control of the entire experiment, supporting both routine operation
+and rapid response to exceptional conditions. Doberman has been deployed and validated in multiple
+experimental setups, ranging from a remotely operated underground gamma-ray spectrometer to a
+large, highly instrumented liquid xenon test facility with several hundred monitored quantities.
+Doberman and Doberview are released under permissive open-source licenses, and the software, documentation, and example device integrations are publicly available.
+Keywords: Detector control systems (detector and experiment monitoring and slow control systems, architecture, hardware, algorithms, databases); Control and monitor systems online; Software
+architectures (event data models, frameworks and databases)
+ArXiv ePrint: 2602.04580
+
+1 Corresponding author.
+
+Contents
+1
+
+Introduction
+
+1
+
+2
+
+Doberman architecture
+2.1 Deployment model
+2.2 Databases
+2.3 Monitor class
+2.4 Hypervisor
+2.5 Sensors, devices, and plugins
+2.6 Pipelines
+2.7 Alarm distribution
+
+2
+3
+4
+4
+5
+6
+7
+8
+
+3
+
+Graphical user interface
+3.1 Interactive overview
+3.2 Sensor inspection and control
+3.3 Pipeline management
+3.4 Additional visualization tools
+
+9
+9
+9
+10
+10
+
+4
+
+Current deployments
+4.1 GeMSE: Remote operation of a gamma-ray spectrometer
+4.2 XeBRA: A small detector test setup
+4.3 PANCAKE: a complex, medium-scale experiment
+4.4 Operational performance and scaling
+
+12
+13
+13
+13
+15
+
+5
+
+Conclusions and outlook
+
+16
+
+1
+
+Introduction
+
+Many physics experiments rely on a slow control system to monitor and regulate auxiliary parameters
+such as voltages, currents, pressures, temperatures, rates, gas flows, or filling levels. In contrast to
+the main data-acquisition system, which records physics signals at high rates, a slow control system
+typically operates at comparatively low sampling frequencies of order 1 Hz. Despite this, its role is
+equally critical: it facilitates the operation of complex detectors, ensures stable detector conditions,
+protects sensitive equipment, provides automated alerts in case of anomalies, and supplies essential
+environmental and detector-state information used to correct and calibrate the physics data.
+For large-scale experiments, these tasks are commonly handled by industrial Supervisory
+Control and Data Acquisition (SCADA) systems or by comprehensive open-source frameworks
+such as EPICS [1, 2]. While these solutions are powerful and highly reliable, they are often too
+complex, resource-intensive, or costly for small and medium-scale laboratory experiments and R&D
+
+–1–
+
+platforms. In practice, many such setups therefore operate either with ad-hoc scripts or without a
+unified slow control infrastructure at all, which can compromise long-term stability, data integrity,
+and operational safety.
+Doberman (Detector OBsERving and Monitoring ApplicatioN) was originally developed to
+address this gap [3] and has since evolved substantially through nearly a decade of continuous
+use and development. It is a lightweight, modular, and open-source slow control system tailored
+to small and medium-scale experiments, while remaining scalable to setups with hundreds of
+monitored quantities. Its design is centered around a plugin-based architecture that allows a wide
+range of commercial and custom-built instruments to be integrated through device-specific drivers,
+while exposing a unified interface to the core system. This approach provides flexibility, simplifies
+maintenance, and enables the system to evolve as experimental setups change.
+A key design goal of Doberman is operational robustness. The system is built to tolerate
+individual device failures, communication problems, and host outages without compromising the
+overall functionality of the slow control infrastructure. Measurements, configurations, and logs
+are stored in dedicated databases, enabling both long-term traceability and prompt, continuously
+updated visualization. In addition, Doberman includes a built-in automation and alarm framework
+that can execute control actions and trigger notifications in response to abnormal conditions, thereby
+reducing the need for continuous human supervision.
+Equally critical is a responsive and intuitive graphical user interface. In practice, the personnel
+responsible for operating an experiment are not necessarily experts on the underlying slow control
+system, yet they must be able to interpret its output and react reliably in time-critical situations. A
+clear, well-structured user interface that presents relevant information at a glance and allows safe
+interaction with control elements is therefore essential for effective operation. Doberman addresses
+this requirement by providing a dedicated web-based interface that enables rapid assessment of detector status, straightforward configuration of the system, and controlled interaction with actuators,
+even under operational stress.
+Here we describe the design and implementation of the Doberman slow control system. In
+section 2 we present the overall system architecture, including the distributed deployment model, the
+database backend, the communication and supervision infrastructure, and the abstraction of devices,
+sensors, and automated control logic. The graphical user interface, Doberview, which provides live
+visualization, configuration, and interaction with the system, is described in section 3. Finally,
+section 4 summarizes several deployments of Doberman in running experiments, illustrating its
+scalability and suitability for long-term operation in heterogeneous laboratory environments.
+
+2
+
+Doberman architecture
+
+Doberman is designed to scale from compact single-host installations to distributed multi-host
+deployments. Its architecture combines a configuration database for system settings, a time-series
+database for slow control measurements, and a set of long-running processes (“Monitors”) that
+acquire data, execute automation logic, and distribute alarms.
+
+–2–
+
+Secondary Host
+
+Serial
+Device
+
+Doberman
+DeviceMonitors
+
+Sensors
+
+Ethernet
+Device
+
+User
+Ethernet Subnet
+
+Main Host
+Configuration
+
+Doberman
+Storage
+
+File
+Server
+...
+...
+
+Web Server
+
+Hypervisor
+Pipeline Monitors
+Device Monitors
+
+Figure 1. Overview of a distributed Doberman setup. A main server hosts the databases and, optionally, a
+network-mounted file system. The Hypervisor (central coordination) and PipelineMonitors (automation) typically run on the main server, while DeviceMonitors (interface to measuring devices) can be
+distributed across additional hosts to reduce cable lengths and improve resilience.
+
+2.1
+
+Deployment model
+
+In a minimal configuration, Doberman can run on a single Linux host (e.g. an industrial mini-PC)
+that connects to devices via Ethernet or a serial interface such as USB. In this context, a device
+denotes a physical instrument that provides access to one or more measured or controlled quantities,
+while a sensor represents a single such quantity (e.g. a temperature, pressure, or digital state)
+handled by the slow control system.
+In such a minimal setup, the configuration and time-series databases are typically hosted
+externally via managed database services, while the local host runs the central coordination and
+device readout processes.
+A more typical laboratory deployment, in which Doberman operates as a distributed system
+with its own on-premise database instances, is shown in Figure 1. Here, a central server hosts the
+databases and the web interface and usually runs the Hypervisor (subsection 2.4), which coordinates communication and supervises system components, as well as the Pipeline Monitors
+responsible for automation and alarm handling (subsection 2.6). The direct readout of devices is
+performed by dedicated Device Monitors (subsection 2.5), which may run on the main server,
+or on one or more secondary hosts placed close to the experimental hardware and connected to the
+same Ethernet network.
+Distributing device readout across multiple hosts improves robustness and operational flexi-
+
+–3–
+
+bility: a failure of a single host affects only the subset of sensors connected to that machine, while
+the remaining system continues to operate normally. Affected components can be restarted on
+the same or on alternative hosts without interrupting global monitoring and alarm handling. In
+multi-host installations, a network-mounted software directory can be used to ensure consistent
+software versions across all machines and to simplify updates and maintenance.
+Doberman is typically deployed within a closed and access-controlled laboratory network.
+Communication between components is therefore not encrypted by default and relies on the security
+of the underlying infrastructure.
+2.2
+
+Databases
+
+Doberman employs a dual-database architecture to clearly separate configuration information from
+time-series measurement data, allowing each database to be optimized for its specific access patterns
+and performance requirements.
+Configuration database (MongoDB). All configuration settings are stored in a MongoDB
+database [4]. A single MongoDB instance can host multiple experiments (separate databases),
+each organized into collections containing JSON-like documents. This structure provides flexibility because documents in a collection need not share identical fields, which simplifies schema
+evolution as new device types or features are added. In addition to configuration, Doberman
+stores log messages (above debug level) in MongoDB to enable centralized inspection via the web
+interface.
+Time-series database (InfluxDB). Slow control measurements are stored in an InfluxDB OSS
+v2 instance [5], which is optimized for time-series data. Similarly, a single InfluxDB instance can
+serve multiple experiments. Besides physics-relevant slow control quantities, Doberman can also
+record system-health metrics (e.g. CPU temperatures, load averages) to detect host-level issues that
+may affect reliability.
+Data retention can be configured directly in InfluxDB. For current deployments, system monitoring data are stored for 30 days, while slow control data are retained indefinitely, as storage
+requirements are modest. For instance, in the PANCAKE experiment described in subsection 4.3,
+more than one year of total operation with about 100 slow control values written per second resulted
+in less than 20 GB of stored data. For substantially larger deployments, InfluxDB provides built-in
+mechanisms to limit storage growth, for example by applying finite retention policies or by storing
+downsampled representations of older data.
+2.3
+
+Monitor class
+
+The fundamental building block of Doberman is the Monitor class. A Monitor manages multiple
+threads that run independently: each thread executes a task (e.g. reading out a sensor) and then
+sleeps for a configurable interval. This thread-based structure is used throughout Doberman for
+sensor readout, automation, supervision, and alarm distribution.
+All major components of Doberman are implemented as specialized subclasses of the Monitor
+class. These include the central coordination unit (Hypervisor); DeviceMonitors interfacing
+with physical instruments; PipelineMonitors executing automated control and data-processing
+
+–4–
+
+logic; and the AlarmMonitor, which evaluates alarm conditions and distributes notifications. The
+roles and interactions of these components are illustrated in Figure 2 and are described in detail in
+the following sections.
+
+Commands
+Data
+
+pl_alarm
+AlarmMonitor
+
+pl_convert
+PipelineMonitor
+
+alarm_1
+
+convert_1
+
+...
+
+check_shifters
+
+...
+
+Storage Database
+listen
+
+listen
+
+device_a
+DeviceMonitor
+sensor_a1
+
+...
+
+sensor_a2
+
+hypervisor
+Monitor
+
+pl_control
+PipelineMonitor
+
+dispatcher
+
+control_1
+
+broker
+
+heartbeat
+
+send_remote_heartbeat
+
+listen
+
+hypervise
+
+...
+listen
+
+Figure 2. Overview of communication between Doberman Monitors and the storage database. Orange
+arrows indicate data flow and pink arrows command flow. Each box inside a Monitor represents a thread.
+All Monitors additionally access the configuration database (not shown).
+
+2.4
+
+Hypervisor
+
+While distributing the Doberman system over multiple hosts can be beneficial, operational experience shows that a central coordinating process is highly valuable. This role is served by the
+Hypervisor, which supervises component health, routes commands, and mediates data distribution. It has the following tasks:
+Supervision and process management. The Hypervisor maintains a list of managed Monitors
+including the PipelineMonitors and a configurable set of DeviceMonitors. It checks responsiveness of all these Monitors via a periodic ping-pong message exchange and via device heartbeats
+recorded in the configuration database. If a Monitor becomes unresponsive, the Hypervisor attempts a restart. Monitors can be started locally or remotely: for remote hosts, the Hypervisor
+connects via SSH and starts the process in a terminal multiplexer session (e.g. screen).
+Command distribution. Inter-component commands are transmitted via ZeroMQ [6] using a
+publish–subscribe pattern: the Hypervisor broadcasts messages, and each Monitor receives and
+
+–5–
+
+filters commands addressed to it. Each command is associated with a unique identifier and is
+acknowledged by the receiving Monitor after successful execution. This acknowledgment mechanism allows the Hypervisor to track command delivery and execution, and log communication or
+process-level issues.
+Data broker. In addition to command routing, the Hypervisor runs a data broker that distributes
+fresh sensor values to multiple consumers (e.g. pipelines) without requiring repeated database
+queries. As shown in Figure 2, pipelines can source data either from the broker (preferred for
+efficiency and reduced database load) or from the time-series database.
+External heartbeat. To protect against rare but critical failure modes (e.g. power outage of
+the main server or network failures), Doberman supports an external heartbeat mechanism: the
+Hypervisor periodically updates a file on a remote system (in a different building, institution etc.).
+A lightweight watcher process on the remote system issues alarms if the heartbeat is not updated
+within a defined interval, preventing “silent” failures of the alarm infrastructure.
+In the event of a temporary failure of the Hypervisor itself, running Monitors continue
+operating independently, including ongoing device readout and data storage. After the Hypervisor
+is restarted, Monitors automatically resume coordinated operation. Since measurement data are
+written directly to the time-series database, no data are lost during such interruptions.
+2.5
+
+Sensors, devices, and plugins
+
+Integrating a new instrument requires configuration documents for the device and its sensors, and
+a device-specific Python plugin. Database documents capture device settings and configurable
+parameters, while plugins encode the instrument-specific communication logic. Depending on the
+device, this logic can range from simple readout instructions to more complex implementations that
+include command execution and control.
+Configuration documents. Device documents define connection parameters (e.g., IP address and
+port for Ethernet devices), the host on which the corresponding DeviceMonitor should run, and the
+list of sensors provided by the device. Sensor documents contain metadata used for organization and
+visualization, readout parameters (e.g., readout command and interval), and alarm configuration.
+Doberman further supports simple value transformations at the sensor level to convert raw
+device outputs into physically meaningful quantities. A typical example is a pressure sensor that
+provides a current output in the range 4–20 mA, which can be converted into a pressure according
+to the calibration specified by the manufacturer.
+Plugins. Plugins are Python classes inheriting from Device or from interface-specific subclasses
+such as LANDevice or SerialDevice. For standard Ethernet and serial devices, connection
+handling and message transport are provided by the base classes. The plugin then specifies how
+to interpret returned messages, either via a simple pattern match (e.g. extracting a number with a
+regular expression) or via a custom parsing routine for more complex data formats.
+Command execution and control. In addition to readout, Doberman can control devices (e.g.,
+changing a PID setpoint, toggling a valve). Commands enter the system via the Hypervisor as
+JSON-like messages (originating from the web interface or from control pipelines) and are placed
+
+–6–
+
+into a time-sorted queue for immediate or scheduled execution. The Hypervisor then broadcasts a
+hashed command to the appropriate DeviceMonitor. The DeviceMonitor translates the generic
+Doberman command syntax into the device-specific protocol using the plugin’s execute_command
+method and returns an acknowledgment containing the command hash.
+2.6
+
+Pipelines
+
+Pipelines implement continuous processing and automation on top of sensor data. They are used
+to detect alarm conditions, compute derived quantities, and execute control logic (e.g. actuating
+valves). For usability, Doberman starts three PipelineMonitors corresponding to the different
+pipeline types: alarm, convert, and control.
+Each pipeline is executed by its corresponding PipelineMonitor in a dedicated thread.
+An AlarmMonitor extends the generic PipelineMonitor with alarm distribution functionality
+(see subsection 2.7). Pipelines can be inactive, active, or silent. In silent mode, pipelines are
+evaluated normally but suppress command emission, alarm logging, and database writes, which is
+useful during commissioning, testing, or maintenance. Alarm pipelines additionally implement an
+auto-silence mechanism after issuing a notification to prevent message flooding.
+Conceptually, pipelines are represented as directed graphs of nodes. Source nodes ingest data
+either from the live broker stream or from the database; intermediate nodes perform operations such
+as filtering, threshold checks, derivatives, or arbitrary expressions; and sink nodes write derived
+quantities to the database or trigger control actions. Some node types maintain internal buffers that
+store a configurable number of recent input values. These buffers enable operations that require
+temporal context, such as checking whether a threshold violation persists for several consecutive
+readouts, computing derivatives or averages, or suppressing short-lived fluctuations. For pipelines
+that depend on multiple input streams, MergeNodes combine incoming values into time-aligned
+payloads before forwarding them downstream.
+Pipeline behavior during temporary communication losses depends on the configured source
+nodes and control logic. If fresh broker data are unavailable, affected source nodes raise an error
+and the corresponding pipeline does not complete the affected cycle. Alarm pipelines can explicitly
+detect stale inputs using dedicated nodes that compare the timestamp of the last received value to
+the configured readout interval and issue an alarm if no new value has arrived within the allowed
+delay. For control pipelines, nodes may define default outputs that are applied when an error occurs,
+allowing safety-critical control logic to fall into a conservative state, for example closing a valve
+rather than leaving it open.
+The latency of control pipelines is small compared to typical slow control readout intervals.
+In measurements with broker-based source nodes, the delay between publication of a thresholdcrossing sensor value and the start of the corresponding command execution is below 25 ms.
+For database-backed pipelines, where input values are queried from InfluxDB, the corresponding
+execution time is about 100 ms. These values describe the internal Doberman processing time up to
+the start of command execution; the subsequent response time of the controlled hardware depends on
+the specific device. For typical slow control applications, such as temperature regulation, pressure
+control, or liquid-level handling, these latencies are negligible compared to the timescales of the
+controlled system.
+
+–7–
+
+The three examples in Figure 3 illustrate the typical use cases of Doberman pipelines. The
+alarm pipeline shown at the top implements a simple threshold check on a sensor value and issues
+an alarm when the device is unresponsive, or the measurement exceeds its configured limits. The
+conversion pipeline in the center combines multiple sensor inputs to compute a derived quantity. In
+this example, the liquid-nitrogen level measurement is used to determine the current consumption
+rate, which is then combined with the remaining mass measured by a scale to estimate the remaining
+supply duration of the nitrogen reservoir. The control pipeline at the bottom uses the same sensor
+inputs to implement a simple control logic. The solenoid valve is opened when the liquid-nitrogen
+level in the receiving vessel falls below a configurable threshold and sufficient nitrogen remains in
+the supply dewar, and is closed once an upper fill level is reached or the supply dewar is depleted.
+
+Alarm
+DeviceRespondingSyncNode
+source
+
+SimpleAlarmNode
+alarm
+
+Convert
+SensorSourceNode
+source_level
+MergeNode
+merge
+
+DerivativeNode
+rate
+
+MergeNode
+merge
+
+EvalNode
+eval_open
+
+EvalNode
+calc_duration
+
+InfluxSinkNode
+sink_duration
+
+SensorSourceNode
+source_scale
+
+Control
+SensorSourceNode
+source_level
+EvalNode
+eval_close
+
+DigitalControlNode
+valve_control
+
+SensorSourceNode
+source_scale
+
+Figure 3. Examples of Doberman pipelines: a simple threshold alarm (top), a conversion pipeline computing
+a derived quantity (center), and a control pipeline actuating a valve based on sensor inputs (bottom).
+
+2.7
+
+Alarm distribution
+
+Alarms are generated by AlarmNodes inside alarm pipelines and distributed by the AlarmMonitor.
+Doberman uses a leveled alarm concept: each alarm has a configured base level (from the sensor
+configuration) and an escalation level that increases if repeated alarm messages are sent without the
+alarm being cleared. Level-dependent parameters such as the auto-silence duration and the number
+of messages before escalation are defined centrally in the experiment configuration.
+Recipients are grouped (e.g. shifters for routine operation and experts for severe conditions)
+based on contact documents in the configuration database. Depending on the effective alarm
+
+–8–
+
+level, the AlarmMonitor sends notifications through one or more communication channels. In
+the current implementation, Doberman supports sending of e-mails, SMS via the SMS Creator by
+Nextp GmbH [7], and automated phone calls using the Voice API by Twilio Inc. [8]. The alarm
+framework is structured such that alternative notification backends can be integrated with minimal
+changes.
+
+3
+
+Graphical user interface
+
+Doberview is a web-based graphical user interface developed as the primary user-facing component
+of Doberman. It provides live visualization of slow control data, access to historical measurements,
+and interactive tools to configure sensors, pipelines, and alarms. Doberview is implemented as a
+Node.js application and uses the Bootstrap front-end framework to provide a responsive interface
+suitable for desktop and mobile devices.
+The web application connects directly to the configuration database and the time-series backend, allowing users to inspect and modify system settings without manual database interaction.
+Authentication can optionally be enabled via GitHub OAuth, granting write access to members of
+a designated GitHub organization while allowing unrestricted read-only access in less restrictive
+deployments. This approach has proven to be low-maintenance, as most collaborations already
+maintain a GitHub organization for code sharing. This system may need an update for experiments
+with more stringent security requirements, for example by restricting read access or by introducing
+user groups with different permission levels.
+3.1
+
+Interactive overview
+
+If enabled, the overview page serves as the main landing page of Doberview. It is based on a userdefined scalable vector graphic (SVG) that visually represents the experimental setup, typically in
+the form of a simplified P&ID diagram. Individual SVG elements are linked to sensors and devices,
+turning the static drawing into an interactive monitoring interface. An example of such an overview,
+showing the PANCAKE experiment described in subsection 4.3, is shown in Figure 4.
+Sensor elements display the most recent measurement values and update automatically. Binary
+states such as valve positions or pump status are represented through color changes and animations,
+while continuous quantities such as liquid-nitrogen fill levels are rendered as proportional graphical
+elements. Clicking on any interactive element opens the corresponding sensor detail view.
+3.2
+
+Sensor inspection and control
+
+The sensor detail view provides a consolidated interface for monitoring, configuration, and control
+of individual sensors. An example of such a sensor detail window is shown in Figure 5. From
+this view, users can inspect recent measurement histories over selectable time ranges, adjust alarm
+thresholds, and interact with pipelines that rely on the sensor’s data. If a sensor is associated with
+a controllable quantity (e.g. a valve state or a PID setpoint), corresponding control elements are
+displayed, allowing commands to be issued directly through the web interface.
+
+–9–
+
+Figure 4. Interactive overview in Doberview for the PANCAKE experiment [9]. Sensor boxes display current
+values, pumps and valves change color or animate according to their state, and liquid levels are visualized
+based on derived quantities.
+
+3.3
+
+Pipeline management
+
+Doberview provides a dedicated overview for managing pipelines, shown in Figure 6. Pipelines
+are grouped by type (alarm, convert, control) and by execution state (active, silent, or inactive). A
+color-coded status indicator provides immediate feedback on the most recent execution cycle: green
+indicates normal operation, red signals an error during execution, and yellow denotes transient
+startup conditions, for example while pipeline nodes with internal buffers are being initialized.
+Hovering over the indicator reveals additional information, such as the time of the last execution or
+the most recent error.
+From this overview, users can start, stop, restart, or silence pipelines directly. Clicking on
+a pipeline opens a detailed configuration view in which the pipeline definition can be edited and
+visualized as a node graph. The same interface is used to create new pipelines from predefined
+templates, allowing users to define alarm, conversion, or control logic without manual interaction
+with the configuration database.
+3.4
+
+Additional visualization tools
+
+In addition to the interactive overview and sensor-level inspection, Doberview provides complementary visualization tools for more advanced data exploration. These include a built-in plotting
+
+– 10 –
+
+Figure 5. Example of a sensor detail window in Doberview. Configuration parameters and alarm settings
+are shown on the left, while recent measurement history and associated pipelines are displayed on the right.
+
+Figure 6. Pipeline overview in Doberview. Pipelines are grouped by type and execution state, with controls
+to start, stop, silence, or restart individual pipelines.
+
+– 11 –
+
+interface for rapid, ad hoc analysis as well as the option to embed external dashboards created with
+Grafana [10].
+The built-in Plotter allows users to create custom time-series diagrams for arbitrary time
+intervals without additional configuration. An example is shown in Figure 7 for a nitrogen-based
+cooling system used to cool down the PANCAKE cryostat. In this case, the target temperature is
+provided by a conversion pipeline, the measured temperature is read by a sensor near a cooling pad,
+and the resulting control action, i.e. the opening of a solenoid valve, is displayed alongside both
+quantities.
+
+Figure 7. Plotter tab in Doberview showing a user-defined graph for the nitrogen-based cooling system of the
+PANCAKE experiment. Displayed are the target temperature (blue) from a convert pipeline, the measured
+temperature in the cooling circuit (orange), and the control signal opening the liquid-nitrogen valve (green).
+
+Frequently used sensor combinations can be stored as templates in the configuration database
+and quickly reloaded. Together, the Doberview-native visualizations and embedded dashboards
+provide complementary tools optimized for different operational tasks. The interactive overview
+emphasizes the current state of the experiment with a clear visual grouping of related components,
+while sensor detail views allow rapid inspection of recent histories for individual measurements.
+The built-in plotter facilitates quick exploratory analyses and correlation checks across multiple
+sensors, whereas embedded Grafana dashboards are well suited for simultaneously monitoring
+larger sets of measurements over both short and extended time scales.
+
+4
+
+Current deployments
+
+Doberman has been used in several experimental setups operated by the Astroparticle Physics
+group at the University of Freiburg. The deployments span a small, remotely operated material
+screening facility in an underground laboratory, a small-scale liquid xenon R&D platform, and
+a large and highly instrumented surface-level liquid xenon test facility. (It was also used for
+testbeam measurements of liquid scintillator-filled detector prototypes at CERN to develop the
+
+– 12 –
+
+SHiP experiment [11], and to operate a sensitive radon emanation detector [12]; both projects
+are not further described here.) Together, these installations demonstrate that the same software
+stack supports very different requirements, ranging from low-rate monitoring on a single host to
+distributed, multi-host operation with extensive automation.
+4.1
+
+GeMSE: Remote operation of a gamma-ray spectrometer
+
+The Germanium Material and Meteorite Screening Experiment (GeMSE) is a low-background
+high-purity germanium (HPGe) gamma-ray spectrometer located in an underground laboratory in
+the Swiss Jura mountains [13–15]. Due to the remote location and the absence of permanent on-site
+personnel, reliable remote supervision and automated notification are essential.
+For GeMSE, the complete Doberman stack runs on a single Linux host located in the underground laboratory and manages a compact set of critical parameters. In particular, Doberman
+supervises the bias voltage of the HPGe detector and the cryogenic cooling of the germanium crystal, which must be maintained at stable low temperatures throughout operation. Cooling is achieved
+using liquid nitrogen supplied from a large storage dewar, with an automated control pipeline periodically refilling a thermal bath connected to the detector. This setup enables fully autonomous
+operation over extended periods, such that manual replacement of the storage dewar is only required
+at intervals of several weeks. The use of Doberman allowed operating the spectrometer without
+unscheduled downtime over several years.
+4.2
+
+XeBRA: A small detector test setup
+
+The Xenon-Based Research Apparatus (XeBRA) is a liquid-xenon R&D platform with target masses
+of order 10 kg, used to study novel detector concepts for low-background xenon detectors [16, 17].
+XeBRA comprises a vacuum-insulated cryostat, nitrogen-based xenon cooling, xenon purification
+and storage, and a dedicated photosensor DAQ [18]. The slow control system monitors temperatures,
+pressures, flows, liquid xenon and liquid nitrogen levels, vacuum systems, and power supplies, and
+it provides automation for recurring operational tasks (e.g., nitrogen handling and cooldown-related
+procedures).
+XeBRA shares its database infrastructure with the PANCAKE installation (see below) on a
+dedicated server in the laboratory. Device readout is performed by a set of DeviceMonitors
+running on hosts close to the setup, while the central services (databases, Hypervisor, pipelines,
+and web interface) run on the shared server. Since the XeBRA platform is used to host a variety
+of experimental configurations for testing novel detector concepts, the slow control system must
+accommodate frequent hardware changes and rapid integration of new instruments. Doberman’s
+flexible plugin-based architecture allows new devices and sensors to be added with minimal effort,
+making it well suited for the iterative R&D workflow typical of the XeBRA platform.
+4.3
+
+PANCAKE: a complex, medium-scale experiment
+
+PANCAKE is a large liquid-xenon test facility with a current xenon gas inventory of about 400 kg [9].
+Its inner diameter of about 3 m allows testing large-scale detector components in cryogenic liquid
+xenon. It was recently used to demonstrate the operation of a liquid xenon TPC with active mass
+of about 130 kg in an unshielded, above-ground environment [19]. Its slow control system, the
+
+– 13 –
+
+most complex Doberman deployment to date, continuously reads out approximately 300 sensors
+across several dozen instruments and provides automated monitoring and control throughout multimonth campaigns, including cooldown, filling, and stable long-term operation. The requirement to
+operate such a setup with a small on-call team was a major motivation for developing Doberman’s
+control-pipeline framework (subsection 2.6).
+As in the XeBRA deployment, the configuration and time-series databases, the Hypervisor,
+the pipeline execution processes, and the Doberview web interface are hosted on the shared central
+server. The readout of most devices runs on additional industrial hosts deployed close to the
+respective subsystems, reducing cable lengths and improving overall robustness. These secondary
+hosts are implemented using Revolution Pi modules manufactured by KUNBUS GmbH [20]. The
+DIN-rail-mounted industrial PCs are based on the Raspberry Pi Compute Module, run a Linux-based
+operating system, and comply with European industrial standards for programmable controllers. In
+the PANCAKE deployment, they have operated stably over extended periods, supporting continuous
+slow control operation.
+Each core module can be extended with multiple modular I/O units, allowing flexible integration
+of a large number of sensors and actuators. In the PANCAKE setup, the cores are equipped with
+analog I/O and digital output modules providing configurable voltage and current inputs (e.g.,
+0–5 V or 4–20 mA), RTD inputs for PT100/PT1000 temperature sensors, and digital outputs for
+controlling actuators such as solenoid valves. An example installation inside a control cabinet is
+shown in Figure 8 (orange frame).
+Most serial devices in PANCAKE are integrated using WaveShare serial-to-Ethernet converters
+[21], two of which are shown in Figure 8 (green frame). These modules provide both RS-232 and
+RS-485 interfaces, enabling reliable readout of a wide range of legacy and industrial devices over
+the laboratory network.
+A large fraction of the PANCAKE slow control channels correspond to temperature measurements distributed throughout the cryostat and its supporting systems. For this purpose, the Web
+Thermometer 8x manufactured by Wiesemann & Theis GmbH has proven to be a reliable solution
+[22]. Each device supports eight PT100 temperature channels and provides network-based access
+via an HTTP interface, allowing straightforward integration through a dedicated Doberman plugin.
+The corresponding plugins, along with those for other PANCAKE-specific devices, are available in
+the public repository [23].
+Doberman was essential for the stable and safe operation of the PANCAKE detector during two
+extended, multi-month run campaigns, including the most recent campaign in late 2024. Continuous
+monitoring and automated control of key parameters such as xenon pressure, cryostat temperatures,
+and liquid levels enabled reliable long-term operation of a Time Projection Chamber (TPC) and its
+cryogenic infrastructure. The alarm system and graphical user interfaces provided rapid feedback
+on detector conditions and facilitated timely intervention when required. The resulting stability of
+cryogenic and high-voltage parameters ensured well-defined and reproducible operating conditions
+during approximately sixty days of TPC operation, forming the basis for the data analysis presented
+in [19].
+
+– 14 –
+
+Figure 8. One of the PANCAKE slow control cabinets, containing a 24 VDC power supply, an uninterruptible
+power supply (UPS), a Revolution Pi core with modular analog and digital I/O modules (orange), and a railmounted Ethernet switch. Serial instruments are integrated via WaveShare serial-to-Ethernet converters
+(green). Sensor cables are routed through a terminal block at the bottom.
+
+4.4
+
+Operational performance and scaling
+
+The long-term operation of the deployments described above demonstrates that Doberman has
+modest hardware requirements. As an example, the PANCAKE slow control system runs mainly
+on a server equipped with an Intel Xeon E3-1231 v3 CPU with four physical cores/eight logical
+threads. Each Monitor typically requires about 50 MB of resident memory. During normal
+operation, the Hypervisor and PipelineMonitors each use less than 1 % CPU on this system,
+while representative DeviceMonitors remain below 0.5 %.
+To probe scalability beyond the current deployments, additional software-only test devices
+were operated on the same system. Ten such devices with 100 sensors each were read out at 1 Hz
+per sensor over several hours, resulting in an aggregate configured measurement rate of 1000 Hz.
+This is about an order of magnitude larger than the configured aggregate measurement rate of
+the PANCAKE deployment described in subsection 4.3. Each synthetic DeviceMonitor required
+about 50 MB of resident memory and about 20 % CPU. The increased readout rate had no significant
+impact on the CPU usage of the Hypervisor, indicating that the dominant load is localized in the
+DeviceMonitor processes. Since DeviceMonitors can be distributed over multiple hosts, this
+
+– 15 –
+
+load can be scaled horizontally.
+A second test used one software-only test device together with 100 active control pipelines.
+Each pipeline read one sensor value and issued a binary control command, resulting in an aggregate
+command rate of about 100 Hz. In this configuration, the Hypervisor used about 6 % CPU,
+while the control PipelineMonitor used about 21 % CPU. These values remain moderate on the
+comparatively modest server hardware used in the test.
+Together, these measurements show that the central Doberman processes do not form a bottleneck at rates well above those required by the largest current deployment. The main readout
+load resides in the DeviceMonitors, which can be distributed across hosts, while the database
+backend based on InfluxDB is designed for substantially higher write rates than those encountered
+in typical slow-control applications. These software-only tests therefore support the use of Doberman for medium-scale experiments beyond the currently operated deployments. A full validation
+of network-level scaling and distributed failure modes, however, will require dedicated tests on a
+physically distributed multi-host installation.
+
+5
+
+Conclusions and outlook
+
+Doberman is a lightweight, modular, and open-source slow control system designed to bridge the gap
+between heavyweight and costly SCADA/EPICS-style frameworks and ad hoc laboratory scripts.
+Its plugin-based device integration, distributed Monitor architecture with a central Hypervisor,
+and node-based pipeline framework enable reliable sensor readout, automation, and transparent
+alarm handling across heterogeneous experimental hardware. The accompanying web interface,
+Doberview, provides an integrated environment for live monitoring, configuration, and control,
+supporting both routine operation and rapid response to exceptional conditions.
+Doberman and Doberview have matured through multiple iterations and have been validated in
+day-to-day operation across several experiments at the University of Freiburg, ranging from a small
+remote underground facility to a large, highly instrumented liquid xenon test platform. Both projects
+are released under permissive open-source licenses, with source code, documentation, and a growing
+collection of device plugins available online [23–26]. Interest from external groups indicates that the
+approach is broadly applicable to laboratory-scale and medium-scale experimental infrastructures.
+Experience from the current deployments, together with the performance tests presented above,
+indicates that Doberman can be used in experiments beyond the scale of the systems operated so far,
+while network-level scaling and distributed failure modes remain deployment-dependent aspects
+that should be evaluated for substantially larger installations. Doberman is foreseen to be used as
+the slow control system for the upcoming light dark matter experiment DELight [27], which may
+motivate targeted refinements where required by specific experimental needs, although the system
+is considered functionally mature and no major architectural changes are foreseen.
+Acknowledgments
+We would like to thank our colleagues using Doberman for their valuable feedback to improve the
+system. Over the years of development, this work was supported in part by the German Federal
+Ministry of Research, Technology and Space through the ErUM-Pro grant 05A23VF1, by the
+European Research Council (ERC) grant No. 724320 (ULTIMATE), by the German Research
+
+– 16 –
+
+Foundation (DFG) through INST 39/1095-1 FUGG and the Research Training Group RTG2044,
+and the Structure and Innovation Fund of the state of Baden-Württemberg (SI-BW).
+
+References
+[1] EPICS Collaboration, “EPICS: Experimental Physics and Industrial Control System.”
+https://epics-controls.org/, accessed on May 6, 2026.
+[2] L.R. Dalesio, J.O. Hill, M. Kraimer, S. Lewis, D. Murray, S. Hunt et al., The experimental physics
+and industrial control system architecture: past, present, and future, Nuclear Instruments and
+Methods in Physics Research Section A: Accelerators, Spectrometers, Detectors and Associated
+Equipment 352 (1994) 179.
+[3] P. Zappa, L. Bütikofer, D. Coderre, B. Kaminsky, M. Schumann and M. von Sivers, A versatile and
+light-weight slow control system for small-scale applications, Journal of Instrumentation 11 (2016)
+T09003 [arXiv:1607.08189].
+[4] MongoDB, Inc., “MongoDB.” https://www.mongodb.com/, accessed on May 6, 2026.
+[5] InfluxData, Inc., “InfluxDB.” https://www.influxdata.com/, accessed on May 6, 2026.
+[6] The ZeroMQ Project, “ZeroMQ.” https://zeromq.org/, accessed on May 6, 2026.
+[7] Nextp GmbH, “SMS Creator bulk messaging service.” https://www.smscreator.de/, accessed
+on May 6, 2026.
+[8] Twilio Inc., “Twilio communications API.” https://www.twilio.com/, accessed on May 6, 2026.
+[9] A. Brown et al., PANCAKE: a large-diameter cryogenic test platform with a flat floor for next
+generation multi-tonne liquid xenon detectors, Journal of Instrumentation 19 (2024) P05018
+[arXiv:2312.14785].
+[10] Grafana Labs, “Grafana monitoring and visualization platform.” https://grafana.com/, accessed
+on May 6, 2026.
+[11] A. Brignoli et al., Performance of prototypes with different reflector materials for the SHiP liquid
+scintillator surrounding background tagger, Journal of Instrumentation 20 (2025) P07023
+[arXiv:2503.10250].
+[12] D. Wiebe, S. Lindemann and M. Schumann, A high-sensitivity radon emanation detector system for
+future low-background experiments, Journal of Instrumentation 19 (2024) P04014
+[arXiv:2309.04514].
+[13] M. von Sivers, B.A. Hofmann, Å.V. Rosén and M. Schumann, The GeMSE facility for low-background
+𝛾-ray spectrometry, Journal of Instrumentation 11 (2016) P12017 [arXiv:1606.03983].
+[14] D.R. García, D. Baur, J. Grigat, B.A. Hofmann, S. Lindemann, D. Masson et al., GeMSE: a
+Low-Background Facility for Gamma-Spectrometry at Moderate Rock Overburden, Journal of
+Instrumentation 17 (2022) P04005 [arXiv:2202.06540].
+[15] Å.V. Rosén, B.A. Hofmann, F. Preusser, E. Gnos, U. Eggenberger, M. Schumann et al., Meteorite
+terrestrial ages in oman based on gamma spectrometry and sediment dating, focusing on the ramlat
+fasad dense collection area, Meteoritics & Planetary Science 56 (2021) 2017.
+[16] J. Dierle, A. Brown, H. Fischer, R. Glade-Beucke, J. Grigat, F. Kuger et al., Reduction of
+222 Rn-induced backgrounds in a hermetic dual-phase xenon time projection chamber, Eur. Phys. J. C
+83 (2023) 9 [arXiv:2209.00362].
+
+– 17 –
+
+[17] F. Tönnies, A. Brown, B. Kiyim, F. Kuger, S. Lindemann, P. Meinhardt et al., Proportional
+scintillation in liquid xenon: demonstration in a single-phase liquid-only time projection chamber,
+Journal of Instrumentation 19 (2024) P09032 [arXiv:2405.10687].
+[18] D. Baur, A. Bismark, A. Brown, J. Dierle, H. Fischer, R. Glade-Beucke et al., The xebra platform for
+liquid xenon time projection chamber development, Journal of Instrumentation 18 (2023) T02004
+[arXiv:2208.14815].
+[19] J. Müller, J. Grigat, R. Glade-Beucke, S. Lindemann, T. Luce, G.C. Madduri et al., Operating a
+large-diameter dual-phase liquid xenon tpc in the unshielded pancake facility, arXiv:2601.15938.
+[20] KUNBUS GmbH, “RevPi Core and RevPi Core 3 datasheet.” https://revolutionpi.com/
+fileadmin/downloads/legacy/Datasheet_RevPi_Core_RevPi_Core3.pdf, accessed on May
+6, 2026.
+[21] Waveshare, “Serial-to-Ethernet converter (RS-232/RS-485).”
+https://www.waveshare.com/product/iot-communication/wired-comm-converter/
+ethernet-to-uart-rs232-rs485.htm, accessed on May 6, 2026.
+[22] Wiesemann & Theis GmbH, “Web Thermometer 8x model 57778 data sheet.”
+https://www.wut.de/e-57778-ww-daus-000.php, accessed on May 6, 2026.
+[23] J. Grigat, A. Brown, D. Masson and T. Luce, “AG-Schumann/doberman_pancake: v1.0.”
+https://doi.org/10.5281/zenodo.20054388, 2026.
+[24] D. Masson, J. Grigat, A. Brown, D. Ramírez García, T. Luce and P. Zappa,
+“AG-Schumann/Doberman: v6.0.0.” https://doi.org/10.5281/zenodo.20043032, 2026.
+[25] J. Grigat, A. Brown, J. Müller, D. Masson and T. Luce, “AG-Schumann/doberview2: v1.0.”
+https://doi.org/10.5281/zenodo.20043125, 2026.
+[26] J. Grigat, D. Masson and T. Luce, “AG-Schumann/doberman_xebra: v1.0.”
+https://doi.org/10.5281/zenodo.20054466, 2026.
+[27] B. von Krosigk, K. Eitel, C. Enss, T. Ferber, L. Gastaldo, F. Kahlhoefer et al., DELight: a Direct
+search Experiment for Light dark matter with superfluid helium, SciPost Physics Proceedings (2023)
+016 [arXiv:2209.10950].
+
+– 18 –
+

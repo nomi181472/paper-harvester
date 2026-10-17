@@ -1,0 +1,1459 @@
+Extending eBPF observability to Non-standard execution environments.
+Pamenas Kariuki
+
+Andre Martin
+
+Christof Fetzer
+
+TU Dresden
+Germany
+
+TU Dresden
+Germany
+
+TU Dresden
+Germany
+
+arXiv:2609.39530v1 [cs.OS] 30 Sep 2026
+
+Abstract
+eBPF observability of non-standard execution environments
+(NEEs) like TEEs or LibOSes is hindered by their unconventional exception-handling and memory-access mechanisms
+that limit standard Linux tooling. This work introduces two
+mechanisms that enable eBPF-based observability for NEEs:
+(1) kernel memory extensions for safely accessing NEE memory from eBPF programs, and (2) a lightweight flexible probe
+performance measurement unit (LWFP PMU) that provides
+flexible and generic probing, for NEEs, through the following LWFP: simple (SLWFP), enclave (ELWFP) and extended
+(ExLWFP) probes.
+We demonstrate the practicality of these extensions by
+developing tooling for tracing, stack sampling with Flame
+Graphs, dynamic instrumentation, timing analysis, and USDT
+support for Intel SGX enclaves and LibOSes. Performance
+measurements show that SLWFP probes achieve a latency of
+394 ns, outperforming uprobes, which exhibit 25% higher latency, while ELWFP probes incur a latency ∼2.8 µs, which is
+practical for enclave observability. The addition of SLWFP introduces negligible overhead to existing uprobe performance.
+Taken together, this work lays the foundation for closing the
+long-standing gap between NEE tooling and Linux observability tooling by enabling generic and reusable eBPF tooling
+for diverse NEE hardware and software architectures.
+
+1
+
+Introduction
+
+The development and shift towards cloud computing motivated the rise of OS- and VM-based containerization technologies to address the need for lightweight isolation, efficient resource sharing, and scalable multi-tenant deployments. However, despite their success, these approaches left
+important gaps in flexibility, trust minimization, and interface specialization. Library operating systems (LibOS) architecture, including unikernels, rose to fill this gap: small
+Trusted Computing Base (TCB), broader application compatibility and personalization, non-native interface support,
+low attack surfaces, and stronger multi-tenant isolation [26,
+33, 35, 50, 51].
+Cloud security was addressed by trusted execution environments (TEEs), that provide confidentiality and integrity
+guarantees to software. Popular TEEs include AMD SEVSNP [40], Intel TDX [4], and Intel SGX (SGX) [30]. SGX has
+a radical programming model that splits an application into
+an untrusted part and a trusted part in an enclave. An enclave is protected from observation by the host OS. LibOSes
+were adopted as a practical solution to SGX programming
+challenges.
+
+SGX, LibOS and unikernels rely on non-standard mechanisms—e.g., loading and executing code, exposing CPU state,
+and handling exceptions—that are opaque to the host OS.
+This situation extends to SGX-like TEEs built on similar principles as well as VM unikernels. In general, there are compute
+extensions and hardware that allow isolated and protected
+memory ranges to be mapped into a process memory, and
+entail the aforementioned features. We collectively categorize such software and hardware execution environments as
+Non-standard Execution Environments (NEEs).
+The Observability Problem
+Optimizing performance, debugging, testing and achieving
+correctness for software running with restricted interfaces
+presents a significant challenge. This fundamentally comes
+from different basic assumptions present NEEs in contrast
+to native environments. Further, the problem is aggravated
+by tooling gaps: tools and infrastructure to identify issues,
+gather evidence and affirm correctness are relatively lacking in comparison to native tools. Although a part of this
+problem can be countered by hardware [37, 48] and software
+architectural enhancements [16, 21, 25, 53], it is still insufficient to address all aspects of observability, performance
+and correctness.
+Introspection is commonly employed to fill the tooling
+gap leading to repetition among the individual frameworks.
+In some restricted environments–such as production mode
+SGX–this is the only recourse. However, in debug and preproduction environments, as well as in software NEEs, there
+is greater freedom to employ other techniques for richer
+observability of NEEs.
+Practitioners deploying NEEs need to answer critical observability questions to characterize and optimize performance:
+• Where is execution time spent? Which functions consume the most CPU cycles?
+• What are the bottlenecks? Is performance limited by
+transition latency, syscall overhead, memory access
+patterns, or application logic?
+• How does actual execution diverge from expected behavior? Are unexpected functions being called? Is library
+behavior inefficient?
+• What evidence can we gather to test bug and performance hypotheses?
+• Can we prove software correctness persists under different environment?
+These questions require observability tooling capable of
+inspection of NEE execution, especially those capable of
+
+operation with minimal or ideally without modifying applications or recompiling of software.
+
+they introduce a context-aware matching of execution context to enable special needs for NEEs like SGX.
+P3: NEE-Aware Exception Handling. We integrate LWFP
+with Linux’s exception and eBPF infrastructure, collectively
+allowing
+Together, these three primitives enable eBPF observability tools to work across NEEs with the same ease and low
+overhead as on native Linux, without requiring application
+recompilation or embedded instrumentation libraries.
+
+Why Existing Tools Fail
+Several existing observability tools target NEEs, but each
+has fundamental limitations. Intel VTune [38] and the GDB
+plugins [5] require software recompilation and introspection or instrumentation libraries embedded in code. Most
+LibOS and unikernels solve this problem by introducing
+introspection libraries. However, this approach requires implementation for each library, duplicating efforts; a strong
+contrast with reusability of native tools. On the other hand,
+there are narrow tooling implementations: Research tools
+like TEE-Perf [23] and SGXoMeter [45] target specific metrics (latency breakdown, performance counters) and cannot
+provide general-purpose tracing or dynamic instrumentation.
+Native Linux has a rich set of observability tools—perf,
+strace, uprobes, and kprobes— but fail to observe NEEs on
+account of the following limitations:
+
+Contributions
+This work makes the following contributions:
+C1 Problem analysis: We present a systematic analysis of
+limitations of general observability of NEEs in Linux, identify the core architectural constraints and their respective
+manifestations across different NEE types.
+C2 eBPF memory extensions: We design and implement
+kernel extensions that enable eBPF programs to safely access
+protected memory regions via pluggable backend drivers and
+demonstrating the capabilities with SGX.
+C3 Lightweight Flexible Probes: We develop a new perf
+PMU that supports dynamic probe insertion and contextaware matching across NEEs, enabling zero-overhead probe
+placement independent of memory layout or initialization
+method.
+C4 Performance evaluation: We demonstrate that LWFP
+achieve latency of 397 ns for native LWFP probes (26% faster
+than uprobes, 17.5% faster than hardware breakpoints) and 2.8
+𝑚𝑢s for enclave-targeted probes, establishing practical overhead.
+C5 Observability tooling: We build eBPF-based tools for
+CPU profiling (DWARF stack sampling), system call tracing,
+function timing, and USDT instrumentation, demonstrating
+the generality, practicality and utility of the primitives across
+multiple observability use cases on real-world applications.
+
+• Probing limitation. user probes rely on the mmap syscall
+to detect code loading. When the kernel observes mmap,
+it scans virtual memory areas and installs INT3 breakpoints at probe points. However, NEE code is loaded
+via direct memory copying of code into memory, without triggering mmap. Consequently, uprobes never install.
+• eBPF programs cannot access protected memory in
+hardware NEEs as special instructions are needed
+for memory access. eBPF helpers fail silently making eBPF-based profiling and tracing are unavailable
+for NEEs.
+• Hardware breakpoints are fixed per CPU core (4 in
+X86), limiting the number of simultaneous addresses
+that can be probed, although their programming is
+more flexible that software breakpoint with respect
+to NEEs.
+
+2
+
+Background
+
+In this section, we provide relevant technical information
+to elucidate the observability problem of general NEEs and
+SGX in Linux.
+
+Our Solution: Three Primitives for NEE Observability
+In order to address these limitations, we introduce the following three primitives:
+P1: Safe Memory Access from eBPF. We extend eBPF
+memory helpers to recognize and handle special memory
+regions via new VMA (Virtual Memory Area) operations.
+A hardware NEE driver implements the new methods to
+support this feature. This enables eBPF programs to access
+and modify NEE state directly.
+P2: Lightweight Flexible Probes (LWFP). We introduce, a
+new LWFP Performance Monitoring Unit (LWFP PMU) associated with LWFP. These software-based probes relieve the
+probe discovery and insertion roles from the kernel, leaving
+only exception reporting and probe management. Further,
+
+2.1
+
+Intel SGX
+
+Intel Software Guard Extensions (SGX)[30] creates protected
+memory regions called enclaves, that are isolated from the
+OS. Each enclave is associated with several data structures,
+with the most relevant ones being presented hereafter.
+The SGX Enclave Control Structure (SECS) defines
+enclave metadata, including its base address, size, State Save
+Area (SSA) frame sizes, and global attributes. Multithreading
+is managed via a per-thread structure, Thread Control Structure (TCS), which specifies entry and asynchronous enclave
+exit (AEX) addresses, settings, and active SSA frames.
+2
+
+SGX exception flow. AEX occurs when interrupts or exceptions occur while executing enclave. The CPU saves the
+extended state into the next available SSA frame and replaces
+it with an AEX-defined synthetic state. Specifically, RAX is
+loaded with the ERESUME leaf value, RBX stores the current
+TCS address, and both RIP and RCX point to the Asynchronous Exit Pointer (AEP). AEP is a trampoline code block
+containing an ERESUME instruction to reenter the enclave
+post-handling.
+
+Enclave
+IRQ
+IRQ
+
+uRTS
+
+0x11: int3
+0x12: inst
+0x14: inst
+0x16: inst
+0x20: inst
+
+eBPF programs and data structures. The bpf system
+call manages program loading and the lifecycle of eBPF maps
+(e.g., hashmaps, arrays, and program arrays). These maps are
+shared across the user-kernel boundary for efficient, zerocopy data transfer and storage [27]. Loaded programs are
+referenced via file descriptors (fd) and linked to kernel event
+sources using ioctl for perf_event subsystems.
+eBPF helpers. Kernel-defined helper functions expose
+stable APIs for memory access and complex operations. They
+guarantee memory safety by encapsulating low-level routines; for instance, bpf_probe_read wraps around the kernel’s
+copy_from_user_nofault routines, which use __put_user_size
+for direct RAM access. Consequently, eBPF programs cannot
+issue specialized I/O instructions or access memory managed
+exclusively by third-party device drivers.
+eBPF userspace ecosystem. Modern infrastructure simplifies eBPF development and runtime management [14].
+This work leverages frameworks like BPF Compiler Collection (BCC) [8] for high-level language interface alongside an
+LLVM-backed C toolchain, as well as libbpf [17] for native
+C and Rust program orchestration.
+
+GDB
+
+sig_handler
+debugger
+AEP
+
+Ring3
+
+Linux
+
+signal
+
+Exception
+Handler
+
+resume
+user
+
+eBPF
+ptrace
+
+Ring0
+
+Hardware
+
+SGX
+#BP/#DB AEX
+resume execution
+
+DR0: 0x16
+#BP
+
+DR6: 0x16
+
+2.3
+
+#DB & #BP
+
+no debugger attached
+
+This section presents the main tools and interfaces for observability and tooling in Linux OS.
+
+Figure 1. SGX AEX on debug and Linux exception reporting
+
+2.3.1 Ptrace. [11, 41] is the core system call for controlling
+execution of inferior processes for tracing and debugging.
+Ptrace requires several context switches between kernel, inferior, and tracer making it characteristically slow. Common
+ptrace-based tools include: strace [12] for tracing issued system calls; ltrace [9] tracing library loading; and GDB [15] for
+debugging.
+
+Enclave behavior on debug. Enclave debug is enabled
+in the SECS and for each TCS which permits permits singlestepping, memory inspection via EDBGRD and EDBGRW, breakpoint and events reporting to OS. A hardware breakpoint
+(HB) is a fault (#DB exception), whereas a software breakpoint
+(SB) is a trap (#BP exception). On debug opt-out , both exceptions trigger an invalid opcode exception (#UD). Figure 1
+illustrates this process within the Linux kernel. If no debugger is attached, a signal is delivered directly to the untrusted
+host application; otherwise, the ptrace subsystem forwards
+the breakpoint events to the debugger. Additionally, Perf can
+leverage an HB to trigger the execution of an eBPF program.
+2.2
+
+Linux Observability Infrastructure
+
+2.3.2 Linux Perf Events. Linux has a performance measurement subsystem that exposes both software and hardware counters through the perf_event_open system call (PEO).
+PEO creates a file descriptor (fd) for a specific performance
+measurement unit (PMU), either sampling or counting, that
+can be read for statistics or as a trigger for execution of eBPF
+programs. Perf tool is a userspace tool that provides utilities
+to exploit this interface.
+
+eBPF
+
+eBPF is an in-kernel 64-bit RISC virtual machine that executes sandboxed user code to extend kernel functionality
+without custom modules or kernel modifications. eBPF is
+integrated with the bpf system call and event-driven hooks,
+allowing its application for packet-filtering use cases, security [20], and system observability [7].
+To ensure safety, a kernel verifier enforces program termination via limited recursion and loop unrolling. To bypass
+its strict 1-million-instruction restriction limit, eBPF supports BPF-to-BPF function calls and tail calls to alternative
+programs . Additionally, the bpf_loop helper facilitates large
+iterations of up to 1 million loops.
+
+2.3.3 Linux Probes and Exception Handling. Linux
+provides kprobes/kretprobes for kernel instrumentation and
+uprobes/uretprobes for userspace probing [42, 46], managed
+via the bpf system call. Entry probes execute at function
+entry, while return probes fire at function exit. For mapped
+targets, the kernel locates the corresponding Virtual Memory
+Area (VMA), caches the original instruction, and overrides it
+with a breakpoint (e.g., INT3 on x86). For unmapped binaries,
+uprobe_mmap defers activation until a future mmap system
+call matches the target filename. Because resolution relies
+strictly on filename matching within the mmap subsystem,
+3
+
+executable regions generated dynamically or loaded directly
+via drivers bypass this mechanism entirely.
+When execution hits a breakpoint, the trap triggers the
+kernel’s notifier framework via register_die_notifier,
+passing the exception context to attached handlers like eBPF
+or perf events. To resume the application path post-handling,
+the cached instruction is executed using either: (1) Single-Step
+In-Line (SSIL), where the original instruction temporarily
+replaces the breakpoint under a hardware single-step flag;
+or (2) Single-Step Out-of-Line (SSOL), where the instruction
+copy executes within a dedicated memory slot via emulation
+or direct patching before updating the CPU context.
+
+3
+
+kernel requires device drivers to manage and access associated resources. A common approach and usage of NEEs
+entails mapping its memory in the address space of a given
+process while restricting its access with hardware. The memory mapping is associated with a virtual memory area.
+The goal of memory extension is to allow safe access from
+bpf programs while maintaining the same exclusive and
+termination expectations of bpf programs. This is achieved
+through two steps: (1) Linux kernel device driver file operations are extended to provide methods to guarantee safe
+access or fail fast without triggering faults. And (2) the bpf
+memory functions are extended to access these extensions
+for special VMAs instead of accessing RAM directly.
+The driver methods added to Linux struct vm_operations_struct
+allow to do the following: (1) Detect if the VMA backed is
+a special backend. (2) An access method for the VMA. And
+finally, (3) methods to request a safe transaction; one that
+locks and another that unlocks. All methods are required to
+be transactional.
+The bpf memory access functions are extended to check
+if the VMA is special and if so, safely access the memory.
+If these methods fail, the bpf functions fall back to original
+execution paths.
+
+Design
+
+This work is designed to allow flexible instrumentation of
+code, eBPF memory access of NEEs and easy integration
+with other eBPF functionality and tooling. In general, in
+order observable NEEs, the following three primitives are
+necessary.
+P1 A means to access NEE memory from eBPF.
+P2 A means to flexibly probe (instrument) NEE code.
+P3 A means to run a specific eBPF program on firing of an
+associated target probe.
+The following discourse explores the changes made to the
+Linux kernel to effect the changes. Fig. 2 shows an overview
+of changes made.
+
+3.2
+
+LWFP introduce a new architecture and approach to probing. Generally, all the tasks in the lifecycle management of
+user-probes are managed by the kernel: (1) In-kernel probe
+registration. (2) Installing the probe in the target address at
+an existing file maping or postponing it till the executable
+is mapped. (3) Delivering notifications and triggering eBPF
+programs on firing of a probe. (4) Updating architectural
+registers, and continuing execution after probe handling. (5)
+De-registration of probes and removal of probes in target
+memory. This model breaks when any fundamental step in
+the chain is hindered.
+LWFP addresses this limitation and, in addition, the fixed
+number of hardware breakpoints, by splitting the probe management roles in the chain between the kernel and user-space.
+The kernel roles in LWFP are as follows: (1) In-kernel probe
+registration and management. (2) Exception management,
+delivering of notifications to bpf programs, and aggregation of probe statistics. (3) De-registration of probes.With
+these scheme, the kernel’s role is reduced to probe management and exception delivery instead of entire work:When
+#BP events are generated, userspace context is compared to
+probe registered information and matches are then appropriately handled by a new perf PMU, including triggering eBPF
+or incrementing a counter.
+The user-space roles in LWFP are as follows: (1) Probe target location discovery in an NEE (2) probe registration with
+kernel. (3) Insertion of software debug instruction (INT3 in
+x86) into a probe address in NEE memory. (4) Advancement
+
+Exception
+native app
+
+0x11: int3
+0x12: inst
+0x14: inst
+0x16: inst
+0x20: inst
+
+perf_syscall
+(LWFP)
+aep
+
+enclave
+
+TCS
+SSA
+
+Access Enclave
+(EDBGWR/EDBGRD)
+Kernel space
+resume user
+
+vma ops
+
+int3_handler
+BP_handler
+
+bpf_*_common
+ELWFP
+DIE_INT3
+
+aep_addr
+tcs_addr
+
+SLWFP virt_addr
+
+DIE handler
+
+LWFP PMU
+
+DR6: 0x16
+SGX
+hardware
+
+unmodified
+ELWFP
+
+get_context
+access enclave
+update context
+
+uprobe
+eBPF
+DIE_BP
+
+hwbp PMU
+
+new
+
+modified
+
+enclave LWFP
+
+SLWFP
+
+/proc/<pid>/map
+Simple LWFP
+
+Figure 2. Design overview. New components are shown in
+green and modified in blue. A new software breakpoint PMU
+and its probes, ESB and SSB.
+3.1
+
+Lightweight Flexible Probes (LWFP)
+
+Extending eBPF Access to NEE Memory
+
+In general, the memory of software NEEs is visible and accessible to bpf programs. For hardware NEEs, the vanilla Linux
+4
+
+of execution context. (5) Probe removal from NEE memory.
+(6) Deregistration with the kernel.
+The split-role design makes LWFP comparatively lighter to
+kprobes or uprobes and flexible enough to meet the unique
+features of NEEs. LWFP is realized through three kernel extensions: (1) The new LWFP performance measurement unit
+(PMU) based on software breakpoints presented in §3.2.2. (2)
+Extensions to kernel exceptions, and bpf handling mechanism illustrated in §3.2.3. And (3) an extension to the perf
+event open syscall to support LWFP probes discussed in §3.2.1.
+
+utilize hash maps at process and thread granularity, each
+keyed by the process id (PID) and thread id (TID) respectively.
+Within a thread, the probes are stored in a hash list for more
+efficient search during an exception.
+To manage fast lookups for LWFP probe reconfiguration,
+statistics, and removal originating from the perf core, we
+use a global hash map to store LWFP probe addresses with
+the perf event identifiers as keys. The combination of both
+approaches allows low-latency lookups from exception contexts and perf core operations.
+
+3.2.1 Extending perf event open syscall(PEO). A new
+PMU identifier, PERF_LWFP, is introduced to select the LWFP
+PMU. allow creation, configuration and connection of probes
+with bpf programs. A new PMU identifier is introduced to
+identify LWFP. The design allows creation of three types of
+LWFP probes: A simple LWFP (SLWFP), enclave LWFP (ELWFP), and extended LWFP (ExLWFP).
+SLWFPs act like traditional probes in that they match the
+configured value to the instruction pointer at exception. An
+ELWFP is targeted towards SGX enclaves and takes two
+values: an address for the instruction pointer and a value
+that is matched to an RBX register at exception as described
+in Section 2.1.
+ExLWFP are the most general probes that are designed to
+match any number of general purpose registers, in addition
+to the instruction pointer, at exception. This is achieved by
+specifying the values of target registers and passing a flag
+that selects the registered to be matched. This generality
+allows them to target any NEE backed that would provide
+special exception context, like context at VM exit, and collectively describe it as a probe.
+For SLWFP and ELWFP, the parameters to configure the
+probes follow the same patterns as in other probes in [10].
+ExLWFP needs an extra structure, passed as a configuration
+struct, to define the exception context. Together, the aforementioned create LWFP probes for PMU described in §3.2.2.
+
+3.2.3 Exception Handling and Reporting. To aggregate statistics, trigger handlers, or send signals, we need to
+identify probes at exception and report to the perf backend.
+LWFP accomplishes this by registering a callback handler
+with the Linux kernel mechanism for INT3 notifications. On
+exception, this handler is triggered. It matches the TID and
+PID of the interrupted thread to look for possible probes. At
+the thread level, each type of probe is matched against the
+exception context according to its respective definition. On
+success, the probe is submitted to the perf core for statistics aggregation and triggering of bpf programs by the eBPF
+backend.
+Depending on the NEE, the handling of the exception and
+advancing execution is the responsibility of the bpf program
+or userspace following the design outlined in Section 3.2.
+This is particularly the case with ELWFP with SGX enclaves,
+where the bpf program has to advance the RIP or manage
+enclave context with extensions in Section 3.1. For SLWFP
+and ExLWFP, context management is done differently. After
+executing handlers, the perf core returns execution to the
+LWFP exception handler.
+ExLWFP allows context management at this point by using control flags configured for the probe. For instance, the
+RIP can be incremented or single-stepped if the respective
+flags are set. For SLWFP, the kernel normally advances the
+instruction pointer and handles other flags. After handling,
+control is returned to the kernel exception handler for return
+to normal execution.
+
+3.2.2 LWFP PMU. LWFP is designed as a counting PMU;
+a single statistic is generated whenever a probe is triggered.
+The core functionality of this module is to manage all registered probes for each process, search and match registered
+probes to CPU context when an exception is delivered, and
+submit the events to the perf core for further statistics aggregation and/or invocation of eBPF handling.
+Probes and Events Management. Management of probes
+and associated perf events is core to the LWFP module. A
+perf -event identifier is associated with all Linux kernel perf
+events and, likewise, with a probe. The perf events are managed by the core perf module, while LWFP probes for each
+event need to be tracked by the LWFP PMU for probe matching and execution. This requires a dual approach: managing
+both perf event identifiers and LWFP probes for fast lookups.
+In general, LWFP probes are designed to target a particular
+thread. To achieve fast and predictable probe lookups, we
+
+3.3
+
+Design of LWFP BPF Programs
+
+In this subsection, we discuss the general design of bpf programs for ELWFP probes. This is illustrative for context management of ELWFP probes and any other NEE that might utilize ExLWFP probes and need special handling at exception.
+The core goal is to determine the execution context in NEE
+hardware and differentiate it from any other closely related
+context. For instance, we can differentiate between hardware
+breakpoints and ELWFP software breakpoints used in SGX
+and handle each appropriately. The design considerations
+for the bpf programs are outlined hereafter.
+Context discovery. SGX applications have to determine
+if the target thread was interrupted inside or outside the
+enclave using RIP. For in-enclave interruption, the correct
+5
+
+execution context is found in the SSA, whose address can
+be obtained from enclave SECS and TCS address in register
+RBX as outlined in §2.1. SECS address should be supplied by
+a userspace frontend or discovered using probes at enclave
+launch. Execution context at exception is accessed from SSA
+using bpf_read/write function. This approach can be used by
+another NEE for the same goal.
+Handling LWFP probes vs Hardware Breakpoints.
+The programming of hardware registers and exception handling of all HB are handled by the kernel. For ELWFP, this
+task has to be handled by the bpf program or a userspace
+frontend. Handling may entail redirection to a trampoline
+code, for complex probing applications like [58], or the RIP in
+the SSA needs to be incremented or modified as appropriate.
+These responsibilities are not part of the core of LWFP PMU
+functionality to allow general and flexible targeting of NEEs.
+3.4
+
+execution context, as in §2.1, and determines what context
+the eBPF program should use.
+3.4.3 Single Stepping. Probe placement involves replacement of an instruction, at a given VA, with INT3. singlestepping-out-of-line (SSOL) is done by having a dedicated
+eBPF function for each instruction type to be emulated. The
+emulation function takes current CPU state, computes and
+updates affected memory and registers, including advancing
+RIP appropriately. The updated state is written back to SSA,
+in the case of SGX. Instructions and their arguments are
+defined in a struct and placed in eBPF hashmaps indexed
+by RIP of probes. Userspace frontends are responsible for
+parsing target instructions and creating these maps.
+3.4.4 Userspace Frontends. Userspace tracers are responsible for acquisition and setup of configuration data in maps
+and post processing for target application. eBPF programs
+should be as small and fast as possible to minimize workload interference. Tracer application gathers and initializes
+shared eBPF maps with apt data for the program to work.
+Control flow can be altered through shared variables. Data
+is collected over shared maps and ringbuffers and all processing left to userspace where myriad of libraries and tools
+exist for this task.
+
+Shared Tooling Mechanisms
+
+This subsection presents shared characteristic aspects of
+new eBPF tooling using the extensions described previously.
+These patterns are encountered when developing bpf programs for NEE using the new extensions. In addition, these
+methods are part of the design of the tools that are later
+presented in section §3.5. Some of these aspects can be seen
+in Fig. 3.
+
+3.5
+
+3.4.1 Controlling Target Process. A tracee can be controlled in one or a combination of the methods below.
+(1) kprobes and uprobes in target executable linked to eBPF
+programs to initialize eBPF maps by hooking into entry or
+exit of appropriate functions. This method anticipates getting
+information during exec syscall with kprobes or when the
+uprobes in the target binary fire at start up. This approach
+can be used to target any, or several instances of the same,
+application.
+(2) ptrace syscall can launch or attach to an application
+and obtain its information to initialize eBPF context. It is
+useful when a launch command is provided or when a target
+application is already running.
+Inferior information. Relevant data like PID, enclave
+base address or linkmap can be obtained using (1) and (2) if
+the target application or libraries have defined execution or
+memory addresses that can be hooked at, and read from. For
+instance, an eBPF strace program can hook into enclave
+creation functions for Gramine or SCONE to obtain enclave
+information. This information can also be supplied by the
+userspace frontend as described in §3.4.4.
+
+Tooling
+
+We present the design of several tools that demonstrate the
+enhanced capabilities afforded by the new extensions. Fig. 3
+shows the new system layout with the added extensions
+and interaction between applications, NEE, eBPF and kernel.
+The prologue and epilogue functions in eBPF summarize the
+context setup and updates needed in NEE, which is not the
+case with normal Linux probes.
+The tools presented are as follows; a stack sampler §3.5.1,
+dynamic and static tracing in §3.5.2 and §3.5.5, a syscall tracer
+§3.5.3 and function timing §3.5.4.
+3.5.1 CPU Profiling. Also referred to as timed sampling
+or stack tracing. The tool provides a CPU usage profile for
+an application to diagnose application hotspots. An application is periodically interrupted and its stack traces are
+recorded and aggregated to show the fraction of execution
+time of each subcomponent. Modern Linux distributions
+moved from stack frame pointers to the DWARF[1][32] format, to allow greater compiler optimization and software
+introspection. DWARF specifies a virtual machine and its instructions which, when executed to termination, reproduce
+the desired cpu state at a desired location.
+Compilers generate and append two DWARF location descriptor sections to binaries; .eh_frame(EH) and an optional
+.eh_frame_hdr(EFH). EFH provides a compact header for
+the EH, enabling fast binary search of Function Description Entries (FDEs) during stack unwinding. FDEs contains
+DWARF instructions for a given function. Shared unwinding
+
+3.4.2 Context Management. NEEs running natively will
+have the correct register state at eBPF program entry. Other
+NEEs, like SGX have to obtain it from saved context in architectural defined regions. SGX establishes its context with
+bpf_read from SSA as described in §2.1 using TCS and SSA
+addresses as initialized as in §3.4.1. For perf timer interrupts,
+the RBX and RIP distinguishes between in-enclave and native
+6
+
+userspace
+
+matches configured values, and obtains enclave context. (2)
+Unwinder that does the DWARF VM emulation. It gets the
+enclave context, and then decodes and executes all CIE and
+FDEs, from the EH and EFH maps, to obtain and submit stack
+samples. It terminates on getting configured sample count,
+fully unwinding stack and on unwind errors.
+
+Target Process
+
+eBPF userspace tools
+eBPF
+bytecode
+
+Enclave / NEE
+ELWFP
+
+Frontend
+
+Userspace libraries:
+libbpf, bcc
+eBPF maps
+& programs
+handling
+
+LWFP /
+sampling
+
+bpf
+syscall
+
+perf
+syscall
+
+verifier
+
+SLWFP
+
+address
+
+*probe
+
+function
+
+attach &
+control
+
+ptrace
+syscall
+
+Trap
+
+eBPF Program
+{
+prologue()
+context_work();
+epilogue();
+}
+
+eBPF
+maps
+
+JIT
+Compiler
+
+address
+
+Kernel space
+
+3.5.2 General design of tracers. Tracers can be achieved
+with dynamic or static instrumentation. Static instrumentation defines probe interfaces programmatically and some
+can be interpreted by the compiler to generate note sections
+describing them or symbol names following a certain naming convention. Two such cases are USDTs and exporting
+addresses of trace points with nop instructions.
+Dynamic instrumentation can be applied to almost any
+instruction. However, the instructions need SSOL through
+emulation as described in §3.4.3. Some common tasks for
+the tracers include. (1) A mechanism to obtain the address
+of target probe and instrument it. (2) Association of target
+probe to an eBPF program. (3) eBPF program execution. (4)
+Update inferior CPU state on eBPF program execution.
+Handling (1) depends on target application e.g. GramineSGX implements ASLR while Intel SGX SDK does not. As
+such, handling Gramine-SGX requires hooking uprobes into
+debug functions that report library loads to debuggers. In
+the other case, this value is knowable beforehand from the
+enclave binary. (2) follows the description given in §3.2.1. (3)
+is dependent on the particulars of tracing task. SSOL and
+context updates achieves (4).
+
+DEBUG:
+READ/WRITE
+
+vma_ops
+kprobe
+perf pmu
+swbp
+
+Figure 3. General overview of new tooling and interaction
+with tracees, eBPF, NEE and the new extensions.
+rules are contained in common instruction entry (CIE). More
+details for DWARF format and how to unwind can be found
+in [1][24].
+The design of the profiler is summarized in Fig. 4. It has a
+userspace frontend and an eBPF DWARF unwinder backend.
+Frontend controls inferiors as described in 3.4.1. Command
+line parameters include PID or inferior command, warm up
+time, sampling duration and frequency (100Hz default), a
+linkmap containing library addresses and names loaded by
+inferior, and output files. Parameters and inferior information are shared with eBPF code in maps, including EH and
+EFH number and data. The eBPF-profiler program is loaded
+and associated with an fd for a PEO periodic hardware timer
+as trigger. A ring buffer callback handler processes stack
+samples to resolve symbol names, aggregate and write the
+data to file. Flame graphs are generated with scripts from
+[2].
+perf pmu
+overflow
+
+Linux kernel space
+
+evaluate_
+context()
+
+enclave
+RIP?
+No
+
+exit()
+program (1)
+eBPF
+
+Yes
+
+userspace
+
+evaluate_
+dwarf()
+
+- stack_depth
+- PID
+- enclave-range
+- TCS addresses
+- enclave base
+
+last frame?
+
+- eh_frame_hdr
+- eh_frame_map
+
+No
+
+Yes
+
+- enable_profile
+
+submit_sample()
+program (2)
+
+libfoo.so::func bar()
+1a0: endbr64
+1a4: push %rbp
+INT3
+1a5: xor %eax,%eax
+
+...
+
+1f4 : pop %rbp
+1f5 : ret
+
+...
+
+22a: pop %rbx
+22b: pop %rpb
+22c: ret
+22d: nopl (%rax)
+
+attach inferior
+
+Process eBPF
+maps, eh_frame,
+eh_frame_hdr,
+settings
+
+value
+0xffff...
+
+0x01F5
+
+0xffff...
+
+0x02CC
+
+0xffff...
+
+key
+
+value
+
+0xffff...
+
+INT3
+
+(a) dynamic instrumentation
+(b) tracepoint addresses share
+descriptor hashmap key
+(c) descriptor hashmap
+(d) instruction descriptor
+
+start profiling
+
+key
+0x01A4
+
+INT3
+
+(a)
+
+parse linkmap
+
+(b)
+
+(c)
+entry:
+0x01a4
+opcode: PUSH
+args:
+RBP
+retcount: 2
+returns:
+[ 0x01f5,
+0x02cc ]
+
+(d)
+
+process data
+Ring
+Buffer
+
+detach & exit
+
+Figure 4. Overview of stack sampling application.
+
+Figure 5. (a) Replacement of target instructions in function
+bar(). (b) Each replaced address shares the key to a map (c)
+whose value(d) is a struct describing the replaced instructions.
+
+The eBPF DWARF unwinder consists of two programs.
+(1) a context evaluator interprets the interruption context,
+
+Dynamic instrumentation of a function needs to group
+the function entry with all its return addresses. This could be
+7
+
+done as show in Fig. 5. The tracepoint addresses, entry and
+all return addresses, of a function share a single instruction
+descriptor struct (d) stored in descriptor hashmap (c). The
+key in (c) is associated with all tracepoint addresses sharing
+the same instruction descriptor in hashmap (b). This way,
+the RIP at exception can be used to find the corresponding
+instruction descriptor. A case statement can be used to call
+the correct emulation function on probe triggers.
+A static tracer for USDTs is presented in §3.5.5. The timing tool §3.5.4 implements both static and dynamic tracing
+methods. A system call tracer (strace) §3.5.3 presents both a
+dynamic syscall tracer and profiler.
+
+§3.5.2. For function probing, it emulates only push and ret
+instructions with dynamic probes, avoiding hard to emulate
+instructions like endbr64. This condition is ensured by the
+frontend.
+3.5.5 USDT. This tool follows the same design as previous
+tools as far as frontend information for inferior management
+is concerned. Data post processing is done in userspace. Its
+unique characteristic is USDT parsing. The userspace loader
+gets USDT information over command line or parsing the
+target library .note.stapsdt section.
+The target USDTs instructions are then executed and converted into structs that can be easily executed in the eBPF
+program. This avoids implementing the full interpreter in
+eBPF. SSOL for USDT is just incrementing the RIP and updating the context. Specifically, this USDT tool is designed
+to handle MariaDB USDTs.
+
+3.5.3 Strace. This tool is designed to do Linux syscall tracing following the System V supervisor call ABI for target
+LibOS. The design follows structure in §3.4.2-§3.4.4 and general ideas in §3.5.2. The distinguishing design aspects are
+presented hereafter.
+Userspace frontend has three unique characteristics. (1)
+Generation of data structures describing arguments and sizes
+of each syscall in a shared map for eBPF program to parse,
+collect and report syscall traces. (2) It requires the information of all syscall entry functions in the target LibOS to hook
+into, which are usually LibOS specific. (3) As dynamic tracer,
+it must define, determine and describe the specific binary
+instructions at all entry and exit points of syscall functions
+in order to prepare appropriate emulation functions. This is
+achieved through disassembly and inspection of the target
+instructions and appropriate locations to install the probes.
+The loader instruments all target locations in the tracee process using ptrace or uprobes. The Gramine-SGX support is
+done using uprobes and HB to dynamically detect enclave
+load addresses, as a way of mitigating variability from ASLR
+feature. ESB are used to instrument the syscall function(s).
+eBPF backend collects syscall traces from data structures
+stored in syscall-indexed hashmap. The main BPF function
+interprets syscall descriptions: argument counts, argument
+lengths, and the locations—registers or memory—from which
+to read them. Traces are written to a shared ringbuffer. Emulation of entry and exit instructions, and the resumption
+of enclave execution, follows §3.4.3. To differentiate syscalls
+across threads, the userspace RBP serves as a LibOS thread
+identifier and as the key for temporary maps that store entry
+data. When the syscall returns, the return value is appended
+to complete the trace.
+Data processing. Syscall traces generated are chronologically ordered and stored to file. The data is also aggregated
+to generate syscall profiles.
+
+This section briefly details the implementation of features
+and tools that were presented in the section 3.
+Linux Kernel Extensions. The Linux kernel extensions
+were developed against kernel version 6.0.0, the earliest release providing the required eBPF capabilities, with 679 LoC.
+Dwarf Profiler. The profiler is implemented in C using
+libbpf[17] and code skeleton from libbpf-bootstrap[18]. Implementing an eBPF DWARF profiler is challenging due to
+verifier limits: programs have a ceiling of one million instructions, large EFH-map offsets are limited by eBPF addressing,
+loops explode instruction count, stack space is restricted
+to 512 B, and call depth is limited to 31 frames. These constraints are mitigated using bpf_loop to handle large loops,
+bpf_tail_call to partition large code, and map-backed temporary structs to minimize stack usage and store global context.
+It has 2096 LoC of bpf, and 1277 LoC of userspace code.
+Strace Tool, Timing and USDT. These tools were implemented using BCC tools[8]. The bpf code is in C with LoC
+of 721, 672 and 560, respectively. The userspace frontend is
+written in Python 3.
+General observations from implementation of the tooling include; shared userspace functionality, prologue and
+epilogue code in eBPF, and only minor distinctions for individual tools. Userspace frameworks like BCC or tools like
+bpftrace [13] normally automate the commonality in libraries
+or code generation, eliminating complexity for the developer.
+This approach can be adopted to address the redundancy.
+
+3.5.4 Timing. This tool uses dynamic instrumentation for
+benchmarking arbitrary functions and static instrumentation for probe benchmarking. A struct defines each sample
+with the key identifier being the function address. Like the
+previous tools, it needs to determine the addresses for each
+function and the number of return functions as described in
+
+The tools described in §3.5 were employed to evaluate applications executed on multiple SGX software stacks, including
+the Intel SGX SDK[36], Gramine-SGX[16], and SCONE[21].
+
+4
+
+5
+
+8
+
+Implementation
+
+Evaluation and Applications
+
+5.3
+
+The timing tool measured the probe-induced overheads. Collectively, these tools demonstrate the tracing, profiling, timing, and benchmarking dimensions of observability, with
+scenario-specific details presented in each case.
+5.1
+
+Profiles give a clear, first-hand view of an application’s performance and how computation is distributed across its internal functions or components. The eBPF DWARF profiler
+described in §3.5.1 and §4 was used to profile MariaDB running on SCONE, at 100Hz, on the same host machine. The
+client executed the Sysbench OLTP[43] read-write database
+benchmarks on a separate machine and connected to the
+database remotely over the network. GDB can also be used
+to get an enclave linkmap from a SCONE debug image. The
+Flame graph in Fig. 6 was generated from the collected stack
+samples with a perl script from [2].
+From Fig. 6, enclave execution spends a significant amount
+of time in the SCONE scheduler (__𝑠𝑐𝑜𝑛𝑒_𝑑𝑖𝑠𝑝𝑎𝑡𝑐ℎ). In particular, function spmc_dequeue seems to take a considerable
+amount of execution time checking for new queue data[22].
+This might cause a characteristic high CPU usage for the
+associated asynchronous syscall interface. Since workload
+characteristics vary across applications, different runtime
+settings could be used to adapt the scheduler i.e it could
+have an IO heavy or compute heavy personality. This profiler is general enough that, by providing relevant enclave
+information as described in §4, any LibOS can be profiled.
+This generality is a testament to the utility of this work for
+tool creation. Prior to this work, profilers were either tied
+to a specific LibOS or embedded within a LibOS through
+dedicated introspection libraries.
+
+Experimental Setup
+
+All experiments are conducted on an Intel Xeon 6787P server
+with 16GB of EPC memory, 256GB RAM, and running Ubuntu
+24.04.2. The benchmarks, tooling and applications run on a
+modified Linux 6.0.0 kernel for all measurements. Reference
+benchmarks were made on a custom compiled stock Linux
+kernel 6.0.0.
+5.2
+
+Profiling
+
+Probe Overheads
+
+This experiment measured the latency introduced by each
+probe. ESB tests use Intel SGX SDK[36] v2.27. The test code
+was statically instrumented as shown in Fig. 7. HB probes
+are placed at the exit and entry for all tests. The probe_point
+probe placement is as follows; ESB and HB for enclaves, SSB,
+HB and uprobes for native modified kernel and only uprobes
+and HB with the stock kernel case. CPU warm up code is
+run before invoking the experiment. Timestamps are taken
+at the entry of bpf_probe_exit and exit of bpf_probe_entry
+probes. eBPF program at probe_point handles SSOL. Further
+experiments were carried out to understand the latency of
+different components.
+Table 1 shows the evaluated values for each probe type.
+We observe that uprobes and HB have a 25% and a 28% higher
+latencies, respectively, over SSB. This is primarily due to the
+extra work uprobes kernel handlers do and the slow #DB
+path for HB involving debug register management. SSB paths
+do not worsen the performance of uprobes relative to the
+stock kernel. With a latency of 394 ns, SSB are a persuasive
+lightweight alternative to uprobes and HBs for typical native
+use cases as well as native NEE scenarios.
+
+5.4
+
+Tracing (eBPF Strace)
+
+Tracing a syscall interface can provide a chronological order
+of executed system calls and the following trace information:
+syscall names, arguments, return values and duration. The
+strace tool described in §3.5.3 was used to hook and trace
+applications running on stock Gramine-SGX v1.9.
+From Python3 log shown in Fig. 8, it can be seen that several attempts to search and open libz fail until the correct
+directory, lib/x86_64-linux-gnu . Each failed attempt ends up
+invoking a sys_newfstatat, incurring unnecessary overheads.
+Such failures are normally a result of incorrect environment
+variables or search path misconfiguration. A common performance optimization strategy is to reorder or customize
+the environment based on the installation path, prioritizing
+the locations that are most frequently accessed.
+The syscall profile data for SQlite3 was rendered to generate a profile as shown in Fig. 9. A LibOS personality can be
+tuned depending on the syscall profile of target application
+to maximize performance. Just like the failures observed in
+Fig. 8, large frequency of system calls can also be indicative
+of high frequency errors motivating further analysis or investigation. This tool is also LibOS agnostic like the previous
+one.
+
+Probe
+Stock Native Enclave
+uprobe
+509
+505
+hw
+477
+492
+2802
+sw
+394
+2757
+Table 1. Minimum probe latencies(ns) for new probes in
+enclaves and native code on modified Linux kernel, and
+stock kernel uprobes and hw probes. ESB is the sw probe in
+the Enclave. SSB is the sw in Native.
+
+Both enclave probes, ESB and HB, show a similar minimum latency of ∼ 2.8 𝜇s for an enclave→eBPF→enclave
+round trip. We measured an EENTER→EXIT round trip
+as 1617 ns (6144 cycles at 3.8 GHz), indicating the enclave
+probes’ latency is dominated by the AEX time. Higher latencies should be expected and are proportional to the amount
+of processing done in the eBPF handler program. Thus, designers should take the latencies into account.
+9
+
+bpf_probe_entry
+
+asm("probe_entry=.;nop");
+
+bpf_probe_handler
+
+for(i=0; i<1000; i++)
+asm("probe_point=.;nop");
+
+bpf_probe_exit
+
+asm("probe_exit=.;nop");
+
+kernel eBPF
+
+userspace/enclave
+
+related metadata. This is equivalently extendable to other
+LibOSes.
+
+6
+
+Discussion
+
+The tool described in §3.5.4 was used to benchmark Intel
+SDK functions as shown in Fig. 10, using dynamic instrumentation of the target functions. The tool requires several
+command-line parameters to measure enclave function latency: enclave base address, a list of function names, the
+target binary’s name and load address, and the addresses of
+the enclave TCS and SECS structures.
+The timing tool can launch or attach to application to
+measure function latency. This tool allows a developer or
+performance analyst to benchmark functions to understand
+effects of code changes.
+
+We have demonstrated the flexibility of our primitives with
+Intel SGX, LibOSes, and native cases. New NEE architectures
+can be supported by implementing the driver interface and
+extending PEO to cater for specific characteristics. For instance, a TEE like vSGX[59] implements SGX ISA and thus
+integration is straight forward. A more general approach to
+support any hardware architecture might be done with a PEO
+probe that can flexibly match any number of registers, but
+this is left for future work. With the most limiting problems
+solved by this work, a simpler approach to this task would be
+utilization of kfuncs [55] and kprobes, along the new TEE’s
+exception path, and use eBPF for context matching.
+eBPF tools are characteristically shorter, faster and easier
+to write than equivalent ptrace-based tools. As such, existing
+tooling can be easily ported to support NEEs. For instance,
+several diverse tools from BCC[8] have the core logic in eBPF.
+Introducing an NEE prologue, epilogue and a corresponding context structure would be sufficient for overwhelming
+majority of applications. For userspace code, such tools can
+adopt a plugin approach to cater to specific NEEs.
+
+5.6
+
+7
+
+Figure 7. Probe overhead test plan and probe placement.
+
+5.5
+
+Function Timing
+
+USDTs
+
+Related Work
+
+eBPF Extensions to the Linux Kernel. There are several
+efforts to extend eBPF interfaces. BPF struct_ops [54] enables
+prototyping kernel extensions in eBPF and calling them from
+within the kernel. We do the opposite. kfuncs [55] allow
+eBPF programs to call kernel functions and approach similar
+capabilities but require driver-specific context awareness.
+Userspace eBPF Runtimes. Userspace runtimes relocate eBPF execution outside the kernel. Bpftime[60] moves
+uprobes to userspace but depends on shared memory and
+ptrace, limiting usage hardware NEEs. uBPF[6] and rbpf [49]
+provide embeddable eBPF VMs and support limited NEE scenarios, but do not address broader observability challenges.
+Specialized TEE Tooling. TEE-specific tools focus on
+narrow or LibOS-specific scenarios. TEEMon [44] monitors
+
+USDTs are employed in applications to provide stable tracing and benchmarking points unlike dynamic tracing. This
+tool is inspired by dbslower[39] tool from BCC. MariaDB run
+under Gramine-SGX v1.19, with the setup and docker image
+adapted from enclaive [3] repository. The tool instruments
+the following MariaDB v10.6 USDTs: query__exec__start,
+query__exec__done, query__cache__hit, query__cache__miss.
+Data captured by the tool was used to generate a histogram
+of query latencies for MariaDB as shown in Fig. 11. The histogram shows a high number of short queries, likely showing
+good caching performance. This analysis can also be applied
+to complex setups to optimize database performance.
+Similar BCC tools can be ported for NEE observability. The
+tool includes a frontend for SCONE that manages enclave
+
+Figure 6. A flame graph of SCONE running MariaDB. The stack profiles appear in pink for SCONE and orange for MariaDB.
+10
+
+Figure 8. A brief strace snippet of Python3 running on Gramine-SGX.
+
+Figure 11. A histogram of MariaDB query latency (𝜇s)
+with synthetic workoad from Sysbech OLTP read-write
+benchmark[43].
+
+SGX and Linux metrics without inspecting enclave execution. SGX-perf [57], TEE-perf [23], and TS-Perf [56] rely on
+instrumentation or recompilation. SGX-Tuner [47] and SGX
+LibOSes [16, 21] expose only limited internal metrics. SGXoMeter [45] benchmarks Intel SDK enclaves, while GDB SGX
+extensions [5] and Intel VTune [38] support debugging or
+hotspot profiling. These tools are single-purpose, enclavespecific, or require recompilation, and cannot generically
+observe NEEs.
+Profiling. X-Prof [34] provides DWARF-based profiling
+for CPUs and GPUs but does not support SGX debug or
+production enclaves. DWARF unwinding optimizations [24]
+improve stack unwinding performance. Native perf [19]
+can measure profile native execution not NEE internals. The
+DWARF profiler in this work demonstrates the capabilities of
+our primitives rather than optimized profiling performance.
+Dynamic Instrumentation. Native dynamic instrumentation tools such as DTrace [28], Utrace [41], and kprobes [46]
+are effective for standard Linux applications but cannot operate inside NEEs due to restricted interfaces and non-standard
+execution paths. Ratel [31] adapts DynamoRIO to SGX for
+
+Figure 9. A syscall profile SQlite3 running under GramineSGX and executing provided sample sql code[52].
+
+Figure 10. Latency of GM cryptography functions in Intel
+SGX SDK Sample Code[29].
+
+11
+
+full instruction-level interposition. The primitives introduced
+in this work generalize such capabilities across diverse NEEs.
+Hardware Tracing Comparison. Hardware tracing mechanisms such as Intel PT and LBR provide exhaustive control-flow
+visibility but generate large traces, whereas a software-driven
+primitive enables selective, condition-based state capture
+suitable for NEEs.
+
+8
+
+Conclusion
+
+In this work presented a set of primitives that solve observability problem of NEEs from eBPF with SGX serving as the
+quintessential example. Linux kernel extensions to virtual
+memory areas and the driver file-operations interface were
+developed to allow safe access to NEE memory. Together,
+these primitives enable the development of rich tooling such
+as profilers and tracers. They provide the necessary flexibility and generality to support a wide range of observability
+use cases. The flexibility and generality of this work forms
+a solid base upon which diverse and capable tooling can be
+developed to close the observability gap with native tooling.
+
+References
+[1] 2017. DWARF Version 5. https://dwarfstd.org/dwarf5std.html
+[2] 2021. Flame Graphs. https://www.brendangregg.com/flamegraphs.
+html
+[3] 2022. enclaive/enclaive-docker-mariadb-sgx: SGX-ready Enclaive
+Docker Image for MariaDB. https://github.com/enclaive/enclaivedocker-mariadb-sgx
+[4] 2022.
+Intel Trust Domain Extensions (Intel TDX) Architecture Specification.
+Architecture Specification. Intel Corporation. https://www.intel.com/content/www/us/en/developer/articles/
+technical/intel-trust-domain-extensions.html
+gdb-sgx-plugin.
+https://github.com/intel/confidential[5] 2023.
+computing.sgx/tree/main/sdk/debugger_interface/linux/gdb-sgxplugin
+[6] 2024. iovisor/ubpf. https://github.com/iovisor/ubpf
+[7] 2024. parca-dev/parca. https://github.com/parca-dev/parca
+[8] 2025. iovisor/bcc. https://github.com/iovisor/bcc
+[9] 2025. ltrace(1) - Linux manual page. https://man7.org/linux/manpages/man1/ltrace.1.html
+[10] 2025. perf_event_open(2) - Linux manual page. https://man7.org/
+linux/man-pages/man2/perf_event_open.2.html
+[11] 2025. ptrace(2) - Linux manual page. https://man7.org/linux/manpages/man2/ptrace.2.html
+[12] 2025. strace(1) - Linux manual page. https://man7.org/linux/manpages/man1/strace.1.html
+[13] 2026. bpftrace/bpftrace: High-level tracing language for Linux. https:
+//github.com/bpftrace/bpftrace
+[14] 2026. eBPF Core Infrastructure Landscape.
+https://ebpf.io/
+infrastructure/
+[15] 2026. GDB: The GNU Project Debugger. https://sourceware.org/gdb/
+[16] 2026. gramineproject/gramine: A library OS for Linux multiprocess applications, with Intel SGX support. https://github.com/
+gramineproject/gramine
+[17] 2026. libbpf/libbpf. https://github.com/libbpf/libbpf original-date:
+2018-10-10T00:24:34Z.
+[18] 2026. libbpf/libbpf-bootstrap: Scaffolding for BPF application development with libbpf and BPF CO-RE. https://github.com/libbpf/libbpfbootstrap
+12
+
+[19] 2026. perf: Linux profiling with performance counters. https://
+perfwiki.github.io/main/
+[20] 2027. Filter and Modify System Calls with seccomp and ptrace –
+Alfonso Sánchez-Beato’s blog. https://www.alfonsobeato.net/c/filterand-modify-system-calls-with-seccomp-and-ptrace/
+[21] Sergei Arnautov et al. 2016. SCONE: Secure Linux Containers with
+Intel SGX. In Proceedings of the 12th USENIX Conference on Operating
+Systems Design and Implementation (OSDI’16). USENIX Association,
+Savannah, GA, USA, 689–703.
+[22] Sergei Arnautov, Pascal Felber, Christof Fetzer, and Bohdan Trach.
+2017. FFQ: A Fast Single-Producer/Multiple-Consumer Concurrent
+FIFO Queue. In 2017 IEEE International Parallel and Distributed Processing Symposium (IPDPS). 907–916. doi:10.1109/IPDPS.2017.41
+[23] Maurice Bailleu, Donald Dragoti, Pramod Bhatotia, and Christof Fetzer.
+2019. TEE-Perf: A Profiler for Trusted Execution Environments. In
+2019 49th Annual IEEE/IFIP International Conference on Dependable
+Systems and Networks (DSN). IEEE, Portland, OR, USA, 414–421. doi:10.
+1109/DSN.2019.00050
+[24] Théophile Bastian, Stephen Kell, and Francesco Zappa Nardelli. 2019.
+Reliable and fast DWARF-based stack unwinding. Proceedings of
+the ACM on Programming Languages 3, OOPSLA (Oct. 2019), 1–24.
+doi:10.1145/3360572
+[25] Andrew Baumann, Marcus Peinado, and Galen Hunt. 2015. Shielding
+Applications from an Untrusted Cloud with Haven. ACM Transactions
+on Computer Systems 33, 3 (Sept. 2015), 1–26. doi:10.1145/2799647
+[26] Andrea Bittau, Petr Marchenko, Mark Handley, and Brad Karp. 2009.
+The Case for Library Operating Systems. In Proceedings of the 12th
+USENIX Workshop on Hot Topics in Operating Systems (HotOS).
+[27] Cyril Cassagnes, Lucian Trestioreanu, Clement Joly, and Radu State.
+2020. The rise of eBPF for non-intrusive performance monitoring.
+In NOMS 2020 - 2020 IEEE/IFIP Network Operations and Management
+Symposium. IEEE, Budapest, Hungary, 1–7. doi:10.1109/NOMS47738.
+2020.9110434
+[28] Greg Cooper. 2012. DTrace: dynamic tracing in oracle Solaris, Mac
+OS X, and free BSD by Brendan Gregg and Jim Mauro. SIGSOFT Softw.
+Eng. Notes 37, 1 (Jan. 2012), 34. doi:10.1145/2088883.2088902
+[29] Intel Corporation. 2025. SampleEnclaveGMIPP: GM Cryptography Sample for Intel SGX. https://github.com/intel/confidentialcomputing.sgx/tree/07cd9c3ba43f66464c7cdd74fcc8e44c4f7ff250/
+SampleCode/SampleEnclaveGMIPP/Enclave. Commit 07cd9c3.
+[30] Victor Costan and S. Devadas. 2016. Intel SGX Explained. IACR
+Cryptol. ePrint Arch. (2016).
+[31] Yinqian Ding, Yinqian Zhang, et al. 2020. Ratel: A Dynamic Binary
+Instrumentation Framework for Intel SGX Enclaves. In Proceedings of
+the 2020 USENIX Annual Technical Conference (ATC).
+[32] Michael J Eager and Eager Consulting. [n. d.]. Introduction to the
+DWARF Debugging Format. ([n. d.]), 11.
+[33] Dawson R. Engler, M. Frans Kaashoek, and James O’Toole. 1995. Exokernel: An Operating System Architecture for Application-Level
+Resource Management. In Proceedings of the Fifteenth ACM Symposium on Operating Systems Principles (SOSP). 251–266. doi:10.1145/
+224056.224076
+[34] Eunomia-bpf. 2023. XPU-Perf: eBPF-based DWARF Profiler for CPUs
+and GPUs. https://github.com/eunomia-bpf/xpu-perf. Accessed:
+2026-05-14.
+[35] Tyler Hunt, Zhiting Zhu, Simon Peter, Arvind Krishnamurthy, and
+Thomas Anderson. 2016. Ryoan: A Distributed Sandbox for Untrusted
+Computation on Secret Data. In Proceedings of the 12th USENIX Symposium on Operating Systems Design and Implementation (OSDI). 533–
+549.
+[36] Intel. 2026. intel/confidential-computing.sgx: Intel SGX for Linux*.
+https://github.com/intel/confidential-computing.sgx
+[37] Intel Corporation 2024. Intel® Xeon® 6979P Processor Specifications.
+Intel Corporation.
+https://www.intel.com/content/www/us/en/
+
+[55] Alexei Starovoitov, Andrii Nakryiko, and et al. 2022. Add Support
+for BPF Kernel Functions (kfuncs). https://git.kernel.org/torvalds/c/
+1f8e2b0c3c. Linux Kernel Commit.
+[56] Kuniyasu Suzaki, Kenta Nakajima, Tsukasa Oi, and Akira Tsukamoto.
+2021. TS-Perf: General Performance Measurement of Trusted Execution Environment and Rich Execution Environment on Intel SGX, Arm
+TrustZone, and RISC-V Keystone. IEEE Access 9 (2021), 133520–133530.
+doi:10.1109/ACCESS.2021.3112202
+[57] Nico Weichbrodt, Pierre-Louis Aublin, and Rüdiger Kapitza. 2018.
+sgx-perf: A Performance Analysis Tool for Intel SGX Enclaves. In
+Proceedings of the 19th International Middleware Conference. ACM,
+Rennes France, 201–213. doi:10.1145/3274808.3274824
+[58] Kenichi Yasukata, Shota Hasegawa, and Kenichi Kourai. 2023. zpoline: A System Call Hook Mechanism Based on Binary Rewriting. In
+2023 USENIX Annual Technical Conference (USENIX ATC 23). USENIX
+Association, 473–488. https://www.usenix.org/conference/atc23/
+presentation/yasukata
+[59] Shixuan Zhao, Mengyuan Li, Yinqian Zhangyz, and Zhiqiang Lin.
+2022. vSGX: Virtualizing SGX Enclaves on AMD SEV. In 2022 IEEE
+Symposium on Security and Privacy (SP). IEEE, San Francisco, CA, USA,
+321–336. doi:10.1109/SP46214.2022.9833694
+[60] Yusheng Zheng, Tong Yu, Yiwei Yang, Yanpeng Hu, Xiaozheng Lai, and
+Andrew Quinn. 2023. bpftime: userspace eBPF Runtime for Uprobe,
+Syscall and Kernel-User Interactions. http://arxiv.org/abs/2311.07923
+
+products/sku/240781/intel-xeon-6979p-processor-504m-cache-2-10ghz/specifications.html
+[38] Intel Corporation. 2026. Intel® VTune™ Profiler. https://www.
+intel.com/content/www/us/en/developer/tools/oneapi/vtuneprofiler.html Version 2026.0.
+[39] iovisor Project. 2022. dbslower: Database Query Latency Tracer (BCC
+Tools). https://github.com/iovisor/bcc/blob/3f5e402/tools/dbslower.py
+[40] David Kaplan. 2020. AMD SEV-SNP: Strengthening VM Isolation with
+Integrity Protection and More. White Paper. Advanced Micro Devices,
+Inc. https://www.amd.com/
+[41] Jim Keniston, Ananth Mavinakayanahalli, Prasanna Panchamukhi,
+and Vara Prasad. 2007. Ptrace, Utrace, Uprobes: Lightweight, Dynamic
+Tracing of User Apps. In Proceedings of the Linux Symposium, Vol. 1.
+Ottawa, Canada, 215–225.
+[42] jim keniston, Prasanna Panchamukhi, and Masami Hiramatsu. [n. d.].
+Kernel Probes (Kprobes) — The Linux Kernel documentation. https:
+//docs.kernel.org/trace/kprobes.html
+[43] Alexey Kopytov. 2026. Sysbench: a modular, cross-platform and multithreaded benchmark tool. https://github.com/akopytov/sysbench.
+Includes OLTP testbench workloads such as oltp_read_write,
+oltp_read_only, and oltp_write_only.
+[44] Robert Krahn, Donald Dragoti, Franz Gregor, Do Le Quoc, Valerio Schiavoni, Pascal Felber, Clenimar Souza, Andrey Brito, and Christof Fetzer.
+2020. TEEMon: A continuous performance monitoring framework for
+TEEs. In Proceedings of the 21st International Middleware Conference.
+ACM, Delft Netherlands, 178–192. doi:10.1145/3423211.3425677
+[45] Mohammad Mahhouk, Nico Weichbrodt, and Rüdiger Kapitza. 2021.
+SGXoMeter: Open and Modular Benchmarking for Intel SGX. In Proceedings of the 14th European Workshop on Systems Security. ACM,
+Online United Kingdom, 55–61. doi:10.1145/3447852.3458722
+[46] Ananth Mavinakayanahalli, Prasanna Panchamukhi, Jim Keniston,
+Anil Keshavamurthy, and Masami Hiramatsu. 2006. Probing the Guts
+of Kprobes. In Proceedings of the Linux Symposium, Vol. 2. Ottawa,
+Canada, 101–114.
+[47] Giovanni Mazzeo, Sergei Arnautov, Christof Fetzer, and Luigi Romano.
+2022. SGXTuner : Performance Enhancement of Intel SGX Applications
+Via Stochastic Optimization. IEEE Transactions on Dependable and
+Secure Computing 19, 4 (July 2022), 2595–2608. doi:10.1109/TDSC.
+2021.3064391
+[48] Frank McKeen, Ilya Alexandrovich, Ittai Anati, Dror Caspi, Simon
+Johnson, Rebekah Leslie, Carlos Rozas, and Mark Shanahan. [n. d.].
+Intel® Software Guard Extensions (Intel® SGX) SGX2. ([n. d.]), 31.
+[49] Quentin Monnet. 2024. qmonnet/rbpf. https://github.com/qmonnet/
+rbpf
+[50] Donald E. Porter, Silas Boyd-Wickizer, Jon Howell, and Galen Hunt.
+2014. Graphene: A Library OS for Portable, Multi-Process Applications.
+In Proceedings of the 2014 USENIX Annual Technical Conference (ATC).
+217–230.
+[51] Donald E. Porter, Silas Boyd-Wickizer, Jon Howell, Reuben Olinsky,
+and Galen Hunt. 2011. Drawbridge: A New OS Architecture for Virtualization. In Proceedings of the 8th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI). 1–14.
+[52] Gramine Project. 2025.
+SQLite Example for Gramine/Intel
+SGX.
+https://github.com/gramineproject/gramine/tree/v1.9/CIExamples/sqlite. Accessed: 2026-05-15.
+[53] Youren Shen, Hongliang Tian, Yu Chen, Kang Chen, Runji Wang, Yi
+Xu, and Yubin Xia. 2020. Occlum: Secure and Efficient Multitasking
+Inside a Single Enclave of Intel SGX. In Proceedings of the Twenty-Fifth
+International Conference on Architectural Support for Programming Languages and Operating Systems. 955–970. doi:10.1145/3373376.3378469
+arXiv:2001.07450 [cs].
+[54] Alexei Starovoitov, Andrii Nakryiko, and et al. 2020. Introduce BPF
+struct_ops for Kernel Subsystem Extensions. https://git.kernel.org/
+torvalds/c/4c1f3e2d9a. Linux Kernel Commit.
+13
+

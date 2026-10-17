@@ -1,0 +1,1720 @@
+PRTree: An R Package for Probabilistic Regression
+Trees with Built-in Missing Data Handling
+Taiane S. Prass
+
+Alisson S. Neimaier
+
+Guilherme Pumi
+
+PPGEst - UFRGS
+
+PPGEst - UFRGS
+
+PPGEst - UFRGS
+
+arXiv:2510.03634v2 [stat.ME] 7 Aug 2026
+
+Abstract
+PRTree is an R package for fitting Probabilistic Regression Trees (PRTrees), a class
+of regression trees that replaces deterministic splits with probabilistic associations to produce smooth prediction functions. The package implements both the original methodology
+and its recent extension for handling missing predictor values, allowing model fitting and
+prediction directly from incomplete datasets without prior imputation. It provides a unified framework for model fitting, prediction, visualization, smoothing-parameter selection,
+cross-validation, and model diagnostics through a standard R interface. Computationally
+intensive routines are implemented in FORTRAN, while the high-level interface follows the
+usual R workflow based on S3 classes and generic methods. This paper reviews the underlying methodology, describes the software architecture and main package components,
+and illustrates their use through reproducible examples.
+
+Keywords: probabilistic regression trees, missing data, nonparametric regression, statistical
+software, R.
+
+1. Introduction
+Regression trees are among the most widely used nonparametric methods for supervised learning because they naturally capture nonlinear relationships and complex interactions while
+producing interpretable predictive models. Since the introduction of Classification and Regression Trees (CART) by Breiman, Friedman, Stone, and Olshen (1984), tree-based methods
+have become a standard tool in statistics and machine learning, with mature implementations available in the R ecosystem, most notably through the rpart package (Therneau and
+Atkinson 2019). Classical regression trees, however, partition the predictor space through
+deterministic recursive binary splits, producing piecewise-constant prediction functions that
+may inadequately represent smooth underlying regression functions.
+Several extensions have been proposed to overcome this limitation by replacing hard decisions with smooth probabilistic mechanisms. Smooth Transition Regression Trees (STRTrees; da Rosa, Veiga, and Medeiros 2008) replace the hard splits of CART by logistic transition functions while preserving axis-aligned splits based on a single predictor variable at
+each internal node. An implementation of the STR-Trees for R is available from GitHub
+(https://github.com/gabrielrvsc/BooST). Soft Trees (İrsoy, Yıldız, and Alpaydın 2012)
+determine routing probabilities through sigmoid functions of linear combinations of the predictor variables, allowing oblique probabilistic splits. A reference C++ implementation is available at https://github.com/oir/soft-tree. Probabilistic Regression Trees (PRTrees), in-
+
+2
+
+PRTree: Probabilistic Regression Trees in R
+
+troduced by Alkhoury, Devijver, Clausel, Tami, Gaussier, and Oppenheim (2020), adopt a
+different perspective by directly defining probability measures over regions of the predictor
+space through smoothing densities. The reference Python implementation is available at
+https://gitlab.com/sami.courie/pr-tree.
+While differing in their probabilistic formulations, these methods share the common goal of
+replacing the discontinuous predictions of classical regression trees with smooth prediction
+functions. However, they all assume that the predictor vector is fully observed and therefore
+provide no native mechanism for handling missing predictor values during model fitting. In
+the companion methodological paper Prass, Neimaier, and Pumi (2026), the original PRTree
+algorithm is adapted to accommodate missing predictor values by introducing alternative definitions of the region-association probabilities for partially observed predictor vectors. These
+adaptations preserve the probabilistic structure of PRTrees while allowing model fitting and
+prediction directly from incomplete data without requiring external imputation.
+To make these developments readily available to researchers and practitioners, this paper
+presents PRTree, the first public R implementation of Probabilistic Regression Trees. The
+package implements both the original methodology of Alkhoury et al. (2020) and the missingdata extensions proposed by Prass et al. (2026) within a unified software framework. It combines a high-level R interface with computational kernels implemented in FORTRAN and C,
+providing an integrated workflow for model fitting, prediction, visualization, cross-validation,
+smoothing-parameter selection, and reproducible empirical evaluation. The PRTree package
+is the first publicly available software implementing the proposed missing-data extensions for
+Probabilistic Regression Trees and, to the best of our knowledge, the first implementatio of
+the PRTree algorithm for R.
+The remainder of this paper is organized as follows. Section 2 briefly reviews the Probabilistic Regression Tree methodology and the missing-data strategies implemented in PRTree.
+Section 3 describes the main components of the package and its implementation. Section 4
+illustrates the principal functionalities of PRTree through reproducible examples. Finally,
+Section 5 concludes with a discussion of the package and directions for future development.
+
+2. Probabilistic Regression Tree Model
+This section briefly reviews the basic concepts underlying the methodology implemented in
+PRTree. These concepts are sufficient to understand the package and the examples presented
+throughout the paper. Complete methodological details of the original PRTree algorithm and
+its missing-data extension can be found in Alkhoury et al. (2020) and Prass et al. (2026),
+respectively.
+
+2.1. PRTree Methodology
+Let (X, Y ) be a random vector taking values in Rp ×R, where Y denotes the response variable
+and X = (X1 , · · · , Xp ) the predictor vector. The regression function is defined by m(x) =
+E(Y |X = x). A PRTree recursively partitions the predictor space into M disjoint rectangular
+regions R1 , · · · , RM . Unlike classical regression trees, an observation is not deterministically
+assigned to a single terminal region. Instead, for every measurable region R ⊂ Rp and
+
+Taiane Schaedler Prass, Alisson Silva Neimaier, Guilherme Pumi
+
+3
+
+predictor value x, the method defines the probability of association
+P(R|X = x) =
+
+Y
+p
+
+−1 Z
+
+vp − x p
+v1 − x 1
+,··· ,
+dv,
+ϕ
+σ1
+σp
+R
+
+σk
+
+k=1
+
+
+
+
+
+(1)
+
+where ϕ is a probability density function and σ = (σ1 , · · · , σp ) is a vector of smoothing
+parameters. Following Alkhoury et al. (2020), we denote the association probability by
+Ψ(x; R, σ) = P(R|X = x). The package currently supports Gaussian, Log-normal, Student’s t, and Gamma association densities.
+The PRTree regression estimator is
+m̂(x) =
+
+M
+X
+
+γm Ψ(x; Rm , σ),
+
+m=1
+
+where γm ∈ R is the coefficient associated with terminal region Rm . Since R1 , · · · , RM form a
+P
+p
+partition of the predictor space, M
+m=1 Ψ(x; Rm , σ) = 1 for every x ∈ R . Consequently, m̂(x)
+is a convex combination of the coefficients γ1 , · · · , γM , with weights given by the association
+probabilities.
+Model fitting proceeds by recursively partitioning the predictor space. At each iteration,
+candidate splits are evaluated according to the empirical loss, the terminal-node weights are
+updated, and tree growth continues until a stopping criterion is satisfied. The estimation of
+the model parameters is described in Section 2.3.
+
+2.2. Handling Missing Data in PRTrees
+The missing-data methodology implemented in PRTree follows the probabilistic framework
+proposed in Prass et al. (2026). When all predictor values are observed, the association
+probability Ψ(X i ; Rm , σ) is evaluated directly. However, when one or more predictor values
+are missing, this quantity is no longer directly defined because the complete predictor vector
+is unavailable. To overcome this limitation, Prass et al. (2026) introduces three alternative extensions of the association probability for partially observed predictor vectors. These
+extensions differ only in how Ψ is evaluated; the remaining tree construction algorithm is
+unchanged. All three approaches are implemented in the package through the fill_type argument. The adapted function Ψ∗ (and, consequently, the corresponding probability measure
+P ∗ ) is defined recursively as follows.
+To fix notation, let S ⊆ {1, · · · , p} denote an arbitrary subset of indices. For any X ∈
+Rp , denote by X |S the subvector containing only the coordinates indexed by S. For any
+Q
+Q
+rectangular region Rm = pj=1 Rmj ⊂ Rp , denote by Rm|S = j∈S Rmj its projection onto
+these coordinates, and for any vector σ ∈ Rp+ , let σ |S be its restriction to the corresponding
+components.
+By a slight abuse of notation, the same symbol Ψ is used to denote both the original association
+probability in Equation (1) and its restriction to lower-dimensional predictor spaces. Thus,
+whenever restricted arguments such as X |S , R|S , and σ |S are used, Ψ is understood to be
+defined by Equation (1) after replacing the predictor vector, the region, and the smoothing
+vector by their corresponding restrictions.
+A notational convention used throughout the paper requires explicit mention: I(A) denotes
+the indicator function of event A and, by convention, is always evaluated first in any expression
+
+4
+
+PRTree: Probabilistic Regression Trees in R
+
+where it appears. This convention ensures unambiguous interpretation of formulas involving
+products of indicators with other mathematical objects.
+Adapted association probability.
+X ∈ Rp and any region R ⊆ Rp :
+
+Let Ψ be the function defined by Equation (1). Given
+
+(a) Base case: if R = Rp (root node), then
+Ψ∗ (X; R, σ) = 1.
+(b) Recursive step: if R ∈ {RFL , RFR } is a child region resulting from the split of a parent
+region RF , first define the set of indices S(X, R) as follows:
+S(X, R) := j ∈ {1, · · · , p} : RFL j ⊊ R and Xj is non-missing ,
+
+
+i.e., the indices j such that the corresponding variable has been used in a previous split and
+Xj is non-missing. Next, define the proxy association function H as
+
+H(X; R, σ) =
+
+
+
+Ψ(X; R, σ),
+
+
+
+
+
+
+1,
+
+if X is fully observed,
+
+
+
+I(X |S(X,R) ∈ R|S(X,R) ),
+
+
+
+
+
+Ψ(X
+;R
+,σ
+
+if fill_type = 1 and S(X, R) ̸= ∅,
+
+|S(X,R)
+
+if fill_type = 0 or S(X, R) = ∅,
+
+|S(X,R)
+
+|S(X,R) ),
+
+if fill_type = 2 and S(X, R) ̸= ∅.
+
+Then Ψ∗ is given recursively by setting p := Ψ∗ (X; RF , σ) and computing
+Ψ∗ (X; RFL , σ) = w1 p,
+
+Ψ∗ (X; RFR , σ) = w2 p,
+
+where w1 = w2 = 0 if p = 0, and
+w1 =
+
+H(X; RFL , σ)
+,
+H(X; RFL , σ) + H(X; RFR , σ)
+
+w2 =
+
+H(X; RFR , σ)
+,
+H(X; RFL , σ) + H(X; RFR , σ)
+
+if p > 0.
+
+Figure 1 illustrates the three missing-data strategies for a two-dimensional predictor space
+when the second coordinate is missing. Panel (a) shows a PRTree and panel (b) the corresponding partition of the predictor space. The gray dot represents the true observation
+(x1 , x2 ), while the dashed vertical line represents all possible values of the unobserved coordinate that are compatible with the observed information (x1 , ?). Although the terminal regions
+are known, the original association probability Ψ(x; R, σ) cannot be evaluated because its
+definition depends on the complete predictor vector. For illustration, let p = P(R2 ∪ R3 |x)
+denote the probability associated with the projected region. Panel (c) shows how the three
+missing-data strategies redistribute this probability between R2 and R3 . For fill_type =
+0, the weights are fixed at w1 = w2 = 1/2. For fill_type = 1, they are given by w1 = 1
+and w2 = 0. For fill_type = 2, the weights are proportional to the probability mass of
+the association density over the projected regions, represented by the shaded areas under the
+curve. The resulting association probabilities are then P(R2 |x) = w1 p and P(R3 |x) = w2 p.
+All three strategies reduce to the original PRTree formulation when no predictor values are
+missing. The default implementation of PRTree uses fill_type = 2.
+
+5
+
+Taiane Schaedler Prass, Alisson Silva Neimaier, Guilherme Pumi
+(a) Tree structure
+
+(c) Redistribution of p
+
+(b) Partition
+x2
+
+p = P (R2 ∪ R3 |x)
+
+(x1 , ?)
+
+fill = 0
+R4
+
+w2 = 12
+
+w1 = 1
+
+w2 = 0
+
+fill = 1
+
+R4
+R1
+
+R1
+R2
+
+w1 = 12
+
+R3
+
+R2
+
+R3
+fill = 2
+
+x1
+
+w1
+
+w2
+
+Figure 1: Illustration of the three missing-data strategies implemented in PRTree. (a) Tree
+structure. (b) Corresponding partition of the predictor space. (c) Redistribution of the
+association probability for the three values of fill_type.
+
+2.3. Parameter estimation
+Given a training sample {(X i , Yi )}ni=1 , parameter estimation aims at minimizing the empirical
+quadratic loss
+(
+)
+argmin
+Θ∈Ξ
+
+n 
+X
+
+M
+X
+
+i=1
+
+m=1
+
+Yi −
+
+2
+
+γm Pim
+
+(2)
+
+,
+
+where Pim = Ψ∗ (X i ; Rm , σ) and the parameter space is
+n
+
+o
+
+p
+p
+M
+Ξ = ({Rm }M
+m=1 , γ, σ) : M ∈ N\{0}, Rm ⊆ R , γ ∈ R , σ ∈ R+ .
+
+The estimation of the different parameters in Θ alternates in between region and weight
+estimates, as in standard regression trees, until a stopping criterion is met. During this
+process, the number of regions is increased by one at each loop and the matrix P and the
+weights γ are gradually updated. The vector σ can either fixed or be estimated through a
+grid search on a validation set.
+Estimating γ. Given the selected smoothing vector σ and the terminal regions {Rm }M
+m=1 ,
+the weight vector γ is estimated by solving the least-squares problem
+γ̂ = argmin
+γ∈RM
+
+( n 
+X
+
+Yi −
+
+i=1
+
+M
+X
+m=1
+
+2 )
+
+γm Pim
+
+= argmin
+
+
+
+Y − Pγ
+
+2
+
+,
+
+γ∈RM
+
+(3)
+
+where Y = (Y1 , · · · , Yn )′ and P = (Pim ) is the matrix of association probabilities.
+Estimating {Rm }M
+m=1 . Assume that M regions, referred to as current regions, have already
+been identified, meaning that the current tree has M leaves. As in standard regression trees,
+each current region Rm , 1 ≤ m ≤ M , can be decomposed into two sub-regions RFL and RFR
+with respect to a coordinate 1 ≤ j ≤ p and a splitting point t (threshold) that minimizes (2).
+
+6
+
+PRTree: Probabilistic Regression Trees in R
+
+Each possible split leads to the update of P , that now belongs to Rn×(M +1) (the space of n
+by M + 1 real matrices), and γ, that now belongs to RM +1 . The corresponding γ̂ is obtained
+through (3). At each step, the split that leads to the smallest mean square error is selected.
+Stopping. The process terminates when any stopping criteria (e.g., depth, minimum node
+size) is met.
+
+3. The PRTree Package
+3.1. Architecture
+The PRTree package implements the methodology described in Section 2 within the R environment. It provides a unified interface for fitting Probabilistic Regression Trees with complete or
+incomplete predictor data, together with tools for prediction, visualization, model selection,
+and cross-validation. The computational core responsible for recursive tree construction and
+split optimization is implemented in FORTRAN. Linear algebra operations rely on the BLAS
+and LAPACK libraries distributed with R, while probability distribution, random number
+generators, and other low-level numerical routines are accessed through R’s native C API.
+Data preprocessing, model management, and graphical utilities are implemented in R.
+Although the computational core is implemented in FORTRAN, the package exposes a compact and consistent R interface following the standard R workflow. Models are fitted through
+the function pr_tree(), which returns an object of class "prtree". Standard S3 methods
+are provided for prediction, visualization, printing, and summarization, allowing the package
+to integrate naturally with the usual R workflow. Most aspects of the fitting algorithm are
+controlled through dedicated control objects, allowing users to modify both the tree-growing
+and cross-validation procedures without changing the main fitting interface. Consequently,
+routine analyses require only a small number of high-level functions for model fitting, data
+partitioning, and cross-validation, together with the corresponding methods for prediction,
+visualization, and model diagnostics.
+Figure 2 summarizes the computational workflow implemented in PRTree. The estimation
+procedure begins in R, where the user inputs are validated before calling the FORTRAN
+subroutine pr_tree_fort. After initializing the required data structures, the subroutine iterates over the candidate smoothing parameter vectors σ. For each candidate, the subroutine
+build_tree recursively constructs a probabilistic regression tree by repeatedly identifying
+splittable nodes, generating candidate splits, evaluating the selected candidates, and updating the tree whenever an admissible split is found. Once the tree has been grown, its predictive
+performance is evaluated, and the current best model is updated whenever an improvement is
+observed. After all candidate smoothing parameter vectors have been evaluated, the selected
+model is returned to R, where it becomes available for prediction, visualization, and diagnostic
+analyses. The following subsections describe the main user-level functions and control objects
+supporting this workflow.
+
+3.2. Main Interface
+Probabilistic Regression Trees are fitted through the function pr_tree(), which provides the
+
+Taiane Schaedler Prass, Alisson Silva Neimaier, Guilherme Pumi
+
+7
+
+In R: pr_tree validates the inputs and calls pr_tree_fort.
+In FORTRAN: Initialize tree structures and workspace.
+YES
+pr_tree_fort:
+Loop over σ values.
+
+build_tree:
+Repeat until a stopping criterion is met:
+
+Any candidates remaining?
+
+(a) Identify splittable nodes.
+(b) Generate candidate splits (stage 1).
+
+NO
+In FORTRAN: Finish the
+loop, process the output
+and return to R.
+In R: Process the output
+and return the results
+Update the best
+tree status
+
+(c) Evaluate candidate splits (stage 2).
+(d) Update the tree with the best split.
+NO
+Evaluate the current tree
+and compute the test MSE
+YES
+
+Lower test MSE than current best?
+
+Figure 2: Process flow for building a tree using the PRTree package.
+main interface to the package. The function follows the standard modeling conventions of R:
+it receives the predictor data, the response variable, and an optional control object specifying
+the fitting procedure, returning an object of class ‘prtree’. This object can subsequently be
+analyzed through methods such as predict(), plot(), print(), and summary().
+The behavior of the fitting algorithm is controlled through the function pr_tree_control(),
+which encapsulates the algorithmic parameters governing tree construction, smoothing parameter selection, candidate split generation, missing-data handling, and computational options.
+Separating the model specification from the algorithmic configuration keeps the main interface compact while allowing detailed control of the estimation procedure whenever needed.
+Complete examples illustrating the use of pr_tree() and pr_tree_control() are provided
+in Section 4.
+The basic syntax of the fitting function is
+pr_tree(X, y, control = pr_tree_control(),...)
+where X is the predictor matrix or data frame, y is the response vector, and control is a list
+of control parameters governing the fitting procedure. As a convenience, these parameters
+may also be supplied directly through .... Any remaining arguments are forwarded to the
+selected association density whenever required.
+The control object is conveniently created through pr_tree_control(...), which returns
+a list containing the algorithmic settings used during model fitting. The available control
+parameters can be grouped according to their role in the estimation procedure.
+• Smoothing parameters, defining the candidate values of the smoothing vector σ:
+sigma_grid, grid_size, min_mult, max_mult, and tiny_sigma.
+
+8
+
+PRTree: Probabilistic Regression Trees in R
+• Tree complexity, controlling tree growth through size, impurity reduction, and probability constraints: max_terminal_nodes, max_depth, cp, n_min, prop_x, and p_min.
+• Validation settings, defining the hold-out sample used for smoothing-parameter selection: prop_hold and idx_train.
+• Missing-data handling, specifying the strategy for evaluating association probabilities and the proxy criterion adopted during candidate generation: fill_type and
+proxy_crit.
+• Candidate split search, controlling the first stage of the split-selection procedure:
+n_candidates and by_node.
+• Association density, specifying the probability density used to compute association
+probabilities through dist together with any distribution-specific parameters supplied
+via ....
+• Output and execution, controlling printed output and execution messages through
+iprint and verbose.
+
+When called without arguments, the function returns a control object initialized with the
+default values:
+R> pr_tree_control()
+========================================================
+PRTree Control Parameters
+========================================================
+Sigma grid: not provided (will be generated with size 8)
+Multiplier range: [0, 2]
+Validation set proportion: 0.20
+Max terminal nodes: 15
+Max depth: 14
+Complexity parameter (cp): 0.010
+Minimum observations per node: 5
+Proportion threshold (prop_x): 0.10
+Probability threshold (p_min): 0.050
+Fill type: 2
+Proxy criterion: both
+Number of candidates: 3
+By node: FALSE
+Distribution: norm
+========================================================
+
+3.3. Association Densities
+The implementation of PRTree assumes that the multivariate association density factorizes
+
+Taiane Schaedler Prass, Alisson Silva Neimaier, Guilherme Pumi
+
+9
+
+as the product of its univariate marginal densities. More precisely,
+ϕ(z) =
+
+p
+Y
+
+ϕ(zj ).
+
+j=1
+
+The same symbol ϕ is used to denote both the multivariate association density and its univariate marginal density. This slight abuse of notation is unambiguous because the joint density
+is completely determined by its marginals, all of which belong to the same parametric family.
+Consequently, restricting the association density to any subset of coordinates preserves the
+same family of distributions. Consequently, the association probability in Equation (1) is
+evaluated as
+
+
+Z Y
+p
+1
+vj − Xj
+Ψ(X; R, σ) =
+ϕ
+dv.
+σj
+R j=1 σj
+The marginal density is specified through the argument dist, while any distribution-specific
+parameters are supplied through dist_pars. The choice of the association density and its
+distribution-specific parameters is part of the model specification. In practice, these quantities are typically selected jointly with the smoothing parameter σ through cross-validation
+using a predictive performance criterion. The package currently supports the following parameterizations.
+Gaussian.
+
+The Gaussian association density requires no additional parameters:
+1
+z2
+ϕ(z) = √ exp −
+.
+2
+2π
+
+
+
+
+Student’s t. The Student’s t association density is parameterized by its degrees of freedom
+ν > 0, specified through dist_pars = list(df = ...):
+Γ (ν + 1)/2
+√
+ϕ(z) =
+Γ(ν/2) πν
+
+
+
+1+
+
+z2
+ν
+
+−(ν+1)/2
+
+.
+
+Log-normal. The Log-normal association density is parameterized by its logarithmic standard deviation s > 0, specified through dist_pars = list(sdlog = ...):
+ϕ(z) =
+
+1
+√
+
+zs 2π
+
+
+
+exp −
+
+[log(z)]2
+I(z > 0).
+2s2
+
+
+Gamma. The Gamma association density is parameterized by its shape parameter α > 0,
+specified through dist_pars = list(shape = ...):
+ϕ(z) =
+
+z α−1 e−z
+I(z > 0).
+Γ(α)
+
+In all cases, the predictor value Xj acts as the location (or lower bound for asymmetric
+distributions), while the smoothing parameter σj controls the scale of the association density
+
+10
+
+PRTree: Probabilistic Regression Trees in R
+
+through the transformation z = (vj − Xj )/σj . Consequently, the user only specifies the
+remaining shape parameters, when applicable.
+
+3.4. Auxiliary Functions
+Besides the main fitting interface, PRTree provides a collection of auxiliary functions supporting model construction, resampling, prediction, visualization, and result inspection. These
+functions can be used independently or combined into customized workflows, while remaining
+fully compatible with the main fitting functions.
+
+Sigma Grid Generation
+The function expand_sigma_grid() generates the grid of candidate smoothing vectors used
+by pr_tree() whenever the argument sigma_grid is not supplied. The construction of the
+grid proceeds as follows:
+1. The sample standard deviation ŝj is computed for each predictor using the training
+sample.
+2. The candidate vectors
+σ (k) = ck (ŝ1 , · · · , ŝp ),
+
+k = 1, · · · , K,
+
+are generated, where K = grid_size and c1 , · · · , cK are equally spaced multipliers
+determined by the arguments min_mult and max_mult. By default, grid_size = 8,
+min_mult = 0, and max_mult = 2.
+Optionally, the argument tiny_sigma may be used to prepend an additional candidate to the
+generated grid. Setting tiny_sigma = 0 includes the deterministic case σ = 0, for which the
+probabilistic assignment coincides exactly with the hard splitting rule of classical regression
+trees. Positive values of tiny_sigma provide smooth approximations of this limiting case.
+Although this procedure is performed automatically whenever sigma_grid is not supplied,
+expand_sigma_grid() is also available as a user-level function, allowing the generated grid to
+be inspected or customized before fitting the model. When the predictor matrix is not available, supplying only n_feat generates the corresponding default grid based on unit feature
+scales, which can subsequently be modified or passed directly to pr_tree().
+R> set.seed(1234)
+R> expand_sigma_grid(n_feat = 3)
+R> expand_sigma_grid(X = matrix(runif(100 * 3, 0, 10), ncol = 3))
+========================================================
+Sigma Grid
+========================================================
+Grid size: 8 candidates
+Features: 3
+First 5 rows:
+
+Taiane Schaedler Prass, Alisson Silva Neimaier, Guilherme Pumi
+
+11
+
+V1
+V2
+V3
+[1,] 0.25 0.25 0.25
+[2,] 0.50 0.50 0.50
+[3,] 0.75 0.75 0.75
+[4,] 1.00 1.00 1.00
+[5,] 1.25 1.25 1.25
+... (3 more rows)
+========================================================
+========================================================
+Sigma Grid
+========================================================
+Grid size: 8 candidates
+Features: 3
+First 5 rows:
+V1
+V2
+V3
+[1,] 0.6968 0.7321 0.663
+[2,] 1.3935 1.4641 1.326
+[3,] 2.0903 2.1962 1.989
+[4,] 2.7870 2.9282 2.652
+[5,] 3.4838 3.6603 3.315
+... (3 more rows)
+========================================================
+
+Data Splitting
+The function train_test_split() generates data partitions for training, validation, and
+cross-validation. When n_rep = NULL (default), it creates a single training/test split. Alternatively, setting n_rep generates a collection of folds suitable for K-fold cross-validation. In
+both cases, the function supports either simple random sampling or stratified sampling based
+on the presence of missing values, ensuring that the proportion of incomplete observations is
+approximately preserved across the generated subsets. The returned object stores the corresponding indices together with summary information describing the resulting partition. An
+example illustrating the generation of cross-validation folds is provided in Section 4.
+The following example compares simple random sampling with stratified sampling. In this
+particular realization, simple random sampling allocates all observations with missing values to the training set, whereas stratification preserves the overall proportion of incomplete
+observations in both subsets.
+R> set.seed(1234)
+R> n_obs <- 100
+R> is_NA <- c(rep(TRUE, 10), rep(FALSE, 90))
+R> summary(train_test_split(n_obs = n_obs, is_NA = is_NA))
+R> summary(train_test_split(n_obs = n_obs, is_NA = is_NA, stratify = TRUE))
+========================================================
+
+12
+
+PRTree: Probabilistic Regression Trees in R
+
+Train/Test Split Summary
+========================================================
+Sampling method: Simple random
+Note: Missing values statistics are shown below but were NOT
+used for stratification (stratify = FALSE).
+Total observations: 100
+Training set: 80 (80.0%)
+Testing set: 20 (20.0%)
+--- Missing Values --Training set: 10 (12.5%)
+Testing set: 0 (0.0%)
+Overall:
+10 (10.0%)
+========================================================
+========================================================
+Train/Test Split Summary
+========================================================
+Sampling method: Stratified (by missing values)
+Total observations: 100
+Training set: 80 (80.0%)
+Testing set: 20 (20.0%)
+--- Missing Values --Training set: 8 (10.0%)
+Testing set: 2 (10.0%)
+Overall:
+10 (10.0%)
+========================================================
+
+Cross-Validation
+Cross-validation is implemented through pr_tree_cv(), while resampling-specific settings
+are specified using pr_tree_control_cv(), which extends pr_tree_control() with crossvalidation parameters. The resampling scheme is selected through the argument method,
+with available options "montecarlo" (Monte Carlo) and "kfold" (K-fold). For K-fold crossvalidation, users may optionally provide the argument fold_idx, specifying the fold assignment of each observation. This allows identical data partitions to be reused across different
+models or experimental settings, ensuring fair performance comparisons.
+The framework supports three common workflows.
+1. Joint smoothing-parameter selection and prediction-error estimation (default).
+Candidate smoothing vectors are evaluated within each resampling iteration, the bestperforming vector is selected, and its predictive performance is subsequently estimated on
+an independent test set.
+
+Taiane Schaedler Prass, Alisson Silva Neimaier, Guilherme Pumi
+
+13
+
+2. Smoothing-parameter selection only. Setting only_sigma = TRUE omits the test
+stage, allowing the resampling procedure to focus exclusively on selecting the smoothing
+parameter. Repeating the procedure across multiple resampling iterations also provides
+information about the stability of the selected smoothing vectors.
+3. Prediction-error estimation for a fixed smoothing parameter. When the supplied
+sigma_grid contains a single candidate, smoothing-parameter selection is skipped and
+cross-validation is used only to estimate the predictive performance of that fixed configuration.
+Under the default workflow, each resampling iteration first partitions the data into training
+and test sets. For method = "kfold", the test set consists of one fold and the remaining folds
+form the training set. For method = "montecarlo", the training and test sets are generated
+by random sampling according to the proportion specified by prop_test.
+The training set may then be further divided into training and validation subsets according
+to prop_valid. When prop_valid > 0, each candidate smoothing vector is fitted on the
+training subset and evaluated on the validation subset. The smoothing vector minimizing
+the validation MSE is selected, after which the model is optionally refitted on the complete
+training set before evaluating its predictive performance on the corresponding test set. This
+final refitting step is controlled by the argument update_final. When update_final =
+FALSE, the model fitted on the reduced training subset is evaluated directly on the test set.
+When prop_valid = 0, no validation subset is created and candidate smoothing vectors are
+instead compared using their training MSE computed on the complete training set.
+The returned object stores the selected smoothing vectors together with the corresponding
+validation and test prediction errors whenever these quantities are computed. These results
+can be used to compare candidate smoothing parameters, estimate predictive performance,
+assess the stability of the selected smoothing vectors across different resampling iterations,
+and identify an appropriate smoothing configuration for fitting the final model.
+
+Prediction
+Predictions for new observations are obtained through the standard S3 generic predict().
+The method accepts matrices or data frames containing new predictor values, including observations with missing covariates. By default, the function returns the predicted responses.
+Setting complete = TRUE additionally returns the corresponding association probability matrix, allowing users to inspect how each observation is probabilistically associated with the
+terminal regions.
+
+Visualization and Summaries
+The package implements standard S3 methods for model inspection. The generic functions
+print() and summary() provide concise and detailed summaries for fitted trees, control
+objects, cross-validation results, and training/test partitions.
+Visualization is provided through two complementary interfaces. For fitted trees, the S3
+generic plot() produces diagnostic graphics, including fitted-versus-observed plots, residual
+diagnostics, and summaries of the association probabilities in the terminal regions. The
+dedicated function plot_tree() provides a graphical representation of the fitted tree itself,
+
+14
+
+PRTree: Probabilistic Regression Trees in R
+
+displaying the splitting rules, the estimated terminal-node weights, and compact heatmaps
+summarizing the association probabilities within each terminal region. For cross-validation
+objects, plot() summarizes the resampling results through graphics of the validation and
+test prediction errors, the selected smoothing vectors across iterations or folds, their empirical
+distributions, and their relationship with the validation error.
+
+3.5. Tree Construction in FORTRAN
+The subroutine pr_tree_fort serves as the interface between R and the FORTRAN implementation and coordinates the entire tree-construction procedure, whose main workflow
+is summarized in Figure 2. First, it initializes the tree structure and allocates the output
+objects. It then verifies whether the root node admits at least one candidate threshold; otherwise, the algorithm immediately returns the root-only tree. Next, the routine iterates over
+the candidate values of the smoothing parameter σ. For each value, it rebuilds the root state,
+constructs the corresponding tree by calling the recursive subroutine build_tree, computes
+the associated predictions, and compares the resulting prediction error with the best solution
+obtained so far. Whenever a better tree is found, the corresponding model is retained and, in
+full-output mode, serialized to the output objects. After all candidate values of σ have been
+evaluated, the routine returns the selected tree together with the requested predictions and
+summary statistics.
+The recursive subroutine build_tree is responsible for constructing the tree associated with
+a fixed value of the smoothing parameter σ. Starting from the root node, the algorithm
+repeatedly identifies the terminal nodes eligible for further partitioning, updates the information required for split evaluation, searches for promising candidate splits through a two-stage
+procedure, and incorporates the best candidate into the tree whenever it satisfies the complexity criterion. This process continues until no further admissible split can be found, the
+limit imposed by max_terminal_nodes is reached, or another stopping criterion is satisfied.
+The following subsections describe the key components of this procedure in detail.
+
+Node Eligibility Criteria
+Before each iteration of the tree-growing procedure, the algorithm updates the list of terminal
+nodes eligible for further partitioning. Only newly created child nodes are evaluated against
+the eligibility criteria described in this subsection. Existing splittable nodes are retained
+unless they have been declared terminal during the tree-growing procedure.
+The argument max_depth specifies the maximum depth allowed for any terminal node, where
+the depth is defined as the number of edges on the path from the root node. Child nodes
+reaching this limit are immediately declared terminal. The remaining newly created child
+nodes are then screened according to the arguments prop_x and p_min.
+Since the posterior probability of a parent region equals the sum of the posterior probabilities
+of its two child regions, a node with insufficient posterior probability mass cannot produce
+two child regions simultaneously satisfying the criterion defined by prop_x and p_min. Moreover, attempting to split such nodes would unnecessarily increase the size of the association
+probability matrix by introducing nearly zero columns, thereby increasing the computational
+cost of subsequent iterations and potentially deteriorating the numerical conditioning of the
+least-squares problem.
+The implementation therefore requires that at least a proportion prop_x of the training
+
+Taiane Schaedler Prass, Alisson Silva Neimaier, Guilherme Pumi
+
+15
+
+observations satisfy P ∗ (R|X i ) ≥ 2 × p_min, where R denotes the current terminal region.
+This provides a sufficient screening criterion, since any node failing this condition cannot
+produce two child regions simultaneously satisfying the criterion defined by prop_x and p_min.
+Satisfying this preliminary criterion does not, however, guarantee that the resulting child
+nodes will also satisfy the probability constraint, as this ultimately depends on the candidate
+threshold.
+
+Threshold Computation
+For each node remaining after the eligibility screening, the algorithm updates the information
+required for split evaluation. This includes computing the admissible candidate thresholds for
+every predictor and updating the set of important features inherited from the parent node.
+The argument n_min specifies the minimum number of observations required in each child
+node produced by a candidate split. Thresholds are computed separately for each predictor
+using only the non-missing observations for that predictor. Consequently, observations routed
+through the tree with a missing value for the current predictor are ignored when generating
+thresholds, although they remain associated with the node and may contribute to threshold
+computation for other predictors.
+Unlike classical regression trees, probabilistic terminal regions need not contain any observations, since observations are associated with regions through posterior probabilities rather
+than hard assignments. Nevertheless, the implementation follows the standard recursivepartitioning literature and generates candidate thresholds as the midpoints between consecutive distinct observed values of the candidate predictor. Restricting the search to these
+midpoints preserves every threshold at which the induced partition changes while substantially reducing the computational cost of the search.
+To satisfy the minimum-node-size constraint, threshold computation is attempted only when
+at least 2 × n_min non-missing observations are available for the current predictor. After
+sorting the observed values, duplicated values are removed and candidate thresholds are
+defined as the midpoints between consecutive distinct values. If no admissible threshold is
+found for any predictor, the node is immediately declared terminal.
+Threshold generation only enforces the minimum-node-size constraint through the argument
+n_min. The probability criterion defined by prop_x and p_min is evaluated later during
+tree construction, since verifying compliance of the resulting child nodes requires computing
+their posterior probabilities. Candidate thresholds failing this criterion are discarded before
+entering the proxy evaluation stage. The remaining thresholds are passed to Stage 1.
+
+Candidate Search – Stage 1
+For each eligible terminal node, Stage 1 searches for the most promising candidate splits. The
+search is performed independently for every predictor with at least one admissible threshold.
+Rather than scanning the candidate thresholds sequentially, the implementation starts from
+the center of the threshold list and progressively explores both directions. This strategy allows
+the search to terminate early whenever the probability constraints can no longer be satisfied.
+Since the candidate thresholds and their proxy scores depend only on the observations associated with the current terminal node, this search is performed only once for each node. The
+resulting candidate list is reused in subsequent iterations until the node is eventually split or
+declared terminal.
+
+16
+
+PRTree: Probabilistic Regression Trees in R
+
+Although the terminal-node weights (γm ’s) and the corresponding empirical loss are not
+recomputed during Stage 1, the posterior probabilities of the child regions must still be evaluated to verify whether a candidate threshold satisfies the admissibility criterion defined by
+prop_x and p_min. While this introduces additional computations compared with classical
+regression trees, it remains substantially less expensive than the complete probabilistic evaluation performed during Stage 2 because it does not require re-estimating the terminal-node
+weights. Moreover, postponing this verification until Stage 2 could allow inadmissible candidate thresholds to be selected by the proxy score, potentially excluding admissible candidates
+from the fixed-size candidate list passed to the second stage. Candidate thresholds failing the
+probability criterion are therefore discarded before proxy ranking.
+The remaining candidates are then ranked using the proxy score. For node m, predictor j,
+and candidate threshold t, the score is defined as
+(m)
+Sj,t =
+
+P
+
+i∈IL (j,t) Yi
+
+|IL (j, t)|
+
+2
+
+P
+
++
+
+i∈IR (j,t) Yi
+
+|IR (j, t)|
+
+2
+
+,
+
+where IL (j, t) and IR (j, t) denote the sets of indices corresponding to the observations assigned
+to the left and right child nodes, respectively. For candidate splitting variables containing
+missing values, these assignments are completed using the proxy routing procedure described
+in the sequel. In the absence of missing values, these sets reduce to IL (j, t) = {i : Xij ≤ t}
+and IR (j, t) = {i : Xij > t}.
+This score coincides with the splitting criterion used in classical regression trees and provides
+a computationally inexpensive approximation to the reduction in empirical loss. Although
+it ignores the probabilistic association matrix and the re-estimation of the terminal-node
+weights, it provides an effective heuristic for identifying the most promising candidate splits
+while avoiding the cost of repeatedly fitting the complete probabilistic model.
+The proxy score is used exclusively as a screening criterion during Stage 1. Only the highestranked candidates proceed to Stage 2, where they are evaluated using the complete probabilistic model. The number of retained candidates is controlled by the argument n_candidates.
+When by_node = TRUE, the best candidates are selected independently within each eligible
+node; otherwise, a single global ranking is constructed across all eligible nodes.
+
+Handling Missing Values
+When the candidate splitting variable contains missing values, the assignment of observations
+to the left and right child nodes is no longer uniquely determined by the candidate threshold.
+Stage 1 therefore employs a proxy routing procedure, similar in spirit to surrogate splits, to
+evaluate each candidate split. First, all observations with non-missing values for the candidate
+predictor are assigned to the left or right child node according to the candidate threshold. The
+remaining observations are then processed sequentially according to the criterion specified by
+proxy_crit. The resulting assignments are retained throughout the remaining tree-growing
+process whenever the corresponding split is ultimately selected.
+Let IL and IR denote the current sets of observations assigned to the left and right child
+P
+nodes, respectively, with cardinalities nL = |IL | and nR = |IR |, and let SL = i∈IL Yi
+P
+and SR = i∈IR Yi denote the corresponding response sums. Finally, let X miss denote an
+observation with a missing value for the candidate predictor and response Ymiss . For each
+incomplete observation, scores CL and CR are computed for assigning the observation to the
+
+Taiane Schaedler Prass, Alisson Silva Neimaier, Guilherme Pumi
+
+17
+
+left or right child node. The observation is assigned to the node with the larger score, after
+which the corresponding node counts and response sums are immediately updated before the
+next incomplete observation is processed. This procedure is repeated until all incomplete
+observations associated with the candidate split have been assigned. Three proxy criteria are
+available.
+Maximizes the separation between the child-node means,
+
+proxy_crit = "mean".
+CL =
+
+SL + Ymiss SR
+,
+−
+nL + 1
+nR
+
+CR =
+
+SR + Ymiss SL
+.
+−
+nR + 1
+nL
+
+proxy_crit = "var". Maximizes between-node variance (proxy for the reduction in the
+residual sum of squares),
+CL =
+
+proxy_crit = "both".
+
+2
+(SL + Ymiss )2 SR
+,
++
+nL + 1
+nR
+
+CR =
+
+(SR + Ymiss )2 SL2
+.
++
+nR + 1
+nL
+
+Uses the sum of the previous two scores.
+
+The resulting assignments are not used solely to evaluate the current candidate split. Once
+a split is accepted, routed observations become permanently associated with their assigned
+child node and participate in all subsequent recursive splitting steps. Candidate thresholds
+are always generated using the observations with non-missing values for the current splitting
+variable. Therefore, a routed observation contributes to threshold computation whenever its
+value for the candidate predictor is observed and is ignored otherwise. After model fitting,
+the terminal node associated with each training observation is returned as part of the fitted
+model object. Together with the fitted tree structure, this information uniquely determines
+the complete path followed by every observation through the tree.
+
+Complete Candidate Evaluation – Stage 2
+The candidates retained from Stage 1 undergo a complete probabilistic evaluation. For each
+candidate split, the association probability matrix is recomputed, the terminal-node weights
+are re-estimated by solving the least-squares problem described in Section 2.3, and the corresponding empirical loss is evaluated. The least-squares problem is solved using the LAPACK
+routine DGELSD, which computes the minimum-norm solution through a divide-and-conquer
+singular value decomposition. This approach provides numerical stability and naturally accommodates rank-deficient association probability matrices.
+After all retained candidates have been evaluated, the candidate producing the largest reduction in the empirical loss is identified. As in classical CART, the argument cp controls
+the trade-off between model fit and tree complexity by preventing splits that do not produce
+a sufficiently large improvement. Unlike the post-pruning strategy traditionally associated
+with CART, however, this criterion is enforced during tree construction. Let MSEcurr denote
+the empirical loss of the current tree and MSEnew the loss obtained after incorporating the
+candidate split. The selected split is accepted only if
+MSEnew ≤ (1 − cp) MSEcurr .
+
+18
+
+PRTree: Probabilistic Regression Trees in R
+
+Equivalently, the relative reduction in the empirical loss must exceed the threshold specified
+by cp. Otherwise, no further split is accepted and all remaining splittable nodes are declared
+terminal, terminating the tree-growing procedure. When a split is accepted, the corresponding
+child nodes are added to the tree, and the algorithm proceeds with the next iteration.
+
+4. Illustrative Examples
+4.1. Data description
+We illustrate the main functionalities of PRTree using the economics data set from the
+ggplot2 package. The response variable is the median duration of unemployment (uempmed),
+while the remaining numeric variables are used as predictors. The predictors are extracted
+as a standard data.frame, which is the expected input format for PRTree.
+R> library("PRTree")
+R> library("ggplot2")
+R> data("economics")
+R> X <- as.data.frame(economics[, sapply(economics, is.numeric)])
+R> y <- X$uempmed
+R> X$uempmed <- NULL
+Since this data set does not contain missing values, we additionally construct a modified
+version by artificially introducing missing values into the predictor variables. Specifically,
+predictor values exceeding the 90th percentile of each variable are set to missing, yielding a
+simple Missing Not At Random (MNAR) mechanism in which the probability of missingness
+depends on the value of the covariate itself. The resulting data set, denoted by X_miss, is
+used throughout the following examples to illustrate the missing-data capabilities of PRTree.
+R> set.seed(1234)
+R> X_miss <- X
+R> for (i in 1:ncol(X)) {
++
+q90 <- quantile(X_miss[, i], 0.9)
++
+X_miss[X_miss[, i] > q90, i] <- NA
++ }
+
+4.2. Basic usage
+Model fitting is controlled through a pr_tree_control() object. In this example, we use a
+Gamma association function with shape parameter 1.5, enable nodewise candidate selection,
+and limit the tree to at most 30 terminal nodes, while all remaining arguments are left at
+their default values.
+R> ctrl <- pr_tree_control(
++
+max_terminal_nodes = 30,
++
+dist = "gamma",
++
+shape = 1.5,
++
+by_node = TRUE)
+
+Taiane Schaedler Prass, Alisson Silva Neimaier, Guilherme Pumi
+
+19
+
+The model is fitted using pr_tree(). The resulting object is of class "prtree" and implements
+the standard S3 methods print(), summary(), plot(), and predict(). The print() method
+provides a concise overview of the fitted tree, reporting the model dimensions, the selected
+association function, the training, validation, and global mean squared errors, and the selected
+smoothing parameters.
+R> set.seed(1234)
+R> fit <- pr_tree(y = y, X = X, control = ctrl)
+R> print(fit)
+========================================================
+Probabilistic Regression Tree (PRTree)
+========================================================
+Number of observations: 574
+Number of features: 4
+Number of terminal nodes: 13
+Distribution: gamma
+with shape = 1.5000
+Mean Squared Error:
+Train: 0.650891
+Validation: 1.279054
+Global: 0.776743
+Selected sigma:
+1787.8132, 18415.0312, 1.4961, 1357.1985
+========================================================
+The summary() method extends the information displayed by print() with a detailed summary of the terminal regions. For each terminal node, it reports the estimated terminal value
+(gamma) together with descriptive statistics of the corresponding association probabilities,
+including the mean, standard deviation, minimum, quartiles, median, and maximum. The
+returned object can also be used programmatically for further analyses.
+R> s <- summary(fit)
+R> print(head(s$terminal_nodes), digits = 4, row.names = FALSE)
+node
+gamma P_mean
+P_sd P_min
+P_q25 P_median
+P_q75 P_max
+1 -73.118 0.06023 0.06763
+0 0.007335 0.02518 0.102671 0.2102
+2 49.655 0.08655 0.10650
+0 0.008863 0.02945 0.155229 0.3239
+3 57.708 0.03977 0.07881
+0 0.001531 0.01010 0.032083 0.3853
+4
+5.262 0.09224 0.20511
+0 0.000000 0.00000 0.002516 0.7082
+5 -1.451 0.04008 0.06591
+0 0.000000 0.00000 0.065545 0.2451
+6 14.025 0.03979 0.06923
+0 0.000000 0.00000 0.059235 0.2854
+The generic plot() method provides a collection of diagnostic plots for fitted probabilistic
+regression trees. By default, it produces five complementary graphics: observed versus fitted
+
+20
+
+PRTree: Probabilistic Regression Trees in R
+
+values, residuals by observation index, a histogram of the residuals, a normal Q–Q plot, and
+boxplots of the terminal-node association probabilities. Alternatively, individual plots can be
+displayed by specifying the corresponding indices through the which argument. The resulting
+diagnostic plots are displayed in Figure 3.
+R> plot(fit, y = y)
+Observed vs Fitted
+
+Residuals
+
+Histogram of Residuals
+
+5.0
+80
+20
+
+60
+
+Residuals
+
+0.0
+
+Count
+
+Fitted values
+
+2.5
+15
+
+10
+
+40
+
+−2.5
+20
+5
+5
+
+10
+
+15
+
+20
+
+25
+
+0
+
+200
+
+400
+
+Observed values
+Data set
+
+train
+
+Data set
+
+validation
+
+Q−Q Plot
+
+0
+
+train
+
+−5.0
+
+validation
+
+−2.5
+
+0.0
+
+2.5
+
+5.0
+
+Residuals
+
+Terminal Node Probabilities
+
+5.0
+
+1.00
+
+2.5
+
+0.75
+
+P(R | X)
+
+Sample Quantiles
+
+600
+
+Index
+
+0.0
+
+0.50
+
+0.25
+−2.5
+
+Theoretical Quantiles
+
+13
+
+12
+
+R
+
+11
+
+R
+
+R
+
+9
+
+10
+R
+
+8
+
+R
+
+7
+
+R
+
+6
+
+R
+
+5
+
+R
+
+4
+
+R
+
+3
+
+R
+
+2
+
+R
+
+2
+
+R
+
+0
+
+R
+
+1
+
+0.00
+−2
+
+Terminal Node
+
+Figure 3: Diagnostic plots produced by plot(). The first four panels evaluate the model
+fit through the observed versus fitted values, residuals by observation index, histogram of
+residuals, and normal Q–Q plot. The fifth panel summarizes the empirical distribution of
+the association probabilities for each terminal node, providing a graphical description of the
+probabilistic partition induced by the fitted tree.
+The plot_tree() function displays the fitted probabilistic regression tree as a dendrogram.
+Internal nodes are labeled with the selected splitting variable and threshold, while terminal
+nodes display the corresponding estimated terminal values (gamma). Additionally, a mini
+heatmap is shown below each terminal node, summarizing the empirical distribution of the
+corresponding association probabilities. This visualization provides an intuitive representation of both the tree structure and the probabilistic partition induced by the model. The
+resulting tree representation is shown in Figure 4.
+R> plot_tree(fit)
+Predictions for new observations are obtained through the generic predict() method.
+R> head(predict(fit, X))
+[1] 4.671657 4.668496 4.668894 4.756089 4.713778 4.685151
+
+21
+
+Taiane Schaedler Prass, Alisson Silva Neimaier, Guilherme Pumi
+
+PRTree Structure
+
+pop
+<3.07e+05
+
+0
+
+unemploy
+<6845.00
+
+1
+
+pop
+<3.15e+05
+
+pce
+<4695.75
+
+pce
+<4108.25
+
+pce
+<1.17e+04
+
+−73.118
+
+Depth
+
+2
+
+3
+
+4
+
+5
+
+5.262
+
+unemploy
+<1.03e+04
+
+−1.451
+
+unemploy
+<7715.50
+
+pop
+<2.37e+05
+
+14.025
+
+unemploy
+<1.12e+04
+
+2.699
+
+5.357
+
+1.587
+
+unemploy
+<1.15e+04
+
+7.542
+
+49.655
+
+57.708
+
+pop
+<3.19e+05
+
+39.994
+
+13.066
+
+12.587
+
+Terminal nodes: 13
+
+Figure 4: Tree representation produced by plot_tree(). Internal nodes are labeled with the
+splitting variable and threshold, terminal nodes display the estimated terminal values (gamma),
+and the heatmaps summarize the empirical distribution of the association probabilities for
+each terminal region.
+
+4.3. Handling Missing Predictors
+A distinctive feature of PRTree is its ability to fit probabilistic regression trees directly from
+data sets containing missing predictor values, without requiring a separate imputation step.
+Since the smoothing parameters are selected using an internal validation sample, we first
+generate a training/validation partition using train_test_split(). In this example, the
+partition is stratified according to the presence of missing values, ensuring that both subsets
+contain similar proportions of incomplete observations. The resulting partition is used only
+by PRTree to select the smoothing parameters.
+R> set.seed(1234)
+R> idx <- train_test_split(
++
+n_obs = nrow(X_miss),
++
+is_NA = apply(X_miss, 1, anyNA),
++
+stratify = TRUE)
+R> summary(idx)
+========================================================
+
+22
+
+PRTree: Probabilistic Regression Trees in R
+
+Train/Test Split Summary
+========================================================
+Sampling method: Stratified (by missing values)
+Total observations: 574
+Training set: 459 (80.0%)
+Testing set: 115 (20.0%)
+--- Missing Values --Training set: 108 (23.5%)
+Testing set: 27 (23.5%)
+Overall:
+135 (23.5%)
+========================================================
+The training indices are supplied through the idx_train argument of pr_tree_control().
+For comparison, CART models are fitted using the default settings of rpart, including the
+complexity parameter cp = 0.01 and the internal 10-fold cross-validation (xval = 10) used
+for cost-complexity pruning. To place both methods under comparable tree-growing conditions, we modify only the node-size parameters by setting minsplit = 10 and minbucket =
+5, matching the corresponding stopping criteria adopted by PRTree.
+R> ctrl <- pr_tree_control(
++
+max_terminal_nodes = 30,
++
+by_node = TRUE,
++
+n_candidates = ncol(X),
++
+tiny_sigma = 0,
++
+dist = "gamma",
++
+shape = 1.5,
++
+idx_train = idx$idx_train)
+R> ctrlC <- rpart.control(minbucket = 5, minsplit = 10)
+The complete and incomplete data sets are then analyzed using both PRTree and CART. For
+reproducibility, the random seed is fixed before each model fit.
+R> set.seed(1234)
+R> fit <- pr_tree(y = y, X = X, control = ctrl)
+R> set.seed(1234)
+R> fit_miss <- pr_tree(y = y, X = X_miss, control = ctrl)
+R> set.seed(1234)
+R> cart <- rpart(y ~ ., data = data.frame(y, X), control = ctrlC)
+R> cp_best <- cart$cptable[which.min(cart$cptable[, "xerror"]), "CP"]
+R> fit_cart <- prune(cart, cp = cp_best)
+R> set.seed(1234)
+R> cart_miss <- rpart(y ~ ., data = data.frame(y, X_miss), control = ctrlC)
+R> w_best <- which.min(cart_miss$cptable[, "xerror"])
+R> cp_best_miss <- cart_miss$cptable[w_best, "CP"]
+R> fit_cart_miss <- prune(cart_miss, cp = cp_best_miss)
+
+Taiane Schaedler Prass, Alisson Silva Neimaier, Guilherme Pumi
+
+23
+
+To illustrate the effect of the missing-data mechanism, we compare the training root mean
+squared errors (RMSE) obtained by both methods under complete and incomplete predictor
+sets.
+R> rmse <- c(
++
+PRTree = sqrt(mean((y - fit$yhat)^2)),
++
+PRTree_missing = sqrt(mean((y - fit_miss$yhat)^2)),
++
+CART = sqrt(mean((y - predict(fit_cart))^2)),
++
+CART_missing = sqrt(mean((y - predict(fit_cart_miss))^2))
++ )
+R> round(rmse, 5)
+PRTree PRTree_missing
+0.62362
+1.41710
+
+CART
+1.03433
+
+CART_missing
+2.73787
+
+As expected, introducing missing predictor values increases the training error for both methods. However, the increase is considerably smaller for PRTree, reflecting its native probabilistic treatment of missing predictors. In contrast, the default missing-data handling strategy
+adopted by rpart leads to a substantially larger deterioration in the fitted model for this
+example.
+To visualize the fitted values, we compare the predictions obtained by PRTree and CART
+under both complete and incomplete predictor sets. For display purposes, the observations
+are ordered according to the pop predictor, while the observed responses are shown as points
+and the fitted values are represented by colored lines. The resulting plots are displayed in
+Figure 5.
+R> library("dplyr")
+R> library("ggplot2")
+R> ord <- order(X$pop)
+R> df_plot <- bind_rows(
++
+data.frame(pop = X$pop[ord], observed = y[ord],
++
+fitted = fit$yhat[ord], Method = "PRTree"),
++
+data.frame(pop = X$pop[ord], observed = y[ord],
++
+fitted = fit_miss$yhat[ord], Method = "PRTree (MNAR)"),
++
+data.frame(pop = X$pop[ord], observed = y[ord],
++
+fitted = predict(fit_cart)[ord], Method = "CART"),
++
+data.frame(pop = X$pop[ord], observed = y[ord],
++
+fitted = predict(fit_cart_miss)[ord],
++
+Method = "CART (MNAR)"))
+R> cols <- c("PRTree" = "#0072B2", "PRTree (MNAR)" = "#0072B2",
++
+"CART" = "#D55E00", "CART (MNAR)" = "#D55E00")
+R> ggplot(df_plot, aes(x = pop)) +
++
+geom_point(aes(y = observed),
++
+colour = "black", alpha = 0.45, size = 0.9) +
++
+geom_line(aes(y = fitted, colour = Method), linewidth = 0.9) +
+
+24
+
+PRTree: Probabilistic Regression Trees in R
+
++
++
++
++
++
+
+facet_wrap(~Method, ncol = 2) +
+scale_colour_manual(values = cols) +
+labs(x = "Population", y = "Median unemployment duration") +
+theme_bw(base_size = 16) +
+theme(legend.position = "none")
+
+CART
+
+CART (MNAR)
+
+PRTree
+
+PRTree (MNAR)
+
+25
+
+20
+
+Median unemployment duration
+
+15
+
+10
+
+5
+
+25
+
+20
+
+15
+
+10
+
+5
+200000
+
+225000
+
+250000
+
+275000
+
+300000
+
+325000200000
+
+225000
+
+250000
+
+275000
+
+300000
+
+325000
+
+Population
+
+Figure 5: Comparison of fitted values obtained by PRTree and CART using complete and
+incomplete predictor sets. Observations are ordered according to the pop predictor for visualization purposes. The probabilistic regression trees produce smooth fitted curves, whereas
+CART yields the characteristic piecewise-constant predictions.
+Although the purpose of this illustration is not to compare predictive performance or establish
+the superiority of one method over another, it demonstrates that missing predictor values can
+affect different tree-based methods in different ways. Under the simple MNAR mechanism
+considered here, the absence of extreme covariate values alters the partitions learned by CART
+more noticeably than those obtained by PRTree. The probabilistic treatment of incomplete
+observations enables PRTree to retain information from partially observed covariate vectors,
+resulting in a smaller change in the fitted values for this example.
+
+4.4. Cross-validation
+The PRTree package provides a flexible framework for model assessment through repeated
+data splitting. Since probabilistic regression trees can be configured through different association functions, distribution parameters, missing-data strategies, proxy criteria, and treegrowing options, evaluating multiple model specifications is often desirable. The function
+pr_tree_cv() performs cross-validation for a single model specification, using the validation observations to select the smoothing parameter vector (sigma) and the test observations
+to estimate predictive performance. When a single candidate smoothing vector is supplied,
+cross-validation is used only to estimate the test prediction error, whereas setting only_sigma
+
+Taiane Schaedler Prass, Alisson Silva Neimaier, Guilherme Pumi
+
+25
+
+= TRUE skips the test stage and performs only smoothing-parameter selection. More elaborate model selection procedures can be readily implemented in R by repeatedly calling
+pr_tree_cv() under different parameter configurations while reusing the same resampling
+scheme.
+For this example, to ensure a fair comparison across different model specifications, we first
+generate a common set of stratified folds using train_test_split(). These folds are subsequently reused by every cross-validation run, so that all candidate models are evaluated
+under exactly the same resampling scheme.
+R> set.seed(1234)
+R> folds <- train_test_split(
++
+n_obs = nrow(X_miss),
++
+is_NA = apply(X_miss, 1, anyNA),
++
+stratify = TRUE,
++
+n_rep = 10
++ )
+R> summary(folds)
+========================================================
+K-fold Partition Summary
+========================================================
+Sampling method: Stratified (by missing values)
+Total observations: 574
+Number of folds: 10
+--- Fold Statistics --Fold Size Missing Missing (%)
+1
+58
+14
+24.1%
+2
+58
+14
+24.1%
+3
+58
+14
+24.1%
+4
+58
+14
+24.1%
+5
+58
+14
+24.1%
+6
+57
+13
+22.8%
+7
+57
+13
+22.8%
+8
+57
+13
+22.8%
+9
+57
+13
+22.8%
+10
+56
+13
+23.2%
+========================================================
+The cross-validation settings are specified through pr_tree_control_cv(), which extends
+pr_tree_control() with the parameters controlling the resampling procedure. To facilitate comparison with the previous examples, we retain the same tree-growing configuration,
+including the Gamma association function with shape parameter equal to 1.5, nodewise candidate selection, and a maximum of 30 terminal nodes. The additional arguments define
+the cross-validation scheme, specifying the previously generated folds and selecting 10-fold
+cross-validation through method = "kfold".
+

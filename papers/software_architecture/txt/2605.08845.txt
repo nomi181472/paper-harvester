@@ -1,0 +1,952 @@
+PREPARED FOR SUBMISSION TO IEEE TRANSACTIONS ON INSTRUMENTATION AND MEASUREMENT
+
+1
+
+A Modular Zero-Dead-Time Data Acquisition and Real-Time GPU
+Processing Platform for High Throughput Physics Experiments
+
+arXiv:2605.08845v1 [physics.ins-det] 9 May 2026
+
+Toma-Stefan Cezar , Marios Maroudas , and Dieter Horns
+
+Abstract—High-throughput physics experiments require efficient
+and increasingly complex real-time processing. This paper presents
+a modular, software-defined platform combining high-bandwidth
+PCIe digitizers with consumer GPUs to achieve continuous, zerodead-time data acquisition. Utilizing NVIDIA CUDA, the system
+provides a scalable pipeline for real-time fast Fourier transforms
+and statistical averaging. Benchmarks demonstrate that the platform can sustain continuous processing at sampling rates up to
+500 MSa/s, effectively managing data throughputs of 1 GB/s.
+To validate the in-situ zero-dead-time architecture, end-to-end
+phase continuity tests were conducted, constraining fractional data
+loss to below 10−12 . Furthermore, long-term system stability was
+demonstrated through an uninterrupted one-month data acquisition
+run. In its current deployment for the WISPLC dark matter
+experiment, the platform operates at 124 MSa/s with a resolution
+bandwidth of 0.1 Hz. This implementation enabled a significant
+reduction in data storage requirements using real-time spectral
+averaging. The callback-driven software architecture, multi-GPU
+workload distribution, and custom hardware shielding solutions are
+detailed, establishing this platform as a flexible and cost-effective
+alternative to traditional hardware-based pipelines.
+Index Terms—Real-time data acquisition, GPU-based processing, CUDA, Zero-dead-time acquisition, Fast Fourier Transform,
+High-throughput instrumentation
+
+I. I NTRODUCTION
+
+M
+
+ODERN high-throughput physics experiments rely on
+robust data acquisition (DAQ) pipelines to digitize
+and process high-bandwidth analog signals. A standard DAQ
+system uses an analog-to-digital converter (ADC) to convert
+detector outputs into digital data. In conventional setups,
+subsequent data processing occurs offline. However, the escalating data volumes in current experiments necessitate realtime processing to reduce storage requirements and enable
+flexible transient signal searches.
+Hardware-based real-time processing systems, particularly
+those utilizing Field Programmable Gate Arrays (FPGAs) or
+Radio Frequency Systems on a Chip (RFSoCs), are the current
+industry standard for high-speed data acquisition and signal
+processing [1], [2]. These systems offer exceptional computational efficiency and deterministic latency, which is critical for
+experiments requiring nanosecond precision. However, they
+present significant development bottlenecks. Developing and
+modifying FPGA-based firmware requires specialized hardware description language (HDL) expertise, such as VHDL or
+Verilog [3]. Furthermore, the synthesis and routing processes
+inherent to FPGAs lead to long compilation times and complex
+debugging cycles [4]. While RFSoCs provide high integration
+The authors are affiliated with the Institut für Experimentalphysik, Universität Hamburg, Luruper Chaussee 149, D-22761 Hamburg, Germany (e-mail:
+toma-stefan.cezar@studium.uni-hamburg.de).
+
+by combining ADCs and FPGAs on a single chip, they remain
+expensive, specialized devices with a high entry barrier for
+general laboratory use [5], [6]. Achieving optimal performance
+on these platforms requires the precise configuration of numerous interdependent parameters, such as decimation factors and
+clock frequencies, which increases system complexity. Consequently, these architectures can become rigid and difficult
+to maintain in experimental environments where processing
+algorithms require frequent iteration.
+As an alternative, this paper presents a modular, softwaredefined DAQ platform that combines high-bandwidth PCIebased ADC cards with standard consumer electronics.
+Software-based processing has been explored for axion
+searches, such as in the CULTASK [7] and CAPP [8] experiments, but these CPU-based implementations remain limited
+in throughput and resolution bandwidth. The utility of a
+GPU-accelerated readout was previously demonstrated in the
+WISPDMX experiment [9]. Our platform builds upon these
+concepts by offloading real-time data processing to NVIDIA
+CUDA-capable graphics processing units (GPUs) to achieve
+high computational throughput while utilizing standard C and
+C++ programming. This approach reduces setup costs and
+development time compared to traditional FPGA pipelines.
+The main contributions of this work are as follows:
+Realization of a modular, software-defined data acquisition architecture that enables continuous high-throughput
+signal acquisition and real-time processing using PCIebased digitizers and GPU-based processing.
+• Implementation of a callback-driven design to enable
+flexible real-time computation of derived signal statistics
+such as power, variances, and spectral averages.
+• In-situ validation of zero dead time capabilities through
+the demonstration of phase consistency over extended
+measurement periods.
+• Deployment of multi-layered software abstractions to ensure compatibility with diverse data acquisition hardware
+platforms.
+•
+
+The platform is currently deployed in the WISPLC dark
+matter experiment at the University of Hamburg [10]. It also
+provides a flexible, software-defined alternative with a larger
+dynamical range in comparison with specialized digital base
+band converter (DBBC) systems [11] utilized in broadband
+searches such as BRASS [12]. By implementing softwaredefined logic rather than fixed hardware architectures, our
+platform supports rapid iteration of diverse signal processing
+operations without requiring specialized firmware development. The software enables real-time fast Fourier transforms
+(FFTs) with highly configurable resolution bandwidths (RBW)
+
+PREPARED FOR SUBMISSION TO IEEE TRANSACTIONS ON INSTRUMENTATION AND MEASUREMENT
+
+2
+
+and continuous statistical averaging. Additional digital signal
+processing and filtering, as well as condition-based data storage can be implemented. By leveraging real-time processing
+and averaging, the raw data storage requirements of the
+WISPLC experiment were reduced by orders of magnitude.
+A detailed description of the hardware constraints, multithreaded software architecture, and performance benchmarks
+is provided, while the underlying C/C++ and CUDA codebase
+will be open-sourced.
+II. T HE P LATFORM A RCHITECTURE
+The proposed data acquisition platform consists of custom
+C/C++ and CUDA software integrated with a hybrid hardware
+setup. This setup merges specialized scientific digitizers with
+standard consumer electronics. The only required external
+hardware is a suitable amplification stage. The following
+sections detail the hardware constraints, the concurrent software architecture, and the implementation of user-defined
+processing callbacks.
+A. Hardware requirements
+The core system requires a high-performance PCIe analogto-digital converter (ADC) paired with a modern multithreaded central processing unit (CPU) and one or more
+CUDA-capable graphics processing units (GPUs). In addition
+to the host computing architecture, the analog signal chain
+requires a suitable amplification stage and a suitable low-pass
+filter for anti-aliasing prior to digitization to prevent highfrequency foldover.
+The platform architecture is hardware agnostic, utilizing
+a modular interface that can support any PCIe ADC card
+employing a first-in-first-out (FIFO) ring buffer structure.
+For our specific experimental deployment, we utilize Spectrum Instrumentation SPCM series digitizers, specifically the
+M4i.4420-x8 [13] and M2p.5941-x8 models [14]. These cards
+provide the high data throughput and bit resolution necessary
+for the real-time spectral analysis required by the WISPLC
+experiment [10]. The M4i.4420-x8 provides continuous sampling rates up to 250 MSa/s across two channels with 16-bit
+resolution and a programmable bipolar input range between
+±200 mV and ±10 V. In most experimental configurations,
+this ADC, combined with a high-stability external reference
+clock, offers adequate performance. Integrating a different
+ADC vendor requires only minimal modifications to the abstract C backend to interface the specific hardware drivers.
+The host system must support multiple PCIe devices at full
+bandwidth to prevent bus bottlenecks between the ADC and
+GPUs. The GPUs execute the real-time processing pipeline.
+Although computational performance, such as floating-point
+operations per second, and memory bandwidth determine
+the achievable processing rate, video random-access memory
+(VRAM) capacity typically imposes the most significant limitation. To overcome this limitation, the software is designed
+to distribute workloads across multiple GPUs. While a single
+GPU with sufficient VRAM is the ideal configuration, our
+specific deployment utilizes a triple GPU setup to achieve
+
+Fig. 1. Design of the custom aluminum Faraday cage utilized to isolate the
+ADC from host system electromagnetic interference.
+
+the required total memory using available consumer hardware. This multi-GPU approach enables higher resolution
+Fourier transforms with narrower resolution bandwidths than
+the single-GPU setup, albeit at the cost of reduced scaling
+efficiency due to non-ideal VRAM distribution across devices,
+as detailed in Section II-C.
+Finally, to mitigate electromagnetic interference (EMI), the
+ADC should be physically isolated from the host PC components using a PCIe riser cable. Enclosing the ADC card and
+secondary RF components within a custom-made grounded
+Faraday cage, constructed from 10 mm-thick aluminum, effectively eliminates high-frequency noise. In particular, this
+external shielding is necessary due to non-ideal shielding along
+the analog input trace of the ADC, which is susceptible to
+RF interference from nearby high-power digital components
+such as the GPU and switching power supplies. Because
+enclosing an active digitizer restricts ambient airflow, passive
+heatsinks and active ventilation fans were integrated directly
+into the custom enclosure. This cooling solution guarantees
+thermal stability, preventing temperature-induced baseline drift
+during extended acquisition runs. The physical design of this
+enclosure is shown in Fig. 1.
+B. General Software structure
+The current software is developed using a mix of C and
+C++1 . It includes additional CUDA modules for GPU-based
+data processing. Although the implementation is primarily
+tailored to Spectrum Instrumentation ADC cards, it contains
+an abstract backend interface. This interface enables support
+for other ADC devices with minimal modification.
+The software architecture is subdivided into multiple concurrent threads utilizing the POSIX Threads (pthreads) API
+[16] to ensure high performance and low latency. The thread
+architecture is illustrated in Fig. 2. By assigning specific tasks,
+such as data acquisition, GPU memory transfer, and disk I/O,
+to independent threads, the platform can maintain a continuous, zero-dead-time pipeline even at maximum sampling rates.
+The system currently provides two long-lived primary threads:
+a DAQ control thread and a user interface (UI) thread. The
+DAQ control thread processes execution commands issued by
+1 We rely on C++ due to external dependencies like CUDA and Dear ImGUI
+[15], but the codebase strictly follows C-style programming conventions.
+
+PREPARED FOR SUBMISSION TO IEEE TRANSACTIONS ON INSTRUMENTATION AND MEASUREMENT
+
+UI Thread
+
+DAQ Thread
+
+ADC Thread
+
+START
+pthread create()
+callback()
+plot()
+callback()
+
+3
+
+and the buffer is large enough to absorb operating system
+scheduling jitter, this approach ensures true zero dead time (see
+Section IV). This abstraction is highly advantageous. The user
+only needs to write a processing callback without managing
+the underlying hardware or memory wrapping logic. Furthermore, this structure enables straightforward future expansion
+to additional features. Examples include supporting multiple
+ADC cards, processing data streamed through network interface cards (NICs), or integrating digital-to-analog converters
+(DACs) for signal synthesis.
+C. User defined Callbacks
+
+plot()
+STOP
+STOP
+UI Thread
+
+DAQ Thread
+
+ADC Thread
+
+Fig. 2. Sequence diagram illustrating the concurrent thread architecture. The
+UI thread issues execution commands to the DAQ thread, which subsequently
+spawns the ADC worker thread via pthread_create(). The ADC thread
+handles the hardware ring buffer, triggers the user-defined data processing
+callbacks, and issues plot() commands back to the UI thread for real-time
+visualization without blocking data acquisition.
+
+either the main thread or the UI thread. Upon receiving a
+request, the DAQ control thread executes the corresponding
+operation, which includes spawning a dedicated DAQ worker
+thread when data acquisition is initiated. This worker thread
+initializes the ADC card and the required data transfer ring
+buffer. After initialization, the worker thread starts the data acquisition by enabling the ADC card. By utilizing the hardware
+FIFO mode (see Sect. II-A), the system continuously acquires
+data without any dead time. The ADC card continuously writes
+into a circular ring buffer in host memory. Once it reaches the
+end of the allocated memory, it wraps around to the beginning.
+During this continuous process, the ADC driver periodically
+updates the worker thread with the volume of newly available
+data. Once this available data exceeds a user-defined threshold,
+the thread invokes a user-provided callback function. This
+callback receives a pointer to the beginning of the valid data
+segment and its length. Through this abstraction, the user can
+treat the continuous data stream as a discrete linear buffer of
+a fixed size. After the callback function finishes execution,
+the processed data segment is marked as processed. This
+allows the ADC hardware to safely overwrite it. Standard
+ring buffer implementations handle wraparounds by copying
+fragmented data into an internal linear buffer if a valid chunk
+crosses the memory boundary. Because this memory transfer is
+computationally expensive, our architecture avoids it entirely.
+We enforce a ring buffer size that is a strict integer multiple
+of the user-defined threshold. This guarantees that every data
+chunk aligns perfectly with the buffer boundaries, preventing
+fragmented reads.
+As long as the execution time of the callback is lower
+than the time required for the ADC to fill the threshold,
+
+The user-defined callback function implements the real-time
+data processing. We present our implementation for computing
+real-time FFTs on a single-GPU or triple-GPU setup. This
+system is highly modular. By modifying the callback function,
+the pipeline can be adapted for different use cases, allowing
+users to implement custom digital filtering, real-time downconversion, or specialized transient signal detection algorithms.
+We provide general-purpose functions for FFTs, thread-safe
+memory buffer handling, downsampling, plotting, and HDF5
+file handling [17].
+1) Baseline Single-GPU Setup: Using a single GPU provides the advantage of continuous VRAM memory. This
+allows for data processing without inter-GPU transfers. The
+downside of this configuration is the limited VRAM, which restricts the achievable maximum resolution bandwidth (RBW).
+For simplicity, we execute one continuous FFT per input
+channel utilizing NVIDIA’s cuFFT library [18]. The RBW
+of a single FFT depends entirely on the duration of data
+acquisition. For a specific sample rate fs , the DAQ time is
+dictated by the FFT input size N in samples. Therefore, the
+input size is inversely proportional to RBW:
+fs
+(1)
+N
+The ADC card provides int16 quantized voltage measurements, with multiple channels interleaved into a single
+buffer. The raw ADC data is first converted into a proper
+physical voltage scale using a CUDA kernel, based on the
+selected hardware voltage range. The result is stored in a
+single-precision floating-point buffer. Optionally, a windowing
+function is applied during this type conversion2 .
+For computing FFTs, a cuFFT plan is created at DAQ
+startup, accounting for the interleaved input format of the
+multi-channel DAQ. The cuFFT library computes the FFTs
+for each channel and stores them as de-interleaved continuous
+data inside a float2 buffer. Since the output is complexvalued, it requires twice as much memory per element. The
+FFT output of a real-valued measurement contains ⌊ N2 ⌋ + c
+elements, where N is the number of input samples and c is
+the number of channels.
+After computing the FFTs, their absolute values are calculated and accumulated into a separate buffer using a custom
+CUDA kernel. To track physical quantities such as signal
+RBW =
+
+2 We precompute and interleave the distinct windows for each channel,
+requiring the GPU to merely multiply the windowing buffer with the voltage
+buffer.
+
+PREPARED FOR SUBMISSION TO IEEE TRANSACTIONS ON INSTRUMENTATION AND MEASUREMENT
+
+h
+i
+VRAM ≈ N sizeof(int16) + 5 · sizeof(float) ≈ 22N
+
+GPU I
+Input data
+int16
+interleaved
+
+Output
+Voltage
+float
+interleaved
+
+GPU III
+
+Input
+FFT
+float2
+linear
+
+Input
+Voltage
+float
+interleaved
+
+Output
+FFT
+float2
+linear
+
+memory copy
+
+Window
+function
+float
+interleaved
+
+(2)
+
+where VRAM is in units of bytes. This calculation accounts
+for the raw input buffer, the intermediate processing stages,
+and the complex spectral output, where the ⌊ N2 ⌋ + c complex
+coefficients are approximately equivalent to N floating point
+values.
+2) Triple-GPU Setup: The single-GPU setup is severely
+limited in the achievable RBW by the onboard VRAM of
+the hardware. Most consumer GPUs are not designed for
+applications with massive contiguous memory requirements.
+We circumvent this by utilizing multiple GPUs. For our current
+WISPLC [10] deployment, we utilize two 11 GB VRAM
+NVIDIA RTX 2080 TI cards [19] and one 16 GB VRAM
+NVIDIA RTX A4000 card [20].
+This multi-GPU setup achieves an increase in the available
+memory at the expense of additional overhead to handle
+the data transfer across several GPUs. It is not possible to
+launch kernels or cuFFT computations on buffers spread
+over different physical GPUs. While it is theoretically simpler
+to split the workload across GPUs by physical channels to
+preserve memory efficiency, this would require either prior
+de-interleaving of the ADC data by a separate host CPU
+or complex strided memory copy schemes. Instead, we split
+the workload sequentially into three stages: type conversion,
+FFT computation, and averaging. These stages are distributed
+across three GPUs, with the FFT GPU possessing the most
+VRAM. The disadvantage of this approach is the loss of
+VRAM efficiency, as it requires mirrored transfer buffers
+between the successive GPUs. In the absence of a shared
+PCIe bridge or NVIDIA NVLink interconnect, data transfers
+are routed through host RAM. This creates a performance
+bottleneck as discussed in Section IV.
+Despite this inefficiency, we achieve a target resolution
+bandwidth of roughly 0.1 Hz with a sample rate of 62 MSa/s
+per channel on a two-channel setup. This equates to an input
+size of 1 GB of int16 data per channel, or a 4 GB total FFT
+input size. Both the VRAM of the first and second GPU are
+allocated almost completely under these parameters. However,
+the final GPU requires significantly less memory. We leverage
+this excess capacity on the third GPU to compute and store
+real-time statistics of the acquired data, such as average total
+power, variances, and phase alignments.
+
+GPU II
+
+memory copy
+
+power and its variance, we additionally store the squared
+and fourth-power magnitude of the FFT spectrum in separate
+accumulation buffers. The callback function continuously accumulates these powers until a user-specified number of FFTs
+is reached, after which the buffers are averaged via a division
+kernel. We store these averaged buffers into an HDF5 file
+utilizing a multi-threaded file handler. For our specific setup,
+this file contains the averaged spectrum, the average of the
+squared spectrum, and the average of the fourth power of the
+spectrum across two channels.
+For an input size of N elements, the minimum required
+VRAM, excluding internal cuFFT workspace overhead, is
+given by:
+
+4
+
+Output
+buffers
+float
+linear
+
+cufft
+library
+overhead
+
+Fig. 3. Overview of the sequential memory layout and workload distribution
+across the three GPUs.
+
+III. V ERIFICATION
+To verify the absence of dead time in the data acquisition
+system in-situ, two complementary validation tests were performed. The first test is designed to probe potential discontinuities occurring during file saving and buffer transitions. The
+second test provides a full-stack validation of the zero-deadtime performance of the acquisition chain. Finally, the longterm stability of the system was assessed through continuous
+operation of the WISPLC setup over several months, during
+which no interruptions, data loss, or performance degradation
+were observed.
+A. File Saving and Buffer Boundary Analysis
+As a first test, continuous sinusoidal signals at various
+frequencies were injected into the ADC card. These signals
+were sampled at a rate of 250 MSa/s to analyze the phase
+continuity at the boundary between consecutive data files. In
+total, six frequencies were evaluated, generating 5000 files per
+frequency with a file size of 2 MB each. Fig. 4 illustrates a
+continuous sine wave at 900 Hz spanning four distinct files,
+where the vertical dashed lines denote the exact boundaries
+between files. This plot confirms the phase continuity for a
+representative sample. However, to ensure this performance is
+consistent throughout the entire dataset, a broader statistical
+verification is required.
+In order to rigorously quantify the continuity between files,
+the amplitude difference at every file boundary was computed.
+This procedure yields amplitude distributions that are sensitive
+to dead time, which enables the comparison between data and
+
+PREPARED FOR SUBMISSION TO IEEE TRANSACTIONS ON INSTRUMENTATION AND MEASUREMENT
+
+Voltage [mV]
+
+File 1
+
+File 2
+
+File 3
+
+File 4
+
+20
+
+5
+
+that lack frequency dependence. Due to a shallow signal slope
+at low frequencies, the expected voltage change over a single
+8 ns sample interval is smaller than the system noise.
+B. End-to-end Zero-Dead Time Validation
+
+0
+20
+0
+
+2
+
+4
+Time [ms]
+
+6
+
+8
+
+Fig. 4. Experimental verification of zero-dead-time continuous data acquisition. A continuous 900 Hz sinusoidal signal was injected into the ADC.
+The plot displays four consecutively saved data files, separated by vertical
+dashed lines. The perfect phase continuity at the exact sample boundary
+demonstrates that no data is dropped during hardware buffer wraparounds
+or software callback executions.
+
+statistical simulations. The resulting sample distributions are
+presented in Fig. 5. To complement the experimental measurements, a Monte Carlo simulation of the measurement process
+was developed to model the expected amplitude difference
+distribution under both zero and finite dead-time conditions.
+The simulation generates consecutive discrete-time samples of
+a sinusoidal signal at frequency f . The final sample of the nth
+file is defined as
+
+
+nN
+x1 (n) = sin 2πf
+,
+(3)
+fs
+where N is the length of each file. The subsequent sample,
+representing the first data point of the next file, is modeled as
+
+
+nN + τ
+x2 (n) = sin 2πf
++ η,
+(4)
+fs
+where τ = 1 for the dead-time free model. To model a system
+with finite dead time, a fractional delay was introduced such
+that τ = 1.5. Furthermore, Gaussian noise was added to the
+second signal to match the experimental conditions, where the
+noise term is modeled as
+η ∼ N (0, σv2 ).
+
+(5)
+
+The noise standard deviation σv is estimated directly from
+the experimental data by evaluating the spectral noise floor
+of the corresponding FFT after the removal of the dominant
+sinusoidal component. The simulated observable is defined as
+the amplitude difference across the file boundary,
+∆x = x2 − x1 ,
+
+(6)
+
+which is evaluated over an ensemble of K = 105 independent realizations. The resulting distribution is then compared
+directly to the experimentally measured distributions under
+identical sampling conditions.
+The experimental results are in agreement with the zerodead-time simulations. As depicted in the upper row of Fig. 5,
+the expected distribution scales appropriately with frequency,
+and the data adequately tracks the zero-dead-time model. Conversely, the lower row exhibits noise-dominated distributions
+
+In the second test, a 3 MHz sinusoidal signal was injected
+into the ADC while synchronizing both the signal generator
+and the ADC card to a shared 10 MHz reference clock. This
+signal was sampled at 125 MSa/s for a continuous duration
+of about 10 minutes3 . Using the first 20 MB of data (corresponding to approximately 0.8 s), the initial phase ϕ0 of the
+3 MHz signal was estimated from the time-domain samples
+x[n] using
+E
+D
+x[n], sin(2πf fns )
+E ,
+(7)
+ϕ0 = arctan D
+x[n], cos(2πf fns )
+where n is the discrete sample index and ⟨·, ·⟩ denotes the
+inner product over the available samples.
+Using the initial phase ϕ0 and the known frequency f =
+3 MHz, a continuous sinusoidal model was extrapolated across
+the entire 10-minute acquisition time. This extrapolated model
+remains in near-perfect agreement with the recorded data
+for the full duration. A comparison of the first and final
+data segments against the model is presented in Fig. 6. Due
+to inherent ADC clock jitter, estimating an absolute phase
+shift over 10 minutes is challenging. However, it is possible
+to constrain the data loss by constraining the phase shift.
+Dead time would manifest as a systematic, cumulative timing
+discontinuity, whereas ADC clock jitter produces zero-mean
+phase fluctuations. Using the acquired data, the maximum
+phase drift is constrained to be below one-hundredth of a
+phase. This constraint corresponds to a maximum hypothetical
+dead time of
+∆ϕ
+1
+Tdead =
+≤
+≈ 3.33 ns,
+(8)
+2πf
+100f
+which is less than the duration of a single sample interval ts ,
+given by
+1
+ts =
+= 8 ns.
+(9)
+fs
+This bounds the fractional data loss L over the total acquisition
+time Ttot to
+L=
+
+Tdead
+3.33 ns
+≤
+≈ 5.6 × 10−12 .
+Ttot
+6 × 1011 ns
+
+(10)
+
+Therefore, it is reasonable to establish an upper bound on the
+fractional dead time of the acquisition system on the order of
+10−12 . Within the resolution limits of the measurement hardware, no evidence of missing samples or timing discontinuities
+is observed over the full 10-minute acquisition time.
+3 Unlike frequency-domain spectra, time-domain data cannot be easily averaged to reduce data rates. Consequently, continuous time-domain acquisition
+requires storage hardware capable of write speeds exceeding the raw data rate.
+The 125 MSa/s rate was chosen to accommodate the maximum sustained
+write speed of the available solid-state drives, as testing at the full 500 MSa/s
+rate requires a sustained throughput exceeding 1000 MB/s for the entire 10minute duration.
+
+PREPARED FOR SUBMISSION TO IEEE TRANSACTIONS ON INSTRUMENTATION AND MEASUREMENT
+
+Density
+
+Data
+f = 19.8 MHz
+
+Model without deadtime ( = 1)
+f = 9.8 MHz
+
+0.050
+
+0.10
+
+0.025
+
+0.05
+
+0.000
+
+Density
+
+10
+
+50
+
+0
+f = 9 kHz
+
+50
+
+Model with deadtime ( = 1.5)
+f = 900 kHz
+0.50
+0.25
+
+25
+
+0
+f = 900 Hz
+
+10
+
+5
+0
+
+0.00
+
+25
+
+0
+
+0.00
+
+2
+
+10
+
+5
+0.2
+0.0
+0.2
+Amplitude Change [%]
+
+6
+
+0
+f = 9 Hz
+
+2
+
+5
+0.2
+0.0
+0.2
+Amplitude Change [%]
+
+0
+
+0.2
+0.0
+0.2
+Amplitude Change [%]
+
+Fig. 5. Histograms of the amplitude change across consecutive file boundaries for six injected frequencies: 19.8 MHz, 9.8 MHz, 900 kHz, 9 kHz, 900 Hz,
+and 9 Hz. The signals were sampled at 250 MSa/s. The experimental data are overlaid with Monte Carlo simulations representing both a strict zero-dead-time
+condition and a finite dead-time condition with a 0.5 sample delay. The symmetric spread around zero in the top row, together with its perfect alignment
+with the zero-dead-time simulation, demonstrates continuous acquisition capability. The bottom row shows the expected distributions dominated by ADC
+quantization and system noise at lower frequencies.
+
+Voltage [mV]
+
+First file
+
+Data
+
+Model
+
+Residuals
+
+Last file
+
+100
+0
+100
+0.00 0.25 0.50 0.75 1.00 1.25 1.50 1.75 2.00 4.75 5.00 5.25 5.50 5.75 6.00 6.25 6.50 6.75
++6.4676167e8
+Time [ s]
+Time [ s]
+
+Fig. 6. Plot of the captured 3 MHz sinusoidal signal superimposed with a mathematical model derived exclusively from the initial 0.8 s of acquired data.
+The left panel shows the first 250 samples of the initial file, while the right panel shows the last 250 samples of the final file recorded around 10 minutes
+later. The perfect phase overlap of the extrapolated model and the data in the right panel indicates zero dead time throughout the entire data acquisition run.
+
+C. Long-Term Stability
+Finally, to validate long-term stability, we deployed the full
+system, including HDF5 file saving, for extended physics runs
+during a WISPLC data-taking campaign. The system operated
+continuously for roughly two months in total, with the longest
+uninterrupted run lasting one full month. The software functioned flawlessly without any crashes or memory corruption.
+Additionally, the onboard ADC hardware maintained a highly
+stable operating temperature, with minimal fluctuations around
+48 ◦ C throughout the entire duration.
+IV. B ENCHMARKS
+To evaluate the performance and reliability of the proposed
+data acquisition platform, we conducted a series of stress
+
+tests designed to probe computational throughput, memory
+transfer bottlenecks, and long-term stability. By replacing the
+UI thread with an automated benchmark controller thread, we
+systematically started and stopped the software across different
+input parameters. We benchmarked the triple GPU setup by
+acquiring a fixed data volume and computing the FFT in real
+time. For each benchmark size, we performed 5 iterations
+utilizing the maximum hardware sample rate. We ran a total
+of 100 benchmarks, each with a different input size.
+The average time spent on each computation step is detailed
+in Fig. 7. We normalized the total GPU computation time by
+the DAQ time, which is the time required by the hardware
+to acquire the respective data chunk. We performed this
+normalization using the maximum sample rate of 500 MSa/s,
+
+PREPARED FOR SUBMISSION TO IEEE TRANSACTIONS ON INSTRUMENTATION AND MEASUREMENT
+
+1500
+1250
+1000
+750
+500
+250
+0
+
+Type Conversion
+Absolute GPU Time
+
+Inter-GPU Transfer
+GPU time / DAQ time
+
+GPU Time [s]
+
+Memory Copy
+
+0
+
+250 500 750 1000 1250 1500 1750 2000
+Benchmark Volume [MB]
+
+7
+
+FFT
+Norm Computation
+Normalized GPU Time
+
+0.8
+0.6
+0.4
+0.2
+0.0
+
+0
+
+250 500 750 1000 1250 1500 1750 2000
+Benchmark Volume [MB]
+
+Fig. 7. Performance benchmarks of the triple GPU setup across 100 different input data volumes. The left panel details the absolute time spent on individual
+computation and inter-GPU memory transfer stages. The right panel displays the total processing time normalized by the DAQ time at a maximum sample
+rate of 500 MSa/s. The constant fraction demonstrates that the processing scales proportionally with the input data volume, dominated by transfer latencies
+rather than algorithmic complexity.
+
+which is equivalent to a data throughput of 1 GB/s. While
+the fast Fourier transform algorithm scales with O(N log N )
+complexity, the actual computation time is heavily dwarfed
+by the inter-GPU memory transfer latencies. All other custom
+processing kernels operate with O(N ) time complexity. Consequently, as shown in the right panel of Fig. 7, the entire
+real-time processing consumes a fixed fraction of the DAQ
+time regardless of the input size.
+At the maximum sample rate, the data processing requires
+approximately 80% of the available DAQ time. However, when
+operating at a lower sample rate, such as the 124 MSa/s
+utilized for the WISPLC experiment, the usage drops to
+roughly 20%.
+The vast majority of the required processing time is spent on
+memory transfers. Because the PCIe bridge of our host motherboard does not support direct GPU peer-to-peer memory
+transfers, we must route the data twice through the host CPU
+RAM. Utilizing a motherboard with a proper PCIe topology
+or incorporating NVIDIA NVLink bridges would immediately
+halve these transfer times. This hardware upgrade would
+reduce the total DAQ time fraction to approximately 12%
+and 50% for the 124 MSa/s and 500 MSa/s configurations,
+respectively.
+V. C ONCLUSION
+The ever-increasing data rates of modern high-throughput
+physics experiments necessitate a shift from rigid hardware
+processing to more flexible and scalable software architectures.
+We have presented a modular data acquisition and real-time
+processing platform that addresses these challenges by combining high-performance PCIe digitizers with consumer-grade
+GPUs. By utilizing a highly scalable multi-threaded POSIX
+(pthreads) architecture, the system efficiently distributes data
+acquisition and memory transfer loads to maintain a zero-deadtime pipeline for fast digitizers. Furthermore, the software
+provides a high degree of flexibility through a user-defined
+callback framework. This architecture facilitates the seamless
+
+integration of software-defined logic, ranging from digital filtering and transient signal detection to continuous fast Fourier
+transforms and statistical averaging, without altering the core
+pipeline.
+The salient features of the system have been empirically
+validated through the WISPLC dark matter search experiment
+at the University of Hamburg. During this deployment, the
+platform maintained a resolution bandwidth of 0.1 Hz at a
+sampling rate of 124 MSa/s with a bandwidth of 62 MHz
+across two channels. The implementation of real-time statistical averaging successfully reduced the experimental data
+storage requirements from 21 TB per day to less than 20 TB
+per month. Furthermore, our custom Faraday cage and cooling
+solution ensured high thermal and electromagnetic stability
+over a continuous month-long acquisition period, with negligible temperature fluctuations and a reduction in environmental
+noise spurs.
+This architecture demonstrates that high-performance GPUbased platforms can effectively replace specialized hardware
+pipelines like FPGAs for medium to large-scale laboratory
+setups. The transition to software-defined processing significantly lowers the entry barrier for high-throughput experiments
+by utilizing standard consumer electronics and established
+programming frameworks. This flexibility allows for rapid iteration and adaptation to different experimental goals, such as
+transient signal detection or high-resolution spectral analysis,
+without requiring hardware redesigns.
+VI. O UTLOOK AND P ERSPECTIVES
+While the current deployment has successfully demonstrated
+the viability of software-defined data acquisition for specific
+physics experiments, the underlying architecture offers opportunities for a broad range of applications. In conjunction with
+appropriate RF equipment, this platform can already replace
+multiple types of standard laboratory instruments, such as
+spectrum analyzers and time-domain data acquisition systems.
+
+PREPARED FOR SUBMISSION TO IEEE TRANSACTIONS ON INSTRUMENTATION AND MEASUREMENT
+
+This significantly simplifies the data acquisition and preprocessing stages. Real-time averaging and the computation
+of basic derived quantities drastically decrease data storage
+requirements and, consequently, total experiment costs.
+We plan to implement additional real-time processing options, including matched filtering for an upcoming highfrequency gravitational wave detector at the University of
+Hamburg. To improve usability for researchers unfamiliar with
+C and CUDA programming, we are planning to develop a
+visual interface for easier customization of the data processing
+pipeline. Furthermore, we intend to integrate a network library
+to decouple the software into a client-server architecture,
+removing the user interface computing load from the host
+server while retaining real-time control.
+Finally, the software was deliberately designed to accommodate future hardware expansions. By integrating a digitalto-analog converter (DAC) card, an external mixing unit,
+directional couplers, and GPIO-controlled SMA switches, the
+system could perform custom signal synthesis and scatterparameter network analysis. The inclusion of heterodyne
+downmixing further enables the platform to probe signals
+in the GHz range, effectively extending the experimental
+frequency reach far beyond the hardware Nyquist limit of
+the digitizer. This extended high-frequency architecture will
+be implemented in the ADAMOS project to facilitate axion
+dark matter searches at 20 GHz [21]. Considering the costeffectiveness and flexibility of this platform, it has the potential
+to replace expensive, rigid laboratory devices while retaining
+full raw data acquisition capabilities.
+ACKNOWLEDGMENTS
+M.M. acknowledges funding by the Deutsche Forschungsgemeinschaft (DFG, German Research Foundation) under Germany’s Excellence Strategy – EXC 2121 “Quantum Universe”
+– 390833306. We thank Marko Ekmedžić for designing the
+ADC enclosure.
+R EFERENCES
+[1] L. Stefanazzi et al., “The QICK (Quantum Instrumentation Control Kit):
+Readout and control for qubits and detectors,” Rev. Sci. Instrum., vol. 93,
+no. 4, p. 044709, 2022.
+[2] J. Michel et al., “The upgraded HADES trigger and data acquisition
+system,” JINST, vol. 6, p. C12056, 2011.
+[3] S. A. Edwards, “The Challenges of Hardware Synthesis from C-Like
+Languages,” 2007. [Online]. Available: https://arxiv.org/abs/0710.4683
+[4] Y. Xiao, D. Park, A. Butt, H. Giesen, Z. Han, R. Ding, N. Magnezi,
+R. Rubin, and A. DeHon, “Reducing FPGA Compile Time with Separate
+Compilation for FPGA Building Blocks,” in 2019 International Conference on Field-Programmable Technology (ICFPT), 2019, pp. 153–161.
+[5] A. Javaid, T. Ahmed, and S. Ali, “Performance evaluation of xilinx
+zynq ultrascale+ rfsoc device for low latency applications,” in 2022 19th
+International Bhurban Conference on Applied Sciences and Technology
+(IBCAST), 2022, pp. 1041–1046.
+[6] S. D. Murthy, V. Moore, Q. Du, A. Jurado, M. Chin, K. Penney, D. Nett,
+and B. Flugstad, “Comparative Evaluation of Xilinx RFSoC Platform for
+Low-Level RF Systems,” in 2025 Low Level Radio Frequency Workshop,
+10 2025.
+[7] S. Lee, “Development of a Data Acquisition Software for the
+CULTASK Experiment,” Journal of Physics: Conference Series,
+vol. 898, no. 3, p. 032035, oct 2017. [Online]. Available: https:
+//doi.org/10.1088/1742-6596/898/3/032035
+
+8
+
+[8] Ahn, S. and Lee, M.J. and Yi, A.K. and Yeo, B. and Ko, B.R. and
+Semertzidis, Y.K., “Fast daq system with image rejection for axion
+dark matter searches,” Journal of Instrumentation, vol. 17, no. 05,
+p. P05025, may 2022. [Online]. Available: https://doi.org/10.1088/
+1748-0221/17/05/P05025
+[9] L. H. Nguyen, A. Lobanov, and D. Horns, “First results from the
+WISPDMX radio frequency cavity searches for hidden photon dark
+matter,” JCAP, vol. 10, p. 014, 2019.
+[10] Z. Zhang, D. Horns, and O. Ghosh, “Search for dark matter with an
+LC circuit,” Phys. Rev. D, vol. 106, p. 023003, Jul 2022. [Online].
+Available: https://link.aps.org/doi/10.1103/PhysRevD.106.023003
+[11] G. Tuccari et al., “DBBC3: VLBI at 32 Gbits per second,” in
+Proceedings of the 11th European VLBI Network Symposium &
+Users Meeting. PoS, 2016, p. 073. [Online]. Available: https:
+//doi.org/10.22323/1.178.0073
+[12] F. Bajjali, S. Dornbusch, M. Ekmedžić, D. Horns, C. Kasemann,
+A. Lobanov, A. Mkrtchyan, L. H. Nguyen, M. Tluczykont, G. Tuccari,
+J. Ulrichs, G. Wieching, and A. Zensus, “”First results from BRASS-p
+broadband searches for hidden photon dark matter”,” Journal of
+Cosmology and Astroparticle Physics, vol. 2023, no. 08, p. 077, aug
+2023. [Online]. Available: https://doi.org/10.1088/1475-7516/2023/08/
+077
+[13] Spectrum Instrumentation GmbH, M4i.44xx Series User Manual:
+14/16 bit digitizer (A/D converter), PCIe x8 interface,
+Spectrum Instrumentation GmbH, 2026. [Online]. Available:
+https://spectrum-instrumentation.com/en/m4i4420-x8
+[14] ——, M2p.59xx Series User Manual: 16 bit digitizer (A/D
+converter), PCIe x4 interface, Spectrum Instrumentation GmbH, 2026.
+[Online]. Available: https://spectrum-instrumentation.com/products/
+details/M2p5941-x4.php
+[15] ocornut. (2026) Dear ImGui: Bloat-free Graphical User Interface for
+C++. [Online]. Available: https://github.com/ocornut/imgui
+[16] “IEEE Standard for Information Technology–Portable Operating System
+Interface (POSIX(TM)) Base Specifications, Issue 7,” IEEE Std 1003.12017 (Revision of IEEE Std 1003.1-2008), pp. 1–3951, 2018.
+[17] The HDF Group, “Hierarchical Data Format, version 5,” 1997–2024,
+https://www.hdfgroup.org/HDF5/.
+[18] NVIDIA. cufft. [Online]. Available: https://developer.nvidia.com/cufft
+[19] NVIDIA GeForce RTX 2080 Ti User Guide, NVIDIA Corporation,
+2018, [Online]. Available: https://www.nvidia.com/content/geforce-gtx/
+GEFORCE RTX 2080Ti User Guide.pdf.
+[20] NVIDIA RTX A4000 Datasheet, NVIDIA Corporation, 2021, [Online].
+Available: https://www.nvidia.com/content/dam/en-zz/Solutions/gtcs21/
+rtx-a4000/nvidia-rtx-a4000-datasheet.pdf.
+[21] M. Maroudas, T.-S. Cezar, A. Gardikiotis, and D. Horns, “ADAMOS:
+Axion Daily Modulation Searches for Dark Matter at 20 GHz,” 2 2026.
+

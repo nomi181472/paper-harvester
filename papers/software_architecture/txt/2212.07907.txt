@@ -1,0 +1,2609 @@
+Automatic Vehicle Trajectory Data Reconstruction at Scale
+Yanbing Wanga,b , Derek Gloudemansb,c , Junyi Jia,b , Zi Nean Teohc , Lisa Liud , Gergely Zachára,b ,
+William Barbourb , Daniel Worka,b,c
+a
+
+Department of Civil and Environmental Engineering, Vanderbilt University, United States
+b
+Institute for Software Integrated Systems, Vanderbilt University, United States
+c
+Department of Computer Science, Vanderbilt University, United States
+d
+Department of Electrical Engineering, Vanderbilt University, United States
+
+arXiv:2212.07907v2 [cs.DS] 5 Nov 2023
+
+Abstract
+In this paper we propose an automatic trajectory data reconciliation to correct common errors in
+vision-based vehicle trajectory data. Given “raw” vehicle detection and tracking information from
+automatic video processing algorithms, we propose a pipeline including (a) an online data association algorithm to match fragments that describe the same object (vehicle), which is formulated
+as a min-cost network circulation problem of a graph, and (b) a one-step trajectory rectification
+procedure formulated as a quadratic program to enhance raw detection data. The pipeline
+leverages vehicle dynamics and physical constraints to associate tracked objects when they become
+fragmented, remove measurement noises and outliers and impute missing data due to fragmentations. We assess the capability of the proposed two-step pipeline to reconstruct three benchmarking
+datasets: (1) a microsimulation dataset that is artificially downgraded to replicate upstream errors,
+(2) a 15-min NGSIM data that is manually perturbed, and (3) tracking data consists of 3 scenes from
+collections of video data recorded from 16-17 cameras on a section of the I-24 MOTION system, and
+compare with the corresponding manually-labeled ground truth vehicle bounding boxes. All of the
+experiments show that the reconciled trajectories improve the accuracy on all the tested input data
+for a wide range of measures. Lastly, we show the design of a software architecture that is currently
+deployed on the full-scale I-24 MOTION system consisting of 276 cameras that covers 4.2 miles of
+I-24. We demonstrate the scalability of the proposed reconciliation pipeline to process high-volume
+data on a daily basis.
+Keywords: trajectory data, data association, data reconciliation,
+
+1. Introduction
+1.1. Motivation
+Vehicle trajectory data has received increasing research attention over the past decades. We draw
+particular attention to extracting high-resolution vehicle trajectory data from video cameras as traffic
+monitoring cameras are becoming increasingly ubiquitous. Video-based trajectory data collection in
+conjunction with image processing algorithms can offer a “bird’s eye” perspective and, with a dense
+deployment of cameras, can achieve complete spatial and temporal coverage of a roadway segment.
+The capability to fully observe every vehicle for a long duration of time and over a long corridor
+is critical to advance research in areas such as training and calibration of traffic flow models, and
+driving behavior modeling [46].
+However, vision-based trajectory data by itself is of limited utility for traffic research because
+of noise and systematic sensing errors, thus necessitates proper processing to ensure data quality.
+Email address: yanbing.wang@vanderbilt.edu (Yanbing Wang)
+
+Preprint submitted to Transportation Research Part C
+
+November 7, 2023
+
+Inaccuracies in such data – projection errors, occlusions, dimensions, and kinematic physicality [56],
+for example – need to be addressed. Automatic data reconciliation methods are needed to deal with
+massive volumes of trajectory data from traffic video processing.
+This paper describes the development of a two-step data reconciliation and postprocessing pipeline
+for a densely-instrumented camera network, I-24 MOTION [26]. This project was in collaboration
+with the Tennessee Department of Transportation (TDOT) and involved 276 fully-connected 4K
+cameras to monitor a 4.2-mile stretch of Interstate 24. The upstream process is an anonymous
+trajectory data generation pipeline using computer vision and image processing algorithms (detailed
+in [26; 25; 28]) to produce 3D vehicle detection and tracking data in a roadway reference system
+(Figure 1). The continuous field of view provides for complete, high-resolution trajectories for nearly
+every individual vehicle on the roadway.
+A preliminary investigation on the raw trajectories revealed various errors arise from a combination of factors in upstream system design and computer vision detection and tracking, such as object
+hand-off across cameras, homography estimation, and the coordinate transformation from imagery
+to roadway coordinates. We have intentionally designed the post-processing step to be independent
+of the tracking algorithm and the specific error structures it may contain.
+
+Figure 1: Left: the field of view from one of the 276 cameras with vehicles detected in 3D bounding boxes. Right:
+Projected positional measurements in roadway coordinates.
+
+1.2. Challenges
+The first challenge in generating high-quality trajectory data through post-processing is the need
+to tackle a range of issues stemming from both upstream system design and computer-vision algorithms. One of the foremost challenges is dealing with “tracking fragmentations”, where the tracking
+of vehicles gets frequently disrupted, often due to errors in tracking algorithms, object occlusions,
+inaccuracies in the transformation from image space to roadway coordinates, and data segmentation due to distributed computation (see Figure 2). Additional issues include missing detections,
+false positives, tracking inconsistencies, and inaccurate localization (see Figure 3). These errors are
+common in video-processing algorithms, which necessitate the significance of having a comprehensive
+data post-processing procedure capable of addressing a broad spectrum of issues before the trajectory
+data can be employed for traffic analysis purposes.
+A secondary challenge is that the data postprocessing algorithms should be efficient in order
+to handle the growing volume of data coming from large-scale real-world camera systems that are
+designed to enable real-time traffic monitoring and control. Data reconciliation must be performed
+in real-time or with low latency to facilitate continuous or even live generation of high-volume data.
+Therefore, fast and online data reconciliation methods are to be explored.
+Last but not the least, while many prior studies in the literature have acknowledged the importance of data cleaning and have proposed various methodologies, there is a noticeable absence
+of open-sourced datasets and implementations suitable for method benchmarking. A reliable benchmarking dataset should contain raw tracking results and their corresponding ground truth. To initiate
+2
+
+Figure 2: Time-space diagram for four hours of I-24 westbound morning rush hour traffic on Nov 22, 2022, generated
+from I-24 MOTION vehicle trajectories. x-axis: time of day (HH:MM); y-axis roadway postmile (mi). Fragments due
+to upstream artifacts are highlighted.
+
+benchmarking endeavors, we are making our datasets available (both simulated data and raw tracking data with manually labeled ground truth), along with the post-processing repository used in this
+paper, accessible to the research community.
+
+Figure 3: Examples of common inaccuracies from upstream video processing algorithms: missing detection, inaccurate
+localization, and false positives.
+
+1.3. Problem statement and contributions
+This paper focuses on the postprocessing component as part of the I-24 MOTION software system.
+The postprocessing takes the raw tracking information from upstream computer vision pipeline as
+input, and outputs trajectory data that is more complete and with kinematic noises and outliers
+removed. The postprocessing pipeline is designed to be agnostic of the specific upstream system
+design and tracking configurations, e.g., setup of camera clusters, image-to-roadway transformation
+and object hand-off between cameras. All of these design decisions have been detailed in [25; 26;
+28]. Instead, the postprocessing pipeline addresses two common tracking problems: the first is
+3
+
+fragmentation, meaning the tracking of a vehicle is interrupted constantly, resulting in multiple
+short, partially-tracked fragments; the second is the presence of noises, outliers and missing data
+on each trajectory (Figure 3), due to miscellaneous detection and tracking errors upstream. The
+raw tracking input is in a 2D relative roadway coordinate system (a locally perpendicular coordinate
+system with the primary axis being the direction of travel and the secondary axis perpendicular to
+the direction of travel). The postprocessed output trajectories are in the same coordinate system.
+We highlight the following contributions in this article:
+• To solve the fragmentation issue, we develop an efficient online data association algorithm,
+online negative cycle canceling, which overcomes the limitations of batch methods for solving the
+data association problem as a network flow problem. The online algorithm ensures optimality
+of the batch algorithm, and is able to process up to half a million fragments per hour as required
+by the streaming data rate from the upstream tracking system. Benchmark experiments show
+that the proposed data association algorithm has the capability to combine together 60-77% of
+fragments, resulting in trajectories that are 3-4.5 times longer.
+• To address the noises, outliers and missing data, we introduce an one-step convex program
+to rectify trajectories. This method is capable of simultaneous imputation of missing data,
+denoising of signals, and removal of outliers. This approach, based on elastic net regularization,
+ensures kinematic feasibility and internal consistency of trajectories and is able to streamline
+the process compared to other multi-step methods.
+• We design a software architecture for postprocessing that utilizes asynchronous processes and
+is currently deployed on the I-24 MOTION system to continuously generate a large volume of
+high-quality open-road trajectory data. The online nature of the data association algorithm
+and the convex trajectory rectification formulation allow this deployment to potentially work
+with streaming raw tracking data from upstream.
+• We release the datasets used to benchmark the proposed postprocessing algorithms in this
+paper, including the ground truth, manually-perturbed and reconciled simulated data, the
+raw tracking data from three scenes and the corresponding manually labeled ground truth and
+reconciled data. Additionally, we provide the postprocessing repository used in our paper for the
+community to start the benchmarking efforts in the direction of trajectory data reconciliation
+[link removed for review purposes].
+The rest of the paper is organized as follows: Section 2 summarizes available vehicle trajectory
+datasets, data acquisition methods and their scopes. Section 3 specifies the problem formulation for
+solving the fragmentation and trajectory rectification problems. In Section 4, we assess the capability
+of the proposed pipeline to reconstruct three benchmarking datasets: (1) a microsimulation dataset
+that is artificially downgraded to replicate upstream errors, (2) a 15-min NGSIM data that is manually
+tampered, and (3) tracking data consists of 3 scenes from a subsection of the I-24 MOTION system.
+All of the experiments show that the postprocessed trajectories improve the accuracy on all the
+tested input data for a wide range of measures. Additionally we demonstrate the design of a software
+architecture that is capable of processing high-volume data from the full-scale I-24 MOTION system.
+Finally in Section 5, we summarize the methods, results and highlight potential future improvements.
+
+2. Related work
+2.1. Vehicle trajectory datasets
+Vehicle trajectory data is integral to the study of traffic dynamics. They reveal the relationship
+between individual traffic participants and the resulting traffic flow phenomena. The increasing vol4
+
+ume of data sources is enabling revolutionary research on, for example, traffic flow theory [69; 35; 30]
+and traffic state estimation [60; 75; 66]. Trajectory data contains the microscopic fidelity (fine-grained
+vehicle positions) necessary for building and validating realistic microscopic models. Accurate estimation of energy consumption also relies on vehicle-level detailed dynamics [19; 20; 54]. The accurate
+quantification of the energy demand of vehicles is of critical importance for many applications, including the design of modern energy-centric intelligent transportation systems. Available high fidelity
+energy modeling tools such as Autonomie [33], CarSim and TruckSim [15] relies on realistic acceleration and velocity dynamics for validation. High-quality trajectory data can close the gap for understanding microscopic traffic phenomena, such as lane-change and car-following [22; 24; 59; 42; 68]
+and the impact of mixed autonomy in traffic [65; 31; 77].
+Small-scale trajectory data is usually collected via vehicles that have been equipped with highaccuracy GPS sensors [39; 38; 14; 36] and other in-vehicle sensors. Unlike conventional probe vehicles
+or floating cars, vehicles currently collect their position data with significantly higher spatial and temporal resolution levels to obtain high-quality trajectory data [32]. Data collected from a combination
+of in-vehicle sensors such as radars, LiDAR and cameras provides ambient information, which can
+be useful for traffic flow studies as well as for training and testing AI algorithms for autonomous
+driving. Readers are directed to references such as [48; 41] for a comprehensive discussion on such
+dataset.
+Image sensors and video processing algorithms associated with overhead cameras or Unmanned
+Aerial Systems (UAV) have become increasingly powerful as a large-scale trajectory data source.
+The seminal work is the Next Generation Simulation (NGSIM) dataset [53] developed in early 2000s,
+which is a collection of real-world trajectories, based on the use of cameras mounted on tall buildings
+and covering approximately 600-meter long roadway sections with a frequency of 10 Hz in several
+US locations. More recently in the highD dataset [45], videos were recorded by overhead flying
+drones (4096 × 2160 pixels, 25 fps), which provided much higher-quality videos than that of the
+NGSIM dataset [13]. HighD provides highway trajectories covering 420m of road segment, for a
+total of 28,000 vehicle miles traveled. The pNEUMA large-scale field experiment [5] recorded traffic
+streams in a multi-modal congested environment over an urban area using UAV. The dataset was
+generated by a swarm of 10 drones hovering over a traffic intensive area of 1.3 km2 in the city center
+of Athens, Greece, covering more than 100 km-lanes of road network at 25Hz. Zen Traffic Data [61]
+is obtained by cameras installed on some of the light poles of the Hanshin Expressway to observe
+all vehicles in target sections at a 0.1 second interval in Osaka, Japan. More recently, Automatum
+dataset became available [64], which covers 12 characteristic highway-like scenes from 30 hours of
+drone videos. HIGH-SIM [62] is another high-quality highway trajectory dataset extracted from
+aerial video data. The videos were collected by three 8K cameras in a helicopter over an 8000 ft
+long segment of the I-75 freeway in Florida for 2 hours. The dataset covers a wide range of traffic
+characteristics. A comparison across selected datasets can be viewed from Table 1. Other examples
+and discussion on their usage in traffic studies can be found in a comprehensive survey, such as [46].
+2.2. Data extraction and quality assessment
+Raw trajectories from video footage are usually obtained from a tracking-by-detection framework [40; 3], where a set of object detections for all frames are linked across time to form continuous
+trajectories. The detected bounding boxes are then transformed to a common reference system for
+meaningful interpretation of dynamics. One of the errors we aim to reconcile is tracking discontinuity
+due to, for example, noisy detection, inevitable object occlusion and switching camera field of views,
+which results in track fragmentations. The first problem to address is data association, with is given a
+set of detections, identify their origin (objects that they are associated with). Data association problems can be difficult when the tracking produces large fragmentations or when the detections have
+false alarms or missing detections, which are common in real-world video-based detection systems.
+
+5
+
+Dataset
+
+Year Context
+
+Camera
+config
+
+Road
+VMT
+segment
+
+Hours of
+recording
+
+NGSIM [53]
+pNeuma [5]
+highD [45]
+Zen Traffic [61]
+
+2006 Highway
+8 cameras 600 m
+18,000
+0.75
+2018 Urban arterial 10 drones
+10 km
+N/A
+59
+2018 Highway
+1 drone
+420 m
+28,000
+147
+2020 Highway
+6 cameras 2 km
+N/A
+5
+Overhead
+Automatum [64] 2021 Highway
+N/A
+18,724
+30
+drones
+Aerial
+HIGH-SIM [62] 2021 Highway
+2,438 m N/A
+2
+cameras
+I-24
+276
+200M/yr
+2022 Highway
+4.2 miles
+daylight
+MOTION [26]
+4K cameras
+(expected)
+Table 1: Video-based trajectory data comparison. VMT: vehicle miles traveled
+
+Different approaches for data association have been proposed depending on the association criteria, complexity of object motion and the computation requirements. In general, these approaches
+differ from their choices of 1) matching cost (sometimes termed as probability, affinity, energy or
+confidence) and 2) matching criteria (Hungarian algorithm [55] and bipartite graph matching [7; 76]
+etc.), which result in various problem formulations. The matching cost reflects kinematic [16; 79]
+and/or appearance information [8; 43; 4; 23], and the matching criteria directly drives the algorithm
+to solve the data association problem.
+Graph-based formulations provide efficient algorithms for finding the global min-cost tracking
+solutions. The tracks (or detections) can be naturally represented as the nodes of a graph and the
+pair-wise matching costs can be represented as graph edges. The general data association problem
+is finding the least-cost set cover on the track graph [12]. Studies such as [10; 80; 71] have explored
+efficient algorithms related to bipartite matching and min-cost flow. Interested readers are referred
+to a recent survey, such as [57] on this topic.
+Although there has been a growing projects dedicated to generate large vehicle trajectory data,
+the quality issues remain insufficiently addressed. Many works [13; 56; 67] raised the issue of the
+quality of the seminal NGSIM data, including nonphysical kinematics and inter-vehicle distance. The
+importance for data postprocessing is also emphasized in [42; 56; 68; 46]. Montanino & Punzo [52]
+undertook one of the most thorough efforts of data reconciliation by applying a series of smoothing
+operations on the dataset. They posed the smoothing and reconstruction as a nonlinear, non-convex
+optimization problem, as to find the minimum local smoothing window subject to kinematic constraints. Other data postprocessing efforts [67; 34; 17] also performed data reconciliation considering
+realistic vehicle kinematics and driving dynamics. Although with the general goal of improving overall quality of the trajectory data, these methods provide treatments for only limited types of errors,
+as summarized in Table 2. Most of the algorithms do not have capabilities to operate online or provide provable optimality, which prevent them from being deployed to a large-scale system with raw
+tracking data as streaming input. There are many practical challenges to benchmark these trajectory
+reconstruction methods. For example, we have not yet found a valid benchmark dataset that consists
+of both raw tracking results and the corresponding ground truth. In this work we demonstrate a
+more efficient alternative for trajectory reconciliation that is capable to treat a wide range of errors
+commonly seen in video processing algorithms, and process high volume of streaming data. We
+also release the datasets (both the simulated data and the raw tracking data with manually labeled
+ground truth) and the postprocessing repository used in our paper for the community to start the
+benchmarking efforts in this direction.
+
+6
+
+Reference
+
+Treatments
+
+Algorithm properties
+
+Data
+Data
+Outlier and
+Conflict
+Provable
+Denoise
+Online?
+association
+imputation false positives resolution
+optimality?
+Montanino [51]
+Montanino [52]
+Coifman [13]
+Punzo [56]
+Thiemann [67]
+Hamdar [34]
+Fard [18]
+Ji [37]
+Ours
+✓
+
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+
+✓
+✓
+✓
+✓
+
+✓
+✓
+✓
+
+Manual correction
+
+✓
+✓
+✓
+
+✓
+✓
+
+✓
+
+✓
+✓
+
+Table 2: A comparison on trajectory data reconstruction methods.
+
+3. Problem formulation
+We focus on addressing two types of issues stemming from the raw tracking data. The first is a
+fragmentation, in which an object (vehicle) is tracked multiple times, resulting in partially tracked
+short trajectories (or fragments). Fragments occur because tracking is disrupted due to occlusion
+by larger vehicles or bridges, or the vehicles move across cameras or computational boundaries
+(Figure 2). It results in discontinuity in tracking and broken trajectories. The second type of errors
+include noises, outliers and missing data which are caused by either a missing detection, errors in
+vehicle position estimation, or false positives produced by the object detector (shown in Figure 3).
+Given these known errors, we propose a two-step trajectory reconstruction approach: 1. an online
+negative cycle cancellation algorithm to solve the fragment/data association problem formulated as
+a network flow problem, and 2. a convex program to rectify trajectories such that their high-order
+derivatives are kinematically feasible (i.e., velocities and accelerations are within a feasible range),
+and the gaps in between associated fragments are filled in and outliers are removed.
+The methods proposed below are performed on the 2D raw trajectories in a relative roadway
+coordinates, assuming a fixed point on each vehicle travels in 2D planar motion. It follows a local
+coordinate system such that the x-axis is parallel to the lane lines, and the y-axis is perpendicular
+to x.
+In this section, we outline the problem formulation for multi-object tracking as a minimum-cost
+circulation (MCC) of a graph. Solving for MCC on a track graph results in trajectory sets that
+have the highest maximum a posteriori (MAP) probability. The problem formulation is explained in
+literature such as [80; 72; 73; 74], and therefore only highlighted briefly in this section.
+3.1. Preliminary: MCC and negative cycle cancellation
+A fragment with index k is denoted as ϕk = {p1 , ..., pn }, which consists of a series of positional
+data ordered by time (frame). Each data point pi is a vector containing timestamp, x and y position
+of a fixed point on the bounding box. We are given a set of fragments as input Φ = {ϕi }. A
+trajectory τk = {ϕk1 , ..., ϕkn } consists of one or multiple fragments. A set of such trajectories form a
+trajectory set hypothesis T = {τ1 , ..., τK }. Assuming that fragments are conditionally independent,
+the fragment association step aims at finding T ∗ , the hypothesis with the highest MAP:
+
+7
+
+T ∗ = argmaxT P (T |Φ)
+= argmaxT P (Φ|T )P (T )
+Y
+Y
+= argmaxT
+P (ϕi |T )
+P (τk )
+
+(1)
+
+τk ∈T
+
+i
+
+s.t. τk ∩ τl = ∅, ∀k ̸= l,
+with a non-overlapping trajectory constraint, since each fragment can belong to at most one trajectory. The likelihood P (ϕi |T ) = P (ϕi ) = βi indicates the probability that fragment i is a false
+positive and thus should not be included in the trajectory hypothesis. The prior of a trajectory can
+be modeled as a Markov chain:
+P (τk ) = Penter (ϕk1 )
+
+n−1
+Y
+
+P (ϕki+1 |ϕki )Pexit (ϕkn ),
+
+(2)
+
+i=1
+
+where Penter (ϕk1 ) and Pexit (ϕkn ) denote the probabilities that ϕk1 starts the trajectory and ϕkn
+ends the trajectory, respectively. Taking the negative logarithm of (1), the MAP problem becomes
+equivalent to the following integer program:
+
+minimize
+en ex
+
+fi ,fi,j ,fi ,fi
+
+X
+
+ci fi +
+
+X
+
+en
+cen
+i fi +
+
+X
+
+ci,j fi,j +
+
+i
+
+i
+i,j
+en ex
+s.t. fi , fi,j , fi , fi ∈ {0, 1},
+
+fien +
+
+X
+
+fj,i = fi = fiex +
+
+j
+
+X
+
+ex
+cex
+i fi
+
+(3a)
+
+i
+
+(3b)
+X
+
+fi,j , ∀i ∈ V \{s, t},
+
+(3c)
+
+j
+
+where
+ex
+cen
+i = − log Penter (ϕi ), ci = − log Pexit (ϕi ), ci,j = − log P (ϕi |ϕj ), ci = − log
+
+1 − βi
+.
+βi
+
+(4)
+
+The decision variables are binary according to constraint (3b). fi indicates whether ϕi should
+be included in any trajectory, fien and fiex determine whether a trajectory starts or ends with ϕi ,
+respectively. fi,j indicates if fragment ϕj is an immediate successor of ϕi . Constraint (3c) ensures
+non-overlapping trajectories. The situations when an object is tracked by multiple fragments are
+addressed automatically in the MCC formulation: the fragments that have overlapped time intervals
+will not be associated into the same trajectory. The most likely association hypothesis is determined
+ex
+by a combination of βi , cen
+i , ci and ci,j .
+In seminal work [80], it is shown that (3) has a natural graph interpretation, and solving for (3)
+is equivalent to solving the min-cost-flow of a tracklet graph, which has a polynomial solution [21].
+Later in the work of [73], it is proven that the min-cost-flow problem for MOT is equivalent to a
+min-cost-circulation problem on a slightly modified graph. Many efficient algorithms are developed to
+solve this problem [2; 63; 44; 29]. The graph is constructed such that each fragment ϕi is represented
+as two nodes ui and vi , with a directed edge (ui → vi ) and a cost $(ui → vi ) = ci indicating
+inclusion of ϕi ; edges between two fragments ϕi and ϕj are represented as (vi → uj ), with the cost
+$(vi → uj ) = cij related to the likelihood of ϕj following ϕi . The edge direction implies the sequential
+order between fragments. Furthermore, the graph has a dummy node s that has an incident edge to
+every u, and every v directs back to s. The resulting graph is therefore a directed circulation graph,
+see Figure 4. We denote this circulation graph as G(V, E), with node set V and edge set E. Each
+edge e := (u, v) ∈ E has a unit capacity r(e) = 1, a cost $(e) and a binary flow f (e) ∈ {0, 1}. The
+
+8
+
+data association problem can be formulated as finding a set of P
+non-overlapping circulations f on G
+with the lowest total cost. The total cost of the circulations is e∈f $(e)f (e).
+
+Figure 4: Left: fragments in time-space coordinates. In this example the correct association is {ϕ1 , ϕ3 } and {ϕ2 , ϕ4 }.
+The numbers indicate the order of last timestamp. Middle: fragments as a circulation graph. Red edges are the entering
+ex
+edges with cost cen
+i ; blue edges are inclusion edges with cost ci ; green ones are exiting edges with cost ci and yellow
+ones are transition edges with cost cij . Right: the residual graph after running the negative cycle canceling algorithm
+to obtain the min-cost circulation. The residual edges that carry the min-cost circulation are highlighted in bold. The
+fragment association assignment can be obtained by tracing along the bold edges.
+
+One efficient algorithm is the negative cycle canceling algorithm (NCC) proposed by Klein [44] and
+later on optimized by Goldberg et al. [29; 63], based on the Ford-Fulkerson’s method for incremental
+improvement. To understand the algorithm we first recall the definition of an important concept – a
+residual graph Gr :
+Definition 1. The residual graph Gr (V, Er ) for the original directed graph G(V, E) with respect to a
+flow f is generated by replacing each edge e = (u → v) ∈ E by two residual edges e′ = (u → v) ∈ Er
+and er = (v → u) ∈ Er , with cost $(e′ ) = $(e) and residual capacity r(e′ ) = r(e) − f (e), while
+$(er ) = −$(e) and r(er ) = f (e).
+In the context of MOT graph as shown in Figure 4, the construction of residual graph can be
+simplified. The edges in the flow of the original graph simply needs to be reversed and costs on the
+edges negated, to form the corresponding residual graph.
+The idea of NCC is to repeatedly find a cycle with negative cost in the residual graph Gr and
+push flow through the cycles. The algorithm terminates when no more negative cycles can be found
+(optimality condition). We direct interested readers the above reference for the details and proof of
+correctness of this algorithm, and only provide an outline in Algorithm 1.
+First, a circulation graph G(V, E) is constructed from the set of fragments Φ (ConstructTrackletGraph) and we iteratively look for a negative cycle in Gr based on, for example, Bellman-Ford
+algorithm. If such cycle exists, then update the residual graph according to Definition 1 (PushFlow). When the iteration stops (no more negative cycle can be found), the assignment, or the
+trajectories, can be extracted by traversing along all the cycles through the residual edges in Gr
+(FlowToTrajectories).
+Next we show an online extension of the NCC algorithm.
+3.2. Online negative cycle cancellation
+The streaming data coming from I-24 MOTION testbed necessitates an online and memorybounded version of Algorithm 1. In other words, the tracking graph G is dynamic: new fragments
+are added and older fragments are removed from the graph constantly. A naive online extension of
+Algorithm 1 is to run the same algorithm on each updated graph. However, it is inefficient because
+the majority of the graph remains the same and the majority of the computation on the shortest path
+is wasted. This opens opportunities for algorithm engineering improvements to improve performance.
+We show an online extension to the NCC algorithm briefly.
+The proposed online algorithm is based on the assumption that fragments are added to the graph
+in the order of last timestamp, which is a reasonable assumption in practice as this is the order
+9
+
+Algorithm 1 Negative cycle cancellation for min-cost-flow on a tracklet graph
+Input: Set of fragments Φ = {ϕi }
+Result: Set of trajectories T = {τi }
+G(V, E, C) ← ConstructCirculationGraph(Φ)
+f ←0
+Gr ← G
+while a negative-cost cycle Γ exists in Gr do
+// Update residual graph
+Gr ← PushFlow(Gr , Γ)
+end
+T ← FlowToTrajectories(Gr )
+that fragments are generated from object tracking. The online algorithm proceeds by adding each
+fragment ϕk to the residual graph from the previous iteration G+
+r,k−1 one at a time, to obtain a new
+−
+−
+graph Gr,k (AddNode(Gr,k−1 , ϕk )). This step adds two nodes uk and vk to the graph along with
+edges (s → uk ), (uk → vk ), (vk → s) and possibly additional transition edges incident to uk . Then,
+−
+we search for the least-cost negative cycle Γ in G−
+r,k (FindMinCycle(Gr,k )) and push flow through the
++
+cycle to obtain the updated residual graph Gr,k . When all the fragments are processed, we output
+the trajectories T by tracing all the cycles in the final residual graph. It can be proved that pushing
+flow through Γ, G+
+r,k contains the min-cost circulation because the flow is feasible and no further
+negative cycles can be found in G+
+r . We denote the residual graph after adding ϕk at iteration k to
+.
+The
+algorithm
+is
+shown
+in
+Algorithm 2.
+be G+
+r,k
+Algorithm 2 Online NCC for MCC on a tracklet graph
+Input: Set of fragments Φ = {ϕi }
+Result: Set of trajectories T = {τi }
+f ←0
+G+
+r,0 ← {s}
+k←1
+for each ϕk (ordered by last timestamp) do
++
+G−
+r,k ← AddNode(Gr,k−1 , ϕk )
+Γ ← FindMinCycle(G−
+r,k )
+−
++
+Gr,k ← PushFlow(Gr,k , Γ)
+k ←k+1
+end
+T ← FlowToTrajectories(G+
+r,k )
+The online algorithm is proved to be correct. To summarize, we proved that the circulation in
++
+G+
+r,k is always optimal, i.e., there is no more negative cycles in Gr,k for every k (optimality condition).
+Details on the proof can be found in [74].
+3.3. Trajectory rectification
+After applying fragment association, the next step is to rectify the stitched, raw trajectories with
+denoising, imputation and smoothing operations. Instead of ad-hoc correcting each source of the
+detection errors shown in Figure 3, we treat all noises and errors in a one-step approach to rectify
+them all at once. To simplify the problem, we consider the fixed-point positions of a trajectory, and
+the dimension of each vehicle is taken as the median from the bounding box trajectories. That way,
+the projected footprints of each vehicle in the roadway coordinate do not change shapes. We consider
+
+10
+
+Figure 5: A simple 2D vehicle model
+
+a 2D vehicle motion model, with independent longitudinal (x) and lateral (y) dynamics. This allows
+us to decompose the problem to solving two independent 1D reconciliation problems.
+We use the rear bottom-center of the 3D bounding boxes as the points of interest. Each trajectory
+τi includes the following features (features are the same for all trajectories, therefore the index i is
+dropped for simplicity): let x = [x[1], x[2], ..., x[N ]]T be the x-positions for N timesteps, and similarly
+let y be the time-series of the y-position; vx = [vx [1], vx [2], ..., vx [N −1]]T is the time-series of speed in
+the longitudinal direction (x-axis), and similarly vy is the time-series of speed in the lateral component
+(y-axis). The acceleration a and jerk j use the same 2D representation. Lastly, l, w represent the
+vehicle length and width, respectively. The vehicle dynamics model can be seen in Figure 5.
+Consider the following discrete-time 3rd order 1D motion model in either longitudinal or lateral
+direction (the same method is applied for x-component and y-component dynamics. We demonstrate
+on x-component only):
+x[t + 1] = x[t] + v[t]∆T
+v[t + 1] = v[t] + a[t]∆T
+
+(5)
+
+a[t + 1] = a[t] + j[t]∆T,
+with ∆T as the timestep. Notice that the finite-difference method decrements the dimension of timeseries as an increase of derivative order, i.e., x ∈ RN , v ∈ RN −1 , a ∈ RN −2 and j ∈ RN −3 . Eq (5)
+can be written in matrix multiplication form:
+v = D(1) x
+a = D(2) x
+
+(6)
+
+j = D(3) x,
+where D(k) ∈ R(N −k)×N represents the k th -order differentiation operator. For example, k = 1, 2, and
+3 can be written as:
+
+
+−1 1 0 ... 0
+0 0
+ 0 −1 1 ... 0
+0 0
+
+
+1
+ ..
+..
+..
+..
+..
+.. 
+D(1) =
+ .
+.
+.
+.
+.
+.
+
+∆T 
+0
+0 0 ... −1 1 0
+0
+0 0 ... 0 −1 1
+.
+
+
+1 −2 1 0 ... 0 0 0
+
+1 
+0 1 −2 1 ... 0 0 0
+D(2) =
+
+.
+.
+.
+.
+.
+.
+.
+..
+..
+..
+..
+..
+.. 
+
+∆T 2  ..
+0
+
+0
+
+0
+
+11
+
+0 .... 1 −2 1
+
+
+
+−1 3 −3 1 ... 0 0 0 0
+1  .
+..
+..
+..
+..
+.. .. ..  .
+.
+D(3) =
+.
+.
+.
+.
+. . .
+3  .
+∆T
+0 0 0 0 .... −1 3 3 1
+Consider corrupted measurement z which contains missing data (indicated by the observation
+operator H), noises w and outliers e:
+z = Hx + w + e,
+
+z ∈ RM , w ∈ RM , e ∈ RM , H ∈ RM ×N ,
+
+(7)
+
+and missing data exists if M < N . We aim to find the reconstructed position x̂ that is smooth in
+k th -order derivatives. The idea is to use a combination of Ridge and Lasso regression [81], to simultaneously handle noises and outliers, assuming outliers are sparse and noises have small magnitude:
+k=K
+X
+
+minimize
+x, e
+
+∥z − Hx − e∥22 +
+
+subject to
+
+− D(1) x ⪯ 0,
+
+(8b)
+
+⌊x⌋(k) ⪯ D(k) x ⪯ ⌈x⌉(k) , k = 2, 3, ..., K.
+
+(8c)
+
+λk ∥D(k) x∥22 + λ1 ∥e∥1
+
+(8a)
+
+k=2
+
+The first term of the cost function (8a) penalizes the data-fitting error on the non-missing entries.
+The second term regularize the smoothness of the position vector, by penalizing the l2 -norm of higherorder derivatives (e.g., k = 2 and k = 3 correspond to accelerations and jerks in respective). The
+third term regularizes the sparsity of the outliers. The first constraint (8b) states that the speed has
+to be non-negative, i.e., no cars are traveling backward at any time. The second constraint (8c) sets
+the upper and lower bound for each high-order derivatives. For example, ⌈x⌉(2) is the largest possible
+acceleration. Note that (8a) can be written into a quadratic programming form by converting the l1
+penalization to a linear programming with linear inequality constraints [11] [9]. The problem can be
+solved with a convex programming solver such as cvxopt [70]. Note that above formulation rectifies
+the trajectory of each vehicle independently of another. After treatment (8), further investigation is
+needed to determine if, for example, considering vehicular interactions in the optimization formulation
+(e.g., with additional non-collision constraint) is required.
+Solving this convex program produces derivative quantities that are internally consistent, i.e.,
+numerical differentiation of the position vector gives the speed vector, and Euler forward integration
+of the speed vector produces the same position vector. The same internal consistency is satisfied
+between other derivative orders.
+The 2D dynamics can be obtained by solving two independent optimization problems of form
+(8) for both longitudinal and lateral dynamics. The lateral movement follows the same discrete-time
+dynamics as (5). Let the solution for solving (8) for the longitudinal movement be (x̂, êx ), and the
+solution for the lateral movement be (ŷ, êy ). The rectified steering angle θ̂ = [θ[1], ..., θ[N − 1]]T can
+be calculated in the end as
+!
+D(1) ŷ
+−1
+θ̂ = tan
+.
+(9)
+D(1) x̂
+4. Experiments
+In this section, we present the results of four experiments designed to evaluate the performance
+of our proposed 2-step data reconciliation pipeline:
+• Experiment 1 (Exp1): In this numerical experiment, we utilize a microsimulation dataset as
+the ground truth. Raw tracking data is generated by intentionally degrading the ground truth
+12
+
+to simulate upstream errors. The objective is to assess the 2-step data reconciliation pipeline’s
+ability to reconstruct the original ground truth data from this downgraded version.
+• Experiment 2 (Exp2): This experiment employs a 15-minute NGSIM I-101 dataset as the
+ground truth. The raw tracking data is produced by manually introducing perturbations to
+the ground truth. The aim is to evaluate how effectively our 2-step data reconciliation pipeline
+can recover the ground truth in this scenario.
+• Experiment 3 (Exp3): Real tracking data from 16-17 cameras recorded on a section of the I-24
+MOTION system serves as the input for this experiment. The data captures three distinct
+traffic conditions. We use manually labeled 3D vehicle bounding boxes for each scene (I243D [25]) as the ground truth to validate our algorithm’s performance.
+• Experiment 4 (Exp4): This experiment assesses the scalability of our algorithms. The input
+is a 4-hour raw tracking data from the full-scale I-24 MOTION system, which includes 276
+cameras covering a 4.2-mile highway segment.
+A summary of these experiments is provided in Table 3.
+Experiment
+
+Ground truth data
+
+Raw tracking data
+
+Exp1
+
+TransModeler
+simulation
+
+Exp2
+
+NGSIM I-101
+
+artificially downgraded
+from ground truth
+artificially downgraded
+from ground truth
+tracking output
+from videos
+tracking output
+from videos
+
+Exp3
+Exp4
+
+Manually labeled
+I24-3D
+No available
+ground truth
+
+Spatial size
+
+Temporal size
+
+# Cameras
+
+2000 ft
+
+15 min
+
+3
+
+2200 ft
+
+13.3 min
+
+7
+
+2000 ft
+
+3 min
+
+16-17
+
+4.5 mi
+
+4 hr
+
+276
+
+Metrics / Goal
+MOT metrics
+Kinematic distributions
+MOT metrics
+Kinematic distributions
+MOT metrics
+Kinematic distributions
+Scalability test
+
+Table 3: Summary of benchmark experiments. MOT: multi-object-tracking
+
+It is important to note that these experiments serve as an initial step towards refining the algorithms. This includes identifying optimal parameters and cost models, among others. Rather
+than focusing on optimizing parameters to remove all errors in a given dataset, the results provide
+preliminary evidence that the methods are capable of reducing errors across a range of datasets.
+4.1. Evaluation metrics
+Vehicles tracking and trajectory reconciliation performance can be evaluated with standard
+multi-object-tracking (MOT) metrics, specified in [6; 50; 47; 58]. For all the following metrics, an
+intersection-over-union (IOU) of vehicle footprint with ground truth of 0.3 or higher is required to
+be considered as a true positive.
+• Precision: number of detected objects over sum of detected and false positives (target: 1).
+• Recall : number of detections over number of objects (target: 1).
+• Sw/GT : total number of track switches per ground truth trajectory (target: 0).
+• Fgmt/GT : total number of fragments (switches from tracked to not tracked) per ground truth
+trajectory (target: 0).
+• Multi-object-tracking accuracy (MOTA): an aggregated measure to indicate tracking performance. It is detection errors (false negatives and false positives) and fragmentations normalized
+by the total number of true detections (target: 1).
+• Multi-object-tracking precision (MOTP): the total error in estimated position for matched prediction and ground truth pairs over all time, averaged by the total number of matches made
+(target: 1).
+13
+
+Figure 6: Probability of fragment ϕi after the last measurement of ϕi is represented as a cone. The matching cost of
+ϕi and ϕj is determined by the negative log likelihood of ϕj given the cone probability.
+
+Other statistics are computed to qualitatively assess the trajectories:
+• Trajectory lengths distribution
+• Speed distribution (calculated using finite-difference)
+• Acceleration distribution (calculated using finite-difference)
+4.2. Implementation details
+In this section, we describe the computation of edge costs for min-cost flow and the choice of
+parameters λi ’s for solving the trajectory rectification problem 8.
+The probabilities of a trajectory starts or ends with a fragment Penter and Pexit is determined by
+the ratio of the true number of trajectories and the predicted number of trajectories. The fragment
+linking costs P (ϕi |ϕj ) can be modeled by (a combination of) dynamics, shape affinity and the time
+interval between the two fragments. We implemented a version that considers the dynamics only, as
+it is shown to properly represent the matching probabilities.
+The general idea is, if ϕj is indeed a continuation of ϕi but the object tracking is broken due
+to, e.g., object occlusion, then the projected position of ϕi at the time of ϕj has a high chance of
+overlapping with the actual detection of ϕj . The probability of track i at the time of ϕj follows a
+stochastic process, with the mean p̂i being the projected position of track i given ϕi , and the variance
+increases with respect to ∆t, the time elapsed since the end of ϕi , tie , i.e.,
+pi (tie + ∆t) = p̂i (tie + ∆t) + ηi (∆t), and ηi (∆t) ∼ N (0, α + β∆t).
+
+(10)
+
+The uncertainty ηi (∆t) follows a Brownian-like process, with zero-mean and variance α + β∆t
+growing linearly with ∆t (see Figure 6). The projected mean of position is:
+p̂i (t) = vi t + p̄i ,
+
+(11)
+
+where vi = [vx,i , vy,i ]T and p̄i = [xi , yi ]T can be determined using, for example, linear regression.
+Finally, the matching cost is the negative log likelihood of ϕj given the probabilities computed from
+ϕi :
+Λ(ϕi , ϕj ) =
+
+1
+2Nj
+
+
+1
+log α + β(tj − tie ) +
+2Nj
+j j
+
+(pj (tj ) − p̂i (tj ))2
+,
+α + β(tj − tie )
+j j
+
+X
+
+X
+
+tj ∈[ts ,te ]
+
+tj ∈[ts ,te ]
+
+(12)
+
+where Nj is the number of measurements of ϕj . tjs and tje are the start and end timestamp of ϕj , and
+pj (tj ) is the measurement of ϕj at tj .
+14
+
+After fragment association, the next step is to impute missing data, correct for outliers, and
+smooth the trajectories in a single step by solving an optimization problem (Eq. (8)). To balance
+the terms in the cost function, we conducted a grid search to determine the optimal parameters λi .
+We found that setting K up to 3, where the λ2 term penalizes large accelerations and λ3 penalizes
+large jerks, was sufficient. Empirical assessment of a subset of trajectories led us to pre-tune the
+parameters to λ1 = 1.2 × 10−3 , λ2 = 1.67 × 10−2 , and λ3 = 1.67 × 10−7 . The acceleration and jerk
+constraints were set to ±10 ft/sec2 and ±10 ft/sec3 , respectively.
+The parameter tuning is subject to the implicit assumption of Euler forward discretization, with
+the current sampling frequency of 25Hz. We demonstrate the capacity the above choice of parameters
+to bring close the speed and acceleration to a more realistic range, but note that a detailed parameter
+optimization that generalizes to a range of datasets is part of our ongoing effort to operationalize the
+described methods.
+4.3. Exp1: Numerical experiments with microsimulation data
+The proposed 2-step data reconciliation pipeline is benchmarked using a micro-simulation dataset
+that showcases various traffic characteristics. In the absence of “ground truth” tracking data of
+sufficiently large scale to test our algorithms, numerical experiments with simulation data serve as a
+fundamental first step to refine algorithms and identify optimal parameters. The simulation dataset
+used in this experiment is the ground truth (dubbed as SIM-GT) and offers a broad range of traffic
+scenarios, including freeflow and congested traffic with various lane-change rates. In addition, this
+dataset is artificially perturbed to replicate the major errors observed in real-world tracking input
+data, such as noise, masks, and overlapped fields of view from multiple cameras. The perturbed
+data is referred to as SIM-RAW. The corresponding reconciled output after executing the 2-step
+postprocessing pipeline is termed as SIM-REC. To evaluate the accuracy of the proposed method,
+we compare SIM-RAW and SIM-REC with the ground truth SIM-GT using standard MOT metrics
+along with other statistics related to traffic dynamics, as mentioned in Section 4.1.
+4.3.1. Simulation description
+The simulation dataset is generated using TransModeler, a micro-simulation software that allows
+customization of highway traffic characteristics such as traffic density, lane blockage, car-following and
+lane-changing behaviors. TransModeler utilizes an extended GM model [1] that closely mimics realworld car-following behaviors. The dataset encompasses a 4-lane highway segment spanning 2000 ft,
+with a simulation duration of 900 seconds (as depicted in Figure 7). Notably, this simulation includes
+a lane blockage around the 800-ft mark, which persists for 400 seconds. Traffic downstream of the
+blockage and subsequent to its removal flows freely, while an induced congestion emerges upstream
+of the bottleneck. Additional details on the simulation dataset can be found in Appendix A. A
+summary is also provided in Table 4.
+The simulation dataset has been intentionally polluted (we refer to the polluted data as SIMRAW, see Figure 8) to mimic the inaccuracies observed in the I-24 MOTION system, which arise from
+factors such as overpasses, misaligned cameras, and offline cameras. This introduced perturbation
+encompasses several elements, including spatial and temporal masks, overlapping trajectory segments,
+and measurement point noise.
+Specifically, the SIM-RAW dataset is generated from the ground truth dataset (SIM-GT) by
+incorporating a mask that spans the entire simulation timeframe and covers all trajectories within
+the distance range of 1550-1700 ft. This mask represents an overhead bridge measuring 150 ft wide,
+leading to tracking disruptions for vehicles passing beneath it. Another mask is placed upstream
+within the distance range of 100-300 ft, where vehicles are decelerating, entering a bottleneck, and
+frequently changing lanes. Several additional masks, each 50 ft wide, are introduced to simulate
+periods of camera package loss in various locations. This results in objects changing their IDs before
+and after the masks.
+15
+
+Furthermore, we introduce a 100-ft-wide overlap in trajectories at two specific locations, occurring
+at distances of 600 ft and 1200 ft. These overlaps are representative of two fields of view from three
+cameras that intersect. The perturbation procedure also includes the introduction of random noises
+and outliers.
+All RAW datasets have two locations (at 700 ft and 1400 ft) with overlapped regions of adjacent
+cameras. Vehicles change IDs when they travel across cameras, resulting in fragmentation. The
+fragments also overlap for about 100 ft, representing inaccuracies due to camera misalignment or
+homography transformation. Lastly, white noises are added to all the fragments. The resulting
+trajectory length, speed, and accelerations are summarized in Table 4.
+Metrics / Statistics
+
+SIM-GT
+
+SIM-RAW
+
+SIM-REC
+
+Precision ↑
+Recall ↑
+MOTA ↑
+MOTP ↑
+Fgmt/GT ↓
+Sw/GT ↓
+No. trajectories
+
+1
+1
+1
+1
+0
+0
+989
+
+0.81
+0.76
+0.58
+0.80
+4.66
+0
+5597
+
+0.98 (+21.0%)
+0.90 (+18.4%)
+0.88 (+51.7%)
+0.92 (+15.0%)
+0.36 (-92.3%)
+0.03 (+NA%)
+1316
+
+Trajectory lengths
+(ft)
+
+min
+max
+avg
+stdev
+
+61.8
+2001
+1976
+14.0
+
+42.5
+802
+327.0
+225.2
+
+72.0
+2003
+1440
+77.1
+
+Speed (ft/sec)
+
+min
+max
+avg
+stdev
+
+0.00
+130.4
+57.8
+33.1
+
+0.00
+294.8
+64.1
+42.6
+
+0.00
+130.3
+60.8
+32.1
+
+Acceleration
+(ft/sec2 )
+
+min
+max
+avg
+stdev
+
+-6.93
+6.93
+0.78
+2.80
+
+-7608
+7446
+0.96
+1591
+
+-6.93
+6.94
+0.83
+2.84
+
+Table 4: Simulation experiment results.
+
+Table 4 summarizes the MOT metrics for the polluted dataset. The raw data has a detection
+precision of 0.81, recall of 0.76, and 4.66 fragments per ground truth vehicle trajectory. We also
+calculate the distributions of trajectory derivative quantities as additional statistics. The polluted
+dataset (SIM-RAW) shows a wide spread in these metrics due to the added noises on the position.
+4.3.2. Results
+The evaluation results are obtained by comparing SIM-RAW and the corresponding reconciled
+trajectories SIM-REC (Figure 9) against the same ground truth SIM-GT. The results are summarized
+in Tables 4. The table indicates that regardless of the traffic scenarios, the 2-step reconciliation output
+improves a wide range of metrics.
+The proposed two-step data reconciliation approach enhances precision and recall by approximately 18-21% when compared to the raw tracking data. This improvement is achieved by correctly
+associating fragments and imputing missing data caused by masks, resulting in an increase in true positives and a decrease in false negatives. False positives are reduced by merging overlapped fragments
+during the data-association step. Furthermore, noise is smoothed during the trajectory rectification
+
+16
+
+Figure 7: Ground truth simulation (SIM-GT).
+
+Figure 8: Manually polluted simulation data (SIM-RAW) including noises, overlapped and non-overlapped fragments.
+
+Figure 9: Reconstructed trajectory data (SIM-REC).
+
+17
+
+step (8), which reduces false positives. As a result, the aggregated score MOTA improves, while
+MOTP primarily improves due to the smoothing effect of the trajectory rectification step.
+The effectiveness of the data association is particularly evident in the higher-speed regions (downstream of the bottleneck and after the lane-blockage is removed), where all fragments are correctly
+matched together. Overall the majority of the fragments are correctly associated (92.3% improvement
+in Fgmt/GT), a few incorrectly-associated fragments lead to ID switches (i.e., when one predicted
+trajectory maps to multiple ground truth trajectories). In total, we counted 30 ID switches in SIMREC and identified two reasons for their occurrence: (1) a change in speed occluded by the mask,
+and/or (2) an abrupt lane-change maneuver occluded by the mask. Several illustrative examples of
+ID switches are shown in Figure 10-12.
+Each plot displays a single predicted trajectory from SIM-REC that mapped to two ground truth
+trajectories, along with the corresponding raw fragments from SIM-RAW. The left sides show time
+vs. longitudinal (x) positions of all trajectories, and the right sides are time vs. lateral (y) positions.
+The matched tracking trajectory (SIM-REC) is shown in an orange dashed line, while the two ground
+truth trajectories (in SIM-GT) are depicted in black and grey solid lines. All the fragments (in SIMRAW) corresponding to those two ground truth trajectories are displayed in colored points, with each
+fragment represented by a distinct color. Figure 10 is an example where an ID switch occurs due
+to an unobserved speedup at the masked region (longitudinal position 100-300 ft). Before entering
+the mask, both vehicles 84e8 and 84b9 traveled on the same lane at approximately 25.5 ft/s with
+84e8 following closely behind 84b9. Tracking for both vehicles was discontinued for 8 seconds due to
+the mask, and when they reappeared at position 300 ft, the speed for both vehicles had increased to
+42.8 ft/s. Our current cost function (Eq (12)) assumes linear longitudinal and lateral dynamics, and
+thus favors matching two fragments that appear to be on a straight line in the time-space dimension.
+Consequently, fragment 84e8 has a lower cost to be matched with fragment 84ba. Matching becomes
+even more challenging when both longitudinal and lateral dynamics change during the occlusion, as
+shown in Figure 11 and 12. In such cases, the lateral dynamics tend to dominate the association
+cost when fragments are “close” together in time vs. x dimension, causing the data association to
+fail because it prefers to match fragments that are in the same lane.
+These examples highlight the difficulty of accurate motion modeling, particularly during nontrivial maneuvers such as speed changes and lane changes in long occlusions. This difficulty motivates
+the search for other representations of “similarity” in matching cost design that do not solely rely
+on motion information. One potential solution is to use appearance embedding from the upstream
+object detector. Another option is to train a classifier-like similarity measure model that learns the
+correct matching function from labeled data. For future work, we could explore a general data-driven
+approach outlined in [49].
+Moreover, we compute the statistics on the dynamical information of the trajectories as some unsupervised measures of data quality when ground truth labels are not present. Specifically, we analyze
+the statistical characteristics of trajectory dynamics. Ideally, the length distribution of trajectories
+should cover the entire road segment (excluding ramps or trajectories at the time boundaries). The
+speed distribution should reflect the traffic dynamics, including free flow, stop-and-go, and congestion, and the acceleration distribution should be within a reasonable range. We calculate speed and
+acceleration by taking the finite difference of positions and speed, respectively. A comparison of
+the traffic dynamics distributions for ground truth, polluted, and postprocessed data is presented
+in Table 4. Generally, SIM-REC generates longer trajectories due to the fragment association step.
+Notably, the regularization terms in (8) of data reconciliation contribute to a significantly narrower
+(or more consistent) and feasible acceleration distribution. Table 4 suggests that the statistics for
+speed and acceleration of the reconstructed data SIM-REC are much closer to the ground truth than
+those of the polluted datasets.
+
+18
+
+Figure 10: ID switch example 1: occluded speedup, no lane change
+
+Figure 11: ID switch example 2: occluded slowdown and lane-change
+
+Figure 12: ID switch example 3: occluded slowdown and lane-change
+
+19
+
+4.4. Exp2: Experiments on the NGSIM I-101 data
+Similar to Exp1, in this experiment we run our algorithms on the manually polluted NGSIM data,
+and benchmarked it against the ground truth NGSIM data [53]. The manual perturbation includes
+masks of widths between 30 and 50 ft, noises and outliers on position measurements. The metrics
+for ground truth, perturbed and reconstructed data are summarized in Table 5, and the time-space
+diagrams are shown in Figure 13-15.
+Metrics / Statistics
+
+NGSIM-GT
+
+NGSIM-RAW
+
+NGSIM-REC
+
+Precision ↑
+Recall ↑
+MOTA ↑
+MOTP ↑
+Fgmt/GT ↓
+Sw/GT ↓
+No. trajectories
+
+1
+1
+1
+1
+0
+0
+1533
+
+0.48
+0.46
+0.81
+0.84
+8.93
+2.69
+13685
+
+0.69 (+43.8%)
+0.67 (+45.7%)
+0.86 (+6.17%)
+0.90 (+7.14%)
+1.52 (-83.0%)
+0.96 (-64.3%)
+2335
+
+Trajectory lengths
+(ft)
+
+min
+max
+avg
+stdev
+
+877.7
+2173.4
+2037.6
+176.4
+
+3.90
+1049.8
+517.9
+322.8
+
+17.7
+2172.9
+1030.6
+605.6
+
+Speed (ft/sec)
+
+min
+max
+avg
+stdev
+
+0.029
+81.6
+29.8
+13.9
+
+7.11
+158.9
+29.94
+15.8
+
+0.00
+81.5
+29.9
+14.0
+
+Acceleration
+(ft/sec2 )
+
+min
+max
+avg
+stdev
+
+-6.82
+6.80
+0.113
+1.82
+
+-1784.4
+2060.8
+0.132
+265.8
+
+-6.91
+6.94
+0.11
+2.06
+
+Table 5: NGSIM experiment results.
+
+We observe that compared to NGSIM-RAW, NGSIM-REC improves on all the metrics. Particularly, 83% of the fragments are reduced. We notice a similar result as compared to the previous
+experiment: the accuracy of data association is particularly high when the traffic is at a higher speed.
+Whereas when the speed variation is occluded by the masks, it is much difficult to match fragments
+that are interrupted by the masks. Additionally, we observe the speed and acceleration distributions
+of the reconstructed data are closer to the ground truth.
+4.5. Exp3: Experiments on the I-24 MOTION validation system
+Next, we demonstrate the application of the proposed pipeline on the I-24 MOTION validation
+system, which was built in 2020 and functioned as a prototype for the design selections in the full
+system. The validation system consists of three poles that host 18 cameras to seamlessly cover 2000-ft
+highway segment. The detailed description of the design can be found in [26].
+4.5.1. Dataset description
+All evaluations have been conducted using three datasets sourced from the I-24 MOTION validation system (I24-3D) [25], each describes a distinct traffic scenario. The ground truth datasets
+comprise a total of 877,000 manually-labeled 3D bounding boxes of vehicles, derived from 57 minutes
+of video data collected across 16-17 cameras. Notably, this dataset stands as the most extensive
+20
+
+Figure 13: Ground truth NGSIM-GT.
+
+Figure 14: Manually polluted NGSIM-RAW including noises and masks.
+
+Figure 15: Reconstructed trajectory data NGSIM-REC.
+
+21
+
+“ground truth” dataset directly obtained from the I-24 MOTION system’s cameras. It captures
+real-world traffic scenes and includes raw tracking results produced by the system’s current tracker.
+This data presents real-world challenges originating from upstream sources, including issues such as
+fragmentations due to occlusions, object handoffs between multiple cameras, projection errors when
+transitioning from camera image space to roadway coordinates, false positives arising from tracking
+and detection errors, and more.
+The three distinct scenes in the I24-3D include:
+• A 60-second free-flow traffic scenario.
+• A 51-second slow traffic in snowy conditions.
+• A 50-second scene of heavily congested traffic with stop-and-go waves.
+The raw tracking data was obtained using a crop-based fast tracking algorithm described in [27].
+The raw tracking results obtained from the three video recordings are denoted as RAW-i, RAWii, and RAW-iii. The corresponding ground truth datasets are labeled as GT-i, GT-ii, and GT-iii,
+respectively. The output generated by our 2-step reconciliation pipeline is designated as REC-i,
+REC-ii, and REC-iii.
+Metrics
+
+GT-i
+
+RAW-i
+
+REC-i
+
+GT-ii
+
+RAW-ii
+
+REC-ii
+
+GT-iii
+
+RAW-iii
+
+REC-iii
+
+Precision ↑
+Recall ↑
+MOTA ↑
+MOTP ↑
+Fgmt/GT ↓
+Sw/GT ↓
+No. trajs
+
+1
+1
+1
+1
+0
+0
+314
+
+0.71
+0.56
+0.32
+0.63
+5.22
+1.43
+789
+
+0.90
+0.83
+0.74
+0.73
+0.60
+0.04
+321
+
+1
+1
+1
+1
+0
+0
+100
+
+0.87
+0.55
+0.48
+0.72
+5.38
+2.98
+411
+
+0.88
+0.79
+0.68
+0.75
+1.93
+0.53
+150
+
+1
+1
+1
+1
+0
+0
+253
+
+0.76
+0.46
+0.31
+0.67
+4.92
+3.01
+1250
+
+0.76
+0.67
+0.46
+0.68
+1.11
+0.52
+282
+
+Trajectory
+lengths (ft)
+
+min
+max
+avg
+stdev
+
+25.6
+2270.5
+1635.4
+639.0
+
+24.0
+2096.5
+507.8
+419.4
+
+17.6
+2094.7
+1455.1
+711.6
+
+36.9
+2183.8
+1013.5
+587.9
+
+5.1
+568.9
+147.9
+126.8
+
+5.1
+2181.2
+588.2
+512.2
+
+5.0
+2278.1
+1042.0
+621.5
+
+0.01
+2066.9
+157.8
+231.8
+
+0.45
+2289.0
+721.2
+649.1
+
+Speed
+(ft/sec)
+
+min
+max
+avg
+stdev
+
+72.3
+147.7
+106.0
+10.9
+
+0.97
+437.8
+106.4
+13.8
+
+72.7
+142.9
+105.9
+10.5
+
+16.7
+62.0
+39.4
+7.24
+
+0.01
+276.4
+39.1
+11.6
+
+8.7
+66.36
+9.3
+7.40
+
+0.00
+136.3
+37.6
+33.9
+
+0.00
+235.2
+40.6
+35.5
+
+0.00
+141.2
+37.7
+33.4
+
+Acceleration
+(ft/sec2 )
+
+min
+max
+avg
+stdev
+
+-5.6
+4.95
+-0.005
+1.29
+
+-54155
+55701.0
+-9.76
+1891.3
+
+-6.9
+6.7
+0.12
+1.46
+
+-6.58
+6.86
+-0.04
+1.01
+
+-20965
+25017.1
+39.2
+675.8
+
+-6.94
+6.94
+-0.04
+1.48
+
+-6.90
+6.90
+-0.157
+2.16
+
+-19233
+54174
+9.1
+1002.3
+
+-6.94
+6.93
+-0.159
+2.21
+
+Table 6: Exp2: Evaluation results using 3 manually-labeled ground truth datasets [25].
+
+4.5.2. Results
+The performance of the pipeline on the three tracking datasets is presented in Table 6. The
+results show that the proposed data reconciliation pipeline improves on all the MOT metrics for all
+three scenes. Noticeably the pipeline is able to match the 60-77% of fragments. The data association
+step enhances precision and recall by accurately connecting fragments and filling in the gaps between
+the detections.
+
+22
+
+EB Lane 1
+
+x-position (ft)
+
+2000
+
+EB Lane 3
+
+2000
+
+1500
+
+1500
+
+1500
+
+1000
+
+1000
+
+1000
+
+1000
+
+500
+
+500
+
+500
+
+500
+
+0
+
+WB Lane 1
+
+2000
+
+0
+
+WB Lane 2
+
+2000
+1500
+
+1500
+
+1500
+
+1000
+
+1000
+
+1000
+
+1000
+
+500
+
+500
+
+500
+
+500
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+WB Lane 4
+
+2000
+
+1500
+
+0
+
+True Positive
+False Negative
+False Positive
+
+0
+
+WB Lane 3
+
+2000
+
+EB Lane 4
+
+2000
+
+1500
+
+0
+
+x-position (ft)
+
+EB Lane 2
+
+2000
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+Figure 16: Lane-specific time-space diagrams for RAW-i (Lane 4 is rightmost lane in direction of travel). False negatives
+(yellow), false positives (red) and true positives (blue) are shown. False negatives indicate missing data due to disrupted
+tracking, and false positives indicate that an object was tracked below the IOU threshold.
+
+EB Lane 1
+
+x-position (ft)
+
+2000
+
+EB Lane 3
+
+2000
+
+1500
+
+1500
+
+1500
+
+1000
+
+1000
+
+1000
+
+1000
+
+500
+
+500
+
+500
+
+500
+
+0
+
+WB Lane 1
+
+2000
+
+0
+
+WB Lane 2
+
+2000
+1500
+
+1500
+
+1500
+
+1000
+
+1000
+
+1000
+
+1000
+
+500
+
+500
+
+500
+
+500
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+WB Lane 4
+
+2000
+
+1500
+
+0
+
+True Positive
+False Negative
+False Positive
+
+0
+
+WB Lane 3
+
+2000
+
+EB Lane 4
+
+2000
+
+1500
+
+0
+
+x-position (ft)
+
+EB Lane 2
+
+2000
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+Figure 17: Lane-specific time-space diagrams for REC-i. False negatives are significantly reduced due to data association
+and imputation.
+
+23
+
+EB Lane 1
+
+x-position (ft)
+
+2000
+
+EB Lane 3
+
+2000
+
+1500
+
+1500
+
+1500
+
+1000
+
+1000
+
+1000
+
+1000
+
+500
+
+500
+
+500
+
+500
+
+0
+
+WB Lane 1
+
+2000
+
+0
+
+WB Lane 2
+
+2000
+1500
+
+1500
+
+1500
+
+1000
+
+1000
+
+1000
+
+1000
+
+500
+
+500
+
+500
+
+500
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+WB Lane 4
+
+2000
+
+1500
+
+0
+
+True Positive
+False Negative
+False Positive
+
+0
+
+WB Lane 3
+
+2000
+
+EB Lane 4
+
+2000
+
+1500
+
+0
+
+x-position (ft)
+
+EB Lane 2
+
+2000
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+Figure 18: Lane-specific time-space diagrams for RAW-ii (snow, low speed traffic). False negatives dominate the errors.
+
+EB Lane 1
+
+x-position (ft)
+
+2000
+
+EB Lane 3
+
+2000
+
+1500
+
+1500
+
+1500
+
+1000
+
+1000
+
+1000
+
+1000
+
+500
+
+500
+
+500
+
+500
+
+0
+
+WB Lane 1
+
+2000
+
+0
+
+WB Lane 2
+
+2000
+1500
+
+1500
+
+1500
+
+1000
+
+1000
+
+1000
+
+1000
+
+500
+
+500
+
+500
+
+500
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+WB Lane 4
+
+2000
+
+1500
+
+0
+
+True Positive
+False Negative
+False Positive
+
+0
+
+WB Lane 3
+
+2000
+
+EB Lane 4
+
+2000
+
+1500
+
+0
+
+x-position (ft)
+
+EB Lane 2
+
+2000
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+Figure 19: Lane-specific time-space diagrams for REC-ii. False negatives are reduced.
+
+24
+
+30
+
+Time (s)
+
+40
+
+50
+
+EB Lane 1
+
+x-position (ft)
+
+2000
+
+EB Lane 3
+
+2000
+
+1500
+
+1500
+
+1500
+
+1000
+
+1000
+
+1000
+
+1000
+
+500
+
+500
+
+500
+
+500
+
+0
+
+WB Lane 1
+
+2000
+
+0
+
+WB Lane 2
+
+2000
+1500
+
+1500
+
+1500
+
+1000
+
+1000
+
+1000
+
+1000
+
+500
+
+500
+
+500
+
+500
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+WB Lane 4
+
+2000
+
+1500
+
+0
+
+True Positive
+False Negative
+False Positive
+
+0
+
+WB Lane 3
+
+2000
+
+EB Lane 4
+
+2000
+
+1500
+
+0
+
+x-position (ft)
+
+EB Lane 2
+
+2000
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+Figure 20: Lane-specific time-space diagrams for RAW-iii (heavy congestion in WB). WB tracking is extremely fragmented.
+
+EB Lane 1
+
+x-position (ft)
+
+2000
+
+EB Lane 3
+
+2000
+
+1500
+
+1500
+
+1500
+
+1000
+
+1000
+
+1000
+
+1000
+
+500
+
+500
+
+500
+
+500
+
+0
+
+WB Lane 1
+
+2000
+
+0
+
+WB Lane 2
+
+2000
+1500
+
+1500
+
+1500
+
+1000
+
+1000
+
+1000
+
+1000
+
+500
+
+500
+
+500
+
+500
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+WB Lane 4
+
+2000
+
+1500
+
+0
+
+True Positive
+False Negative
+False Positive
+
+0
+
+WB Lane 3
+
+2000
+
+EB Lane 4
+
+2000
+
+1500
+
+0
+
+x-position (ft)
+
+EB Lane 2
+
+2000
+
+40
+
+50
+
+0
+
+0
+
+10
+
+20
+
+30
+
+Time (s)
+
+40
+
+50
+
+Figure 21: Lane-specific time-space diagrams for REC-iii. Fragmentation is addressed in most cases. However, ID
+switching can occur when the speed varies, due to the constant-velocity assumption in the current matching cost
+formulation.
+
+25
+

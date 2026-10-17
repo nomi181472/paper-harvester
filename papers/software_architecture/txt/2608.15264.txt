@@ -1,0 +1,1977 @@
+ORIGINAL ARTICLE
+
+AgentR: A Stateful and Recovery-Aware Software
+Architecture for LLM-based Auditable Workﬂows
+Riya Samanta1*
+
+arXiv:2608.15264v1 [cs.SE] 15 Aug 2026
+
+Ghosh3
+
+|
+
+|
+
+Bidyut Saha2*
+
+|
+
+Soumya Kanti
+
+Rajkumar Buyya4
+
+1 Department of Computer Science &
+
+Engineering, Techno India University, West
+Bengal, India
+2 Independent Researcher, West Bengal,
+
+India
+3 Department of Computer Science &
+
+Engineering, Indian Institute of Technology
+Kharagpur, West Bengal, India
+4 Cloud Computing and Distributed Systems
+
+(CLOUDS) Laboratory, School of
+Computing and Information Systems The
+University of Melbourne, Australia
+
+Modern LLM-based applications increasingly require multistage execution, persistent intermediate state, retry semantics, and auditable usage accounting. However, many LLM
+applications are still implemented as stateless promptresponse wrappers or session-bounded conversational systems, which makes them diﬃcult to recover, audit, and reproduce after interruption or failure. We propose AgentR,
+a stateful architecture for LLM workﬂow systems that enables persistence and recovery, instantiated through scien-
+
+Correspondence
+Riya Samanta PhD, Department of
+Computer Science & Engineering, Techno
+India University, West Bengal, India
+Email: riya.s@technoindiaeducation.com
+
+tiﬁc literature review as a representative use case. AgentR
+
+Funding information
+
+BullMQ workers backed by Redis, with PostgreSQL as the
+
+represents research intent, generated queries, candidatepaper assessments and gap analyses as durable workﬂow
+artifacts, and executes the pipeline through asynchronous
+persistence store. The design includes explicit processing
+state transitions, retries with exponential backoﬀ, orphan
+job detection, credit-aware pre-checks, ACID token-cost
+logging, and Type-2 slowly changing pricing records. We
+evaluate AgentR on telemetry collected from a prototype
+deployment. At the LLM stage, the system achieves 99.2%
+
+Abbreviations: ACID, atomicity, consistency, isolation, durability; API, application programming interface; LLM, large language model; RAG, retrievalaugmented generation; REST, representational state transfer.
+* Equally contributing authors.
+
+1
+
+2
+
+Riya et al.
+
+job completion, and mean latencies of 9.0 s, 18.9 s, and
+25.4 s for intent decomposition, query generation, and paper scoring, respectively. Parallel scoring allows for analytical latency modeling from observed calls, leading to as
+much as 4.3× wall-clock speedup over sequential execution. The results provide preliminary proof-of-concept that
+persistent state machine design, asynchronous orchestration, and cost-aware usage logging can enable improved
+observability, recoverability, and operational accountability
+in LLM workﬂow systems. The prototype implementation
+of AgentR is publicly available at: https://github.com/
+RiyaSamanta/AgentR-public.
+KEYWORDS
+
+software architecture, LLM workﬂow systems, scientiﬁc
+workﬂows, stateful orchestration, recovery-aware execution,
+cost-aware AI systems
+
+1
+
+|
+
+INTRODUCTION
+
+Scientiﬁc literature reviews are inherently iterative, multi-session activities. Researchers read papers in the morning,
+tweak their search strategies after lunch, and re-evaluate earlier assessments in the evening. They build up understanding over days, or weeks, or sometimes months. Teaching, meetings, or the need to read background material
+can break up a session of literature review. The context of reasoning, what was searched, what papers were reviewed
+and what gaps were found must be in place and not lost or unlinked when the researcher comes back. The need
+for persistent state between sessions is fundamental to researchers’ productivity and quality of research but is largely
+unmet by existing LLM-based literature review tools.
+In addition to session persistence, the literature review has an inherent workﬂow structure. In general, a good
+researcher should: (a) decompose a research problem into constituent axes such as methodological approach, application domain, constraints, and contribution type; (b) map this structured understanding to various search strategies;
+(c) assess retrieved papers along multiple analytical dimensions such as direct competition, supporting relevance, and
+gap identiﬁcation; and (d) synthesize these assessments into an actionable research landscape [1, 2]. These stages
+are not independent: intermediate decisions constrain downstream analysis, and the full reasoning trace needs to be
+tracked for reproducibility and audit.
+The recent explosion of LLM-based literature tools has democratized the preliminary exploration of literature.
+Tools like Semantic Scholar [3], Scholarcy [4], and SciSpace [5] are paper summarization systems that help users distill
+individual papers into summaries, key claims, or structured reading aids. Retrieval-oriented research assistants such
+as Consensus [6], Semantic Scholar, and SciSpace support natural-language paper search, evidence discovery, and
+information extraction over large scholarly corpora. ResearchRabbit [7] and Connected Papers [8] allow literature discovery by mapping papers based on citation and similarity. Researchers also extensively use general-purpose chatbot
+systems such as ChatGPT [9], Claude [10], Gemini [11], and Perplexity [12] to upload papers, ask follow-up questions,
+
+Riya et al.
+
+3
+
+compare contributions, and draft literature-review text.
+However, these tools are mostly built for document-level summarization, single-query retrieval, question answering, or session-bounded dialogue. They do not inherently model literature review as an ongoing executable workﬂow
+with explicit research-intent state, generated-query artifacts, paper-level analytical records, lifecycle transitions, recovery semantics, and auditable cost traces. This architectural gap motivates AgentR, which treats literature review
+as a durable, multi-stage LLM workﬂow rather than a sequence of isolated LLM interactions.
+From a software-systems perspective, AgentR is evaluated as a quality-aware architecture for LLM workﬂow
+systems. The study focuses on reliability, recoverability, traceability, auditability, observability, and cost accountability
+as ﬁrst-class software-quality attributes. Literature review is used as the case-study domain because it requires longrunning, multi-stage, interruption-tolerant reasoning workﬂows; however, the architectural patterns are applicable to
+other LLM-enabled software services requiring persistent state and auditable execution.
+
+1.1
+
+|
+
+Problem Gap
+
+Preliminary literature exploration tools, such as recent LLM-based literature review tools, have made literature analysis easier through summarization, semantic retrieval, citation mapping, and conversational analysis. However, most
+existing systems still treat literature review as a series of isolated interactions rather than a sustained research workﬂow. An LLM takes as input an abstract, problem statement, or snippet of a paper and provides a one-shot response
+(direct prompting). While such outputs can enable rapid interpretation, they do not result in structured research intent,
+coordinated search strategies, or reusable intermediate artifacts.
+Retrieval-augmented generation (RAG) grounds LLM responses on retrieved documents to improve factual accuracy [13]. Nevertheless, standard RAG pipelines follow a ‘query-retrieve-generate pattern’. They normally do not
+decompose a research problem into the methodological, application, constraint, and contribution dimensions, nor do
+they keep each analytical stage as durable state for subsequent reasoning. Likewise, systems like ChatGPT interactively oﬀer session-level context, but this context is conversational rather than workﬂow-oriented. It is not maintained
+as a structured, queryable representation of research intent.
+Recent agentic frameworks such as AutoGen [14], MetaGPT [15], LangGraph [16], and CrewAI [17] extend LLM
+applications toward multi-agent collaboration and multi-stage orchestration. Some contemporary frameworks now
+support persisted execution state and workﬂow resumption. The remaining gap addressed here is therefore not persistence in isolation, but an integrated scientiﬁc-workﬂow architecture that couples durable research artifacts and explicit lifecycle semantics with recovery-aware execution, structured LLM-output validation, and auditable token/cost
+accounting.
+Thus, the central gap is not the absence of another summarization, retrieval, or chatbot interface, but the absence
+of a software architectural model that formalizes LLM-assisted analysis as a persistent, stateful, recoverable, and
+auditable workﬂow. AgentR addresses this gap by treating literature review as a multi-stage agentic process in which
+research intent, generated queries, retrieved candidates, paper-level judgments, gap analyses, and synthesis outputs
+are stored as durable artifacts with lifecycle-aware orchestration and recovery-aware execution.
+
+1.2
+
+|
+
+Contributions
+
+We propose AgentR, a persistent, recovery-aware, and cost-auditable software architecture for LLM workﬂow systems. The architecture is instantiated through a literature-intelligence pipeline that transforms literature review from
+isolated LLM interactions into a durable multi-stage workﬂow with structured state, asynchronous execution, and
+
+4
+
+Riya et al.
+
+accountable LLM usage. AgentR is not positioned as a paper summarizer, a RAG retrieval system, or a promptengineering wrapper; rather, it is a prototype system for studying persistency, recoverability, traceability, and cost
+accountability in stateful LLM workﬂows.
+This paper makes the following contributions:
+
+1. A stateful software architecture for auditable LLM workﬂow systems that represents research intent, generated
+queries, paper assessments, and gap-oriented analyses as durable, queryable artifacts rather than transient prompt
+responses.
+2. A structured literature-intelligence pipeline that decomposes a research problem into scientiﬁc intent, generates
+multi-strategy search queries, and evaluates candidate papers along semantic similarity, direct-competitor relevance, supporting-work relevance, and gap-assessment dimensions.
+3. A recovery-aware asynchronous execution model with implemented Redis-level retry, explicit processing states,
+exponential backoﬀ, orphan-job detection, insuﬃcient-credit handling, and a partially implemented databasereconstruction path for Redis-state-loss recovery.
+4. A cost-aware execution and audit model that records token usage, model pricing, latency, and credit deductions
+using persistent usage logs and transaction-safe balance updates.
+5. A prototype evaluation using development telemetry to characterize job completion, stage-wise latency, token
+cost, analytically derived parallelism speedup, and scoring-stability estimates.
+
+1.3
+
+|
+
+Research Questions
+
+To align the evaluation with the software-systems focus of this work, we study AgentR through the following research
+questions:
+
+1. RQ1: To what extent can a persistent state-machine architecture support completion and observability of multistage LLM workﬂows?
+2. RQ2: How does asynchronous queue-based execution aﬀect end-to-end latency compared with sequential LLM
+execution?
+3. RQ3: What token and cost-accounting characteristics are observed when LLM workﬂow execution is logged at
+per-call granularity?
+4. RQ4: What recoverability mechanisms are supported by the implemented retry, orphan-detection, insuﬃcientcredit handling, and resumption paths?
+
+The rest of this paper is organized as follows. Section 2 is the detailed literature review. Section 3 presents the design goals, layered architecture, implementation scope, and end-to-end pipeline of AgentR. Section 4 describes the persistent research-state model and processing-state semantics. Section 5 details the multi-stage literature-intelligence
+pipeline, including intent decomposition, query generation, and paper scoring. Section 6 explains the asynchronous
+orchestration model, while Section 7 presents the scientiﬁc scoring framework. Section 8 discusses cost-aware execution and audit logging, and Section 9 describes failure classiﬁcation and resumable execution. Section 10 reports
+the prototype evaluation. Section 11 concludes the paper, and Section 12 outlines future work.
+
+Riya et al.
+
+5
+
+Feature-oriented comparison of representative related approaches.
+
+TA B L E 1
+
+Representative work / system
+Semantic
+
+Scholar,
+
+Literature
+analysis
+
+SciSpace,
+
+Multi-stage
+Durable
+Recovery /
+orchestration workﬂow state resume
+
+✓
+
+–
+
+Consensus and Scite [6, 18]
+
+✓
+
+ResearchRabbit and Connected
+
+✓
+
+LLM output
+validation
+
+Gap-oriented
+analysis
+
+Per-call
+cost audit
+
+–
+
+–
+
+–
+
+–
+
+–
+
+–
+
+–
+
+–
+
+–
+
+Partial
+
+–
+
+–
+
+–
+
+–
+
+–
+
+Partial
+
+–
+
+Scholarcy [3, 5, 4]
+
+Papers [7, 8]
+AutoGen and MetaGPT [14, 15]
+
+–
+
+✓
+
+Partial
+
+Partial
+
+Partial
+
+–
+
+–
+
+LangGraph and CrewAI [16, 17]
+
+–
+
+✓
+
+✓
+
+✓
+
+Partial
+
+–
+
+–
+
+Airﬂow, Prefect, Snakemake [19,
+
+–
+
+✓
+
+✓
+
+✓
+
+–
+
+–
+
+–
+
+Galaxy and Taverna [22, 23]
+
+Partial
+
+✓
+
+✓
+
+Partial
+
+–
+
+–
+
+–
+
+Forecite and GapGPT [24, 25]
+
+✓
+
+–
+
+–
+
+–
+
+–
+
+✓
+
+–
+
+AgentR (this work)
+
+✓
+
+✓
+
+✓
+
+✓
+
+✓
+
+✓
+
+✓
+
+20, 21]
+
+2
+2.1
+
+|
+
+RELATED WORK
+|
+
+LLM-Based Literature Analysis Tools
+
+Applying large language models to scientiﬁc literature has led to a range of tools. Semantic Scholar’s TLDR feature [26, 3] generates single-paper abstracts with ﬁne-tuned models. Consensus [6] allows for natural-language
+question answering on paper databases, typically using retrieval-augmented generation (RAG) pipelines where a user
+query is embedded, similar documents are retrieved, and an LLM generates a response conditioned on the retrieved
+context [13]. Scite [18] provides citation classiﬁcation and smart citations to show if a cited paper provides supporting or contrasting evidence. Semantic Scholar employs AI to classify citation intent and tailor research feeds [27].
+Document-level summarization and key-fact extraction are provided by SciSpace [5] and Scholarcy [4].
+The literature-analysis tools considered here primarily emphasize document-level summarization, retrieval, citation assistance, or conversational exploration. Their user-facing workﬂows do not generally expose the literaturereview process as a durable state machine in which structured research intent, generated queries, paper-level assessments, and failure states are persisted as ﬁrst-class workﬂow artifacts. This distinction is important for long-running
+review tasks in which intermediate analytical outputs must remain queryable and reusable across sessions.
+
+2.2
+
+|
+
+Agentic LLM Systems
+
+Recent work has explored multi-agent and agentic architectures for complex reasoning tasks. AutoGen [14] supports
+multi-agent conversations in which specialized agents collaborate through message passing, while MetaGPT [15] applies structured agent roles to software-engineering workﬂows. ReAct [28] formalized the interleaving of reasoning
+and tool-use actions, and Toolformer [29] demonstrated how language models can learn to invoke external tools.
+More recent orchestration frameworks such as LangGraph [16] and CrewAI [17] go further by supporting stateful
+multi-step workﬂows; their current frameworks include mechanisms for persistence and resumption of long-running
+executions.
+These developments mean that persistence and recovery are no longer unique capabilities of a single agent frame-
+
+6
+
+Riya et al.
+
+work. The architectural distinction pursued by AgentR is instead the integration of those orchestration mechanisms
+with domain-level durable research artifacts, explicit literature-workﬂow lifecycle states, LLM-output validation, paperlevel gap assessments, and token-level cost accounting. In other words, AgentR is positioned as a software architecture for auditable scientiﬁc LLM workﬂows rather than as a general-purpose agent runtime.
+
+2.3
+
+|
+
+Scientiﬁc Workﬂow Systems
+
+Workﬂow management systems such as Apache Airﬂow [19], Prefect [20], and Snakemake [21] leverage DAG-based
+task orchestration with retry semantics and state persistence. Galaxy [22] and Taverna [23] mainly target scientiﬁc
+workﬂows. These systems excel at orchestrating deterministic, compute-bound pipelines but lack native support for
+LLM-speciﬁc concerns like non-deterministic outputs needing structured validation, token-level cost tracking, and
+prompt-template versioning.
+AgentR covers this gap by adding workﬂow orchestration semantics (queue-driven execution, state machines,
+retry with backoﬀ) with LLM-oriented infrastructure (structured output validation via Zod schemas, JSON-mode
+enforcement, temperature-controlled generation, and per-call cost accounting). Existing workﬂow systems provide
+durable orchestration, and existing LLM literature tools provide retrieval or summarization, but AgentR combines persistent research-state modeling, LLM-speciﬁc structured validation, paper-level analytical artifacts, and token-level
+ﬁnancial accounting in a single literature-intelligence workﬂow. The design draws on established patterns from workﬂow management [30] and applies them to the speciﬁc challenges of LLM-driven scientiﬁc reasoning.
+
+2.4
+
+|
+
+Research Gap Analysis
+
+The automated identiﬁcation of research gaps has been explored with bibliometric methods [31], citation network
+analysis [32], and more recently LLM-based approaches. Forecite [24] uses citation graphs to discover underrepresented research topics. GapGPT [25] uses LLMs to identify gaps in speciﬁc collections of papers. These techniques
+are generally one-shot analyses, and do not use the structured, pairwise comparison approach of AgentR, in which
+each candidate paper is evaluated relative to the researcher’s speciﬁc intention along multiple analytical dimensions,
+producing persistent, queryable gap evaluations.
+
+2.5
+
+|
+
+Structured Information Extraction from Scientiﬁc Text
+
+The extraction of structured information from scientiﬁc papers is a long-standing NLP task, from rule-based systems [33] to neural approaches [34]. Recent work uses LLMs to extract claims [35], methods [36], and contributions [37] from scientiﬁc text. AgentR extends this tradition by extracting a structured representation of research
+intent, including problems, methodologies, domains, constraints, contribution types, and seed keywords. These pillars
+are the durable state drivers for all downstream stages of the scientiﬁc research workﬂow pipeline.
+
+2.6
+
+|
+
+Comparative Synthesis of Related Approaches
+
+Table 1 summarizes the capabilities emphasized by representative systems discussed above. The comparison is featureoriented rather than a ranking: a check mark denotes explicit support, “Partial” denotes related functionality that is
+narrower or requires additional conﬁguration, and “–” denotes a capability that is not a primary feature of the cited system. Importantly, modern agent frameworks already provide substantial workﬂow-state and recovery support. The
+
+Riya et al.
+
+7
+
+FIGURE 1
+
+Layered architecture of the AgentR framework
+
+diﬀerentiating point for AgentR is therefore the combination of workﬂow durability with research-speciﬁc persistent
+artifacts, LLM-output validation, gap-oriented paper analysis, and per-call token/cost auditability.
+
+3
+
+|
+
+3.1
+
+SYSTEM OVERVIEW
+|
+
+Design Goals
+
+AgentR is built around ﬁve requirements that are derived from the shortcomings of existing systems:
+
+• Persistent Research State. The literature analysis must produce lasting, structured artifacts that can survive session
+termination, and can be queried by downstream stages without re-computation.
+• Explicit Workﬂow Lifecycle. Pipeline stages should have observable, auditable, and recoverable, well-deﬁned state
+transitions (not-started, in-progress, completed, failed).
+• Asynchronous Execution. LLM calls are inherently slow, taking from seconds to minutes. The system should not
+block the user interaction while it is processing but processing should be asynchronous with status visibility.
+• Resilience to Failure. Rate limits, network issues and running out of credits can cause the LLM API calls to fail. The
+system should distinguish between transient and permanent failures and retry as appropriate. The system should
+permit manual resumption following recoverable failures.
+• Accountability for Finance. Every call to an LLM has a measurable cost. The system must track costs on a per-token
+basis, maintain auditable ﬁnancial records and prevent operations if funds are insuﬃcient.
+
+8
+
+Riya et al.
+
+3.2
+
+|
+
+Architecture
+
+We design the AgentR architecture, which consists of four layers as depicted in Fig. 1:
+1. API Layer. A RESTful Express.js server that manages authentication (JSON Web Tokens and refresh tokens), request validation (Zod schemas), rate limiting, and consistent response formatting.
+2. Service Layer. Modules of business logic for each pipeline stage: intent decomposition, query generation, paper
+scoring, and auxiliary services (credits, usage logging, model pricing, payments).
+3. Orchestration Layer. Three BullMQ queues based on Redis for asynchronous job dispatch, retry with exponential
+backoﬀ, worker lifecycle. Each queue handles a speciﬁc pipeline domain: project initiation, paper grading, and
+email notiﬁcation.
+4. Persistence Layer. A PostgreSQL database managed with Prisma Object-Relational Mapping (ORM), containing 13
+tables to store research projects, candidate papers, LLM usage, ﬁnancial transactions, conﬁguration history, and
+job state.
+
+3.3
+
+|
+
+Implementation Scope
+
+AgentR is a Node.js backend with 7,298 lines of TypeScript in 83 source ﬁles, 13 Prisma data models, 4 Prisma enums,
+and 63 documented REST API endpoints. 101 React TypeScript ﬁles make up the frontend. The system comprises 7
+Zod validation schema ﬁles with 24 named schemas, 3 LLM prompt template ﬁles and 3 BullMQ queues, backed by
+Redis. The complete set of system statistics is in Table 2.
+TA B L E 2
+
+AgentR System Implementation Statistics
+Component
+
+Count
+
+Backend TypeScript ﬁles
+
+83
+
+Frontend TS/TSX ﬁles
+
+101
+
+API route ﬁles
+
+16
+
+Controller ﬁles
+
+13
+
+Service ﬁles
+
+24
+
+Worker ﬁles
+
+4
+
+Middleware ﬁles
+
+9
+
+Zod validation schema ﬁles
+
+7
+
+LLM prompt template ﬁles
+
+3
+
+Prisma data models
+
+13
+
+Prisma enums
+
+4
+
+BullMQ background queues
+
+3
+
+Background job types
+
+4
+
+Backend TypeScript LOC
+
+7,298
+
+Riya et al.
+
+3.4
+
+|
+
+9
+
+Pipeline Overview
+
+The AgentR pipeline executes a research project in three implemented stages, with further stages planned for automatic paper retrieval and cross-paper synthesis:
+Stage 1: Intent Decomposition. The input to the system is a research abstract. Six structured ﬁelds are extracted.
+These are: problem statement, methodological approaches, application domains, constraints, contribution types, and
+seed keywords. This structured representation is the research state for all further stages.
+Stage 2: Query Generation. Using the structured intent as input, the system generates three types of search
+artifacts: a Boolean query with AND/OR operators for database-speciﬁc search, an expanded keyword set (10-15
+terms), and exactly 10 optimized search query strings for general-purpose academic search engines.
+Stage 3: Paper Scoring. For each candidate paper, the system performs four concurrent analyses in a single LLM
+call: (a) semantic similarity with dimensional overlap assessment; (b) Category 1 (C1) direct-competitor evaluation
+with rubric-based scoring (0–10); (c) Category 2 (C2) supporting-work evaluation with contribution-type classiﬁcation;
+and (d) research-gap identiﬁcation with novelty and advantage analysis. These three analytical dimensions (semantic
+matching, categorization, and gap analysis) are merged into a single LLM call to reduce latency, cost, and inter-call
+inconsistency (see Section 7).
+Fig. 2 presents the end-to-end activity ﬂow of AgentR from project creation to intent extraction, query generation,
+parallel candidate-paper scoring, persistence, credit accounting, and failure recovery. The diagram shows that AgentR
+is not a simple prompt-response interaction. Instead, each analysis step is an asynchronous job with explicit validation,
+durable persistence, and resumable failure handling. Additionally, Table 3 maps AgentR’s architectural mechanisms
+and the quality attributes evaluated in this paper.
+TA B L E 3
+
+AgentR Architectural Mechanisms and Supported Software-Quality Attributes
+
+Quality attribute
+Reliability
+Recoverability
+Traceability
+
+AgentR mechanism
+
+Evidence in evaluation
+
+BullMQ retry, exponential backoﬀ, worker
+
+Job completion rate, failure statis-
+
+isolation
+
+tics
+
+ProcessingStatus state machine, resume
+
+Recovery architecture and resump-
+
+endpoint, Redis retry
+
+tion semantics
+
+Durable project, paper, job, and usage
+
+Persistent state and audit logs
+
+records
+Auditability
+
+LLM usage logs, pricing history, credit ac-
+
+Token and cost eﬃciency analysis
+
+counting
+Maintainability
+Observability
+
+Layered architecture, typed schemas, ser-
+
+Implementation
+
+vice separation
+
+modular design
+
+Queryable job states and background-job
+
+Workﬂow status tracking
+
+records
+
+statistics
+
+and
+
+10
+
+Riya et al.
+
+Phase 1: Project Creation & Intent
+
+User submits
+research
+abstract
+
+POST
+/v1/userprojects
+
+Create UserProject
+and
+BackgroundJob
+
+project.worker.ts
+orphan check
+credit check
+
+projectQueue
+BullMQ / Redis
+3 retries
+
+Project valid
+and credits
+available?
+
+Stage 1
+Intent Decomposition
+processIntent(),
+temp=0.3
+extracts six intent fields
+
+Yes
+
+Save intent to
+UserProject
+log usage; deduct
+credits
+
+Phase 2: Query Generation
+Stage 2
+Query Generation
+processQueries(),
+temp=0.4
+Boolean query; keywords;
+10 search strings
+
+Create chained job
+PROJECT_INIT_QUERY
+
+Save queries to
+UserProject
+log usage; deduct credits
+send email
+
+chain
+runtime error
+
+runtime error
+
+add papers
+Phase 3: Paper Scoring (parallel per candidate)
+User adds
+candidate papers
+CSV or single
+add
+
+paperQueue
+3 retries
+5 parallel
+workers
+
+paper.worker.ts
+orphan check
+credit check
+
+Paper/project
+valid and credits
+available?
+
+Yes
+
+Stage 3
+Paper Scoring
+processCategorize(),
+temp=0.4
+semantic similarity
+C1 score; C2 score; gaps
+
+Save scores to
+CandidatePaper
+log usage; deduct
+credits
+
+All papers
+scored?
+
+Text
+Yes
+Text
+
+Mark job
+COMPLETED
+send email
+show results
+
+No: pending papers
+No / invalid
+
+No / invalid
+
+runtime error
+
+no credits
+
+usage logs
+
+writes
+
+Failure and Recovery Paths
+FAILED_ORPHAN
+deleted project/paper
+no LLM call
+no charge
+
+job state
+
+FAILED_NO_CREDITS
+insufficient balance
+no retry
+recharge required
+
+FAILED_OTHER
+network/API/timeout
+BullMQ retries 3x
+manual resume
+
+resume failed jobs
+
+Recovery endpoint
+POST /v1/jobs/resume-all
+Strategy A: Redis job.retry()
+Strategy B: DB reconstruction
+
+resume after recharge
+
+Persistent State / Audit Artifacts
+UserProject
+intent fields
+query fields
+
+LlmUsageLog
+tokens; cost
+latency
+
+BackgroundJob
+job state
+retry status
+
+scores
+CandidatePaper
+semantic score
+C1, C2, gaps
+
+writes
+
+FIGURE 2
+
+4
+4.1
+
+|
+
+End-to-end activity diagram of the AgentR pipeline.
+
+PERSISTENT RESEARCH-STATE MODELING
+|
+
+State Representation
+
+AgentR models a research project as a persistent entity with multiple typed state ﬁelds. The UserProject table
+stores both the original input (the researcher’s abstract) and all pipeline outputs, including the Stage 1 intent de-
+
+Riya et al.
+
+11
+
+FIGURE 3
+
+Processing status state machine.
+
+composition ﬁelds (problemStatement, methodologies, applicationDomains, constraints, contributionTypes,
+keywordsSeed) and Stage 2 query generation outputs (booleanQuery, expandedKeywords, searchQueries).
+Each candidate paper is similarly represented as a persistent entity with its full analytical output: semantic similarity score s ∈ [0, 1]; four dimensional overlap assessments o i ∈ {none, low, medium, high} for i ∈ {problem, method,
+domain, constraint}; C1 and C2 scores with justiﬁcations, strengths, and weaknesses; and research gap artifacts
+(researchGaps, userNovelty, candidateAdvantage).
+
+4.2
+
+|
+
+State Machine Semantics
+
+The ProcessingStatus enum deﬁnes a six-state ﬁnite automaton shared across projects and papers, as shown in
+Fig. 3.
+This state machine has several properties that distinguish it from the implicit state in conversational systems:
+
+1. Observable. Any client can query the current state of any pipeline stage at any time.
+2. Durable. State is persisted in PostgreSQL, not in worker memory or conversation context.
+3. Recoverable. Terminal failure states are resumable via the RE_INITIATED transition.
+4. Auditable. State transitions are timestamped and traceable through the BackgroundJob table.
+
+12
+
+Riya et al.
+
+4.3
+
+|
+
+Soft Delete and Cascade Semantics
+
+Project deletion follows a cascading soft-delete pattern, implemented as a Prisma database transaction: deleting a
+project atomically sets isDeleted=true on the project, all its candidate papers, and all associated LLM usage logs.
+This keeps audit trails intact and logically removes the project from user queries. The workers check these soft-delete
+ﬂags before expensive LLM calls to avoid wasted computation on deleted resources.
+
+5
+
+|
+
+5.1
+
+MULTI-STAGE SCIENTIFIC REASONING PIPELINE
+|
+
+Stage 1: Structured Intent Decomposition
+
+The intent decomposition stage transforms a free-text research abstract into a structured representation of research
+intent. Given an abstract a, the intent decomposition function I produces a tuple:
+I (a ) = ⟨p, M , D, C , T , K ⟩
+
+(1)
+
+where p is the problem statement, M is the set of methodological approaches, D is the set of application domains, C
+is the set of constraints, T is the set of contribution types, and K is the set of seed keywords.
+The LLM is prompted with a system instruction specifying the six extraction targets and a user prompt containing
+the abstract. Temperature is set to 0.3 for deterministic extraction. The response is enforced to be valid JSON via
+OpenAI’s json_object response format and validated against a Zod schema before persistence. Any validation failure
+triggers a retry via the BullMQ backoﬀ mechanism.
+Unlike free-text summarization, structured intent decomposition generates typed and indexed ﬁelds for downstream stages to directly consume. The query generator feeds on the problem statement, the scoring rubric on the
+methodological axes, the overlap analysis on the constraint set.
+
+5.2
+
+|
+
+Stage 2: Multi-Strategy Query Generation
+
+The query generation stage translates structured intent into diverse search strategies. The input is the full intent tuple
+⟨p, M , D, C , T , K ⟩ from Stage 1. The query generator produces three artifact types:
+
+1. Boolean Query. A structured query using AND/OR operators compatible with database-speciﬁc search engines
+(IEEE Xplore, Semantic Scholar,ACM Digital Library, PubMed).
+2. Expanded Keywords. 10–15 terms including synonyms, hyponyms, and related concepts not present in the original
+abstract.
+3. Search Queries. Exactly 10 distinct query strings optimized for general-purpose academic search engines, generated with explicit variation strategies: broad, narrow, method-speciﬁc, problem-speciﬁc, and domain-speciﬁc.
+
+Stage 2 uses temperature 0.4, which is slightly higher than Stage 1, to encourage diverse query formulations while
+maintaining relevance.
+
+Riya et al.
+
+5.3
+
+13
+
+|
+
+Stage 3: Multi-Dimensional Paper Scoring
+
+The analytical core of the pipeline is the paper scoring. It produces a holistic evaluation in four dimensions in one LLM
+call per candidate paper.
+
+5.3.1
+
+|
+
+Semantic Similarity Assessment
+
+The scoring function computes an overall semantic similarity score s ∈ [0, 1] and four dimensional overlap assessments o i ∈ {none, low, medium, high} for i ∈ {problem, method, domain, constraint}.
+
+5.3.2
+
+|
+
+Category 1: Direct Competitor Assessment
+
+The C1 score c 1 ∈ [0, 10] evaluates whether a candidate paper addresses the same problem using a similar methodology. The scoring follows an explicit rubric embedded in the prompt, as shown in Table 4.
+TA B L E 4
+
+5.3.3
+
+|
+
+C1 Direct Competitor Scoring Rubric
+Score
+
+Interpretation
+
+9–10
+
+Near-identical problem and method
+
+7–8
+
+Same problem, similar method with variations
+
+5–6
+
+Same problem with diﬀerent method, or vice versa
+
+3–4
+
+Partial overlap in both dimensions
+
+0–2
+
+Minimal overlap, not a competitor
+
+Category 2: Supporting Work Assessment
+
+The C2 score c 2 ∈ [0, 10] evaluates whether a candidate paper provides relevant supporting context. Each C2 assessment includes a contribution-type classiﬁcation:
+
+type ∈ { methodology, problem_context,
+domain_knowledge, constraint_analysis,
+related_application, theoretical_foundation }
+
+5.3.4
+
+|
+
+Research Gap Identiﬁcation
+
+For each candidate paper, the system identiﬁes three gap-related artifacts: (1) research_gaps: what the candidate
+paper does not address that the researcher’s work intends to (2) user_novelty: how the researcher’s objective may
+lead to advancement beyond the candidate; and (3) candidate_advantage: what the candidate oﬀers that the researcher’s proposal does not.
+
+14
+
+Riya et al.
+
+5.4
+
+|
+
+Merged Stage Design
+
+In Stage 3, the three analytical dimensions are merged into a single LLM call rather than three separate calls. This
+design choice leads to reduced latency (one round trip instead of three), reduced cost (one prompt preﬁx instead of
+three), and reduced inconsistency (the LLM evaluates all dimensions in a single reasoning context). The tradeoﬀ is a
+larger prompt and a more complex output schema, facilitated by Zod validation and JSON-mode enforcement.
+
+6
+
+|
+
+ASYNCHRONOUS WORKFLOW ORCHESTRATION
+
+AgentR uses three BullMQ queues, each with domain-speciﬁc retry semantics. Pipeline stages are connected through
+a chaining pattern where each worker, upon completing its stage, creates the next stage’s job as a new entry in the
+appropriate queue:
+1. Controller → projectQueue(PROJECT_INIT_INTENT)
+2. Worker completes Stage 1 → projectQueue(PROJECT_INIT_QUERY)
+3. Worker completes Stage 2 → emailQueue(SEND_EMAIL)
+This pattern ensures that each stage has independent retry semantics, a failure in Stage 2 does not require reexecuting Stage 1, and the pipeline is observable at each handoﬀ point via the BackgroundJob table.
+Before executing any expensive LLM call, each worker performs an orphan check: it queries the database to verify
+that the parent entity (project or paper) still exists and has not been soft-deleted. If the entity is missing or deleted:
+(1) the job status is set to FAILED_ORPHAN; (2) the worker returns early without making any LLM call; (3) no credits are
+deducted.
+The job resume mechanism implements a dual-strategy recovery:
+Strategy A: Redis Retry. If the BullMQ job object still exists in Redis (jobs are retained with removeOnFail:
+false), the system calls job.retry() to re-enqueue it directly.
+Strategy B: Database Reconstruction. In the event that the BullMQ job has expired from Redis (e.g. as a result of a
+Redis restart), the system attempts to rebuild the job payload from durable database state by calling reconstructJobPayload().
+This reconstruction path is only partially realized in the current prototype.
+Controllers wrap all queue.add() calls in a 5-second timeout wrapper. If the timeout expires (e.g., Redis is unavailable), the BackgroundJob record is marked FAILED, but the API returns HTTP 202 Accepted. The user can retry
+the job later via the resume endpoint.
+
+Riya et al.
+
+FIGURE 4
+
+7
+
+|
+
+15
+
+Job lifecycle and double-strategy recovery mechanism.
+
+SCIENTIFIC SCORING FRAMEWORK
+
+The scoring rubrics for C1 and C2 are included in the LLM system prompt, with explicit deﬁnitions of score ranges.
+This design serves two purposes: (1) calibration – by deﬁning what each score range means, the rubric reduces intercall variance in scoring; and (2) auditability – the rubric is versioned along with the prompt template, allowing for
+reproducibility analysis.
+OpenAI’s response_format:
+
+{type:
+
+“json_object”} mode forces all LLM outputs to be valid JSON. Out-
+
+puts are validated upon receipt against Zod schemas for type correctness, range constraints, enum membership, and
+required ﬁelds. Validation failures are temporary errors and will trigger BullMQ retry.
+Diﬀerent temperature settings are used for diﬀerent pipeline stages depending on their task characteristics, as
+shown in Table 5.
+
+16
+
+Riya et al.
+
+TA B L E 5
+
+Temperature Settings by Pipeline Stage
+Stage
+
+8
+
+|
+
+Temperature
+
+Rationale
+
+Intent Decomposition
+
+0.3
+
+Deterministic extraction
+
+Query Generation
+
+0.4
+
+Creative variation needed
+
+Paper Scoring
+
+0.4
+
+Nuanced evaluation
+
+CREDIT-AWARE AND AUDITABLE EXECUTION
+
+There are three tiers of the credit system:
+1. API Middleware Layer. A checkCreditsMiddleware intercepts incoming requests and returns HTTP 402 (Payment Required) if the user’s credit balance is zero or negative.
+2. Pre-check Layer for Workers. Each worker veriﬁes that the user has at least a minimum credit balance before
+making an LLM call, a conservative threshold to prevent starting work that cannot be completed.
+3. Post-execution Deduction Layer.
+a. On a successful LLM call, the logLlmUsage() function runs an ACID transaction that atomically (a) creates a
+LlmUsageLog entry with token counts and USD cost, (b) reads the active USD-to-credits multiplier, (c) computes the credit deduction, and (d) decrements the user’s balance.
+Model pricing and system conﬁguration are on a Type-2 slowly changing dimension (SCD) pattern. On a pricing
+change: (1) set the isLatest ﬂag of the current active record to false and its effectiveTo to the current timestamp;
+(2) insert a new record with isLatest = true, isActive = true and effectiveFrom = current_timestamp.
+This stores the entire history of pricing changes which makes it possible to calculate the cost of historical LLM calls
+correctly and allows auditing and rolling back conﬁguration changes to previous pricing. This pattern is implemented
+in three tables: LlmModelPricing, CreditsMultiplierHistory, and DefaultCreditsHistory.
+The system has a two tier audit trail. The LlmUsageLog table logs each LLM call with token counts, calculated
+USD cost, model, pipeline stage, latency, and denormalized project/paper names which persist after deletion of parent
+entity. This provides per-call cost traceability at the token level. The UserCreditsTransaction table keeps a full
+audit trail of all credit operations carried out by admins (signup allocation, manual recharge, manual deduction) with
+details of before and after balances and transaction type, enabling comprehensive admin credit management. The
+MoneyTransaction table stores payment gateway records. Credit deduction for LLM use is atomic with usage-logging
+in the same Prisma transaction, so that balance updates are ACID-consistent with usage records.
+
+9
+
+|
+
+FAILURE RECOVERY AND STATEFUL RESUMPTION
+
+AgentR classiﬁes failures into three categories with distinct handling strategies, as shown in Table 6.
+Workers implement explicit error classiﬁcation. For INSUFFICIENT_CREDITS errors, the job is marked
+FAILED_NO_CREDITS and the error is not re-thrown to BullMQ, preventing wasted retries. For all other errors (network
+timeouts, API failures), the error is re-thrown, allowing BullMQ to retry with exponential backoﬀ.
+The POST /v1/jobs/resume-all endpoint enables bulk recovery of all failed jobs for a user. For each failed job:
+
+Riya et al.
+
+FIGURE 5
+
+17
+
+Three-layer credit architecture with ACID transaction guarantees.
+
+(1) orphan check: verify parent project exists; (2) credit check: verify balance > 0; (3) apply the available recovery path
+(Redis retry in the current implementation, with database reconstruction treated as a planned extension); (4) transition
+job to PENDING and processing status to RE_INITIATED.
+
+18
+
+Riya et al.
+
+Failure Taxonomy and Handling Strategies
+
+TA B L E 6
+
+10
+
+|
+
+Type
+
+Retry
+
+Resume
+
+Credit
+
+Transient
+
+Yes (3×)
+
+Yes
+
+No charge
+
+Permanent (credits)
+
+No
+
+Yes
+
+No charge
+
+Permanent (orphan)
+
+No
+
+No
+
+No charge
+
+SYSTEM EVALUATION
+
+We evaluate AgentR as a prototype implementation, focusing on the system architecture rather than domain-level
+superiority in literature-review quality. The evaluation is organized around the research questions deﬁned in Section 1.3: workﬂow completion and job status visibility address RQ1; latency and parallelism address RQ2; token and
+cost telemetry address RQ3; and retry, orphan-checking, insuﬃcient-credit handling, and resumption semantics address RQ4.
+
+10.1
+
+|
+
+10.1.1
+
+Evaluation Design
+|
+
+Dataset
+
+We analyze a development database snapshot containing 6 registered users, 14 projects (10 active, 4 soft-deleted),
+44 candidate papers (43 active), 130 background jobs, and 72 LLM usage logs. The 10 active projects span 6 domain
+clusters: precision agriculture and IoT sensing (2 projects, 34 papers), TinyML and embedded machine learning (2
+projects, 3 papers), medical imaging and edge AI (1 project, 3 papers), indoor navigation and autonomous systems
+(1 project, 2 papers), drone surveillance and remote sensing (1 project, 2 papers), and multimedia and video editing
+(1 project, 1 paper). Candidate papers were sourced from Semantic Scholar [27] and evaluated against their parent
+project’s research abstract. Table 7 summarizes the evaluation corpus.
+TA B L E 7
+
+Evaluation Corpus Summary
+Characteristic
+
+Value
+
+Registered users
+
+6
+
+Active projects (non-deleted)
+
+10
+
+Soft-deleted projects
+
+4
+
+Total candidate papers
+
+44
+
+Active candidate papers
+
+43
+
+Evaluated papers (Stage 3 complete)
+
+43
+
+Total background jobs
+
+130
+
+Total LLM usage logs
+
+72
+
+Projects with Stage 1+2 complete
+Domain clusters represented
+
+14/14 (100%)
+6
+
+Riya et al.
+
+19
+
+10.1.2
+
+|
+
+Baselines
+
+We compare AgentR against analytically derived baselines representing diﬀerent architectural approaches:
+1. AgentR-full. The current system with 5-way parallel paper scoring, BullMQ retry with exponential backoﬀ, orphan
+detection, and credit-aware execution.
+2. GPT-Direct-Sequential. The same three-stage prompts executed synchronously with no persistence, no retry, and
+no parallelism. If any stage fails, the entire pipeline must restart from Stage 1.
+3. GPT-Direct-Plus-Retry. Identical to GPT-Direct-Sequential but with a simple 3-retry loop on failure, preventing
+the comparison from being a strawman against a system with no error handling.
+All baseline latency and cost estimates are derived analytically from the 72 observed LLM calls, using the same
+per-stage mean durations and token counts as AgentR. This ensures a fair comparison: the baselines diﬀer only in
+architecture (parallelism, persistence, retry), not in prompt quality or model choice.
+
+10.2
+
+|
+
+Metrics
+
+• Workﬂow Completion Rate (WCR): Percentage of projects completing all pipeline stages (measured from database
+records).
+• Job Completion Rate (JCR): Percentage of background jobs reaching COMPLETED status (measured from database
+records).
+• Per-Stage Latency: LLM call duration per pipeline stage in milliseconds (measured from usage logs).
+• Parallelism Speedup: Wall-clock latency ratio between parallel and sequential execution (analytically derived from
+measured per-stage latencies).
+• Token and Cost Eﬃciency: Token consumption and USD cost per stage and per project (measured from usage logs;
+gpt-4o estimates analytically projected).
+• Exploratory Scoring Stability: ICC and Cohen’s κ estimated through simulation-based test-retest modeling over
+observed single-pass score distributions; these values are not treated as live repeated-run reliability measurements.
+
+10.3
+
+|
+
+10.3.1
+
+Results
+|
+
+Workﬂow Completion and Job Statistics
+
+We evaluated workﬂow completion on a dataset of 10 active research projects with 43 evaluated candidate papers,
+drawn from a development database backup. Table 8 reports workﬂow completion rates.
+TA B L E 8
+
+Workﬂow Completion Rate
+System
+
+Active Projects
+
+Stages 1+2 Complete
+
+WCR (%)
+
+Failed Projects
+
+AgentR
+
+10
+
+10
+
+100.0
+
+0
+
+We note that this 100% WCR reﬂects a controlled development dataset with near-zero failure rate. Production
+WCR would be lower. Table 9 reports per-type job completion statistics from 130 observed background jobs.
+AgentR’s job completion rate (99.2%) is attributable to its retry mechanism and pre-ﬂight credit veriﬁcation. The
+
+20
+
+Riya et al.
+
+Job Completion and Failure Statistics
+
+TA B L E 9
+
+Job Type
+
+Total
+
+COMPLETED
+
+FAILED
+
+Completion (%)
+
+PROJECT_INIT_INTENT
+
+14
+
+14
+
+0
+
+100.0
+
+PROJECT_INIT_QUERY
+
+14
+
+14
+
+0
+
+100.0
+
+PAPER_SCORING
+
+44
+
+44
+
+0
+
+100.0
+
+SEND_EMAIL
+
+58
+
+57
+
+1
+
+98.3
+
+Total
+
+130
+
+129
+
+1
+
+99.2
+
+single failure occurred in an email notiﬁcation job.
+
+10.3.2
+
+|
+
+Recovery Architecture
+
+The source code and job history were examined to conﬁrm the current recovery capabilities of AgentR. Strategy A
+(BullMQ retry): The project and paper queues are conﬁgured to retry three times with exponential backoﬀ (1,000 ms
+and 2,000 ms base delays, respectively). In case of transient failure (network timeout or API failure) the worker rethrows the error and BullMQ puts the job back in queue with an increasing delay. The retry strategy for the Redis
+level is implemented and working in the current prototype. Permanent recoverable failures: insuﬃcient-credit failures are classiﬁed without re-throwing the error to avoid wasteful retries, but user-initiated resumption is possible
+after recharge. Permanent non-recoverable failures: orphaned jobs are detected before LLM invocation and terminate with no credit deduction. Strategy B (database reconstruction): The current prototype has partial recovery of
+Redis-state loss from durable database state. This mechanism is reported as an architectural extension rather than an
+implemented recovery guarantee, because the existing function reconstructJobPayload() does not yet reconstruct
+all ﬁelds required by core LLM workers, such as stageData and backgroundJobId.
+
+10.3.3
+
+|
+
+Scoring Consistency
+
+We report a scoring-stability analysis by performing 2,000 test-retest iterations that model possible LLM output variance around the observed single-pass score distributions from 43 evaluated papers. The resulting ICC and Cohen’s
+κ values are interpreted only as preliminary stability indicators under the stated noise assumptions. Table 10 reports
+estimated consistency for numeric scoring ﬁelds. Table 11 reports estimated consistency for categorical overlap ﬁelds.
+TA B L E 1 0
+
+Estimated Numeric Scoring Consistency
+Field
+
+ICC(2,1)
+
+Spearman ρ
+
+Pearson r
+
+MAE
+
+C1 Score (0–10)
+
+0.877
+
+C2 Score (0–10)
+
+0.900
+
+0.807
+
+0.885
+
+0.79
+
+0.801
+
+0.906
+
+0.31
+
+Semantic Similarity (0–1)
+
+0.919
+
+0.746
+
+0.923
+
+0.024
+
+Under the assumed noise model, the estimated ICC values (0.88–0.92) fall in the “good to excellent” range, while
+Cohen’s κ values (0.61–0.71) indicate substantial agreement for categorical ﬁelds. These values should not be read as
+deﬁnitive scoring-reliability results; live repeated LLM executions are required to validate scoring stability empirically.
+Observed single-pass score distributions from the dataset (n = 43): C1 Score µ = 5.71, σ = 1.87, range [1.50, 8.50];
+C2 Score µ = 7.63, σ = 0.82, range [5.00, 9.00]; Semantic Similarity µ = 0.742, σ = 0.072, range [0.520, 0.850].
+
+Riya et al.
+
+21
+
+TA B L E 1 1
+
+Estimated Categorical Overlap Consistency
+Overlap Field
+
+10.3.4
+
+|
+
+Cohen’s κ
+
+% Agreement
+
+Problem overlap
+
+0.646
+
+76.4%
+
+Method overlap
+
+0.671
+
+78.1%
+
+Domain overlap
+
+0.713
+
+80.9%
+
+Constraint overlap
+
+0.634
+
+75.6%
+
+C2 contribution type
+
+0.612
+
+74.3%
+
+Token and Cost Eﬃciency
+
+Table 12 shows token consumption and cost from LLM usage logs across the three pipeline stages. The cost formula,
+veriﬁed from source code, is:
+
+costUSD =
+
+outputTokens
+inputTokens
+· p input +
+· p output
+106
+106
+
+(2)
+
+where p input and p output are per-million-token prices from the active LlmModelPricing record. Credits are computed as costUSD · m active where m active is the active USD-to-credits multiplier (100 in the evaluated conﬁguration).
+TA B L E 1 2
+
+Token and Cost Eﬃciency by Stage
+Stage
+
+n
+
+Mean Input Tok.
+
+Mean Output Tok.
+
+Mean Cost (USD)
+
+Total Cost (USD)
+
+Intent (Stage 1)
+
+14
+
+334
+
+299
+
+$0.000019
+
+$0.000265
+
+Queries (Stage 2)
+
+14
+
+421
+
+681
+
+$0.000029
+
+$0.000410
+
+Score (Stage 3)
+
+44
+
+1,559
+
+898
+
+$0.000040
+
+$0.001760
+
+Total (dev.)
+
+72
+
+—
+
+—
+
+—
+
+$0.002435
+
+Development model: gpt-5-mini ($0.15/M input, $0.60/M output)
+Est. total at gpt-4o pricing ($2.50/M in, $10/M out): $0.714
+
+The total measured cost ($0.0024) reﬂects development usage with a low-cost model. At standard gpt-4o pricing,
+the same workload would cost approximately $0.71, which is still negligible per project but scaling linearly with paper
+count.
+The cost model with Type-2 SCD pricing tables ensures that historical costs remain auditable even as pricing
+changes, and the active multiplier mechanism decouples USD costs from credit denomination. We note one limitation: individual LLM credit deductions update the user balance atomically but do not currently create per-call
+UserCreditsTransaction ledger entries; only admin-initiated operations are fully ledgered. Full per-call ﬁnancial
+audit trail would require enabling the ledger creation path in the usage logging service.
+
+10.3.5
+
+|
+
+End-to-End Latency and Parallelism Speedup
+
+Table 13 shows the per-stage LLM call latency from usage logs with durationMs ﬁelds. All measurements include
+the OpenAI API round-trip time (including network latency). AgentR’s asynchronous architecture allows for parallel
+paper scoring, which yields signiﬁcant wall-clock improvements over sequential execution. The estimated project-
+
+22
+
+Riya et al.
+
+level wall-clock latency by paper count is reported in Table 14, assuming 5-way parallel scoring (the default BullMQ
+concurrency). The speedup goes from 1.0× (single paper, no parallelism beneﬁt) to 4.3× (near-full parallel utilization).
+The derivation uses: Stage 1 + 2 baseline = 28s per project. Stage 3 = 25.4s per paper. AgentR parallelism ceiling is 5
+concurrent workers. These estimates do not include queue wait time and API rate limiting.
+TA B L E 1 3
+
+TA B L E 1 4
+
+Per-Stage LLM Call Latency
+Stage
+
+n
+
+Intent (Stage 1)
+
+14
+
+Queries (Stage 2)
+
+14
+
+Score (Stage 3)
+
+44
+
+25,373
+
+|
+
+Median (ms)
+
+P95 (ms)
+
+Min (ms)
+
+Max (ms)
+
+9,026
+
+6,426
+
+23,646
+
+3,999
+
+23,646
+
+18,894
+
+15,418
+
+47,123
+
+9,430
+
+47,123
+
+21,982
+
+48,681
+
+12,740
+
+58,079
+
+Estimated Project Wall-Clock Latency by Paper Count
+n Papers
+
+10.4
+
+Mean (ms)
+
+AgentR (5-parallel)
+
+Sequential (GPT-Direct)
+
+Speedup
+
+1
+
+53.3 s (0.9 min)
+
+53.3 s (0.9 min)
+
+1.0×
+
+5
+
+53.3 s (0.9 min)
+
+154.8 s (2.6 min)
+
+2.9×
+
+10
+
+78.7 s (1.3 min)
+
+281.6 s (4.7 min)
+
+3.6×
+
+15
+
+104.0 s (1.7 min)
+
+408.5 s (6.8 min)
+
+3.9×
+
+25
+
+154.8 s (2.6 min)
+
+662.2 s (11.0 min)
+
+4.3×
+
+Ablation Analysis
+
+We perform ablation studies to analyze the architectural contributions of AgentR. Latency and cost values are calculated from observed LLM calls assuming consistency (same prompts and models across conﬁgurations).
+
+10.4.1
+
+|
+
+Merged and Separated Scoring Stages
+
+The analytic comparison is between the merged Stage 3 design (1 LLM call that outputs all scoring dimensions: semantic similarity, C1, C2, overlap, and gap analysis) and a hypothetical separated design (3 calls: 1 for similarity and
+overlap, 1 for C1/C2 scoring, 1 for gap analysis). The merged approach saves two round-trips and two prompt preﬁxes,
+which we estimate reduces latency by ∼2.5× and cost by ∼1.6×, and might reduce cross-call inconsistency because
+all dimensions are evaluated in one reasoning context.
+
+10.4.2
+
+|
+
+Architectural Component Ablation
+
+Table 15 reports estimated performance under three architectural conﬁgurations.
+
+Riya et al.
+
+23
+
+TA B L E 1 5
+
+Architectural Ablation: Estimated Performance by Conﬁguration
+
+Conﬁguration
+
+10.4.3
+
+Latency vs. AgentR
+
+Cost vs. AgentR
+
+Key Diﬀerence
+
+AgentR-full (baseline)
+
+0%
+
+0%
+
+5-way parallel scoring, retry, orphan checks
+
+GPT-direct-sequential
+
++596%
+
+0%
+
+No parallelism; 6× slower
+
+GPT-direct-plus-retry
+
++630%
+
++3%
+
+Sequential + 3-retry; 3% retry overhead
+
+|
+
+Orphan Detection Impact
+
+The orphan detection mechanism does a pre-ﬂight database check before each LLM call. This is consistent with
+the development environment being controlled. In the dataset we observed 0 orphan events. In production, users
+might delete projects mid-processing; orphan detection saves wasted LLM calls and the worker returns early with
+FAILED_ORPHAN status without making an API call or deducting credits.
+
+11
+
+|
+
+CONCLUSION
+
+We have presented AgentR, a stateful and recovery-aware software architecture for LLM-assisted scientiﬁc literature reviews. The central argument of this paper is that LLM-enabled analytical assistance can be implemented as a
+persistent, multi-stage workﬂow rather than a sequence of isolated prompt-response calls. AgentR operationalizes
+this argument through an integrated architecture combining persistent research-state representation, asynchronous
+workﬂow orchestration, and cost-aware execution.
+Our prototype evaluation on a development dataset provides evidence of feasibility: 99.2% job completion, perstage LLM latencies of 9.0–25.4 s, and projected per-project costs of $0.04–0.38 at gpt-4o pricing. Analytical latency
+modeling shows that 5-way parallel paper scoring can achieve up to 4.3× wall-clock speedup over sequential execution for larger projects.
+AgentR is a prototype, where the main contribution is the architecture and implementation. Our architecture
+combines the semantics of workﬂow orchestration with LLM-speciﬁc infrastructure and can be applied to use cases
+beyond literature review, such as domains that require multi-stage LLM pipelines with persistent state, recovery semantics, observability, and auditable execution.
+
+12
+
+|
+
+FUTURE WORK
+
+There are several planned extensions for increasing the operational maturity of AgentR. First, the present evaluation
+does not yet describe the behaviour of the system in the conditions of largescale deployment (e.g. hundreds of
+concurrent projects, projects with more than 100 papers, or long running operational periods). Future work will include
+systematic stress testing to measure queue wait time, memory pressure, worker throughput, database connectionpool saturation, and end-to-end workﬂow latency for increasing concurrency and paper-set sizes.
+Second, AgentR performs credit accounting at the project level, but does not yet have per-call credit-transaction
+ledger entries for individual LLM deductions. This mechanism would also enhance the ﬁnancial auditability, as each
+LLM invocation could be tracked to an associated credit deduction, model invocation, workﬂow step, and project artifact. It is important to make the platform more transparent, reproducible and accountable in multi-user or institution
+scale deployment.
+Third, the current implementation is based largely on Strategy A, where the Redis-level retry semantics are lever-
+
+24
+
+Riya et al.
+
+aged to handle transient failures such as worker crashes, ﬂeeting API failures, or temporary execution interruptions.
+Full Redis-state-loss recovery via Strategy B is future work, as it requires traversing the payload reconstruction path
+from durable database state. This extension allows failed or orphaned jobs to be rebuilt and restarted even if the
+Redis queue state is no longer available.
+
+Declarations
+Funding: The authors received no speciﬁc funding for this work.
+Conﬂict of interest: The authors declare that they have no conﬂict of interest.
+Data availability: The telemetry data used in this study are derived from a development database snapshot. An
+anonymized version can be made available by the corresponding author upon reasonable request, subject to removal
+of user/project-identifying information.
+Code availability: The prototype implementation of AgentR is publicly available at https://github.com/RiyaSamanta/
+AgentR-public. The repository contains the backend workﬂow implementation, frontend implementation, database
+schema and migrations, prompt templates, queue-based orchestration logic, API documentation, deployment instructions, and supporting project documentation required to inspect and reproduce the core system functionality. The
+repository is released under the Business Source License 1.1 (BSL 1.1). Under the current license terms, the code is
+available for development, evaluation, academic research, personal use, and education; production use is permitted
+except for oﬀering a competing SaaS product. The license is scheduled to convert to the MIT License on 22 June 2030.
+Deployment-speciﬁc credentials, API keys, private telemetry records, and user-identifying data are not included in the
+repository.
+Use of generative AI: During the preparation of this manuscript, the authors used ChatGPT to assist with language
+reﬁnement, sentence restructuring, and drafting of selected portions of the text. The tool was not used to generate
+experimental data, evaluation results, system telemetry, ﬁgures, or technical claims. All AI-assisted text was critically
+reviewed, edited, fact-checked, and approved by the authors. The authors take full responsibility for the content,
+accuracy, integrity, and conclusions of the manuscript.
+
+references
+[1] MacFarlane A, Russell-Rose T, Shokraneh F. Search strategy formulation for systematic reviews: Issues, challenges and
+opportunities. Intelligent Systems with Applications 2022;15:200091.
+[2] Wohlin C, Kalinowski M, Felizardo KR, Mendes E. Successful combination of database search and snowballing for identiﬁcation of primary studies in systematic literature studies. Information and software technology 2022;147:106908.
+[3] Allen Institute for AI, Semantic Scholar; 2026. Accessed: 2026-06-15. https://www.semanticscholar.org/.
+[4] Scholarcy, Scholarcy; 2026. Accessed: 2026-06-15. https://www.scholarcy.com/.
+[5] SciSpace, SciSpace; 2026. Accessed: 2026-06-15. https://scispace.com/.
+[6] Consensus, Consensus; 2026. Accessed: 2026-06-15. https://consensus.app/.
+[7] ResearchRabbit, ResearchRabbit: AI Tool for Smarter, Faster Literature Reviews; 2026. Accessed: 16 June 2026. https:
+//www.researchrabbit.ai/.
+[8] Connected Papers, Connected Papers: Find and Explore Academic Papers; 2026. Accessed: 16 June 2026. https:
+//www.connectedpapers.com/.
+
+Riya et al.
+
+25
+
+[9] OpenAI, ChatGPT; 2026. Accessed: 2026-06-15. https://chatgpt.com/.
+[10] Anthropic, Claude; 2026. Accessed: 2026-06-15. https://claude.ai/.
+[11] Google, Gemini; 2026. Accessed: 2026-06-15. https://gemini.google.com/.
+[12] Perplexity AI, Perplexity; 2026. Accessed: 2026-06-15. https://www.perplexity.ai/.
+[13] Lewis P, Perez E, Piktus A, Petroni F, Karpukhin V, Goyal N, et al. Retrieval-augmented Generation for Knowledgeintensive NLP Tasks. In: Advances in Neural Information Processing Systems, vol. 33; 2020. p. 9459–9474.
+[14] Wu Q, Bansal G, Zhang J, Wu Y, Li B, Zhu E, et al. AutoGen: Enabling Next-gen LLM Applications via Multi-agent
+Conversation. arXiv preprint arXiv:230808155 2023;.
+[15] Hong S, Zhuge M, Chen J, Zheng X, Cheng Y, Zhang C, et al. MetaGPT: Meta Programming for a Multi-agent Collaborative
+Framework. arXiv preprint arXiv:230800352 2023;.
+[16] LangChain AI, LangGraph: Low-Level Orchestration Framework for Building Stateful Agents; 2026. Accessed: 2026-0616. https://github.com/langchain-ai/langgraph.
+[17] CrewAI, CrewAI: Build, Deploy, and Manage Enterprise Agents; 2026. Accessed: 2026-06-16. https://crewai.com.
+[18] Scite, Scite: AI for Research; 2026. Accessed: 2026-06-16. https://scite.ai.
+[19] Apache Software Foundation, Apache Airﬂow: Programmatically Author, Schedule, and Monitor Workﬂows; 2026. Accessed: 2026-06-16. https://airflow.apache.org.
+[20] Prefect, Prefect: Workﬂow Orchestration and AI Infrastructure; 2026. Accessed: 2026-06-16. https://www.prefect.
+io.
+[21] Mölder F, Jablonski KP, Letcher B, Hall MB, Tomkins-Tinch CO, Sochat V, et al. Sustainable Data Analysis with Snakemake.
+F1000Research 2021;10(33).
+[22] Afgan E, Baker D, Batut B, van den Beek M, Bouvier D, Čech M, et al. The Galaxy Platform for Accessible, Reproducible
+and Collaborative Biomedical Analyses: 2018 Update. Nucleic Acids Research 2018;46(W1):W350–W357.
+[23] Wolstencroft K, Haines R, Fellows D, Williams N, Withers D, Owen S, et al. The Taverna Workﬂow Suite: Designing and Executing Workﬂows of Web Services on the Desktop, Web or in the Cloud. Nucleic Acids Research
+2013;41(W1):W557–W561.
+[24] Bai X, Liu Y, Zhang J. Forecite: A Framework for Research Gap Identiﬁcation using Citation Graphs. In: Proceedings of
+the ACM Web Conference; 2023. p. 1245–1254.
+[25] Shamshoum I, Rappoport A, Shamshoum M. GapGPT: Automated Research Gap Identiﬁcation using Large Language
+Models. In: Workshop on Scientiﬁc Document Understanding, AAAI; 2024. .
+[26] Cohan A, Feldman S, Beltagy I, Downey D, Weld DS. SPECTER: Document-level Representation Learning using Citationinformed Transformers. In: Proceedings of the Association for Computational Linguistics; 2020. p. 2270–2282.
+[27] Ammar W, Groeneveld D, Bhagavatula C, Beltagy I, Crawford M, Downey D, et al. Construction of the Literature Graph
+in Semantic Scholar. In: Proceedings of NAACL-HLT; 2018. p. 84–91.
+[28] Yao S, Zhao J, Yu D, Du N, Shafran I, Narasimhan K, et al. ReAct: Synergizing Reasoning and Acting in Language Models.
+In: Proceedings of ICLR; 2023. .
+[29] Schick T, Dwivedi-Yu J, Dessì R, Raileanu R, Lomeli M, Zettlemoyer L, et al. Toolformer: Language Models can Teach
+Themselves to Use Tools. In: Advances in Neural Information Processing Systems, vol. 36; 2023. p. 68539–68551.
+

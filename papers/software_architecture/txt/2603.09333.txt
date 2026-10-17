@@ -1,0 +1,1343 @@
+arXiv:2603.09333v1 [cs.PF] 10 Mar 2026
+
+Dynamic Precision Math Engine for Linear
+Algebra
+and Trigonometry Acceleration on
+Xtensa LX6 Microcontrollers
+Elian Alfonso Lopez Preciado
+Independent Researcher, México
+
+March 2026
+Abstract
+Low-cost embedded processors such as the ESP32 (Xtensa LX6, 32-bit, dualcore, 240 MHz) are increasingly deployed in edge computing scenarios that demand
+real-time physical simulation, sensor fusion, and control systems. While the ESP32
+integrates a single-precision IEEE 754 floating-point unit, its use incurs pipeline
+disruption and elevated energy consumption relative to integer Arithmetic Logic Unit
+(ALU) operations, imposing a practical throughput ceiling on floating-point-intensive
+workloads.
+This paper presents the design, formal specification, and empirical evaluation
+of a Dynamic Precision Math Engine that addresses this constraint through
+three integrated contributions. First, a Q16.16 fixed-point arithmetic core maps all
+mathematical operations onto the 32-bit integer pipeline of the Xtensa LX6, with
+multiplication requiring two to three assembly instructions and introducing a bounded
+rounding error of |ϵ| ≤ 2−17 . Second, a 16-iteration CORDIC trigonometric module
+computes sine and cosine entirely through addition and binary shifts, achieving an
+angular error bound of |ϵθ | ≤ 1.526 × 10−5 radians within a static memory footprint
+of 64 bytes. Third, a cache-aware tiled matrix multiplication kernel with deferred
+Q16.16 correction reduces per-element rounding events from b to one, where b = 32 is
+the tile dimension derived from the ESP32 Static Random Access Memory (SRAM)
+bank geometry.
+The engine’s principal architectural contribution is a runtime precision switching mechanism—implemented through function pointer dispatch and a two-phase
+FreeRTOS barrier protocol—that allows application code to transition between the
+Q16.16 fast path and an IEEE 754 precise path at O(1) cost without recompilation.
+This design follows the separation-of-concerns principle established by the BLAS
+specification [4] and applies it to the novel context of dynamic precision arbitration
+on a dual-core RISC microcontroller. The total static memory footprint of the engine
+is 88 bytes, independent of matrix dimensions.
+Experimental evaluation across 300 paired measurements on physical ESP32WROOM-32 hardware demonstrates that the CORDIC trigonometric module achieves
+median latencies of 293 cycles for both sin and cos, yielding mean speedups of
+
+18.54× and 24.68× respectively over standard sinf()/cosf() (Wilcoxon signedrank, p < 10−12 ), with a Determinism Score of 0.994 confirming input-independent
+execution time. Scalar Q16.16 multiplication achieves a consistent 1.5× speedup at
+12 cycles versus 18 cycles with perfect determinism. Matrix multiplication performance
+exhibits a dimension-dependent crossover: the tiled kernel underperforms naive
+floating-point for matrices smaller than the tile size (n < 32), while theoretical
+analysis predicts the crossover at n ≥ 64—a result requiring empirical validation
+in future work. The engine fills an identified gap in the ESP32 ecosystem where
+no existing library provides a unified, precision-aware mathematical API combining
+trigonometry, linear algebra, and runtime mode selection.
+
+Keywords: fixed-point arithmetic, CORDIC algorithm, Q16.16, ESP32, Xtensa LX6,
+embedded computing, edge computing, loop tiling, FreeRTOS, dynamic precision switching.
+
+2
+
+Contents
+1 Introduction
+
+5
+
+2 Related Work
+2.1 Fixed-Point Arithmetic in Embedded Systems . . . . . . . . . . . . . . . .
+2.2 The CORDIC Algorithm and Its Embedded Implementations . . . . . . . .
+2.3 Cache-Aware Matrix Multiplication . . . . . . . . . . . . . . . . . . . . . .
+2.4 Mathematical Libraries for the ESP32 Ecosystem . . . . . . . . . . . . . .
+2.5 The Identified Research Gap . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+6
+6
+7
+7
+7
+7
+
+3 Mathematical Foundations
+3.1 Fixed-Point Arithmetic in Q16.16 Format . . . . . . . . . . . . . . . . . .
+3.1.1 Arithmetic Operations . . . . . . . . . . . . . . . . . . . . . . . . .
+3.1.2 Overflow Analysis . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+3.2 CORDIC Algorithm for Trigonometric Computation . . . . . . . . . . . . .
+3.2.1 Geometric Foundation . . . . . . . . . . . . . . . . . . . . . . . . .
+3.2.2 Convergence and the CORDIC Gain . . . . . . . . . . . . . . . . .
+3.2.3 Error Bound . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+3.3 Cache-Aware Matrix Multiplication via Loop Tiling . . . . . . . . . . . . .
+3.3.1 Loop Tiling Formulation . . . . . . . . . . . . . . . . . . . . . . . .
+3.3.2 Block Size Derivation for the ESP32 . . . . . . . . . . . . . . . . .
+3.3.3 Deferred-Shift Accumulation . . . . . . . . . . . . . . . . . . . . . .
+
+8
+8
+8
+8
+9
+9
+9
+9
+10
+10
+10
+10
+
+4 System Architecture
+4.1 Design Rationale: Runtime vs. Compile-Time Precision Selection . . . . .
+4.2 The Precision Context: Formal Definition . . . . . . . . . . . . . . . . . . .
+4.3 Dual-Core Task Orchestration via FreeRTOS . . . . . . . . . . . . . . . . .
+4.3.1 Mode Transition Safety Protocol . . . . . . . . . . . . . . . . . . .
+4.3.2 Memory Architecture . . . . . . . . . . . . . . . . . . . . . . . . . .
+4.4 API Design . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+10
+10
+11
+11
+11
+12
+12
+
+5 Implementation
+5.1 Q16.16 Arithmetic Core . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+5.2 CORDIC Trigonometric Module . . . . . . . . . . . . . . . . . . . . . . . .
+5.3 Tiled Matrix Multiplication Kernel . . . . . . . . . . . . . . . . . . . . . .
+5.4 Overflow and Underflow Management . . . . . . . . . . . . . . . . . . . . .
+
+12
+12
+13
+14
+14
+
+6 Experimental Evaluation
+6.1 Experimental Setup and Methodology . . . . . . . . . . . . . . . . . . . . .
+6.2 Trigonometric Function Performance . . . . . . . . . . . . . . . . . . . . .
+6.3 Scalar Multiplication Performance . . . . . . . . . . . . . . . . . . . . . . .
+6.4 Matrix Multiplication: A Boundary Condition Finding . . . . . . . . . . .
+6.5 Runtime Precision Switch Overhead . . . . . . . . . . . . . . . . . . . . . .
+6.6 Statistical Validity . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+6.7 Summary of Results . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+15
+15
+15
+16
+16
+16
+16
+17
+
+7 Discussion
+18
+7.1 Interpretation of Results . . . . . . . . . . . . . . . . . . . . . . . . . . . . 18
+3
+
+7.2 The Matrix Multiplication Crossover Problem . . . . . . . . . . . . . . . . 18
+7.3 Limitations . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 19
+8 Future Work
+8.1 Resolving the Matrix Multiplication Crossover (Immediate Priority) . . . .
+8.2 Branchless CORDIC Quadrant Normalization . . . . . . . . . . . . . . . .
+8.3 Mean Absolute Error Characterization . . . . . . . . . . . . . . . . . . . .
+8.4 Tensor Operations and TinyML Inference . . . . . . . . . . . . . . . . . . .
+8.5 Elliptic Curve Cryptography for Secure Edge Nodes . . . . . . . . . . . . .
+8.6 Distributed Multi-Node Linear Algebra . . . . . . . . . . . . . . . . . . . .
+
+19
+19
+19
+19
+20
+20
+20
+
+9 Conclusion
+
+20
+
+4
+
+1
+
+Introduction
+
+The proliferation of low-cost, low-power microcontrollers as the computational substrate of
+edge systems has created a fundamental tension in embedded software engineering. Devices
+such as the ESP32—based on the Xtensa LX6 dual-core architecture, available at under
+three US dollars, and deployed in an estimated installed base exceeding one billion units
+across industrial automation, robotics, environmental sensing, and consumer Internet of
+Things (IoT)—are increasingly expected to execute workloads that were, until recently, the
+exclusive domain of processors an order of magnitude more powerful. Physical simulation,
+sensor fusion via Kalman filtering, real-time kinematics, and digital signal processing all
+reduce, at their computational core, to the same two operations: trigonometric evaluation
+and matrix multiplication. The efficiency with which a microcontroller executes these
+operations determines not merely performance, but the class of applications that is feasible
+at all on a given hardware platform.
+The ESP32’s Xtensa LX6 integrates a single-precision IEEE 754 floating-point unit (FPU)
+capable of hardware-accelerated arithmetic. However, the practical throughput of this
+FPU is constrained by factors that aggregate benchmark figures do not capture. Each
+floating-point operation requires mantissa alignment, exponent management, normalization,
+and exception handling across multiple pipeline stages; the resulting instruction latency
+disrupts the integer pipeline and introduces energy consumption that the ALU-bound
+execution model of the Xtensa architecture is not designed to absorb efficiently [17]. For
+the class of applications that invoke trigonometric functions hundreds of times per control
+cycle—a six-degree-of-freedom robot arm evaluating forward kinematics at 1 kHz, for
+instance—this per-operation overhead accumulates into a throughput ceiling that cannot
+be overcome by firmware optimization alone within the standard mathematical library.
+The response to this constraint in the embedded community has been fragmented. Espressif’s official esp-dsp library provides Xtensa-optimized kernels for signal processing
+primitives—FFT, FIR filtering, dot products—but explicitly excludes trigonometric functions, delegating them to the standard math.h bindings [18]. General-purpose linear
+algebra libraries such as ArduinoEigen and BasicLinearAlgebra operate exclusively in
+IEEE 754 floating-point with no accommodation for pipeline costs. TensorFlow Lite Micro
+provides INT8 quantized kernels optimized for neural network inference but does not expose
+a general-purpose mathematical API [12]. The consequence is that an ESP32 developer
+requiring efficient trigonometry, matrix operations, and precision control simultaneously
+has no unified tool: the ecosystem is a collection of specialized solutions with no common
+abstraction layer.
+This paper addresses that gap through the design, implementation, and empirical evaluation
+of a Dynamic Precision Math Engine for the ESP32 Xtensa LX6. The engine’s
+central contribution is architectural: a runtime precision switching mechanism that allows
+application code to select, at any point during execution, between a fast integer path and a
+precise floating-point path without recompilation and without modifying the application’s
+mathematical API. The fast path is built on three algorithmic foundations. First, Q16.16
+fixed-point arithmetic maps all mathematical operations onto the 32-bit integer ALU,
+with multiplication requiring two to three assembly instructions and a quantization error
+bounded by |ϵ| ≤ 2−17 [10, 20]. Second, a 16-iteration rotation-mode CORDIC algorithm
+computes sine and cosine through addition and binary shifts alone, eliminating all floating5
+
+point operations from the trigonometric pipeline [1, 2]. Third, a cache-aware tiled matrix
+multiplication kernel with deferred Q16.16 correction leverages the ESP32’s SRAM bank
+geometry for matrices exceeding the tile dimension [3, 5]. The switching mechanism is
+implemented through function pointer dispatch governed by a two-phase FreeRTOS barrier
+protocol, following the separation-of-concerns principle established by the original BLAS
+specification [4].
+Experimental evaluation on physical ESP32-WROOM-32 hardware across 300 paired
+measurements produces results that are both significant and instructive. The CORDIC
+trigonometric module achieves median latencies of 293 cycles for both sin and cos, against
+6,915 and 7,847 cycles for the standard sinf()/cosf()—mean speedups of 18.54× and
+24.68× respectively, statistically confirmed at p < 10−12 . Matrix multiplication results
+reveal a dimension-dependent boundary condition: the tiled kernel underperforms naive
+floating-point for the tested dimensions (n ≤ 16), exposing the condition n ≥ b = 32 as
+a prerequisite for the tiling optimization to engage. This finding precisely characterizes
+the engine’s operational envelope and validates the necessity of the runtime switching
+mechanism: no single execution path is universally optimal, and the value of the engine
+lies in making the choice between paths explicit, safe, and costless at the application layer.
+The remainder of this paper is organized as follows. Section 2 surveys related work.
+Section 3 establishes the mathematical foundations. Section 4 describes the system
+architecture. Section 5 details the implementation. Section 6 presents the experimental
+evaluation. Section 7 discusses the findings. Sections 8 and 9 describe future work and
+conclusions.
+
+2
+
+Related Work
+
+The acceleration of mathematical computation on resource-constrained processors is a
+well-established research domain, yet the specific challenge of dynamic precision arbitration
+on Xtensa-based microcontrollers remains insufficiently addressed in the literature. This
+section surveys the four pillars upon which the proposed engine is constructed.
+
+2.1
+
+Fixed-Point Arithmetic in Embedded Systems
+
+Fixed-point arithmetic has been a cornerstone of digital signal processing since the early
+adoption of dedicated DSP chips [16, 21]. The Q-format notation provides a systematic
+framework for representing fractional values as scaled integers, enabling ALU-bound
+computation on processors lacking hardware floating-point units or possessing limited
+FPU throughput [20]. Yates [20] demonstrates that for a Q(m.n) representation, the
+rounding error is bounded by 2−(n+1) , a property central to the precision analysis presented
+in Section 6. Sung and Kum [10] provide simulation-based methods for word-length
+optimization in fixed-point DSP systems, directly relevant to the Q16.16 format selection
+rationale of this work.
+More recent work has examined fixed-point arithmetic in the context of neural network
+quantization. Jacob et al. [11] demonstrated that quantized integer representations preserve
+model accuracy within acceptable margins for inference tasks. Critically, however, these
+works target GPU and FPGA architectures; their methodologies do not account for the
+specific pipeline characteristics of the Xtensa LX6, where a 64-bit intermediate product
+6
+
+during Q16.16 multiplication requires careful register management to avoid pipeline stalls.
+
+2.2
+
+The CORDIC Algorithm and Its Embedded Implementations
+
+The CORDIC (Coordinate Rotation Digital Computer) algorithm, introduced by Volder [1],
+remains one of the most cited contributions in computer arithmetic. Its significance lies
+in reducing trigonometric computation to iterative addition and binary shifting, entirely
+eliminating hardware multipliers. Walther’s 1971 unified extension [2] generalized the
+method to cover hyperbolic functions, exponentials, and square roots. Llamocca and
+Agurto [7] provide a fixed-point implementation of the expanded hyperbolic CORDIC
+algorithm with direct relevance to embedded deployments. Mokhtar et al. [8] and Ait Madi
+and Addaim [9] document contemporary hardware implementations of CORDIC for
+trigonometric generation, confirming latency reductions of 3× to 8× over software floatingpoint on integer-dominated pipelines. A key gap in the existing literature is the absence
+of a published CORDIC implementation specifically profiled against the Xtensa LX6
+instruction set [18].
+
+2.3
+
+Cache-Aware Matrix Multiplication
+
+The seminal work of Lam, Rothberg, and Wolf [3] formally established that loop tiling
+reduces cache line transfers from O(n3 ) to O(n3 /B), where B denotes the block size.
+Goto and van de Geijn [5] extended this with near-theoretical peak performance through
+micro-kernel design. Kelefouras et al. [6] provide a comprehensive methodology for CPU
+and GPU matrix multiplication, including the influence of register blocking. The Roofline
+model of Williams et al. [14] provides the theoretical framework for understanding the
+arithmetic intensity—memory bandwidth tradeoff that motivates the tiling strategy. These
+works focus on x86 and GPU architectures; their tiling parameters do not translate directly
+to the Xtensa LX6 memory subsystem without re-profiling [17].
+
+2.4
+
+Mathematical Libraries for the ESP32 Ecosystem
+
+The practical landscape of mathematical acceleration for the ESP32 consists of three
+categories. First, Espressif’s esp-dsp library [18] targets signal processing primitives
+with Xtensa-optimized assembly, but explicitly excludes trigonometric functions. Second,
+Arduino ecosystem libraries such as BasicLinearAlgebra and ArduinoEigen provide
+template-based matrix operations compiled exclusively to IEEE 754 floating-point. Third,
+TensorFlow Lite Micro [12] includes INT8 quantized kernels for neural network inference
+but does not expose a general-purpose mathematical API suitable for physics simulation
+or control systems. Courbariaux et al. [13] further demonstrate binary weight quantization
+for deep learning, reinforcing the broader motivation for precision-aware computation.
+
+2.5
+
+The Identified Research Gap
+
+The survey above reveals a consistent pattern: existing solutions optimize for either signal
+processing (esp-dsp), general linear algebra (ArduinoEigen), or inference (TFLM), but
+none provides a unified engine that (1) exposes a single developer-facing API, (2) allows
+runtime selection between fixed-point and floating-point execution paths, (3) integrates
+CORDIC-based trigonometry within the same fixed-point domain, and (4) orchestrates
+7
+
+computation across the ESP32’s dual cores through the FreeRTOS task model. The
+proposed engine addresses precisely this intersection.
+
+3
+
+Mathematical Foundations
+
+3.1
+
+Fixed-Point Arithmetic in Q16.16 Format
+
+Fixed-point arithmetic represents real numbers as scaled integers, where a predefined
+number of bits is allocated to the fractional part. For a general Q(m.n) format, a real
+value v ∈ R is represented as an integer V ∈ Z according to:
+V = ⌊v · 2n ⌉
+
+(1)
+
+where ⌊·⌉ denotes rounding to the nearest integer and n is the number of fractional bits.
+The representable range of a signed Q(m.n) format using a w-bit word is:
+
+
+v ∈ −2m−1 , 2m−1 − 2−n
+(2)
+The proposed engine adopts the Q16.16 format, allocating 16 bits to the integer part
+(including sign) and 16 bits to the fractional part within a 32-bit signed integer (int32_t).
+The representable range is [−32768, 32767.9999847] with a resolution of 2−16 ≈ 1.526 ×
+10−5 .
+3.1.1
+
+Arithmetic Operations
+
+Addition and subtraction in Q16.16 are algebraically exact provided no overflow occurs,
+since the scaling factor 216 is preserved across operands:
+CQ = AQ + BQ
+
+⇐⇒
+
+(a + b) · 216 = a · 216 + b · 216
+
+(3)
+
+Multiplication requires correction. Given two Q16.16 operands AQ = a·216 and BQ = b·216 ,
+their integer product yields:
+AQ · BQ = (a · 216 )(b · 216 ) = (a · b) · 232
+
+(4)
+
+Correction is achieved via an arithmetic right shift:
+CQ =
+
+AQ · B Q
+= (a · b) · 216
+16
+2
+
+(5)
+
+The quantization error introduced by this shift is bounded by [20]:
+|ϵmul | ≤ 2−17
+3.1.2
+
+(6)
+
+Overflow Analysis
+
+For a multiplication of two values close to the representable maximum, the 64-bit intermediate product reaches ≈ 262 , safely within int64_t capacity. However, if the final
+result a · b > 32767.999, overflow occurs upon return to 32 bits. The engine implements
+saturating arithmetic at the API boundary, clamping results to [INT32_MIN, INT32_MAX].
+8
+
+3.2
+
+CORDIC Algorithm for Trigonometric Computation
+
+The CORDIC algorithm [1] computes trigonometric functions through iterative plane
+rotations requiring only addition, subtraction, and binary shifts.
+3.2.1
+
+Geometric Foundation
+
+The exact rotation matrix for a vector (xi , yi ) by angle θ is:
+ ′ 
+ 
+x
+cos θ − sin θ xi
+=
+y′
+sin θ cos θ
+yi
+
+(7)
+
+CORDIC replaces this with n micro-rotations by angles αi = arctan(2−i ), converting
+trigonometric multiplications into bit shifts. The iterative update equations are:
+xi+1 = xi − di · yi · 2−i
+
+(8)
+
+−i
+
+(9)
+
+yi+1 = yi + di · xi · 2
+
+zi+1 = zi − di · arctan(2−i )
+
+(10)
+
+where di ∈ {−1, +1} is the rotation direction, determined by the sign of the residual angle
+zi . In matrix form:
+
+ 
+ 
+xi+1
+1
+−di · 2−i xi
+=
+(11)
+yi+1
+di · 2−i
+1
+yi
+3.2.2
+
+Convergence and the CORDIC Gain
+
+After n iterations [2]:
+yn = Kn · sin(θ)
+
+(12)
+
+√
+n→∞
+1 + 2−2i −−−→ 1.6467602 . . .
+
+(13)
+
+xn = Kn · cos(θ),
+where the cumulative CORDIC gain is:
+Kn =
+
+n−1
+Y
+i=0
+
+The convergence domain is θ ∈ (−π/2, π/2); inputs outside this range require a preliminary
+quadrant reduction step.
+3.2.3
+
+Error Bound
+
+The angular error after n iterations is bounded by:
+|ϵθ | ≤ arctan(2−n ) ≈ 2−n radians
+
+(14)
+
+For n = 16: |ϵθ | ≤ 2−16 rad ≈ 1.526 × 10−5 rad, aligning with the fractional resolution of
+Q16.16.
+
+9
+
+3.3
+
+Cache-Aware Matrix Multiplication via Loop Tiling
+
+Naive matrix multiplication of two n × n matrices generates O(n3 ) cache miss events for
+large matrices [3]:
+n
+X
+Cij =
+Aik · Bkj
+(15)
+k=1
+
+3.3.1
+
+Loop Tiling Formulation
+
+Loop tiling partitions each matrix dimension into blocks of size b, reducing the number of
+main-memory transfers from O(n3 ) to O(n3 /b) [3, 5]:
+X X
+Aik · Bkj , i ∈ I-block, j ∈ J-block
+(16)
+Cij =
+K k∈K-block
+
+3.3.2
+
+Block Size Derivation for the ESP32
+
+For Q16.16 data (int32_t, 4 bytes per element), targeting a working set below 8 KB
+yields:
+4b2 ≤ 8192 =⇒ b ≤ 45
+(17)
+The implementation adopts b = 32 as a power-of-two block size, enabling inner loop bounds
+to be computed via bitwise AND masking.
+3.3.3
+
+Deferred-Shift Accumulation
+
+Within each tiled block, accumulation uses int64_t intermediates to defer the right-shift
+correction until the block reduction is complete, minimizing rounding error accumulation:
+X
+
+(acc)
+(acc)
+Q
+Cij =
+AQ
+(in 64-bit),
+CijQ = Cij ≫ 16
+(18)
+ik · Bkj
+k∈block
+
+This reduces rounding events from b per inner product to 1.
+
+4
+
+System Architecture
+
+4.1
+
+Design Rationale: Runtime vs. Compile-Time Precision Selection
+
+Existing approaches to precision management in embedded systems typically operate at
+compile time, forcing the developer to maintain separate firmware builds and precluding
+adaptive behavior in deployed systems. The proposed engine adopts a runtime switching
+model implemented through function pointer dispatch. The engine maintains two parallel
+sets of function pointers—one resolving to the Q16.16 fast path, one to the IEEE 754
+precise path—and exposes a single context object whose active pointer set is swapped
+atomically at the application layer.
+This design satisfies four architectural requirements:
+
+10
+
+• R1 — API Stability: Application code remains unchanged regardless of precision
+mode.
+• R2 — Zero-Cost Abstraction: In Q16.16 mode, all operations reduce to integer
+ALU instructions with no virtual dispatch overhead at the mathematical operation
+level.
+• R3 — Deterministic Switching Latency: Mode transition completes in O(1)
+time, consisting solely of pointer reassignment.
+• R4 — RTOS Compatibility: The architecture coexists with FreeRTOS task
+scheduling without introducing priority inversion or shared-state race conditions.
+
+4.2
+
+The Precision Context: Formal Definition
+
+Let F denote the set of supported operations:
+F = {fmul , fadd , fsub , fsin , fcos , fmatmul }
+
+(19)
+
+Each f ∈ F has a fast implementation f Q in the Q16.16 domain and a precise implementation f F in IEEE 754. The context object C maintains a dispatch table:
+(20)
+
+D : F → {f Q , f F }
+
+A mode transition C.setMode(m) for m ∈ {FAST, PRECISE} reassigns all entries in D
+simultaneously, ensuring no operation executes in a mixed-precision state after the call
+returns.
+
+4.3
+
+Dual-Core Task Orchestration via FreeRTOS
+
+The ESP32’s Xtensa LX6 integrates two symmetric 32-bit cores at up to 240 MHz. Under
+FreeRTOS, tasks are pinned to a specific core using xTaskCreatePinnedToCore() [17],
+enabling deterministic core affinity. The engine enforces a fixed assignment policy:
+• Core 0 (Protocol Core): Handles WiFi stack, Bluetooth controller, UART/I2C
+peripheral drivers, and the application control loop. Core 0 owns the MathContext
+object and is the sole authority for mode transitions.
+• Core 1 (Compute Core): Hosts the MathWorker task, a high-priority FreeRTOS
+task that blocks on a job queue, executes the requested mathematical operation, and
+returns results through a mutex- protected shared buffer.
+The inter-core communication lifecycle is:
+FreeRTOS Queue
+
+Mutex
+
+Core 0: enqueue(job) −−−−−−−−−→ Core 1: execute f ∈ D −−−→ Core 0: read result
+(21)
+4.3.1
+
+Mode Transition Safety Protocol
+
+To satisfy requirement R4, the engine implements a two-phase barrier:
+
+11
+
+1. Suspension Phase: Core 0 sends a SUSPEND notification via xTaskNotify(). The
+worker completes its current operation and enters a blocked state, signaling readiness
+via a binary semaphore.
+2. Transition Phase: Core 0 acquires the semaphore, reassigns all function pointers
+in D, and releases the semaphore.
+The total overhead is bounded by the worst-case completion time of a single in-flight operation plus two context switches, yielding a switching latency on the order of microseconds—
+empirically measured as 8.09 µs at 240 MHz (see Section 6).
+4.3.2
+
+Memory Architecture
+
+The engine’s static memory footprint decomposes as follows: the dispatch table D occupies
+|F| × 4 = 24 bytes (one 32-bit pointer per operation); the CORDIC arctangent lookup
+table occupies 16 × 4 = 64 bytes of read-only data. The total static footprint is therefore
+88 bytes, independent of matrix dimensions.
+
+4.4
+
+API Design
+
+The public API exposes three primitives:
+1. MathEngine::init(mode) — Initializes the engine and sets the initial precision
+mode.
+2. MathEngine::setMode(mode) — Triggers the mode transition protocol. Blocks until
+transition is complete.
+3. MathEngine::ctx() — Returns a reference to the active MathContext.
+
+5
+
+Implementation
+
+5.1
+
+Q16.16 Arithmetic Core
+
+The core arithmetic primitives are implemented as inline functions in the FastMathEngine
+namespace within a header file (fast_math_engine.h), ensuring zero-overhead inlining at
+every call site:
+1
+
+# include < stdint .h >
+
+2
+3
+
+namespace FastMathEngine {
+
+4
+5
+6
+
+typedef int32_t q16_t ;
+const int Q_FRACT_BITS = 16;
+
+7
+8
+9
+10
+11
+12
+13
+14
+
+// Float <-> Q16 .16 conversion ( used only at pipeline boundaries )
+inline q16_t floatToQ ( float val ) {
+return ( q16_t ) ( val * (1 << Q_FRACT_BITS ) ) ;
+}
+inline float qToFloat ( q16_t val ) {
+return ( float ) val / ( float ) (1 << Q_FRACT_BITS ) ;
+}
+
+15
+16
+
+// Core multiply : 64 - bit intermediate , single >> 16 correction
+
+12
+
+inline q16_t mulQ ( q16_t a , q16_t b ) {
+return ( q16_t ) ((( int64_t ) a * ( int64_t ) b ) >> Q_FRACT_BITS ) ;
+}
+
+17
+18
+19
+20
+
+// Saturating multiply : clamps to INT32 range on overflow
+inline q16_t mulQ_sat ( q16_t a , q16_t b ) {
+int64_t result = (( int64_t ) a * ( int64_t ) b ) >> Q_FRACT_BITS ;
+if ( result > 0 x7FFFFFFF ) return 0 x7FFFFFFF ;
+if ( result < -0 x80000000 ) return ( int32_t ) 0 x80000000 ;
+return ( int32_t ) result ;
+}
+
+21
+22
+23
+24
+25
+26
+27
+28
+
+// Add / subtract : exact in Q16 .16 , no shift required
+inline q16_t addQ ( q16_t a , q16_t b ) { return a + b ; }
+inline q16_t subQ ( q16_t a , q16_t b ) { return a - b ; }
+
+29
+30
+31
+32
+33
+
+} // namespace FastMathEngine
+
+Listing 1: Q16.16 arithmetic core (fast_math_engine.h)
+
+5.2
+
+CORDIC Trigonometric Module
+
+The CORDIC arctangent table stores precomputed values ⌊arctan(2−i ) · 216 ⌉ for i =
+−1
+0, . . . , 15 and the gain correction constant K16
+= 0.6072529 . . . as Q16.16 integer 39797.
+1
+
+namespace FastMathEngine {
+
+2
+3
+4
+5
+6
+7
+
+static const int32_t atan_table [16] = {
+51472 , 30386 , 16055 , 8150 , 4091 , 2047 , 1024 ,
+512 ,
+256 , 128 ,
+64 ,
+32 ,
+16 ,
+8, 4, 2
+};
+static const int32_t Q16_K_INV = 39797; // 0.6072529 in Q16 .16
+
+8
+9
+
+10
+11
+12
+
+void cordic_sincos ( int32_t theta , int32_t * out_sin , int32_t * out_cos
+) {
+const int32_t PI_Q
+= 205887; // pi
+in Q16 .16
+const int32_t HALF_PI = 102944; // pi /2 in Q16 .16
+int8_t negate_cos = 0;
+
+13
+
+if
+( theta > HALF_PI ) { theta -= PI_Q ; negate_cos = 1; }
+else if ( theta < - HALF_PI ) { theta += PI_Q ; negate_cos = 1; }
+
+14
+15
+16
+
+int32_t x = Q16_K_INV , y = 0 , z = theta ;
+
+17
+18
+
+for ( int i = 0; i < 16; i ++) {
+int8_t d
+= ( z >= 0) ? 1 : -1;
+int32_t x_new = x - ( int32_t ) ( d * ( y >> i ) ) ;
+int32_t y_new = y + ( int32_t ) ( d * ( x >> i ) ) ;
+z -= d * atan_table [ i ];
+x = x_new ; y = y_new ;
+}
+* out_cos = negate_cos ? -x : x ;
+* out_sin = y ; // sin is always in y ; no negation needed
+
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+
+}
+
+29
+30
+
+} // namespace FastMathEngine
+
+Listing 2: CORDIC kernel (cordic.h)
+13
+
+Three implementation decisions are specific to the Xtensa LX6. First, the loop is not
+manually unrolled at source level; the Xtensa GCC compiler with -O2 applies unrolling
+automatically. Second, the direction variable di is represented as int8_t; sign-extension
+to int32_t is performed in a single SEXT instruction. Third, arithmetic right shift for
+signed integers is guaranteed by the ESP-IDF Xtensa GCC toolchain and is documented
+as a portability constraint.
+
+5.3
+1
+
+Tiled Matrix Multiplication Kernel
+
+namespace FastMathEngine {
+
+2
+
+struct Matrix { int32_t * data ; uint16_t rows ; uint16_t cols ; };
+
+3
+4
+
+inline int32_t mat_get ( const Matrix & M , int i , int j ) {
+return M . data [ i * M . cols + j ];
+}
+inline void mat_set ( Matrix & M , int i , int j , int32_t val ) {
+M . data [ i * M . cols + j ] = val ;
+}
+
+5
+6
+7
+8
+9
+10
+11
+
+const int TILE_SIZE = 32;
+
+12
+13
+
+void matmul_q16 ( const Matrix & A , const Matrix & B , Matrix & C ) {
+for ( int idx = 0; idx < C . rows * C . cols ; idx ++) C . data [ idx ] = 0;
+
+14
+15
+16
+
+for ( int I = 0; I < A . rows ; I += TILE_SIZE )
+for ( int J = 0; J < B . cols ; J += TILE_SIZE )
+for ( int K = 0; K < A . cols ; K += TILE_SIZE ) {
+
+17
+18
+19
+20
+
+int i_max = MIN ( I + TILE_SIZE , A . rows ) ;
+int j_max = MIN ( J + TILE_SIZE , B . cols ) ;
+int k_max = MIN ( K + TILE_SIZE , A . cols ) ;
+
+21
+22
+23
+24
+
+for ( int i = I ; i < i_max ; i ++)
+for ( int j = J ; j < j_max ; j ++) {
+int64_t acc = 0; // 64 - bit deferred accumulator
+for ( int k = K ; k < k_max ; k ++)
+acc += ( int64_t ) mat_get (A ,i , k ) *
+( int64_t ) mat_get (B ,k , j ) ;
+C . data [ i * C . cols + j ] += ( int32_t ) ( acc >> 16) ;
+}
+
+25
+26
+27
+28
+29
+30
+31
+32
+
+}
+
+33
+
+}
+
+34
+35
+36
+
+} // namespace FastMathEngine
+
+Listing 3: Tiled Q16.16 matrix multiplication (matrix_q16.h)
+
+5.4
+
+Overflow and Underflow Management
+
+The accumulation overflow constraint for the tiled kernel requires that element magnitudes
+satisfy |Aij |, |Bij | ≤ 214 (Q16.16 value ≤ 16383) to guarantee accumulator safety with
+b = 32:
+|accmax | ≤ b · (231 )2 /216 · 216 = 32 · 262 = 267 > 263
+(22)
+14
+
+This constraint is stated in the API documentation and motivates the recommendation
+that fast-mode matrix operands be normalized to [−1, 1], where Q16.16 precision is highest
+and overflow is structurally impossible.
+
+6
+
+Experimental Evaluation
+
+6.1
+
+Experimental Setup and Methodology
+
+Benchmarks were conducted on an ESP32-WROOM-32 module (Xtensa LX6 dual-core,
+240 MHz, 4 MB flash, 520 KB SRAM) running ESP-IDF v5.x with compiler optimization
+level -O2. Both firmware variants were compiled from identical sdkconfig.defaults
+specifying a fixed CPU frequency of 240 MHz with dynamic frequency scaling disabled.
+Execution latency was measured using the Xtensa hardware cycle counter register accessed
+via xthal_get_ccount(), with interrupts disabled via portDISABLE_INTERRUPTS() for
+the duration of each measurement to prevent FreeRTOS tick contamination. All benchmark
+tasks were pinned to Core 1 via xTaskCreatePinnedToCore() in both firmware variants,
+eliminating core-affinity bias [17].
+A seeded linear congruential generator (seed = 42) guaranteed identical input sequences
+across both firmware variants, making the comparison valid for paired statistical analysis.
+A total of 300 tests were executed per firmware variant across five operation categories,
+yielding 600 paired measurements.
+Statistical analysis applied the Wilcoxon signed-rank test rather than the paired t-test, as
+Shapiro-Wilk normality tests confirmed that cycle-count distributions were non-Gaussian
+for most operations (p ≪ 0.05), consistent with the expected behavior of cache-sensitive
+code on embedded processors [15].
+
+6.2
+
+Trigonometric Function Performance
+
+The CORDIC-based trigonometric module produced the most significant performance gains
+of the evaluation. For sin(x) over x ∈ [−π, π], the Fast Engine achieved a median latency
+of 293 cycles compared to 6,915.5 cycles for the standard sinf() implementation,
+yielding a mean speedup of 18.54× (Wilcoxon, p = 3.56 × 10−13 ). For cos(x), the
+improvement was more pronounced: 293 cycles versus 7,847.5 cycles, corresponding to
+a mean speedup of 24.68× (p = 3.56 × 10−13 ).
+The near-identical median latency of 293 cycles for both functions reflects the fixediteration structure of the 16-step CORDIC kernel: execution time is input-independent by
+construction. This is confirmed by the Determinism Score for cos Fast Engine of 0.9938,
+compared to 0.7203 for the standard implementation.
+The jitter asymmetry for sin (coefficient 2.449 versus 0.534 for the standard) is attributable
+to the conditional branch in the quadrant normalization preprocessor for inputs near
+±π/2, producing branch predictor mispredictions. This constitutes the primary target for
+optimization in future work.
+
+15
+
+6.3
+
+Scalar Multiplication Performance
+
+Scalar Q16.16 multiplication demonstrated a consistent 1.5× speedup over IEEE 754
+multiplication, with median latencies of 12 cycles versus 18 cycles (Wilcoxon, p =
+1.54 × 10−12 ). Both implementations achieved a Determinism Score of 1.0000 and
+zero jitter. The constant-data classification by the Shapiro-Wilk test confirms that all
+50 measurements in each condition were identical, establishing these values as exact
+architectural constants.
+
+6.4
+
+Matrix Multiplication: A Boundary Condition Finding
+
+Matrix multiplication results reveal an important boundary condition of the proposed
+engine. The Q16.16 tiled kernel exhibited a mean speedup of 0.542×—a slowdown of
+1.85× relative to naive floating-point—with median latencies of 16,591 cycles versus
+7,806 cycles (Wilcoxon, p = 1.72 × 10−16 ).
+This result is analytically consistent with the test conditions. The evaluated dimensions—
+4 × 4, 8 × 8, and 16 × 16—are all strictly smaller than the configured tile size b = 32,
+so the loop tiling optimization never activates. The Q16.16 inner product requires a
+32×32→64-bit multiply and a right shift per element, with the int64_t accumulator
+requiring 64-bit register management on a 32-bit Instruction Set Architecture (ISA). The
+ESP32 FPU, by contrast, executes float multiply-accumulate in a dedicated pipeline with
+native 32-bit operands, producing lower per-element latency when cache effects are absent.
+The performance crossover point—the minimum matrix dimension at which the tiled Q16.16
+kernel outperforms naive floating-point—was not reached within the tested dimensions.
+Based on the theoretical analysis of Section 3, the crossover is expected at n ≥ 64.
+
+6.5
+
+Runtime Precision Switch Overhead
+
+The mode-switching protocol introduced a measured overhead of 1,942.5 cycles (median)
+for the two-phase FreeRTOS barrier, compared to 29 cycles for equivalent function-pointer
+dispatch in the standard path. At 240 MHz, 1,942 cycles correspond to 8.09 µs—negligible
+for any application where mode transitions occur on timescales of milliseconds or longer.
+The switch overhead is reported here for completeness and for developers designing
+latency-sensitive switching policies.
+
+6.6
+
+Statistical Validity
+
+All five operation categories yielded Wilcoxon signed-rank p-values below 10−4 , confirming
+that the observed latency differences are statistically significant at any conventional
+threshold. One outlier exceeding 3σ was detected in the sin Fast Engine data, attributed to
+a FreeRTOS tick interrupt that escaped the interrupt-disable window—a known limitation
+of software-based interrupt suppression on ESP32. This measurement was retained in the
+dataset and flagged in the raw data, consistent with the benchmark protocol’s immutability
+principle.
+
+16
+
+6.7
+
+Summary of Results
+
+Table 1: Benchmark results: 300 paired measurements per firmware variant on ESP32WROOM-32 at 240 MHz. Speedup = cyclesStd / cyclesFast .
+Operation
+sin
+cos
+mul
+matmul
+switch
+
+Fast Median
+(cycles)
+
+Std Median
+(cycles)
+
+Mean Speedup
+
+Det. Score
+(Fast)
+
+Wilcoxon p
+
+293
+293
+12
+16 591
+1 942.5
+
+6 915.5
+7 847.5
+18
+7 806
+29
+
+18.54×
+24.68×
+1.50×
+0.54× †
+0.088× ‡
+
+0.290
+0.994
+1.000
+0.472
+0.999
+
+3.56 × 10−13
+3.56 × 10−13
+1.54 × 10−12
+1.72 × 10−16
+8.13 × 10−5
+
+† All tested dimensions (n ≤ 16) are below tile size b = 32; tiling does not activate.
+‡ Expected by design; represents FreeRTOS barrier overhead (8.09 µs), not mathematical throughput.
+
+Figure 1: Distribution of execution cycles for Fast Engine (Q16.16, green) and Standard
+Math (math.h, blue) across all benchmark categories. The Fast Engine achieves near-zero
+variance for trigonometric operations, confirming input-independent execution time. Matrix
+multiplication shows higher variance in both implementations due to dimension-dependent
+computation paths.
+
+17
+
+Figure 2: Mean speedup ratio (Standard / Fast Engine) per operation category. Bars above
+the 1.0× baseline (dashed red) indicate that the Fast Engine outperforms the standard
+path. sin and cos achieve 18.54× and 24.68× respectively. matmul falls below baseline
+(0.54×) due to the tested dimensions being smaller than the tile size b = 32.
+
+7
+
+Discussion
+
+7.1
+
+Interpretation of Results
+
+The experimental results support a domain-specific performance model rather than the
+uniform speedup originally anticipated. The engine delivers substantial and statistically
+robust gains for operations mapping cleanly onto the integer pipeline—trigonometric
+functions (18–25×) and scalar arithmetic (1.5×)—while exhibiting a performance deficit
+for matrix multiplication at the tested dimensions.
+This outcome reframes the engine’s contribution: it is not a general-purpose accelerator
+for all mathematical operations, but a precision-aware accelerator whose performance envelope is well-characterized and application-dependent. For embedded applications whose
+computational load is dominated by trigonometric evaluation—kinematics, signal processing, IMU sensor fusion, angle-based control—the engine provides an order-of-magnitude
+improvement that fundamentally changes what is achievable on a $3 microcontroller.
+
+7.2
+
+The Matrix Multiplication Crossover Problem
+
+The 0.54× matmul result exposes the boundary condition of the tiling optimization. The
+theoretical argument of Section 3—that tiling reduces cache misses from O(n3 ) to O(n3 /b)—
+holds only when n > b. For n ≤ 16 and b = 32, the tiling introduces loop overhead without
+delivering cache benefit, and the int64_t intermediate imposes a register pressure penalty
+on the 32-bit Xtensa ISA.
+The practical implication is clear: the matrix module in its current form should be used for
+18
+
+dimensions n ≥ 64. For small matrices common in embedded control (rotation matrices,
+Jacobians, covariance updates), the standard floating-point path is preferable, and the
+engine’s dynamic precision switch enables exactly this hybrid strategy: CORDIC for
+trigonometry, standard FPU for small matrix operations.
+
+7.3
+
+Limitations
+
+Three limitations bound the generalizability of these results. First, all measurements were
+conducted on a single ESP32-WROOM-32 unit; manufacturing variation may produce
+cycle-count distributions that differ from those reported here, though the fixed-iteration
+nature of CORDIC limits this sensitivity for trigonometric measurements. Second, the
+benchmark does not characterize mean absolute error (MAE) for matrix operations; this is
+deferred to the extended evaluation. Third, the matrix crossover point at n ≥ 64 remains
+a theoretical prediction requiring empirical validation.
+
+8
+
+Future Work
+
+8.1
+
+Resolving the Matrix Multiplication Crossover (Immediate
+Priority)
+
+The most urgent item is the empirical characterization of the performance crossover
+between the Q16.16 tiled kernel and naive floating-point matrix multiplication. The
+specific questions requiring answers are: at what exact matrix dimension does the tiled
+Q16.16 kernel first outperform naive float; how does this crossover depend on matrix
+density and value distribution; and whether reducing the tile size from b = 32 to values
+matched to the tested dimensions (e.g., b = 8 or b = 16) recovers performance for small
+matrices. A secondary investigation should determine whether replacing the int64_t
+intermediate accumulator with paired int32_t registers reduces register pressure at the
+cost of a tighter safe operand magnitude constraint.
+
+8.2
+
+Branchless CORDIC Quadrant Normalization
+
+The jitter asymmetry in sin measurements (coefficient 2.449) is attributable to the
+conditional branch in the quadrant normalization preprocessor. A branchless normalization
+using arithmetic shift and masking operations would eliminate this variance and bring
+the sin Determinism Score in line with the 0.994 already achieved by cos. This is a
+single-function optimization estimated at under 10 lines of code with measurable impact
+on real-time worst-case execution time (WCET) guarantees.
+
+8.3
+
+Mean Absolute Error Characterization
+
+The current evaluation characterizes MAE only for scalar operations. A complete precision
+analysis requires MAE measurement for matrix multiplication across the full range of
+tested dimensions and input distributions, including
+√ the error accumulation behavior as a
+function of matrix size—predicted to grow as O( n) for normalized inputs but not yet
+empirically confirmed on the Xtensa LX6.
+
+19
+
+8.4
+
+Tensor Operations and TinyML Inference
+
+With the matrix multiplication crossover resolved, the natural extension is generalization
+to rank-3 and rank-4 tensor operations for neural network inference. The Q16.16 multiplyaccumulate kernel is mathematically equivalent to the quantized integer kernel used in
+INT16 inference [11]; the path to a minimal convolutional layer requires only a threedimensional tiling extension, a bias-addition operation, and a saturating ReLU activation.
+This targets the precision gap between INT8 inference and IEEE 754 inference documented
+by [12, 13].
+
+8.5
+
+Elliptic Curve Cryptography for Secure Edge Nodes
+
+The field arithmetic underlying ECDSA and X25519—modular addition, modular multiplication, and modular inversion over 256-bit prime fields—maps directly onto the integer
+pipeline through a multi-limb arithmetic extension [22]. The dual-core architecture is
+well-suited to this application: scalar multiplication on the elliptic curve is pinned to
+Core 1 while Core 0 manages the TLS handshake state machine, enabling non-blocking
+authenticated communication without an external cryptographic coprocessor.
+
+8.6
+
+Distributed Multi-Node Linear Algebra
+
+The ESP32’s integrated WiFi controller enables a distributed computation architecture
+in which multiple nodes partition a large matrix operation across a local network. For
+matrix dimensions where the single-device Q16.16 kernel is competitive (n ≥ 64), a mesh
+of k ESP32 nodes provides a theoretical k-fold throughput improvement. The practical
+characterization of communication overhead versus computation gain constitutes an open
+research problem at the intersection of distributed systems and embedded computing.
+
+9
+
+Conclusion
+
+This paper has presented the design, formal specification, and empirical evaluation of
+a Dynamic Precision Math Engine for the ESP32 Xtensa LX6 microcontroller. The
+engine integrates three computational modules—a Q16.16 fixed-point arithmetic core, a
+16-iteration CORDIC trigonometric unit, and a cache-aware tiled matrix multiplication
+kernel—unified by a runtime precision switching mechanism implemented through function
+pointer dispatch and a two-phase FreeRTOS barrier protocol.
+Experimental evaluation across 300 paired measurements on physical hardware produced
+results that are both significant and instructive. The CORDIC module demonstrated that
+software architecture can decisively outperform the ESP32’s standard math library for
+trigonometric computation: median latencies of 293 cycles for sin and cos—against 6,915
+and 7,847 cycles for sinf()/cosf()—represent speedups of 18.54× and 24.68× confirmed
+at p < 10−12 . The Determinism Score of 0.994 for cos establishes that the CORDIC
+kernel delivers not only speed but predictability, a property of equal value in real-time
+control systems where worst-case execution time guarantees are required. Scalar Q16.16
+multiplication achieved a consistent and perfectly deterministic 1.5× speedup at 12 cycles
+versus 18 cycles.
+The matrix multiplication results tell a more complex story. The tiled Q16.16 kernel
+20
+
+performed at 0.54× the speed of naive floating-point for the tested dimensions (4×4 through
+16 × 16), revealing that the loop tiling optimization is inert when matrix dimensions fall
+below the tile size b = 32. This finding does not invalidate the engine’s design; it precisely
+defines its operational envelope and validates the necessity of the dynamic precision switch:
+no single execution path is universally optimal, and the value of the engine lies in making
+the choice between paths explicit, safe, and costless at the application layer.
+The total static memory footprint of 88 bytes and the switch overhead of 8.09 µs confirm that
+the engine’s infrastructure cost is negligible for any realistic embedded workload. Beyond
+the individual algorithms—each with a well-established theoretical basis in the literature
+of Volder [1], Walther [2], Lam [3], and Goto [5]—the engine’s distinctive contribution is
+architectural: the application of the separation-of-concerns principle established by the
+original BLAS specification [4] to the novel context of dynamic precision arbitration on a
+dual-core RISC microcontroller.
+The broader implication of this work is that the performance ceiling of low-cost microcontrollers is not fixed by hardware alone: it is negotiable through principled software
+architecture. For the class of applications dominated by trigonometric computation—robot
+kinematics, IMU fusion, angle-based control, DSP—the engine presented here moves the
+ESP32 into a performance regime previously requiring more expensive hardware, while
+the identified boundary conditions provide a clear roadmap for future improvement.
+
+References
+[1] J. E. Volder, “The CORDIC trigonometric computing technique,” IRE Transactions
+on Electronic Computers, vol. EC-8, no. 3, pp. 330–334, Sep. 1959.
+[2] J. S. Walther, “A unified algorithm for elementary functions,” in Proceedings of the
+Spring Joint Computer Conference, vol. 38, pp. 379–385, May 1971.
+[3] M. S. Lam, E. E. Rothberg, and M. E. Wolf, “The cache performance and optimization
+of blocked algorithms,” in Proceedings of the 4th International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS IV),
+Apr. 1991, pp. 63–74.
+[4] C. L. Lawson, R. J. Hanson, D. R. Kincaid, and F. T. Krogh, “Basic linear algebra subprograms for Fortran usage,” ACM Transactions on Mathematical Software
+(TOMS), vol. 5, no. 3, pp. 308–323, Sep. 1979.
+[5] K. Goto and R. A. van de Geijn, “Anatomy of high-performance matrix multiplication,”
+ACM Transactions on Mathematical Software (TOMS), vol. 34, no. 3, art. 12, May
+2008.
+[6] V. Kelefouras, A. Kritikakou, I. Mporas, and V. Kolonias, “A high-performance
+matrix-matrix multiplication methodology for CPU and GPU architectures,” Journal
+of Supercomputing, vol. 72, no. 3, pp. 804–844, 2016.
+[7] D. Llamocca and C. Agurto, “A fixed-point implementation of the expanded hyperbolic
+CORDIC algorithm,” Latin American Applied Research, vol. 37, no. 1, pp. 83–91, Jan.
+2007.
+
+21
+
+[8] A. S. N. Mokhtar, M. I. Ayub, N. Ismail, and N. G. Nik Daud, “Implementation of
+trigonometric function using CORDIC algorithms,” in AIP Conference Proceedings,
+vol. 1930, no. 1, 2018.
+[9] A. Ait Madi and A. Addaim, “Optimized method for sine and cosine hardware implementation generator, using CORDIC algorithm,” International Journal of Applied
+Engineering Research, vol. 13, no. 1, pp. 21–29, 2018.
+[10] W. Sung and K. I. Kum, “Simulation-based word-length optimization method for
+fixed-point digital signal processing systems,” IEEE Transactions on Signal Processing,
+vol. 43, no. 12, pp. 3087–3091, Dec. 1995.
+[11] B. Jacob et al., “Quantization and training of neural networks for efficient integerarithmetic-only inference,” in Proceedings of the IEEE Conference on Computer Vision
+and Pattern Recognition (CVPR), 2018, pp. 2704–2713.
+[12] R. David et al., “TensorFlow Lite Micro: Embedded machine learning on TinyML
+systems,” in Proceedings of Machine Learning and Systems (MLSys), 2021.
+[13] M. Courbariaux, Y. Bengio, and J. P. David, “BinaryConnect: Training deep neural
+networks with binary weights during propagations,” in Advances in Neural Information
+Processing Systems (NIPS), 2015.
+[14] S. W. Williams, A. Waterman, and D. A. Patterson, “Roofline: An insightful visual
+performance model for multicore architectures,” Communications of the ACM, vol. 52,
+no. 4, pp. 65–76, Apr. 2009.
+[15] T. Mytkowicz, A. Diwan, M. Hauswirth, and P. F. Sweeney, “Producing wrong data
+without doing anything obviously wrong!” in Proceedings of the 14th International
+Conference on Architectural Support for Programming Languages and Operating
+Systems (ASPLOS), 2009.
+[16] R. G. Lyons, Understanding Digital Signal Processing, 3rd ed. Upper Saddle River,
+NJ: Pearson Education, 2011.
+[17] Espressif Systems, ESP32 Technical Reference Manual, Version 4.3. Shanghai, China:
+Espressif Systems (Shanghai) Co., Ltd., 2020. [Online].
+Available: https://www.espressif.com/sites/default/files/documentation/
+esp32_technical_reference_manual_en.pdf
+[18] Espressif Systems, “ESP-DSP library API reference,” Read the Docs, 2020. [Online].
+Available: https://docs.espressif.com/projects/esp-dsp/en/latest/
+[19] Cadence Design Systems, “Xtensa LX6 customizable DPU datasheet,” [Online]. Available: https://ip.cadence.com/uploads/pdf/xtensa-lx-product-brief.pdf
+[20] R. Yates, “Fixed-point arithmetic: An introduction,” Digital Signal Labs, Sep. 2020.
+[Online]. Available: https://www.digitalsignallabs.com/fp.pdf
+[21] C. Felton, “A fixed-point introduction by example,” DSPRelated.com, Apr. 2011.
+[Online]. Available: https://www.dsprelated.com/showarticle/139.php
+[22] E. Rescorla, “The Transport Layer Security (TLS) protocol version 1.3,” IETF
+RFC 8446, Aug. 2018. [Online]. Available: https://www.rfc-editor.org/rfc/
+rfc8446
+22
+
