@@ -1,0 +1,757 @@
+arXiv:2404.05598v1 [cs.CR] 8 Apr 2024
+
+Hook-in Privacy Techniques for
+gRPC-based Microservice Communication
+Louis Loechel[0000−0002−5877−3706] , Siar-Remzi Akbayin[0009−0009−3415−0449] ,
+Elias Grünewald[0000−0001−9076−9240] , Jannis Kiesel[0000−0002−7412−3746] ,
+Inga Strelnikova[0009−0003−0980−0944] , Thomas Janke[0009−0009−6021−9817] , and
+Frank Pallas[0000−0002−5543−0265]
+Information Systems Engineering, Technische Universität Berlin
+
+Abstract. gRPC is at the heart of modern distributed system architectures. Based on HTTP/2 and Protocol Buffers, it provides highly performant, standardized, and polyglot communication across loosely coupled microservices and is increasingly preferred over REST- or GraphQLbased service APIs in practice. Despite its widespread adoption, gRPC
+lacks any advanced privacy techniques beyond transport encryption and
+basic token-based authentication. Such advanced techniques are, however, increasingly important for fulfilling regulatory requirements. For
+instance, anonymizing or otherwise minimizing (personal) data before
+responding to requests, or pre-processing data based on the purpose of
+the access may be crucial in certain usecases. In this paper, we therefore
+propose a novel approach for integrating such advanced privacy techniques into the gRPC framework in a practically viable way. Specifically,
+we present a general approach along with a working prototype that implements privacy techniques, such as data minimization and purpose limitation, in a configurable, extensible, and gRPC-native way utilizing a gRPC
+interceptor. We also showcase how to integrate this contribution into a
+realistic example of a food delivery use case. Alongside these implementations, a preliminary performance evaluation shows practical applicability
+with reasonable overheads. Altogether, we present a viable solution for
+integrating advanced privacy techniques into real-world gRPC-based microservice architectures, thereby facilitating regulatory compliance “by
+design”.
+Keywords: gRPC · Microservices · Privacy · Purpose Limitation · Data
+Minimization · API · Cloud Native · Web Engineering.
+
+1
+
+Introduction
+
+Microservice architectures, which divide a system into many small services that
+all fulfill a specific business capability or purpose, have established as the prevailing paradigm for implementing and operating complex, large-scale web systems
+and applications [18]. In cloud native computing environments, respective microservices materialize as containerized, loosely-coupled system components [22].
+Meanwhile, agile development teams and DevOps practices further support the
+
+2
+
+Loechel et al.
+
+use of different technology stacks (incl. programming languages) per microservice
+and, consequently, allow separating teams accordingly [13]. However, to leverage
+these advantages, microservice architectures need language-agnostic or at least
+polyglot interfaces such as Representational State Transfer (REST), GraphQL,
+or Remote Procedure Calls (RPC) which enable efficient communication between
+different services. The utilization of a specific Application Programming Interface (API) paradigm depends on the usecase and, e.g., the data characteristics
+(cf. Sect. 2).
+Alongside these technical developments towards microservice architectures,
+the importance of privacy regulations – such as the GDPR [9], the CCPA and
+others – and the need to properly address them technically (“by design”) is
+increasingly recognized. Noteworthily, this goes way beyond mere access restrictions but calls for nuanced measures: The privacy principle of data minimization
+(embodied in, e.g., Art. 5(1c) of the GDPR), for instance, requires that personal
+data are “limited to what is necessary in relation to the purposes for which they
+are processed”. The principle of purpose limitation (Art. 5(1(b)), in turn, requires that personal data are only used for those purposes they were originally
+collected for (or for those purposes deemed compatible with the initial ones).
+One and the same data-providing service must therefore respond with different
+“views” to the same data, depending on the access context [19]. Further privacy principles induce similar or additional needs, but we exemplarily confine
+ourselves to these two herein.
+With large microservice architectures consisting of hundreds of services –
+using different technology stacks [22] and independently developed and maintained by different teams – adherence to such requirements cannot be achieved
+by manual implementation or audit. Instead, compliance must be supported
+through configurable technical approaches, which implement privacy principles
+on a per-service basis. To date, however, developers lack the means to do so [11].
+In particular, API frameworks, such as gRPC,1 expose an inherent lack of advanced privacy techniques that go beyond mere transport encryption and simple
+token-based authentication. Such advanced techniques are, however, indispensable for properly addressing said principles. So far, developers can thus either
+go without appropriate technical implementation of privacy requirements within
+their services (leaving compliance to rather non-technical means) or implement
+required techniques manually, in a rather ad-hoc fashion (raising excessive efforts
+as well as the risk of errors and improper implementations).
+First proposals to close this gap have been made for services exposed via
+GraphQL [19], but for the whole field of performance-sensitive microservices
+communicating via gRPC, the need to integrate advanced privacy techniques
+in a configurable and performance-aware manner remains largely untapped. In
+consequence, we herein propose and contribute:
+– A general approach for hook-in privacy techniques in high-performance
+remote procedure call frameworks, especially applicable in cloud native
+microservices,
+1
+
+grpc.io/docs/what-is-grpc/faq
+
+Hook-in Privacy Techniques for gRPC-based Microservice Communication
+
+3
+
+– a proof-of-concept implementation of our approach for the widely-used,
+enterprise-grade gRPC framework in a polyglot, cloud-native microservice
+environment, exemplified through the privacy principles of data minimization and purpose limitation, and
+– a preliminary performance evaluation in a realistic food delivery scenario.
+These contributions unfold as follows: Background and related work are explained in Sect. 2. In Sect. 3, we identify the requirements to be fulfilled. Our
+general approach is presented in Sect. 4, followed by our proof-of-concept implementation in Sect. 5 and a preliminary performance evaluation in Sect. 6. Sect. 7
+discusses our results, identifies prospects for future work, and concludes.
+
+2
+
+Background and Related Work
+
+Our work builds on the following foundations and related work.
+2.1
+
+Microservices Communication via gRPC
+
+One popular communication method between microservices is the Remote Procedure Call (RPC). RPCs are a way to invoke procedures across machines, while
+it looks like a single-machine execution from a developer’s perspective [4, 27].
+One of the most popular RPC frameworks, gRPC, was initially developed internally at Google and open-sourced in 2015.2 It is an efficient and scalable framework for inter-service communication implementing RPCs over HTTP/2 [5]. Furthermore, it supports basic authentication mechanisms, streaming, blocking /
+non-blocking transmission, etc., and is available for a broad variety of programming languages. By default, it uses Protocol Buffers3 for serializing structured
+data in a forward- and backward-compatible way. Protocol Buffers support many
+languages by default and even more through third-party add-ons [14]. The definition of the data structure has to be defined in a .proto file which is then used
+by the protoc compiler to generate the necessary code in the chosen language
+which can then be used by the application [14].
+Using gRPC is most suitable for communication between microservices in a
+cloud environment, while, for the browser interface, alternatives such as REST or
+GraphQL are the preferred options [14]. Thus far, privacy-enhancing technologies, including data minimization and purpose limitation, are mostly lacking [1].
+2.2
+
+Technical Approaches for Privacy Techniques in Inter-Service
+Communication
+
+In related work, an approach on how to implement purpose-based access control
+on the application layer is proposed [20]. Their work presents two prototype
+2
+3
+
+developers.googleblog.com/2015/02/introducing-grpc-new-open-source-http2.html
+protobuf.dev/overview
+
+4
+
+Loechel et al.
+
+implementations with respective benchmarks. This informs our work regarding
+ease of implementation. Furthermore, the Janus prototype provides a viable
+approach, which extends the popular Apollo server to introduce attribute-level
+access control and role-based data minimization mechanisms to GraphQL APIs
+[19]. Janus employs JSON Web Tokens (JWTs) to identify roles and, on this
+basis, parameterize the application of common data minimization techniques in a
+per-request fashion. With its flexible hook-in capabilities, Janus shall thus serve
+as a blueprint for our endeavor to implement similar capabilities into gRPCbased service APIs.
+Specifically related to gRPC and Protocol Buffers, previous work proposes
+the implementation of data flow assertions [15]. Put briefly, a Go library here
+generates access policies based on JSON files and a gRPC interceptor inspects
+the HTTP request headers. Therefore, access control is purely based on the
+encryption of strings. The interceptor only decrypts the data after comparing
+the headers with the policies. Encrypting every string in a message by default
+makes the overhead of this approach not feasible for high-performance scenarios.
+Beyond this work, gRPC interceptors are used for security (authentication),4
+observability practices (tracing),5 or fault tolerance mechanisms (retries).6 Approaches utilizing the interceptor concept to implement privacy techniques such
+as data minimization and purpose limitation in high-performance settings are,
+however, to the best of our knowledge not existing.
+2.3
+
+Data Minimization and Purpose Limitation in Inter-Service
+Communication
+
+Established privacy-preserving techniques, such as suppression, generalization
+and noising, serve as a foundation for this work regarding data minimization
+[16, 17, 25]. Likewise, purpose limitation techniques following the idea of the
+Purpose-Based Access Control model are incorporated prototypically into this
+work [6, 7, 20]. Furthermore, we build upon the field of access control. The eXtensible Access Control Markup Language (XACML) [2] and its respective component model have been widely adopted as a standard for creating fine-grained
+policy rules [21, 23]. Within the XACML framework, access control operations
+are partitioned into distinct functional components, which are the Policy Administration Point (PAP), Policy Decision Point (PDP), and Policy Enforcement Point (PEP). This component model is frequently applied to the privacy
+principles of purpose limitation [6], data minimization, and their overlaps with
+traditional technical access control measures [3, 8, 10].
+
+3
+
+Requirements
+
+In line with other privacy engineering endeavors (such as [12, 19, 20]) we outline
+a set of reasonable functional and non-functional requirements.
+4
+
+grpc.io/docs/guides/auth
+go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc
+6
+pkg.go.dev/github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/retry
+5
+
+Hook-in Privacy Techniques for gRPC-based Microservice Communication
+
+5
+
+Policy-Based Data Minimization (FR1): Derived from the privacy principle
+of data minimization (codified, e.g., in Art. 5 GDPR) access to specific personal
+information must be restricted as far as possible. In particular, it may not always
+be necessary to expose the complete set of accessed information. The proposed
+solution should therefore apply different types of data minimization mechanisms.
+These include noising, suppression, or advanced anonymization techniques [3].
+Policy-Based Purpose Limitation (FR2): For enabling basic purpose limitation [28], it is required that each category of personal data and every gRPC
+call can be supplemented with specific processing purposes. This allows the utilization of various purpose-based access policies. Related to Art. 5 GDPR, this
+provides the means to specifically control which calls and services can access
+personal data.
+Configurability (FR3): The proposed solution must be highly configurable to
+facilitate adoption in different use case scenarios. Developers must therefore be
+able to specify and choose a domain-specific set of available purposes, according
+to their system-specific needs. This is desirable because the required processing
+purposes of different domains can diverge greatly.
+Native gRPC integration (FR4): As mentioned in Sect. 2, many technologies
+can map gRPC to be interoperable with different communication protocols and
+data structures, which are not gRPC-native. However, whenever possible the
+solution should consist of gRPC-native protocols and data structures to keep
+its benefits such as high performance as well as low integration overhead, and
+without adding another level of complexity.
+Reasonable Performance Overhead (NFR1): According to Art. 25 GDPR,
+technical measures that realize privacy principles must be applied while taking
+into account the cost of implementation, which includes induced overheads. We
+will therefore assess the performance of our approach with real-world settings
+and configurations to ensure that the overhead is at a reasonable level.
+Polyglot compatibility (NFR2): To ensure that our approach is compatible
+with a wide range of programming languages and frameworks, it has to be implemented in a modular and extensible manner. This will allow developers to
+easily integrate the privacy-enhancing technologies into their existing applications. Additionally, clear documentation and examples shall guide developers in
+the integration process.
+
+4
+
+Approach
+
+To fulfill the functional and non-functional requirements including regulatory
+obligations, we propose a conceptual approach for effective and efficient data
+minimization and purpose limitation for high-performance gRPC-based interservice communication in microservice architectures.
+Derived from FR1, FR2 as well as FR4, our general approach for integrating
+privacy techniques, such as purpose limitation and data minimization, will be
+realized as a server-side middleware. In our implementation, we opt for adding
+
+6
+
+Loechel et al.
+
+a gRPC response interceptor. This allows the integration in the required gRPCnative manner, while working on an abstraction layer that does not require
+existing microservices and their respective code base to be modified with more
+than about two lines of code (NFR2). Additionally, to meet the performance
+requirements outlined in NFR1, we minimize the complexity of the interceptor.
+Therefore, any computation that is not required to be performed immediately
+with each response will be conducted in a separate system component, independent of the interceptor itself. Following the XACML component model, access
+policy enforcement is preceded by policy administration and interpretation in
+context-specific scenarios. Thus, to allow for a scalable interceptor, the PAP and
+the PDP are consciously separated from the PEP.
+The separation of the PAP and PDP from the PEP not only reduces the
+anticipated performance overhead from the interceptor but also necessitates the
+establishment of reliable and efficient communication for decisions made at the
+PDP. We address this challenge by implementing signed JSON Web Tokens
+(JWTs). A JWT typically consists of three parts: header, payload, and signature.
+The payload consists of claims that can be exchanged between different parties
+securely [24]. These tokens will serve as a trusted certificate enabling parties to
+exchange decisions made at the PDP, prior to the PEP. Thus, a client, Service
+A, intending to send a gRPC request to a server, Service B, must first get such
+a trusted JWT as illustrated in Fig. 1. We propose to sign the message via
+standard asymmetric cryptography, including a public/private key pair.
+To reduce the computational and communicative overhead, a given JWT
+remains valid for a specified time. This method assumes that neither the access
+policy nor the context on which the decision is based are subject to frequent
+alterations. Therefore, neither the PAP nor the PDP require round-trips for each
+outgoing response. After validating the JWT, the interceptor merely executes
+the policy decision upon receiving an outgoing server response. For more details,
+we provide an in-depth explanation of the JWT implementation in Sect. 5.1.
+Assuming the client possesses a valid JWT containing a recent access policy
+decision, it can proceed to communicate with other microservices within the
+architecture. The JWT is appended to the outgoing context of the message
+whenever a request is sent to another microservice. Other data stored within the
+context are not affected by this addition, nor does it prevent future alterations,
+which substantially enhances integration. Upon request arrival at the server, the
+procedure is handled regularly. Data is aggregated to form the response message
+if the request invokes a response. The interceptor acts as the policy enforcing
+middleware as soon as the server sends the response back to the client.
+gRPC interceptors can generally interact with almost all facets of a message,
+including the payload, which may contain personal data. For applying privacy
+techniques, the message payload is central to modifications. Responses sent via
+gRPC can contain multiple data fields, each comprising a field name and its
+value. An accompanying access policy, retrieved from the JWT (which is stored
+within the intercepted context of the message), precisely defines which of the
+data fields can be sent safely to the client, and to what level of detail.
+
+Hook-in Privacy Techniques for gRPC-based Microservice Communication
+
+7
+
+Fig. 1: Architectural overview representing the communication process between
+client and server using JWT in gRPC communication incl. the XACML-inspired
+control functionality mapping.
+
+Data, including personal data, can reveal different types of information, which
+have varying levels of dependence on coherence (e.g., ZIP codes or phone numbers lose different amounts of information when the last digit is removed). This
+calls for the effective application of different data minimization techniques. The
+interceptor determines not only whether a data field can exist in the outgoing
+response message, but also controls its level of detail. Ultimately, data minimization is governed by the content of the PDP’s decision and the contents of the
+response message.
+Data minimization techniques for this proof of concept prototype include
+generalization, noising, reduction, and complete suppression of values. Since we
+published our contribution as an open-source project, implementing additional
+techniques is encouraged (FR3). We provide a detailed description of the implementation of each method in Sect. 5.2.
+
+5
+
+Implementation
+
+As introduced in section 4, the reusable component of our approach is divided
+along the XACML component structure. First, we will describe the practical
+implementation of the PAP and PDP, followed by the implementation of the
+gRPC interceptor which performs the PEP.
+5.1
+
+Policy Administration and Decision
+
+To achieve our goal of providing a solution that enables privacy techniques, such
+as automated (purpose-driven) policy enforcement and data minimization, we
+propose a structured machine-readable policy format. To be fully compatible
+with JWTs, we define a JSON-based policy.7 First, it comprises a list of service
+objects. Each service object can have a list of purpose objects in a flat structure, which distinguishes the data fields in the following categories: allowed,
+generalized, noised, and reduced. The data fields in these category objects
+may include a parameter to determine the applied minimization techniques more
+precisely. These options will be explained in section 5.2.
+7
+
+github.com/PrivacyEngineering/purpl-jwt-go-rsa
+
+8
+
+Loechel et al.
+
+Furthermore, we implement the policy to be the single source of truth for
+the inter-service communication of the whole system. However, it should still be
+possible to use multiple policies in a system (up to one policy per service) since
+organization structures may not allow access to a system-wide policy. Nevertheless, having multiple policies necessitates well-defined policy management for
+avoiding bypassing or the circumvention of policy decisions. Our solution is suitable for individualization since the claims in the generated JWT are system-wide
+and their origin does not affect the interceptor behavior.
+We implement our interceptor using the Go programming language, as being a natural high-performance fit to gRPC. Our implemented module generates the JWT based on five parameters: The service name, purpose, and
+policy path are used to get the corresponding data fields from the policy and
+parse them into the JWT claims. The key path is used to retrieve the provided
+Rivest–Shamir–Adleman (RSA) private key and to sign the JWT. Finally, the
+expirationInHours parameter sets the expiration of the JWT.
+In addition to our RSA-based module, we implemented the same functionality for a Elliptic Curve Digital Signature Algorithm (ECDSA) private key and
+published it as a separate Go module8 . We decided to implement these two algorithms since both are broadly used and supported by the module to handle
+JWTs.9
+Having the policy administration and decision separated from the policy enforcement, we abstract the token generation from the interceptor and, therefore,
+decrease its overhead. For the interested reader, we provide a simple overhead
+comparison of both approaches.10
+5.2
+
+Policy Enforcement
+
+Whenever a response message is to be dispatched from the server, our interceptor,11 will be activated within the usual grpc.NewServer() function. The
+subsequent actions of the interceptor are as follows. Initially, the JWT is subjected to origin and expiration time verification. Once these checks pass successfully, the client-specific access policy from the PDP (as described in Sect. 5.1)
+is extracted from the JWT and stored in a struct. Concurrently, the data field
+names from the response are extracted and stored in a slice. Having isolated the
+client-specific policy from the PDP and the data field names from the response
+message, the interceptor then performs the critical privacy technique, such as a
+data minimization task. The pseudocode as seen in algorithm 1 describes this
+workflow on a high level.
+We intended this algorithm to introduce only reasonable performance overheads. For each field name in the response message, the interceptor determines
+whether the field should remain unmodified, needs to be minimized, or must be
+8
+
+github.com/PrivacyEngineering/purpl-jwt-go-ecdsa
+github.com/golang-jwt/jwt
+10
+github.com/PrivacyEngineering/purpl-naive-approach
+11
+github.com/PrivacyEngineering/purpl
+9
+
+Hook-in Privacy Techniques for gRPC-based Microservice Communication
+
+9
+
+Algorithm 1 Schematic description
+of the gRPC interceptor.
+Require: JW T.expiration > time.now
+Require: JW T.signature = valid
+policy ← JW T.policy
+for all fields in message do
+if f ield ∈ policy.allowed then
+pass
+else if f ield ∈ policy.minimized then
+message.f ield ← minimize(f ield)
+else
+message.f ield ← suppress(f ield)
+end if
+end for
+return message
+
+Fig. 2: gRPC interceptor chaining.
+
+completely suppressed. Our implementation is inspired by common privacy techniques. For instance, all four data minimization mechanisms can handle integers,
+floats, and strings. Yet, some mechanisms differ in functionality depending on
+the data type that needs to be minimized, as follows.
+Suppression of a data field leads to the maximum information loss while
+maintaining the initial data types. Numeric values, such as integers and floats,
+are suppressed to a −1, while a string value is suppressed to an empty string
+(if needed differently, this can be changed easily). This guarantees the intended
+information loss while maintaining compatibility within the receiving programs,
+should they require the respective data types to be returned by the server. If,
+for example, the integer value of 42 were to undergo suppression, the result
+would be −1. For compatibility reasons, the client would still receive an integer
+value for this data field, but every additional information would be lost in the
+minimization process. Here we point out that full suppression (i.e., removal of
+the data field entirely) is also technically possible in gRPC.
+Generalization of a data field leads to a reduction of the value precision. The
+information conveyed by the data should be neither lost nor altered completely,
+while still making the data less accurate. This mechanism is implemented for
+integers and floats by passing the respective value and a range parameter to the
+function. The range is defined in the JWT’s policy and might change depending
+on the informational context. Assuming a data field age with the value 25 were
+to undergo generalization with a range parameter of 10, then the result would
+come out as 21. 21 representing, in this case, the age range from 21 up until 30.
+Respectively, 31 represents the range 31−40. In a different context, the parameter
+might change (e.g., accountBalance: 2.300 with a parameter of 1000 would
+return 2.001). The chosen mapping ensures numbers larger than zero to always
+maintain this one property (but could be changed easily if needed). Similarly to
+the numeric operations, invoking the generalization function for a string value in
+combination with a parameter will decrease the data’s accuracy without altering
+it entirely. In these cases, the parameter specifies how many characters are to
+
+10
+
+Loechel et al.
+
+be returned. A name: "Alice" with parameter 1 would thus be generalized to
+name: "A".
+Noising of a data field leads to an intended information loss, while maintaining a vague context of the initial data. This mechanism employs Google’s
+differential privacy Go library.12 Our noising function can apply either Laplace
+or Gaussian noise to an input value of type integer or float. Due to the probabilistic nature of the noising function, an input value would be returned in a
+pseudo-random fashion (e.g., age: 25 could be returned as age: 45 in one and
+as age: 7 in a subsequent function call). We implement the handling of stringtype values for robustness, while invoking the noising function will here lead to
+its suppression (as described above). For actually achieving differential privacy,
+scenario-specific extensions would need to be implemented additionally.
+Reduction of data fields follows a similar idea as the generalization mechanism, but offers greater flexibility. Reducing an integer or float value requires
+passing of a parameter value, which will then be used as a divisor in a simple division calculation (e.g., a houseNumber: 135 with parameter 10 will be returned
+as houseNumber: 13, while a parameter 5 would lead to a houseNumber: 27, due
+to the nature of integers). A reduction of string-typed values, on the other hand,
+follows the same mechanism as the aforementioned generalization of strings. A
+use case could be the reduction of a ZIP code data field to its first four digits (e.g., 10623 to 1062). Thus, not contradicting the initial information, while
+losing accuracy through broadening the geographical scope.
+Ultimately, any field that requires minimization will be altered using the functions mentioned above. The output of the respective minimization function is
+used to overwrite the original message content with the ProtoReflect().Set()
+function. We support protobuf v1.5.0 to be used for inter-service communication. Once all message fields have been minimized according to the policy, the
+modified message handler, and consequently the message itself, will be returned
+and transmitted to its intended destination service.
+5.3
+
+Usage and Configuration Mechanism
+
+To integrate the two reusable components, both referenced Go modules need to
+be included in the respective microservice, following our documentation. After
+successful integration, every privacy technique can be defined in the access policy
+and enforced through the gRPC interceptor. The interceptor can also be chained
+with other existing interceptors, as shown in Fig. 2. Within a service policy for a
+defined purpose, the data field names can be listed in either the allowed object
+or in one of the minimization objects. Fields listed in generalized, noised,
+or reduced require the specification of a parameter, as described in the previous section. Not documenting a field in one of the four objects will lead to its
+suppression, in case the data field appears in a response message.
+12
+
+github.com/google/differential-privacy/tree/main/go
+
+Hook-in Privacy Techniques for gRPC-based Microservice Communication
+
+6
+
+11
+
+Preliminary Performance Evaluation
+
+In the following, we summarize our preliminary performance assessment.
+Scenario: We assume a food delivery platform as a use case. Such services
+are widely utilized across the globe and inherently deal with personal information, such as address or payment information, detailed purchase histories, or
+demographic data. In real settings, the collected information is actively shared
+with other parties for multiple different purposes. For example, contact information will have to be shared with the restaurants that prepare the food and
+the riders delivering the food, while demographic or device data will be used for
+internal research, technical, or marketing purposes. It would be disastrous if the
+marketing department could access banking information, without a valid legal
+basis under Art. 6 GDPR. Data minimization is also an important aspect, as
+the marketing department might want to use demographic data, such as age and
+place of residence, for a more focused marketing campaign. However, there is no
+need for detailed information, because the generalization of the data, e.g., an
+age range or the district of the residence, can already yield the needed results.
+To represent such a usecase, we modified the Online Boutique,13 which is
+a sample open-source microservice-based e-commerce application, initially provided by the Google Cloud Platform developers. The inter-service communication is gRPC-based, so we implemented our use case by expanding the architecture with an additional microservice, namely the trackingservice. It requests
+personal data like the address, name, and contact information to calculate the
+shortest route to the destination and displays the information, as seen by a potential delivery person, to the customer. We provided the trackingservice with
+multiple different purpose specifications, and each of them has a varying degree of
+allowed or restricted access to the requested information. For the following evaluation, we deployed the application to the Google Kubernetes Engine (GKE).
+Further details and instructions to reproducible the experiments are provided
+via Github.14
+We begin to assess the performance overhead generated by our purpose limiter technique. The experiments consist of a load generator imitating 10 users
+sending concurrent gRPC requests to the trackingservice. Each experiment
+iteration lasts ten minutes. The number of data fields in the response message
+and the kind of data minimization method are modified at every iteration. We
+assume that both the different minimization methods and the overall length of
+the response message can influence the performance of the gRPC interceptor.
+Fig. 3a depicts the measured latency in milliseconds, while Fig. 3b illustrates the
+measured throughput. In both figures, the Baseline represents communication
+without an interceptor, No-Op communication with an interceptor performing
+no operations, All-Denied suppression of all data fields, for All-Allowed every
+data field is allowed to pass the interceptor without data minimization applied,
+13
+14
+
+github.com/GoogleCloudPlatform/microservices-demo
+github.com/PrivacyEngineering/purpl-pizza-boutique/tree/main/terraform-gcp
+
+200
+
+316.67
+283.33
+
+100
+
+2
+
+13
+
+26
+
+52
+
+13
+
+Data fields
+
+No-Op
+
+52
+
+Data fields
+
+(a) Mean latency in milliseconds.
+Baseline
+
+26
+
+171.67
+153.33
+108.33
+91.67
+
+300
+
+366.67
+350
+
+400
+
+193.33
+175
+150
+133.33
+
+5.59
+6.25
+2.91
+3.21
+
+4
+
+4.81
+5.28
+6.25
+7.2
+
+6
+
+2.62
+2.72
+
+4.49
+5.18
+6.2
+6.44
+
+8
+
+2.36
+2.42
+
+Latency (ms)
+
+10
+
+216.67
+200
+166.67
+150
+
+9.29
+10.12
+
+12
+
+400
+383.33
+
+Loechel et al.
+
+Requests/s
+
+12
+
+All-Denied
+
+(b) Throughput in requests per second.
+All-Allowed
+
+Mixed
+
+Maximized
+
+Fig. 3: Performance overheads for 3 different message sizes and 6 degrees of
+operational complexity.
+
+Mixed a variety of allowed fields and data minimization methods invoked, and
+Maximized is the minimization methods on all data fields present.
+Latency: The mere use of an interceptor (see Fig. 3a), even without performing any additional operations (No-Op), always made a measurable impact
+compared to the Baseline. We observe that the fastest performing functionality of our purpose limiter is the All-Denied scenario with an average increase
+of 88%. At the same time, the All-Allowed follows with an average increase of
+108%. More complex data minimization techniques being applied, as the Mixed
+or Maximized cases, show increases up to 200% compared to the Baseline. Increased amounts of fields in a request lead to increased latency. However, the
+increase is within a reasonable margin considering that the number of fields has
+been increased up to 4-fold, while the measured latency of our slowest-performing
+minimization technique has reached a 1.57-fold increase.
+Throughput: Fig. 3b shows the measured throughput of our requests with
+13, 26, and 52 data fields respectively, comparing varying degrees of minimization techniques. The Baseline performs the best, while the No-Op follows closely
+behind. The loss of throughput is noticeable even with the fastest-performing
+All-Denied scenario with an average loss of 47% in throughput. The throughput decreases significantly with the amount of fields that need to be minimized.
+Increasing the number of data fields further also leads to a decrease in throughput, also for the Baseline. Note, the relative loss of throughput is much smaller
+for the Baseline than it is for scenarios that utilize many of the minimization
+techniques.
+Considering the amount of added computational complexity to an otherwise
+performance-optimized communication framework, such as gRPC, the measured
+latency and throughput fall into a reasonable range (NFR1). Additionally, the
+evaluations show a latency difference between the highest and lowest perform-
+
+Hook-in Privacy Techniques for gRPC-based Microservice Communication
+
+13
+
+ing data minimization scenarios (All-Denied and Maximized ) from 43% to 81%,
+while the throughput difference spans from 44% to 87%. Therefore, these findings
+suggest that the choice of data minimization scenario can significantly impact
+both latency and throughput, with potential variations. Albeit, advanced data
+minimization mechanisms will always be resource-intensive due to their computational complexity and the inherent need to explicitly handle single data fields.
+On the other hand, the relative overhead generated by our solution would probably decrease as soon as the corresponding microservice system itself increases
+in complexity.
+
+7
+
+Limitations, Future Work and Conclusion
+
+Given the nature of this work as a prototype, some limitations remain. First,
+when including the two Go modules in an application, actual secret management needs to be handled by the developers. For demonstration purposes, this
+aspect was excluded. Thus, public and private key generation should not be
+incorporated directly within the development environment.
+Further, the implementation of advanced purpose-based access control, including tree or graph structures of allowed/prohibited intended purposes, downstream usage policies, or transformation functions, seems a promising path for future work [26]. The current prototype is limited by simple purpose specifications
+and does not yet fully implement the advances in this field [28]. Nevertheless,
+our general approach paves the way for such extensions.
+Secondly, we propose to implement the PEP component as a StreamInterceptor. This would cover a second possible communication method, apart from
+unary interceptors, offered by gRPC, thus making the adaptation in existing
+microservice applications more likely. Moreover, the handling of further data
+types, apart from the ones described herein, such as complex objects, should be
+addressed. Lastly, the set of data minimization or masking methods should be
+extended to include as many options as possible (e.g., different hashing algorithms, actual differential privacy, k anonymity of sets, etc.).
+Apart from additional features, further performance assessments could be
+conducted. The impact of policy size, for example, has not been measured yet.
+Regarding our assumption that validation using a JWT (generated from a tailormade policy that only contains the necessary accepted and restricted data fields)
+might perform better than a JWT that contains many different purposes and
+fields that are not relevant for a respective service. Further measurements should
+also be accompanied by performance optimizations of the reusable components.
+Regardless of the mentioned limitations and future work, we presented the
+first reusable approach that combines privacy techniques, such as data minimization and purpose limitation, natively into the gRPC communication framework.
+To illustrate the wide applicability of our contribution, we integrated our Go
+modules into an exemplary food delivery application. The observed performance
+overhead generated by our contribution is deemed reasonable. Ultimately, in the
+broader context of technical as well as legal privacy requirements, the importance
+
+14
+
+Loechel et al.
+
+of such technical contributions is evident. We addressed performance and implementation costs as two of the key factors in deciding whether data controllers
+are likely to implement the approach to ensure data protection by design and
+by default.
+Acknowledgements. We thank Huaning Yang, who contributed to the initial implementation within the scope of a privacy engineering course at TU Berlin.
+
+References
+1. Agape, A.A., Danceanu, M.C., Hansen, R.R., Schmid, S.: Charting the security
+landscape of programmable dataplanes (2018). https://doi.org/10.48550/arXiv.
+1807.00128
+2. Anderson, A., Nadalin, A., Parducci, B., Engovatov, D., Lockhart, H., Kudo, M.,
+Humenn, P., Godik, S., Anderson, S., Crocker, S., et al.: eXtensible access control
+markup language (XACML) (2003)
+3. Biega, A.J., Potash, P., Daumé, H., Diaz, F., Finck, M.: Operationalizing the legal
+principle of data minimization for personalization. In: Proc. of the 43rd International ACM SIGIR Conference on Research and Development in Information
+Retrieval. pp. 399–408 (2020)
+4. Birrell, A.D., Nelson, B.J.: Implementing remote procedure calls. ACM Transactions on Computer Systems (TOCS) 2(1), 39–59 (1984). https://doi.org/10.1145/
+2080.357392
+5. Brown, S., Harman, D., Anderson, C., Dwyer, M.: Measuring data transmissions from the edge for distributed inferencing with grpc. In: 2023 IEEE International Conference on Big Data (BigData). pp. 3853–3856 (2023). https:
+//doi.org/10.1109/BigData59044.2023.10386142
+6. Byun, J.W., Bertino, E., Li, N.: Purpose based access control of complex data
+for privacy protection. In: Proceedings of the tenth ACM symposium on Access
+control models and technologies. pp. 102–110 (2005)
+7. Byun, J.W., Li, N.: Purpose based access control for privacy protection in relational database systems. The VLDB Journal 17, 603–619 (2008). https://doi.org/
+10.1007/11408079 2
+8. Chandramouli, R., Butcher, Z., Chetal, A., et al.: Attribute-based access control
+for microservices-based applications using a service mesh. NIST 800 (2021)
+9. European Parliament and Council of the European Union: General Data Protection
+Regulation (2018)
+10. Finck, M., Biega, A.: Reviving purpose limitation and data minimisation in personalisation, profiling and decision-making systems. Technology and Regulation
+pp. 21–04 (2021)
+11. Grünewald, E.: Cloud Native Privacy Engineering through DevPrivOps, p.
+122–141. Springer International Publishing (2022). https://doi.org/10.1007/
+978-3-030-99100-5 10
+12. Grünewald, E., Kiesel, J., Akbayin, S.R., Pallas, F.: Hawk: DevOps-driven Transparency and Accountability in Cloud Native Systems. In: IEEE 16th International
+Conference on Cloud Computing (CLOUD). IEEE (Jun 2023). https://doi.org/10.
+1109/CLOUD60044.2023.00027
+
+Hook-in Privacy Techniques for gRPC-based Microservice Communication
+
+15
+
+13. Jabbari, R., bin Ali, N., Petersen, K., Tanveer, B.: What is DevOps? A systematic
+mapping study on definitions and practices. In: Scientific workshop proceedings of
+XP2016. pp. 1–11 (2016). https://doi.org/10.1145/2962695.2962707
+14. Kumar, P.K., Agarwal, R., Shivaprasad, R., Sitaram, D., Kalambur, S.: Performance characterization of communication protocols in microservice applications.
+In: International Conference on Smart Applications, Communications and Networking. pp. 1–5 (2021). https://doi.org/10.1109/SmartNets50376.2021.9555425
+15. Mahajan, A., Xue, Y., Weisskoff, J.: Implementing data flow assertions in gRPC
+and Protobufs. Brown University (2020), https://cs.brown.edu/courses/csci2390/
+2023/assign/project/report/2020/grpc-df-asserts.pdf
+16. Majeed, A., Lee, S.: Anonymization techniques for privacy preserving data publishing: A comprehensive survey. IEEE Access 9, 8512–8545 (2021). https://doi.
+org/10.1109/ACCESS.2020.3045700
+17. Marques, J.F., Bernardino, J.: Analysis of data anonymization techniques. In:
+KEOD. pp. 235–241 (2020)
+18. Nadareishvili, I., Mitra, R., McLarty, M., Amundsen, M.: Microservice architecture:
+aligning principles, practices, and culture. O’Reilly (2016)
+19. Pallas, F., Hartmann, D., Heinrich, P., Kipke, J., Grünewald, E.: Configurable PerQuery Data Minimization for Privacy-Compliant Web APIs. In: Di Noia, T., Ko,
+I.Y., Schedl, M., Ardito, C. (eds.) Web Engineering. pp. 325–340. Springer International Publishing, Cham (2022). https://doi.org/10.1007/978-3-031-09917-5 22
+20. Pallas, F., Ulbricht, M.R., Tai, S., Peikert, T., Reppenhagen, M., Wenzel, D.,
+Wille, P., Wolf, K.: Towards application-layer purpose-based access control. In:
+Proceedings of the 35th Annual ACM Symposium on Applied Computing. pp.
+1288–1296 (2020). https://doi.org/10.1145/3341105.3375764
+21. Parkinson, S., Khan, S.: A survey on empirical security analysis of access-control
+systems: A real-world perspective. ACM Comput. Surv. 55(6) (dec 2022). https:
+//doi.org/10.1145/3533703, https://doi.org/10.1145/3533703
+22. Salah, T., Jamal Zemerly, M., Yeun, C.Y., Al-Qutayri, M., Al-Hammadi, Y.: The
+evolution of distributed systems towards microservices architecture. In: 11th International Conference for Internet Technology and Secured Transactions (ICITST).
+pp. 318–325 (2016). https://doi.org/10.1109/ICITST.2016.7856721
+23. Seitz, L., Selander, G., Gehrmann, C.: Authorization framework for the internetof-things. In: 2013 IEEE 14th International Symposium on A World of Wireless, Mobile and Multimedia Networks. pp. 1–6 (2013). https://doi.org/10.1109/
+WoWMoM.2013.6583465
+24. Shingala, K.: JSON web token (JWT) based client authentication in message queuing telemetry transport (MQTT). NTNU (2019). https://doi.org/10.48550/arXiv.
+1903.02895
+25. Sweeney, L.: k-anonymity: A model for protecting privacy. International journal of
+uncertainty, fuzziness and knowledge-based systems 10(05), 557–570 (2002)
+26. Ulbricht, M.R., Pallas, F.: YaPPL – a lightweight privacy preference language
+for legally sufficient and automated consent provision in IoT scenarios. In: Data
+Privacy Management, ESORICS International Workshops. pp. 329–344. Springer
+(2018). https://doi.org/10.1007/978-3-030-00305-0 23
+27. White, J.E.: A high-level framework for network-based resource sharing. In: Proceedings of the National Computer Conference and Exposition. p. 561–570. AFIPS
+’76, ACM, New York (1976). https://doi.org/10.1145/1499799.1499878
+28. Wolf, K., Pallas, F., Tai, S.: Messaging with Purpose Limitation–PrivacyCompliant Publish-Subscribe Systems. In: IEEE 25th International Enterprise Distributed Object Computing Conference. pp. 162–172. IEEE (October 2021)
+

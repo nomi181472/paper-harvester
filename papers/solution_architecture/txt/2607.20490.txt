@@ -1,0 +1,986 @@
+CRAWO: Custom Resources for Adaptive Workload
+Orchestration
+Eugênio Santos, Daniel Maia, Stefano Loss, José Manoel Silva, Aluizio
+Rocha Neto, Thais Batista, Everton Cavalcante∗, Nélio Cacho, Eduardo
+Nogueira, Daniel Araújo, Frederico Lopes
+
+arXiv:2607.20490v1 [cs.AI] 8 Jun 2026
+
+Federal University of Rio Grande do Norte, Natal, Brazil
+
+Abstract
+Edge Intelligence has emerged as a key paradigm for enabling real-time applications in smart cities by shifting computation from centralized cloud data
+centers to the network edge, thereby reducing latency and bandwidth consumption. However, deploying Artificial Intelligence (AI) pipelines across heterogeneous edge infrastructures remains challenging due to the wide range of
+device capabilities, from low-power microcontrollers to accelerator-equipped
+systems. Existing edge orchestration platforms primarily focus on deployment
+automation and infrastructure management, but these approaches are often
+inefficient and limit the ability to adaptively allocate resources under dynamic
+conditions. To tackle these issues, this paper introduces CRAWO (Custom
+Resources for Adaptive Workload Orchestration), an architectural framework
+for coordinating AI pipelines across distributed edge environments. CRAWO
+follows a control-loop-based model that separates allocation intelligence from
+execution by managing placement decisions, state management, and interstage data flows while instantiating services on edge nodes. The framework
+incorporates a hardware-aware allocator with a pluggable multi-criteria deci∗
+
+Corresponding author
+Email addresses: eugenio.lopes.090@ufrn.edu.br (Eugênio Santos),
+daniel.azevedo.095@ufrn.edu.br (Daniel Maia), momoloss10@gmail.com (Stefano
+Loss), manoel.freitas.071@ufrn.edu.br (José Manoel Silva), aluizio@imd.ufrn.br
+(Aluizio Rocha Neto), thaisbatista@gmail.com (Thais Batista),
+everton.cavalcante@ufrn.br (Everton Cavalcante), neliocacho@dimap.ufrn.br (Nélio
+Cacho), eduardo@imd.ufrn.br (Eduardo Nogueira), daniel@imd.ufrn.br (Daniel
+Araújo), fred@imd.ufrn.br (Frederico Lopes)
+
+sion layer that leverages real-time infrastructure metrics to enable adaptive
+workload placement. The reference implementation adopts a microservices
+architecture deployed on a lightweight Kubernetes distribution (K3s), using
+Custom Resource Definitions (CRDs) for domain modeling and a dedicated
+operator for state reconciliation. Evaluation in a vehicle surveillance scenario
+using license plate recognition demonstrates improved workload distribution
+and reduced reliance on centralized cloud processing in latency-sensitive environments.
+Keywords: edge orchestration, smart cities, Kubernetes, multi-criteria
+decision making, Edge Intelligence.
+1. Introduction
+The shift of computation from centralized cloud data centers to the network edge has positioned edge intelligence as a fundamental paradigm for
+real-time applications. Edge intelligence enables Artificial Intelligence (AI)
+processing at or near data sources by leveraging the enhanced computational
+capabilities of modern edge devices. This approach reduces communication
+latency, alleviates bandwidth pressure, and enables timely analytics at the
+source [1], benefits that are often lost in traditional cloud-based approaches.
+These capabilities are particularly crucial for AI-driven video processing, in
+which tasks must be performed near the capture devices to meet strict timesensitive requirements and avoid the prohibitive overhead of transmitting
+raw, high-volume multimedia streams to a remote infrastructure [2].
+While cloud-only architectures simplify management through a global
+system view, they are often impractical at scale. For example, in scenarios
+involving object detection and recognition from images or video streams,
+even a small number of high-definition cameras can overload the network
+backhaul, thereby hampering reliable target identification. To address this
+challenge, complex AI workloads are increasingly modeled as data flows by
+decomposing monolithic applications into modular pipelines. This structure
+allows AI services to be expressed as interconnected stages (e.g., detection,
+recognition, and decision), enabling each component to be deployed on different nodes across the edge-cloud continuum to reduce end-to-end latency
+and network overhead [3].
+On the other hand, implementing AI pipelines across edge infrastructures remains a significant challenge, as these environments often comprise
+2
+
+a wide range of heterogeneous devices, from low-power microcontrollers to
+units with integrated GPUs and AI accelerators [1]. Such diversity makes
+static deployment strategies inefficient, as each node exhibits distinct constraints and performance characteristics. This challenge is further amplified
+in scenarios such as smart cities, which demand low latency and efficient
+coordination across interconnected devices and mobile processing units [4].
+Consequently, an intelligent orchestrator is essential to manage distributed
+processing. This orchestrator must translate high-level service requirements
+into concrete execution plans by dynamically allocating computationally intensive workloads encapsulated as microservices or containers to the most
+suitable nodes. This process must consider resource availability and critical
+operational constraints to ensure efficiency and scalability under dynamic
+cluster conditions [5, 6, 7].
+To address these issues, this work presents CRAWO (Custom Resources
+for Adaptive Workload Orchestration). We designed CRAWO to operate
+alongside modern workload execution platforms, leveraging their reliability
+while addressing orchestration challenges in complex edge environments. A
+key aspect of the solution is the separation of execution and orchestration
+concerns. While the underlying platform manages service deployment and
+system state, CRAWO introduces a dedicated layer for allocation and context
+management. This design enables adaptive coordination without modifying
+internal execution mechanisms. By treating processing pipelines as cohesive
+units, CRAWO allows platforms such as Kubernetes to focus on execution
+consistency while it manages the “where and when” of pipeline deployment
+based on runtime conditions.
+The contributions of this work are threefold:
+1. A control-loop model organized into different planes, featuring a hardwareaware allocator that employs real-time metrics and a pluggable multicriteria decision layer for dynamic task distribution.
+2. A reference implementation for CRAWO following a microservices architecture deployed on K3s,1 leveraging Kubernetes Custom Resources
+Definition (CDR) for domain modeling and a Go-based component for
+state reconciliation.
+3. A demonstration of our proposal with a license plate recognition (LPR)
+use case and its performance evaluation considering network conditions
+1
+
+https://k3s.io
+
+3
+
+and varying high-resolution video workloads.
+The remainder of this paper is organized as follows. Section 2 introduces a
+vehicular surveillance scenario as a motivational use case. Section 3 discusses
+related work. Section 4 details the CRAWO architecture, while Section 5
+describes the reference implementation. Section 6 demonstrates the practical
+instantiation for an LPR use case. Section 7 presents the evaluation. Section 8
+provides final remarks and directions for future work.
+2. Motivational use case: Vehicular surveillance in smart cities
+Our motivational scenario focuses on mobile law enforcement units, specifically police patrol vehicles operating within a smart city environment. These
+vehicles are equipped with high-definition cameras that continuously record
+video for monitoring. To transform this raw data into actionable intelligence,
+the video streams must be processed efficiently to support immediate police
+decision-making. The critical requirement is to perform LPR in real time,
+ensuring that suspicious vehicle identification occurs instantly on-site and
+that video processing does not depend solely on network connectivity.
+As illustrated in Figure 1, the LPR workflow consists of a sequential
+computer vision pipeline. This process begins by detecting the vehicle in raw
+video frames, followed by localizing and isolating the specific license plate
+area. Subsequently, the system performs character segmentation to separate
+individual letters and numbers, followed by Optical Character Recognition
+(OCR) and database queries to verify the vehicle’s legal status.
+
+Figure 1: Use case: Vehicular surveillance in smart cities and processing alternatives.
+
+4
+
+To execute this pipeline, the vehicular infrastructure is highly heterogeneous, offering various processing options with distinct trade-offs. The need
+for local processing is driven by the dynamic nature of vehicular surveillance,
+which demands response times in the order of milliseconds to effectively identify and intercept moving targets. Furthermore, the architecture must be
+able to seamlessly propagate updated detection rules, such as stolen-vehicle
+watchlists, from the central cloud to the distributed edge nodes.
+2.1. Cloud-only execution baseline
+In the conventional cloud-only deployment model, the vehicle serves solely
+as a data generator, with all stages of the AI pipeline executed remotely on
+a centralized infrastructure. This approach is commonly adopted in smart
+city surveillance architectures, as it simplifies management by relying on
+centralized cloud infrastructure or a single Kubernetes cluster for service
+execution [8].
+However, such centralized processing requires the continuous transmission
+of high-volume video streams to remote infrastructures, which introduces
+significant bandwidth pressure and latency. These constraints often violate
+the real-time requirements of law enforcement applications, as the system
+remains entirely dependent on the stability and availability of the network
+backhaul.
+2.2. Edge-distributed execution with orchestration
+An edge-distributed execution model can offload computationally intensive stages to heterogeneous nodes located within the vehicle, closer to the
+data source. In this architecture, a microcontroller handles acquisition and
+virtualization, acting as a device adapter that encapsulates the sensor and
+standardizes the data flow. Computationally intensive tasks, such as OCR,
+are then forwarded over the local network to more robust onboard edge nodes,
+such as an NVIDIA Jetson or a Raspberry Pi.
+While this approach significantly reduces latency and backhaul bandwidth consumption, it introduces a trade-off in architectural complexity.
+Managing a distributed set of heterogeneous mobile nodes is far more demanding than maintaining a centralized cloud because it requires handling
+intermittent connectivity, hardware-specific constraints, and the overhead of
+local resource coordination.
+
+5
+
+To mitigate these challenges, the system’s effectiveness becomes entirely
+dependent on a sophisticated orchestration layer. This orchestrator must
+meet three critical requirements:
+1. Dynamic workload mapping: It must automatically assign AI inference
+tasks to GPU-accelerated nodes while keeping lightweight adaptation
+tasks on microcontrollers to prevent bottlenecks.
+2. Resource awareness: It must maintain real-time awareness of the heterogeneous hardware state to ensure millisecond-range response times
+and optimize data flows.
+3. Seamless synchronization: It must support selective synchronization of
+metadata to the cloud, ensuring the system remains interoperable with
+broader smart city ecosystems without overloading the network.
+These requirements highlight the limitations of general-purpose orchestration in specialized edge environments. To address these challenges, we
+propose CRAWO to bridge the gap between high-level AI pipeline definitions and the physical constraints of heterogeneous nodes. By implementing
+a control-loop model that operates alongside existing execution platforms,
+CRAWO can transform the complex operational requirements of the LPR
+scenario into a manageable, automated workflow.
+3. Related work
+Orchestration across edge and cloud infrastructures has been widely investigated to support real-time applications. Early efforts, such as FogFlow [3],
+introduced programming abstractions for deploying Internet of Things (IoT)
+service pipelines across distributed resources, enabling application components to be positioned closer to data sources to reduce latency and network
+overhead. More recent platform-oriented approaches have extended cloudnative orchestration mechanisms to the edge by leveraging Kubernetes as the
+underlying execution environment. These solutions typically maintain compatibility with the Kubernetes control plane while enabling the deployment
+of containerized services on geographically distributed, resource-constrained
+nodes.
+Such frameworks provide localized autonomy and facilitate infrastructure
+management across heterogeneous devices, supporting container execution,
+
+6
+
+remote management, and partial network independence [8]. However, the literature on fog and edge computing consistently identifies heterogeneity, mobility, and dynamic resource variability as persistent challenges, particularly
+in large-scale deployments characterized by fluctuating network conditions
+and diverse hardware capabilities [4]. Although existing solutions enable distributed execution, their scheduling logic frequently remains aligned with
+assumptions inherited from data center environments, where resource stability and network predictability are significantly higher.
+3.1. Workload placement and multi-criteria decision-making
+In many existing systems, workload placement decisions are primarily
+driven by predefined descriptors such as CPU and memory requests, node
+labels, or static policies [8]. While some solutions incorporate basic network
+awareness or topology constraints, allocation logic is often tightly coupled
+to the underlying execution environment and limited to rule-based or singlemetric optimization strategies. Under highly dynamic edge conditions, where
+latency, bandwidth, accelerator availability, and workload intensity continually vary, such approaches often fail to provide sufficiently adaptive decisionmaking behavior.
+To address these limitations, recent research explores intelligent workload placement strategies based on multi-criteria decision-making (MCDM).
+Methods such as the Technique for Order of Preference by Similarity to Ideal
+Solution (TOPSIS) and VIKOR have been applied to balance conflicting objectives, including latency, throughput, and resource utilization in distributed
+resource selection scenarios [7]. While TOPSIS ranks alternatives based on
+their geometric distance from an ideal reference solution [9], VIKOR adopts
+a compromise ranking mechanism that jointly considers aggregate utility and
+individual regret [10]. This strategy allows for more balanced decisions when
+criteria exhibit inherent conflicts.
+Table 1 summarizes representative allocation approaches based on their
+optimization characteristics and suitability for heterogeneous edge environments. Traditional load-balancing approaches, such as Random, Round Robin,
+and Least Loaded, either neglect multiple decision criteria or assume homogeneous processing capabilities, thus limiting their effectiveness in heterogeneous edge scenarios. In contrast, MCDM models explicitly capture tradeoffs among performance, latency, and resource utilization. Among these approaches, VIKOR stands out for its ability to handle conflicting evaluation
+criteria in dynamic environments.
+7
+
+Table 1: Comparison of representative workload allocation strategies in edge environments.
+
+Strategy
+Random
+Selection
+Round
+Robin
+Least
+Loaded
+
+Multi-criteria
+
+Conflicting
+criteria
+
+✕
+
+✕
+
+Computational
+complexity
+O(1)
+
+✕
+
+✕
+
+O(1)
+
+✕
+
+✕
+
+O(m)
+
+TOPSIS
+
+●
+
+❍
+
+O(mk)
+
+VIKOR
+
+●
+
+●
+
+O(mk)
+
+Edge suitability
+Low (no resource
+awareness)
+Low (assumes
+homogeneity)
+Moderate
+(single-metric
+adaptation)
+High
+(multi-objective
+ranking)
+High
+(compromise-based
+decision)
+
+Legend: ● = fully supported; ❍ = partially supported; ✕ = not supported
+m: number of candidate nodes; k: number of criteria
+
+3.2. Architectural coupling in edge orchestration
+Recent Kubernetes-based edge orchestration proposals enhance scheduling behavior through tightly integrated plugins and control plane extensions [11]. Although these approaches improve resource awareness, the allocation logic remains embedded within the underlying environment. Consequently, decision intelligence is implemented at the scheduler level, resulting in strong coupling between execution control and placement strategy.
+This architectural coupling implies that evolving, replacing, or experimentally evaluating alternative decision models often requires modifications to
+the orchestration framework itself. Therefore, allocation quality depends not
+only on deployment capabilities but fundamentally on how decision logic is
+architecturally positioned.
+Table 2 summarizes various edge-cloud platforms according to the scope
+of decision criteria supported in their placement logic, as reported in their
+documentation and the literature [3, 8, 4]. We can note that either resource
+descriptors, network metrics, hardware capability differentiation, or multicriteria ranking mechanisms are natively incorporated into allocation decisions. While several platforms support container deployment across heteroge8
+
+neous infrastructures, the combination of explicit multi-criteria ranking with
+architecturally decoupled allocation intelligence is rarely treated as a primary
+design principle.
+Table 2: Decision criteria and allocation strategies adopted by representative edge-cloud
+orchestrators.
+
+Platform/framework
+KubeEdge
+FogFlow
+OpenYurt
+Baetyl
+CRAWO (this work)
+
+CPU
+
+Memory
+
+Network
+metrics
+
+Hardware
+awareness
+
+Native
+MCDM
+
+●
+
+●
+
+❍
+
+❍
+
+✕
+
+●
+
+●
+
+●
+
+❍
+
+✕
+
+●
+
+●
+
+❍
+
+❍
+
+✕
+
+●
+
+●
+
+❍
+
+❍
+
+✕
+
+●
+
+●
+
+●
+
+●
+
+●
+
+Legend: ● = fully supported; ❍ = partially supported; ✕ = not supported/detailed
+
+In contrast to these embedded approaches, CRAWO introduces an architectural model that explicitly separates allocation intelligence from execution
+management. The reference implementation adopts a VIKOR-based ranking
+strategy integrated within a Kubernetes-native control loop. However, the
+decision mechanism is not bound to a specific algorithm, but rather the
+allocation layer is designed to support many multi-criteria models without
+modifying the underlying execution environment. This separation enables
+systematic experimentation with alternative decision strategies while maintaining architectural consistency across heterogeneous edge deployments.
+4. CRAWO: Custom Resources for Adaptive Workload Orchestration
+We designed the CRAWO framework to orchestrate multi-stage AI processing pipelines across heterogeneous edge computing infrastructures. It addresses the challenge of managing complex workloads on distributed nodes
+with varying capabilities by providing a high-level abstraction layer that decouples service definition from infrastructure complexity.
+CRAWO currently works as the orchestrator for the SAALSA (Stream AI
+Analytics for Live Situational Awareness) framework [12, 13]. While SAALSA
+provides the underlying intelligent video processing capabilities, CRAWO orchestrates these analytics to achieve high-performance situational awareness
+in smart city environments.
+9
+
+4.1. Architecture
+Unlike edge orchestrators that embed decision logic directly within the
+underlying execution environment, making placement policies inseparable
+from deployment mechanisms, CRAWO isolates intelligence, domain modeling, and enforcement into three coordinated planes. This separation allows
+allocation strategies to evolve independently of infrastructure concerns. The
+CRAWO architecture follows a control-loop model organized into three distinct planes, as depicted in Figure 2:
+• The Control Plane provides the framework’s intelligence, handles user
+interactions, manages service compositions, and executes decision-making
+logic to map abstract workloads to physical resources, while maintaining a global view of the domain and optimizing execution strategies
+based on real-time conditions.
+• The Data Plane defines standardized domain-specific data models for
+edge nodes, AI services, topologies, and task allocations, serving as the
+common language that binds the Control and Execution planes.
+• The Execution Plane continuously monitors the definitions provided
+by the Control Plane and enforces them on the physical infrastructure,
+managing the life cycle of deployed services to ensure the actual state
+converges with the desired state.
+4.2. Core components
+The architecture is realized through a set of collaborating components,
+each fulfilling a distinct role in the orchestration lifecycle.
+The Manager is the orchestration component that coordinates the execution of AI pipelines, maintaining the system’s structural aspects, including
+the association between data sources and processing tasks, the set of available processing nodes, and the definition of service topologies. As the entry
+point for expressing execution intent, it translates high-level specifications
+into plans for the underlying platform. By delegating placement decisions to
+the Allocator, the Manager focuses on coordination and enforcement.
+The Allocator determines how execution decisions are derived from current operating conditions. It consolidates the policies and algorithms used
+to select suitable nodes for each pipeline stage, taking into account hardware capabilities, resource availability, and performance indicators. The Allocator operates independently of deployment and execution mechanisms,
+10
+
+Figure 2: CRAWO architecture.
+
+ensuring that the logic governing allocation decisions is not entangled with
+infrastructure-level concerns. This separation allows allocation strategies to
+be adjusted or replaced as needed without affecting the orchestration process
+coordinated by the Manager.
+The Context component provides a real-time view of the execution environment by aggregating operational data and metrics on node availability
+and performance to inform allocation decisions. By limiting this component
+to reflecting runtime behavior rather than participating in decision-making,
+CRAWO establishes clear boundaries between state observation and orchestration logic.
+The Operator bridges high-level decisions made by the Control Plane and
+low-level execution on the infrastructure by translating abstract scheduling
+decisions into concrete resources. Following a reconciliation pattern, the Operator continuously monitors the desired state and enforces it by provisioning
+execution units, configuring environment variables, and establishing network
+services. It also closes the control loop by observing the lifecycle of running
+workloads and updating the status of allocation entities.
+4.3. Orchestration and interaction workflow
+The orchestration process is implemented through a synchronized interaction sequence among the control and execution components. This workflow
+11
+
+translates high-level user intents into hardware-aware execution units while
+maintaining continuous state reconciliation.
+Allocation decision flow. The workflow begins when a service request is
+submitted to the Manager. As illustrated in Figure 3, the Manager validates
+the topology and requirements before delegating the placement decision to
+the Allocator. The Allocator performs a hardware-aware selection by querying the Context component for real-time metrics and capabilities. Using a
+VIKOR-based multi-criteria strategy, it ranks candidate nodes and selects a
+compromise execution target. Finally, the Manager persists this intent as a
+TaskAllocation Custom Resource (CR) in the Kubernetes API.
+
+Figure 3: Sequence diagram illustrating the allocation decision flow, from user request to
+creating a TaskAllocation CR.
+
+Reconciliation and provisioning flow. Once the TaskAllocation CR
+is persisted, the Execution Plane takes control. As shown in Figure 4, the
+Operator detects the new resource via a watch mechanism and initiates the
+reconciliation loop. It provisions the necessary Kubernetes resources, including a ConfigMap for runtime parameters, a Deployment for the service container, and, optionally, a Service for network access. Crucially, the Operator
+injects a nodeSelector constraint to pin the workload to the node selected
+by the Allocator. Throughout the Pod lifecycle, the Operator continuously
+monitors the workload state and reflects it back into the TaskAllocation
+12
+
+status field.
+
+Figure 4: Sequence diagram illustrating the reconciliation flow, from TaskAllocation detection to status synchronization.
+
+Context awareness and resource monitoring. A continuous secondary workflow ensures the orchestration engine remains aware of cluster
+health and performance. The Context component periodically pulls metrics
+from Prometheus (e.g., CPU, RAM, and GPU utilization) and state information from the Kubernetes API. As shown in Figure 5, these metrics are processed and provided to the Allocator for calculating scores for future scheduling decisions, ensuring the system adapts to the dynamic conditions of the
+edge environment.
+4.4. Allocation decision model
+CRAWO introduces an explicit decision layer that assigns AI pipeline
+stages to heterogeneous edge processing nodes. This layer is conceptually
+separated from orchestration control and execution concerns, allowing placement decisions to be derived from runtime conditions without coupling them
+to deployment mechanisms. Within this model, the Allocator evaluates candidate nodes and selects an execution target for each pipeline stage based on
+a structured sequence.
+13
+
+Figure 5: Sequence diagram illustrating the context awareness flow, and how real-time
+metrics influence allocation logic.
+
+First, the Allocator identifies the set of processing nodes that satisfy basic
+feasibility constraints, such as architectural compatibility, reachability, and
+execution capacity. This filtering step ensures that only nodes capable of
+executing the service are considered. From this reduced candidate set, the
+Allocator builds a decision matrix using runtime information provided by the
+Context component.
+4.4.1. Decision criteria and selection strategy
+The decision criteria reflect both performance and resource-utilization
+aspects relevant to heterogeneous edge environments. In the current implementation, these criteria include:
+• Inference throughput (frames per second, FPS): it is prioritized as a
+benefit criterion to sustain real-time processing rates and avoid backlog.
+• Estimated processing latency: it is treated as a cost criterion to prevent
+violations of strict response-time constraints.
+• Node load: it is treated as a cost criterion to prevent resource saturation
+and ensure stability under multi-tenant conditions.
+Together, these indicators capture the inherent trade-off between maximizing performance and avoiding resource exhaustion. To rank candidate
+nodes according to these criteria, the reference implementation for CRAWO
+14
+
+uses the VIKOR method [10]. This MCDM technique identifies a compromise solution by simultaneously minimizing group utility loss and individual regret. Its compromise-ranking formulation enables balanced decisions
+without privileging any single performance dimension, making it more robust than common baselines. For instance, Random selection ignores node
+conditions and may overload constrained devices, Round Robin assumes homogeneous capabilities, and Least Loaded disregards differences in hardware
+acceleration. By jointly accounting for throughput, latency, and node load,
+the VIKOR method yields a more robust compromise solution under dynamic
+and heterogeneous edge conditions.
+The VIKOR-based allocation strategy evaluates each candidate node against
+the three runtime decision criteria that capture the fundamental trade-off between computational performance and resource saturation in heterogeneous
+edge environments. Within the VIKOR method, these criteria jointly contribute to the computation of a compromise ranking that balances overall
+utility and individual regret. Table 3 summarizes the adopted criteria, their
+optimization direction, and the relative weights used in the current implementation of the Allocator.
+Table 3: Decision criteria adopted by the Allocator in CRAWO.
+Criterion
+FPS
+Latency
+Load
+
+Type
+Benefit (max)
+Cost (min)
+Cost (min)
+
+Weight
+0.40
+0.35
+0.25
+
+Interpretation
+Inference throughput (processing performance)
+Estimated network delay to execute the stage
+Current node utilization level (congestion)
+
+4.4.2. Mathematical formulation
+The VIKOR method determines a compromise solution by evaluating the
+relative distance of each alternative from the ideal performance for each criterion. Initially, a decision matrix F = [fij ] is defined, where each candidate
+node i is evaluated against criterion j. For each criterion, the best value fj∗
+and the worst value fj− are identified. The limits are defined by Equation 1
+for benefit criteria (to be maximized) and follow Equation 2 for cost criteria
+(to be minimized).
+fj∗ = max fij ,
+
+fj− = min fij
+
+(1)
+
+fj∗ = min fij ,
+
+fj− = max fij
+
+(2)
+
+i
+
+i
+
+i
+
+i
+
+15
+
+Once the ideal points are established, the normalized distance dij of an
+alternative i under criterion j is computed. For benefit and cost criteria, these
+distances are defined as shown in Equation 3. These values are subsequently
+aggregated using predefined weights wj to derive the group utility Si and the
+maximum individual regret Ri , according to the formulations in Equation 4:
+fij − fj∗
+Cost: dij = −
+fj − fj∗
+
+fj∗ − fij
+Benefit: dij = ∗
+fj − fj−
+Si =
+
+n
+X
+
+wj dij ,
+
+(3)
+(4)
+
+Ri = max(wj dij )
+j
+
+j=1
+
+We defined the adopted weights empirically based on workload requirements observed during controlled experiments in the LPR use case. In the
+context of LPR, maximizing throughput (0.40) is prioritized to prevent frame
+dropping at the source, while latency (0.35) remains critical for timely police
+response, and node load (0.25) serves as a stabilizing penalty rather than a
+primary driver. The configuration prioritizes sustained inference throughput
+while maintaining latency constraints and preventing resource saturation.
+The weight distribution is not fixed by the architectural design and can be
+adjusted to accommodate different application domains or operational priorities without requiring modifications to the orchestration framework.
+The final selection is based on the compromise ranking index Qi , which
+balances the overall group utility and individual regret. Let S ∗ , S − , R∗ , and
+R− be the minimum and maximum values of Si and Ri , respectively, as
+shown in Equation 5. The index Qi is then formulated using a strategy weight
+v ∈ [0, 1] (Equation 6), where v = 0.5 is typically adopted to provide a neutral
+balance. In cases where the denominators (S − − S ∗ ) or (R− − R∗ ) are zero,
+the corresponding term is set to zero to prevent division-by-zero errors.
+S ∗ = min Si ,
+i
+
+S − = max Si ,
+i
+
+R∗ = min Ri ,
+i
+
+R− = max Ri
+i
+
+(5)
+
+Ri − R∗
+Si − S ∗
++
+(1
+−
+v)
+(6)
+S− − S∗
+R− − R∗
+Alternatives are evaluated based on their Qi values, and the node with the
+smallest Qi is selected as the compromise solution. Algorithm 1 details this
+Qi = v
+
+16
+
+mechanism encapsulated within the Allocator, thus preserving the policyagnostic nature of CRAWO. This separation enables the current VIKORbased strategy to be replaced by alternative heuristics or learning-based approaches without modifications to the orchestration control flow.
+Algorithm 1: VIKOR-based hardware-aware node selection
+Input: Candidate set N ̸= ∅
+Output: Selected node nbest
+1: m ← |N |
+// number of candidates
+2: k ← 3
+// criteria: FPS, latency, load
+3: Initialize matrix F [m][k]
+// Step 1: Construct decision matrix F
+4: for i = 1 to m do
+5:
+F [i, 1] ← FPS(ni )
+6:
+F [i, 2] ← Latency(ni )
+7:
+F [i, 3] ← Load(ni )
+8: end for
+// Step 2: Determine best and worst values f ∗ and f −
+9: for j = 1 to k do
+10:
+if criterion j is benefit then
+11:
+f ∗ [j] ← maxi F [i, j]
+12:
+f − [j] ← mini F [i, j]
+13:
+else
+14:
+f ∗ [j] ← mini F [i, j]
+15:
+f − [j] ← maxi F [i, j]
+16:
+end if
+17: end for
+// Step 3: Compute normalized distances d
+18: for i = 1 to m do
+19:
+for j = 1 to k do
+20:
+if f ∗ [j] = f − [j] then
+21:
+d[i, j] ← 0
+22:
+else if criterion j is benefit then
+f ∗ [j] − F [i, j]
+23:
+d[i, j] ← ∗
+f [j] − f − [j]
+24:
+else
+
+17
+
+25:
+
+d[i, j] ←
+
+F [i, j] − f ∗ [j]
+f − [j] − f ∗ [j]
+
+26:
+end if
+27:
+end for
+28: end for
+
+// Step 4: Compute Si and Ri
+29: W ← [0.40, 0.35, 0.25]
+30: for i = 1 to m do
+P
+31:
+S[i] ← j W [j] · d[i, j]
+32:
+R[i] ← maxj W [j] · d[i, j]
+33: end for
+
+// Step 5: Compute compromise index Qi
+34: S ∗ ← mini S[i]
+35: S − ← maxi S[i]
+36: R∗ ← mini R[i]
+37: R− ← maxi R[i]
+38: v ← 0.5
+39: for i = 1 to 
+m do
+
+∗
+
+ S[i] − S , S − ̸= S ∗
+40:
+termS ← S − − S ∗
+0,
+otherwise
+
+∗
+ R[i] − R , R− ̸= R∗
+41:
+termR ← R− − R∗
+0,
+otherwise
+42:
+Q[i] ← v · termS + (1 − v) · termR
+43: end for
+return nbest ← arg mini Q[i]
+
+The computational complexity of the VIKOR scoring procedure is O(mk)
+for computing the Si and Ri measures, where m is the number of candidate
+nodes and k is the number of criteria. The subsequent computation of the
+compromise index Qi and the selection of the minimum value require O(m)
+time, resulting in an overall linear complexity. In typical edge-cluster scenarios, where the number of candidate nodes per allocation decision is limited,
+this cost remains negligible.
+
+18
+
+5. CRAWO implementation
+We developed the reference implementation of the CRAWO platform as
+a distributed system following the microservices architecture pattern. To ensure portability and scalability across edge environments, the components are
+containerized and deployed on K3s, a lightweight Kubernetes distribution certified by the Cloud Native Computing Foundation (CNCF) and specifically
+designed for resource-constrained clusters. K3s preserves full compatibility
+with the Kubernetes API while reducing the system footprint by consolidating components and minimizing runtime dependencies, making it well-suited
+for edge deployments.
+5.1. Control Plane
+The Control Plane comprises three core microservices implemented in
+Java 17 using Spring Boot 3.0. This stack was selected for its mature ecosystem and strong type safety, which are essential for managing complex domain
+models in distributed systems.
+The Manager acts as the entry point and API Gateway. In the current
+implementation, it utilizes a PostgreSQL database to persist infrastructure
+descriptions and pipeline topologies. While the CRAWO architecture conceptually models all entities as native Kubernetes CRDs, a relational database is
+used to accelerate validation of management logic. The textitManager translates high-level user requests into strongly typed TaskAllocationCRs, serving as the primary interface between the Control Plane and the Execution
+Plane.
+The Allocator is logically decoupled from the management layer and encapsulates the framework’s core decision-making logic. It exposes a RESTful
+interface to process allocation requests using the VIKOR MCDM method.
+The decision process balances performance (throughput) against resource
+constraints (latency and node load). By relying on data from the Context
+component, the Allocator remains independent of direct interactions with
+the infrastructure.
+The Context component serves as the framework’s information repository.
+It aggregates static hardware descriptions, calibrated performance profiles,
+and real-time operational metrics (e.g., node availability and resource utilization). This component provides the situational awareness required for the
+Allocator to perform hardware-aware, adaptive scheduling.
+
+19
+
+5.2. Data Plane
+The Data Plane state is modeled using Kubernetes CRDs that extend the
+Kubernetes API to support CRAWO’s domain-specific requirements. These
+CRDs establish a formal contract for state synchronization between the Control Plane and the Execution Plane.
+The infrastructure and inputs are represented by the ProcessingNode
+and DataSource resources. ProcessingNode encapsulates the state of edge
+compute units (e.g., NVIDIA Jetson, Raspberry Pi), storing hardware capabilities (e.g., CPU, RAM, and GPU availability) and scheduling labels.
+DataSource models input streams, such as RTSP camera feeds, and encapsulates the connection URIs and authentication credentials required for data
+consumption.
+The software catalog is defined through ServiceDefinition and TopologyTemplate resources. The former defines individual pipeline components, specifying container images and environment variables, while the latter arranges
+these services into a directed acyclic graph to represent complex workflows.
+Finally, the TaskAllocation serves as the central artifact of the orchestration process. It binds a TopologyTemplate to a specific ProcessingNode
+and DataSource, thereby declaring the desired state of a running pipeline
+and triggering the reconciliation loop.
+5.3. Execution Plane
+The execution logic resides in the Operator, a custom Kubernetes controller developed in Go using the Kubebuilder framework.2 This choice leverages Go’s native efficiency and Kubebuilder’s code-generation capabilities for
+robust Kubernetes API interactions.
+The Operator employs a watch mechanism on TaskAllocation resources
+to trigger an idempotent reconciliation sequence. For each pipeline stage, the
+controller:
+1. Generates a ConfigMap containing runtime parameters
+2. Instantiates a Deployment using the specified container image.
+3. Injects a nodeSelector to pin the workload to the specific edge node
+selected by the Allocator
+4. Provisions a Service (ClusterIP, NodePort, or LoadBalancer) to ensure
+network accessibility
+2
+
+https://github.com/kubernetes-sigs/kubebuilder
+
+20
+
+The control loop is closed by continuously monitoring the created resources and reflecting their aggregated state (e.g., pending, running, or failed)
+back into the TaskAllocation status field, providing real-time feedback to
+the Control Plane.
+6. LPR use case using CRAWO
+This section demonstrates the practical application of the CRAWO framework by instantiating the vehicular surveillance use case introduced in Section 2. This LPR solution is being integrated into CAD-Patrol [14], a mobile
+system designed to optimize public safety incident response and enhance situational awareness for officers in the field. By leveraging 5G connectivity, edge
+computing, and AI, CAD-Patrol enables real-time analysis of video captured
+by smartphone-based cameras. Processing is performed directly on the vehicle’s onboard unit at the network edge, ensuring low latency and operational
+continuity even in environments with unstable backhaul.
+CAD-Patrol is developed using the SAALSA framework [12, 13], which
+provides the underlying intelligent video processing, and utilizes CRAWO
+as its primary orchestrator. Both solutions are part of the SPICI,3 an R&D
+project aimed at developing integrated public safety applications leveraging 5G networks. These applications have strict requirements for reliable
+communication, high availability, and low latency in information transfer.
+Consequently, they require a 5G network infrastructure that provides high
+capacity and communication speed, supporting a massive number of devices
+with minimal latency.
+To instantiate CRAWO, the LPR pipeline stages are modeled as a set of
+CRD manifests. Each resource addresses a specific orchestration concern:
+• ServiceDefinition: describes a containerized pipeline stage.
+• TopologyTemplate: encodes the processing directed acyclic graph and
+its hardware requirements.
+• ProcessingNode: registers the physical edge infrastructure.
+• DataSource: binds the video feed (e.g., RTSP) to the pipeline entry
+point.
+• TaskAllocation: records the placement decision produced by the Allocator.
+3
+
+https://smlab.imd.ufrn.br/spici/en
+
+21
+
+6.1. Pipeline definition and implementation
+The LPR pipeline is decomposed into four sequential stages, following a
+cascaded detection-recognition pattern: Vehicle Detection, Plate Detection,
+OCR Processing, and Notification (database verification). The first three
+stages require GPU acceleration for real-time inference, while the notification
+stage performs lightweight lookups that can be handled by any CPU-based
+node. Figure 6. shows the pipeline dataflow structure.
+
+Figure 6: Four-stage LPR pipeline
+
+The TopologyTemplate (see Listing 1) encodes these relationships. The
+hardwareConstraints block at each stage is the only placement directive required from the human operator. The Allocator uses these constraints, along
+with real-time node metrics, to determine optimal assignments, removing the
+need for manual node selection.
+Listing 1: TopologyTemplate for the LPR pipeline
+apiVersion: orchestration.saalsa.spici/v1
+kind: TopologyTemplate
+metadata:
+name: lpr-pipeline
+spec:
+description: "License Plate Recognition Pipeline"
+stages:
+- name: vehicle-detection
+serviceRef: vehicle-detector
+hardwareConstraints:
+gpu: true
+minMemoryMB: 2048
+- name: plate-detection
+serviceRef: plate-detector
+hardwareConstraints:
+gpu: true
+minMemoryMB: 1024
+
+22
+
+- name: ocr-processing
+serviceRef: plate-ocr
+hardwareConstraints:
+gpu: true
+minMemoryMB: 1024
+- name: notification
+serviceRef: notification-service
+hardwareConstraints:
+gpu: false
+minMemoryMB: 512
+
+The video source is declared as a separate DataSource resource (see Listing 2), which binds the RTSP stream from the on-board camera to the
+pipeline entry point. Decoupling the data source from the processing graph
+allows the same TopologyTemplate to be reused across different patrol vehicles without modifying the core pipeline definition.
+Listing 2: DataSource binding the patrol vehicle’s camera to the LPR pipeline
+apiVersion: orchestration.saalsa.spici/v1
+kind: DataSource
+metadata:
+name: camera-patrol-01
+spec:
+protocol: rtsp
+uri: "rtsp://192.168.1.10:554/stream"
+pipelineRef: lpr-pipeline
+entryStage: vehicle-detection
+
+Finally, the heterogeneous nodes aboard the vehicle are registered as
+ProcessingNoderesources (see Listing 3), providing the Allocator with a
+stable hardware profile (GPU availability, core count, memory) for constraint
+filtering and eliminating runtime capability queries during scheduling.
+Listing 3: ProcessingNode definitions for the vehicular cluster
+apiVersion: orchestration.saalsa.spici/v1
+kind: ProcessingNode
+metadata:
+name: patrol-01-rpi
+spec:
+hostname: "rpi-patrol-01"
+capabilities:
+cpu: "ARM Cortex-A72"
+cores: 4
+memoryMB: 4096
+
+23
+
+gpu: false
+labels:
+vehicle: "patrol-01"
+role: "acquisition"
+--apiVersion: orchestration.saalsa.spici/v1
+kind: ProcessingNode
+metadata:
+name: patrol-01-jetson
+spec:
+hostname: "jetson-patrol-01"
+capabilities:
+cpu: "ARM Cortex-A78AE"
+cores: 12
+memoryMB: 32768
+gpu: true
+gpuModel: "NVIDIA Ampere"
+cudaCores: 2048
+labels:
+vehicle: "patrol-01"
+role: "inference"
+
+6.2. Allocation decision and orchestration
+Upon receiving a deployment request, the Manager validates the TopologyTemplate against the available ProcessingNode pool and invokes the Allocator. For the three GPU-dependent stages, the hardware filter immediately
+identifies patrol-01-jetsonas the only viable candidate, so no multi-criteria
+ranking is required.
+For the Notification stage, both the NVIDIA Jetson and the Raspberry
+Pi devices (patrol-01-rpi) meet the basic CPU and memory constraints.
+In this case, the VIKOR-based mechanism constructs a decision matrix evaluating processing capacity (IPT, benefit weight 0.40), network Latency (cost
+weight 0.35), and current processor load (cost weight 0.25). If the NVIDIA
+Jetson is heavily committed to the preceding inference stages, its load score
+is penalized, allowing the lightly loaded Raspberry Pi to rank higher for this
+CPU-bound task. The resulting placement is persisted as a TaskAllocation
+resource (see Listing 4), serving as the execution contract between the Control Plane and the Execution Plane.
+Listing 4: TaskAllocation produced by the Allocator for the LPR pipeline
+apiVersion: orchestration.saalsa.spici/v1
+
+24
+
+kind: TaskAllocation
+metadata:
+name: lpr-pipeline-alloc-v1
+spec:
+pipelineRef: lpr-pipeline
+assignments:
+- stage: vehicle-detection
+nodeSelector:
+kubernetes.io/hostname: jetson-patrol-01
+- stage: plate-detection
+nodeSelector:
+kubernetes.io/hostname: jetson-patrol-01
+- stage: ocr-processing
+nodeSelector:
+kubernetes.io/hostname: jetson-patrol-01
+- stage: notification
+nodeSelector:
+kubernetes.io/hostname: rpi-patrol-01
+
+Upon persistence of the TaskAllocation, the Operator then initiates
+the reconciliation loop described in Section 5. For each stage, it provisions
+a ConfigMap for runtime parameters, a Deployment with the designated
+nodeSelector, and a Service for inter-stage communication. This translates
+the declarative allocation into a running inference pipeline with no further
+operator intervention.
+7. Evaluation
+This section presents a systematic evaluation of CRAWO through discreteevent simulation using YAFS (Yet Another Fog Simulator) [15], a Pythonbased framework for fog computing environments. To evaluate the performance and viability of the framework, we formulate three research questions
+that address the fundamental trade-offs in edge orchestration:
+RQ1 – Decision quality and efficacy: How does the VIKOR-based allocation
+strategy compare to traditional heuristics and the TOPSIS algorithm
+regarding end-to-end latency, load balancing, and resource utilization? Furthermore, how sensitive is this performance advantage to
+increases in workload intensity?
+RQ2 – Scalability and network sensitivity: To what extent does the framework maintain stable performance as the infrastructure scales, and
+25
+

@@ -1,0 +1,493 @@
+AI for Distributed Systems Design:
+Scalable Cloud Optimization Through Repeated LLMs Sampling And Simulators
+Jacopo Tagliabue
+
+arXiv:2510.18897v1 [cs.DC] 20 Oct 2025
+
+Bauplan Labs
+New York City, NY USA
+jacopo.tagliabue@bauplanlabs.com
+
+Abstract
+We explore AI-driven distributed-systems policy design by
+combining stochastic code generation from large language
+models (LLMs) with deterministic verification in a domainspecific simulator. Using a Function-as-a-Service runtime
+(Bauplan) and its open-source simulator (Eudoxia) as
+a case study, we frame scheduler design as an iterative
+generate–and–verify loop: an LLM proposes a Python policy,
+the simulator evaluates it on standardized traces, and structured feedback steers subsequent generations. This setup preserves interpretability while enabling targeted search over a
+large design space. We detail the system architecture and report preliminary results on throughput improvements across
+multiple models. Beyond early gains, we discuss the limits of
+the current setup and outline next steps; in particular, we conjecture that AI will be crucial for scaling this methodology by
+helping to bootstrap new simulators.
+
+Simulator — https://github.com/BauplanLabs/eudoxia
+Code — https://github.com/BauplanLabs/AI-forDistributed-System-Design
+
+1
+
+Introduction
+
+Distributed cloud systems have many degrees of freedom:
+what is the optimal configuration for a Kubernetes cluster?
+What is the best caching policy given the history of read access to a system? In the majority of cases, experts turn to
+manually crafted rules (Nguyen et al. 2020)—i.e., programs
+whose input is the system state at a given t (and possibly
+historical traces) and whose output is the recommended infrastructure change for t + 1.
+Rules-as-programs are interpretable and easy to run, but
+they are costly to scale, especially in business-to-business
+(B2B) settings. On the one hand, deep domain expertise is
+needed to craft sensible heuristics; on the other hand, even
+a “perfect program” crafted for customer k will not necessarily generalize to k + 1. While rules may have degrees of
+freedom themselves, even when heuristics or machine learning (Yu et al. 2021; Ling et al. 2024) are used to set parameters, we are still searching for the optimal settings for k + 1
+within the same space as k.
+Copyright © 2026, Association for the Advancement of Artificial
+Intelligence (www.aaai.org). All rights reserved.
+
+The rapidly improving coding capabilities of Large Language Models (LLMs) suggest a radically different approach: instead of manually crafting distributed-system policies, we could automatically generate and evolve them; as
+the cost of producing policies approaches zero, the search
+for optimal rules for customers k and k + 1 can now occur in different spaces altogether, as defined by semantically
+different programs.
+In this paper, we share preliminary results in applying
+LLMs to a concrete distributed-systems challenge. In particular, we summarize our contributions as follows:
+• We motivate our investigation with a real-world challenge, i.e., improving scheduling in a Function-as-aService (FaaS) runtime (Bauplan (Tagliabue, CarazaHarter, and Greco 2024)) through an existing opensource simulator (Eudoxia (Srivastava, Tagliabue, and
+Greco 2025)).
+• We pair a deterministic system simulator with the codegeneration and reasoning abilities of frontier AI models.
+While simulators have been historically designed for humans to experiment without the complexity of real-world
+deployments (Casanova, Legrand, and Quinson 2008),
+we repurpose them as verifiers for machine-generated
+ideas, a pattern that echoes recent successes in neurosymbolic theorem proving (Jiang et al. 2023).
+• We release open-source code with a minimal, easy-toextend reference implementation of the generate-andverify loop.1 Our prototype shows significant improvements in throughput over baseline policies across multiple frontier models.
+The paper is organized as follows: Section 2 gives a brief
+overview of the target system and the available simulator;
+we then describe the sampling loop in Section 3 and present
+our preliminary experiments in Section 4. We conclude by
+describing our roadmap and drawing general conclusions on
+the virtuous circle between code generation and simulations.
+While the present implementation is tied to a specific
+cloud environment, scheduling is a general challenge, and
+our neuro-symbolic methodology is arguably scalable across
+the system landscape. For these reasons, we believe our
+work to be interesting to a broad range of practitioners, as
+1
+
+Code will be made available with the camera-ready version.
+
+it sits at the intersection of reasoning-as-code in LLMs, testing in distributed systems, and practical industry challenges.
+Params
+
+2
+
+Industry Background
+
+To make the work self-contained, we provide a brief description of the salient design decisions behind the target
+FaaS runtime and a quick introduction to the FaaS simulator that will be used as the verifier in our experiments.
+We refer the interested reader to the relevant literature for a
+deeper understanding of both Bauplan (Tagliabue, Greco,
+and Bigon 2023; Curtin and Tagliabue 2025; Tagliabue and
+Greco 2024; Tagliabue, Curtin, and Greco 2024; Tagliabue
+and Greco 2025) and Eudoxia (Srivastava, Tagliabue, and
+Greco 2025).
+
+2.1
+
+A FaaS for Data: Bauplan Design
+
+Bauplan is a composable (Pedreira et al. 2023) data lakehouse (Zaharia et al. 2021), characterized by a unified execution model for synchronous and asynchronous data workloads. Departing from traditional architectures with heterogeneous abstractions, Bauplan adopts a pure FaaS model
+for all data operations (Tagliabue, Caraza-Harter, and Greco
+2024): both SQL queries and multi-language data pipelines
+are decomposed into directed acyclic graphs (DAGs) of
+functions.
+Bauplan’s cloud architecture follows the standard separation of one global control plane and per-customer data
+planes. The scheduler, sitting in the control plane, receives
+user requests through a public API; workers in a data plane
+are off-the-shelf VMs, providing stateless compute capacity to run the desired functions over data in object storage.
+While the FaaS execution model provides elegant abstractions for both end users and system developers alike, it also
+places extraordinary demands on the scheduler, which must
+efficiently pack functions onto available resources while respecting dependencies and latency requirements – e.g., an
+interactive query should preempt a long-running job as users
+expect interactivity from the former, but not the latter. The
+challenge is particularly complex in such a system due to the
+interplay of two dimensions of variation:
+
+Pools
+
+Initializer
+
+2.2
+
+A FaaS Simulator: Eudoxia Design
+
+Recognizing the challenge of iterating on distributed systems (Dao et al. 2009), Eudoxia was developed to enable
+
+Pipelines
+
+Scheduler
+
+Assignments
+
+Executor
+Stats
+
+Visualizer
+
+Figure 1: Simulator architecture. Users set parameters and
+pass them to the initializer, which starts a loop of three components—the Workload Generator, Scheduler, and Executor.
+Once that loop completes, visualizers or other downstream
+applications can access execution statistics.
+rapid prototyping and evaluation of scheduling policies before investing in real-world changes. The simulator provides
+a deterministic execution environment that models key aspects of FaaS scheduling: function arrival, resource allocation, execution-time modeling, and completion tracking.
+Figure 1 presents a high-level overview of the architecture,
+with the three main modules: Workload Generator, Scheduler, and Executor.
+For our purposes, we can consider the Generator and Executor as providing the black-box scaffolding needed to instantiate and evaluate any scheduling policy that gets registered in the Scheduler. As a stripped-down example2 , the
+following listing shows the required functions for a baseline
+FIFO policy:
+Listing 1: A FIFO baseline policy
+@register_scheduler_init(key=’naive’)
+def naive_pipeline_init(s):
+s.waiting_queue = []
+@register_scheduler(key=’naive’)
+def naive_pipeline(s, failures,
+pipelines):
+# populate the queue
+for p in pipelines:
+ops = [op for op in p.values]
+# queue logic here
+
+• Within-customer diversity: within a data plane, workloads vary widely in time—from sub-second interactive queries to multi-hour batch pipelines—and in
+scale—from dozens to hundreds of millions of rows.
+• Across-customer diversity: depending on their data estate and concurrency requirements, two customers may
+differ greatly with regard to available resources and the
+workloads they run.
+Bauplan is therefore an ideal testbed for exploring AIdriven optimizations—the B2B complexity justifies going
+beyond one-size-fits-all scheduling policies, but the problem
+is easy enough to state and constrained enough to permit
+meaningful evaluation.
+
+Workload
+Generation
+
+suspensions = []
+assignments = []
+for pool_id in range(s.executor.
+num_pools):
+# FIFO logic here
+return suspensions, assignments
+
+Users can implement new scheduling algorithms by
+matching the required type signature: the function accepts
+a set of pipelines from the Generator and returns a list of
+new allocations and preemptions to the Executor. At the end
+of a simulation, the system returns metrics of interest (e.g.,
+2
+
+Full code is available in the Eudoxia open-source repository.
+
+throughput, p99 latency, and the number of failed DAGs).
+Crucially, the simplicity of the interface makes it
+amenable to LLM generation, while at the same time the
+code-first approach and built-in APIs to simulate resource
+pools, priority queues, and hardware consumption make it
+possible to explore a potentially large and sophisticated design space.
+
+3
+
+AI-Driven Policy Discovery
+
+Frontier models’ ability to answer complex questions can be
+effectively augmented without access to their weights by repeated sampling at inference time (Brown et al. 2024). Our
+approach similarly treats code generation – i.e., a computational policy compliant with the Eudoxia interface and
+APIs – as a sampling process from a black-box model, with
+context modified between inferences. As such, the system
+operates as an iterative refinement loop, where each iteration generates a new policy, evaluates it, and incorporates
+the results to guide subsequent generation.
+
+3.1
+
+System Architecture
+
+Built on a black-box LLM (accessed via LiteLLM3 ), the system comprises three modules:
+1. the policy generator takes as input the current context
+and produces a new Python policy algorithm (via an
+LLM call, syntax checks, and string manipulation);
+2. the deterministic simulator takes as input a generated
+Python policy and runs it on standardized traces, producing key performance metrics (e.g., throughput, p99
+latency) and (optionally) verifying safety invariants via
+runtime monitors (e.g., no oversubscription, bounded
+waiting);
+3. the context manager takes as input the current context
+and the result of a simulation run, and produces an updated context (for the next iteration) that includes a summary of the results obtained by the run and the given policy—for example, early policies typically have an imprecise understanding of the semantics of Eudoxia APIs,
+so reporting precise failures back to the model helps it
+get unstuck.
+As the interfaces are well-defined, it is important to note
+that in our design all four components (the three modules
+and the LLM) can be changed and improved independently:
+not only can better LLMs be trivially tested with a simple
+configuration change, but the system will also immediately
+benefit from any independent improvement in the simulator
+software itself.
+
+3.2
+
+The Discovery Loop
+
+The pseudo-code in Algorithm 1 describes the essential
+steps in the sampling loop. Starting from a context built from
+a system prompt and a user prompt (see below), workload
+and simulation parameters define a standard, deterministic
+simulation environment in Eudoxia that persists for the entire experiment. The loop itself is straightforward: the policy
+3
+
+https://docs.litellm.ai/
+
+Algorithm 1: Sampling Loop for Policy Discovery
+Input: System prompt, user prompt
+Parameters: LLM model, target metric, workload parameters, number of iterations, simulation parameters (e.g., number of CPUs, number of pools)
+Output: Best policy with score (e.g., latency, throughput)
+1: Initialize context with system prompt and user prompt
+2: for iteration i in 1 to K do
+3:
+Request new policy from LLM given context
+4:
+Parse and validate generated Python code
+5:
+if code is valid then
+6:
+Run policy in simulator with test workload
+7:
+Collect performance metrics and trace data
+8:
+Synthesize structured feedback
+9:
+Append (policy, metrics, feedback) to context
+10:
+else
+11:
+Append (policy, error, suggestions) to context
+12:
+end if
+13:
+if context exceeds token limit then
+14:
+Compress context
+15:
+end if
+16: end for
+17: Return best policy with score
+
+generator takes the current context and produces a scheduling policy as Python code; if the code is correct, the simulator runs it against the environment and records the target
+metric over time; finally, the manager evaluates the results
+and updates the LLM context for the next iteration with a
+summary of what happened in the current turn.
+This iterative process allows the LLM to learn from both
+successes and failures. Syntax errors teach it about interface constraints, while performance feedback guides it toward more effective strategies. Crucially, because the generated policies are readable Python code, human operators can
+inspect, understand, and modify them—as part of the loop,
+all policies are logged as executable Python files for asynchronous debugging and human evaluation.
+
+3.3
+
+Context Management
+
+At the start of an experiment, the context comprises only
+the system and user prompts. The system prompt provides a
+high-level view of the FaaS system, the simulator, and key
+metrics. Then, in a few-shot fashion, existing policies are
+provided as examples, with an emphasis on respecting the
+interfaces. The user prompt asks the model to generate a new
+policy starting from the baseline policy. The prompt also explicitly states which metric to optimize.
+As the experiment progresses, the LLM builds a larger
+context containing previous policies and their results: rather
+than generating entirely new approaches each time, the context manager nudges the LLM to analyze previous attempts
+and propose targeted improvements.
+
+4
+
+Experiments
+
+We present preliminary results from running the discovery
+loop with frontier models to improve the throughput of the
+
+Table 1: Policy improvements across models (best in bold)
+Model
+Sonnet 4.5
+Opus 4.1
+GPT5
+GPT5-mini
+
+Improv.
+313.2%
+263.2%
+371.1%
+0%
+
+Cost (USD)
+4.587
+37.27
+9.92
+1.65
+
+Total time (s)
+2785
+2158
+8292
+7669
+
+FIFO policy that comes with Eudoxia. FIFO is a good
+choice for our present feasibility study because it is easy to
+inspect even for programmers not familiar with Bauplan
+architecture, but it is still a working policy that can be used
+as the starting point for code evolution.
+The setup is as follows. We first generate six realistic
+traces using Eudoxia’s built-in APIs: three sets of two
+traces each are generated by specifying different parameters for the random distribution, and then varying the seed
+to get two out of the same parameter set. For each LLM, we
+run the sampling procedure for 50 iterations and collect the
+best-performing policy by throughput (i.e., median throughput across traces). Finally, we report the improvement relative to the baseline, the total cost (as reported by LiteLLM),
+and the total time for the full loop.
+Table 1 summarizes the results of our experiments, comparing Sonnet (with temperature 0.7), Opus (with temperature 0.7), GPT5 and GPT5-mini (both with high reasoning
+effort).4 Interestingly enough, models vary wildly in their
+ability to provide good policies, with GPT5 providing the
+biggest improvement and taking the longest. The failure of
+GPT5-mini to produce any improvement at all over three
+trials shows that the baseline is indeed non-trivial even for
+capable models.
+Figure 2 provides a visual representation of how models
+compare along the price-performance dimensions. For the
+purpose of this preliminary investigation, we are concerned
+about the general feasibility of the proposed methodology
+and the questions raised for the future of co-designing distributed systems with AI. Nor the setup, nor the magnitude
+of the improvement over FIFO is intended to convey a judgment on model strength or generalizable improvement, but
+only to illustrate how even a single change in the loop may
+result in drastically different outcomes.
+
+5
+
+Conclusion and Future Work
+
+This work represents an early exploration into AI-driven
+systems optimization. While LLM inference is rapidly being commoditized, our project was enabled by an independently developed simulator for the target system. As we defer thorough investigation of this point to future work, we
+cannot help but wonder whether LLMs could help bootstrap
+the verifier itself, enabling this methodology to scale without
+relying solely on manually built simulators – for example, it
+has been conjectured that predicting system-level outcomes
+4
+
+We report the best policy results out of three independent runs
+for each model. All experiments were performed between October
+19–21, 2025.
+
+Figure 2: Price-performance landscape. X-axis: LLM performance as measured by improvement over the baseline for
+the best generated policy (omitting models with no improvements). Y-axis: cost in USD.
+from specifications could “open new avenues for creating
+universal simulators for complex systems.” (Akhauri et al.
+2025)
+We conclude by highlighting a few directions for future
+work, along the key dimensions of robustness (“how much
+can we trust the results?”), accuracy (“how do we get better policies?”) and extensibility (“how do we extend the
+methodology to a different system?”):
+• Robustness: sampled policies will match real-world outcomes only if the simulator is representative enough – a
+nontrivial amount of engineering and statistical inference
+is required to build more confidence in the verifier before
+scaling up costly experiments.
+• Accuracy: immediate prompt-related optimizations are
+prompt evolution (Agrawal et al. 2025) and better context management, e.g., Eudoxia produces fine-grained
+logs which arguably contain useful details. Furthermore,
+recent successes with evolutionary computation suggest
+a way to perform a structured exploration of the space
+(Nagda, Raghavan, and Thakurta 2025); finally, training
+smaller models with RL (DeepSeek-AI et al 2025) could
+yield policies that are both effective and efficient.
+• Extensibility: Bauplan is a good initial case study because it is complex enough to be interesting, but also
+simple enough that current LLMs can realistically make
+progress. Starting from our initial success with FaaS-fordata, we could try and adapt the simulator to model more
+general serverless systems, e.g., a multi-tenant, Lambdalike FaaS – it is an open question how far sampling can
+get us when modeling more complex and concurrent distributed systems.
+The convergence of AI and systems optimization represents a fundamental shift in how we approach complex engineering challenges. Rather than carefully crafting algorithms by hand, we can leverage AI to explore vast design
+spaces while maintaining human interpretability (Cheng
+et al. 2025). While our experiments represent only a first
+prototype, they offer a glimpse of a new dawn, through the
+practical lens of a real-world FaaS.
+
+6
+
+Acknowledgments
+
+The author wishes to thank Tapan Srivastava and Tyler
+Caraza-Harter for their work on Eudoxia, and the
+Bauplan team for the extraordinary work in building a
+FaaS runtime from scratch. Thanks to Ciro Greco and Federico Bianchi for helpful comments on a preliminary version
+of this draft.
+
+References
+Agrawal, L. A.; Tan, S.; Soylu, D.; Ziems, N.; Khare, R.;
+Opsahl-Ong, K.; Singhvi, A.; Shandilya, H.; Ryan, M. J.;
+Jiang, M.; Potts, C.; Sen, K.; Dimakis, A. G.; Stoica, I.;
+Klein, D.; Zaharia, M.; and Khattab, O. 2025. GEPA: Reflective Prompt Evolution Can Outperform Reinforcement
+Learning. arXiv:2507.19457.
+Akhauri, Y.; Lewandowski, B.; Lin, C.-H.; Reyes, A. N.;
+Forbes, G. C.; Wongpanich, A.; Yang, B.; Abdelfattah,
+M. S.; Perel, S.; and Song, X. 2025. Performance Prediction for Large Systems via Text-to-Text Regression.
+arXiv:2506.21718.
+Brown, B.; Juravsky, J.; Ehrlich, R.; Clark, R.; Le, Q. V.;
+R’e, C.; and Mirhoseini, A. 2024. Large Language Monkeys: Scaling Inference Compute with Repeated Sampling.
+ArXiv, abs/2407.21787.
+Casanova, H.; Legrand, A.; and Quinson, M. 2008. SimGrid: A Generic Framework for Large-Scale Distributed Experiments. In Tenth International Conference on Computer
+Modeling and Simulation (uksim 2008), 126–131.
+Cheng, A.; Liu, S.; Pan, M.; Li, Z.; Wang, B.; Krentsel, A.;
+Xia, T.; Cemri, M.; Park, J.; Yang, S.; Chen, J.; Agrawal,
+L.; Desai, A.; Xing, J.; Sen, K.; Zaharia, M.; and Stoica, I.
+2025. Barbarians at the Gate: How AI is Upending Systems
+Research. arXiv:2510.06189.
+Curtin, R.; and Tagliabue, J. 2025. The Deconstructed Warehouse: An Ephemeral Query Engine Design for Apache Iceberg. Proceedings of Workshops at the 51th International
+Conference on Very Large Data Bases.
+Dao, D.; Albrecht, J.; Killian, C.; and Vahdat, A. 2009. Live
+Debugging of Distributed Systems. In de Moor, O.; and
+Schwartzbach, M. I., eds., Compiler Construction, 94–108.
+Berlin, Heidelberg: Springer Berlin Heidelberg. ISBN 9783-642-00722-4.
+DeepSeek-AI et al. 2025. DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning.
+arXiv:2501.12948.
+Jiang, A. Q.; Welleck, S.; Zhou, J. P.; Li, W.; Liu, J.; Jamnik,
+M.; Lacroix, T.; Wu, Y.; and Lample, G. 2023. Draft, Sketch,
+and Prove: Guiding Formal Theorem Provers with Informal
+Proofs. arXiv:2210.12283.
+Ling, J.; Worah, P.; Wang, Y.; Kong, Y.; Wang, C.; Stein,
+C.; Gupta, D.; Behmer, J.; Bush, L. A.; Ramanan, P.; Kumar, R.; Chestna, T.; Liu, Y.; Liu, Y.; Zhao, Y.; McKinley,
+K. S.; Park, M.; and Maas, M. 2024. LAVA: Lifetime-Aware
+VM Allocation with Learned Distributions and Adaptation
+to Mispredictions. ArXiv, abs/2412.09840.
+
+Nagda, A.; Raghavan, P.; and Thakurta, A. 2025. Reinforced Generation of Combinatorial Structures: Applications to Complexity Theory. arXiv:2509.18057.
+Nguyen, T.-T.; Yeom, Y.-J.; Kim, T.; Park, D.-H.; and Kim,
+S. 2020. Horizontal Pod Autoscaling in Kubernetes for Elastic Container Orchestration. Sensors, 20(16).
+Pedreira, P.; Erling, O.; Karanasos, K.; Schneider, S.; McKinney, W.; Valluri, S. R.; Zait, M.; and Nadeau, J. 2023. The
+Composable Data Management System Manifesto. Proc.
+VLDB Endow., 16(10): 2679–2685.
+Srivastava, T.; Tagliabue, J.; and Greco, C. 2025. Eudoxia:
+a FaaS scheduling simulator for the composable lakehouse.
+arXiv:2505.13750.
+Tagliabue, J.; Caraza-Harter, T.; and Greco, C. 2024. Bauplan: Zero-copy, Scale-up FaaS for Data Pipelines. In Proceedings of the 10th International Workshop on Serverless
+Computing, WoSC10 ’24, 31–36. New York, NY, USA: Association for Computing Machinery. ISBN 9798400713361.
+Tagliabue, J.; Curtin, R.; and Greco, C. 2024. FaaS and Furious: abstractions and differential caching for efficient data
+pre-processing . In 2024 IEEE International Conference on
+Big Data (BigData), 3562–3567. Los Alamitos, CA, USA:
+IEEE Computer Society.
+Tagliabue, J.; and Greco, C. 2024. Reproducible data science over data lakes: replayable data pipelines with Bauplan and Nessie. In Proceedings of the Eighth Workshop
+on Data Management for End-to-End Machine Learning,
+DEEM ’24, 67–71. New York, NY, USA: Association for
+Computing Machinery. ISBN 9798400706110.
+Tagliabue, J.; and Greco, C. 2025.
+Safe, Untrusted,
+”Proof-Carrying” AI Agents: toward the agentic lakehouse.
+arXiv:2510.09567.
+Tagliabue, J.; Greco, C.; and Bigon, L. 2023. Building
+a Serverless Data Lakehouse from Spare Parts. ArXiv,
+abs/2308.05368.
+Yu, H.; Irissappane, A. A.; Wang, H.; and Lloyd, W. J. 2021.
+FaaSRank: Learning to Schedule Functions in Serverless
+Platforms. In 2021 IEEE International Conference on Autonomic Computing and Self-Organizing Systems (ACSOS),
+31–40.
+Zaharia, M. A.; Ghodsi, A.; Xin, R.; and Armbrust, M. 2021.
+Lakehouse: A New Generation of Open Platforms that Unify
+Data Warehousing and Advanced Analytics. In Conference
+on Innovative Data Systems Research.
+

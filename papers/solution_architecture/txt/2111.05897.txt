@@ -1,0 +1,3167 @@
+Persia: An Open, Hybrid System Scaling Deep Learning-based
+Recommenders up to 100 Trillion Parameters
+Xiangru Lian1 , Binhang Yuan3 , Xuefeng Zhu2 , Yulong Wang2 , Yongjun He3 , Honghuan Wu2 , Lei
+Sun2 , Haodong Lyu2 , Chengjun Liu2 , Xing Dong2 , Yiqiao Liao2 , Mingnan Luo2 , Congfei Zhang2 ,
+Jingru Xie2 , Haonan Li2 , Lei Chen2 , Renjie Huang2 , Jianying Lin2 , Chengchun Shu2 , Xuezhong
+Qiu2 , Zhishan Liu2 , Dongying Kong2 , Lei Yuan2 , Hai Yu2 , Sen Yang2 , Ce Zhang3 , Ji Liu1
+
+arXiv:2111.05897v3 [cs.LG] 23 Nov 2021
+
+1
+
+Kwai Inc., USA; 2 Kuaishou Technology, China; 3 ETH Zürich, Switzerland;
+{firstname.lastname}@{1.kwai.com;2.kuaishou.com;3.inf.ethz.ch}
+
+ABSTRACT
+Deep learning based models have dominated the current landscape
+of production recommender systems. Furthermore, recent years
+have witnessed an exponential growth of the model scale—from
+Google’s 2016 model with 1 billion parameters to the latest Facebook’s model with 12 trillion parameters. Significant quality boost
+has come with each jump of the model capacity, which makes
+us believe the era of 100 trillion parameters is around the corner.
+However, the training of such models is challenging even within
+industrial scale data centers. This difficulty is inherited from the
+staggering heterogeneity of the training computation—the model’s
+embedding layer could include more than 99.99% of the total model
+size, which is extremely memory-intensive; while the rest neural
+network is increasingly computation-intensive. To support the training of such huge models, an efficient distributed training system is
+in urgent need. In this paper, we resolve this challenge by careful
+co-design of both the optimization algorithm and the distributed
+system architecture. Specifically, in order to ensure both the training
+efficiency and the training accuracy, we design a novel hybrid training algorithm, where the embedding layer and the dense neural network are handled by different synchronization mechanisms; then
+we build a system called Persia (short for parallel recommendation
+training system with hybrid acceleration) to support this hybrid
+training algorithm. Both theoretical demonstrations and empirical
+studies up to 100 trillion parameters have been conducted to justified the system design and implementation of Persia. We make
+Persia publicly available (at https://github.com/PersiaML/Persia)
+so that anyone would be able to easily train a recommender model
+at the scale of 100 trillion parameters.
+
+1
+
+INTRODUCTION
+
+A recommender system is an important component of Internet
+services today. Tasks such as click-through rate (CTR) and buythrough rate (BTR) predictions are widely adopted in industrial
+applications, influencing the ad revenues at billions of dollar level
+for search engines such as Google, Bing and Baidu [78]. Moreover,
+80% of movies watched on Netflix [30] and 60% of videos clicked
+on YouTube [25] are driven by automatic recommendations; over
+40% of user engagement on Pinterest are powered by its Related
+Pins recommendation module [58]; over half of the Instagram community has visited recommendation based Instagram Explore to
+discover new content relevant to their interests [12]; up to 35% of
+Amazon’s revenue is driven by recommender systems [18, 104]. At
+
+# of Recommender Model Parameters (by Trillion)
+100
+
+Persia
+
+10
+
+FB-ZionEX (2022)
+
+1
+
+FB-ZionEX (2021)
+
+0.1
+0.01
+
+Baidu-AIBox (2018)
+
+FB-ZionEX (2020)
+Amazon-XMC (2021)
+
+Alibaba-XDL (2016)
+Youtube (2016)
+
+0.001
+2016
+
+2017
+
+2018
+
+2019
+
+2020
+
+2021
+
+2022
+
+Figure 1: Model sizes of different recommender systems,
+among which only XDL and AIBox (via PaddlePaddle) are
+open-source. Persia is an open-source training system for
+deep learning-based recommender systems, which scales up
+models to the scale of 100 trillion parameters.
+Kwai, we also observe that recommendation plays an important
+role for video sharing—more than 300 million of daily active users
+explore videos selected by recommender systems from billions of
+candidates.
+Racing towards 100 trillion parameters. The continuing advancement of modern recommender models is often driven by the ever
+increasing model sizes—from Google’s 2016 model with 1 billion
+parameters [24] to Facebook’s latest model (2022) with 12 trillion
+parameters [62] (See Figure 1). Every jump in the model capacity
+has been bringing in significantly improvement on quality, and the
+era of 100 trillion parameters is just around the corner.
+Interestingly, the increasing parameter comes mostly from the
+embedding layer which maps each entrance of an ID type feature
+(such as an user ID [50, 83] and a session ID [79, 85, 86]) into a
+fixed length low-dimensional embedding vector. Consider the billion scale of entrances for the ID type features in a production
+recommender system (e.g., [28, 89]) and the wide utilization of
+feature crosses [23], the embedding layer usually domains the parameter space, which makes this component extremely memoryintensive. On the other hand, these low-dimensional embedding
+vectors are concatenated with diversified Non-ID type features (e.g.,
+image [95, 98], audio [87, 96], video [20, 46], social network [27, 33],
+
+Lian et al.
+
+etc.) to feed a group of increasingly sophisticated neural networks
+(e.g., convolution, LSTM, multi-head attention) for prediction(s) [24,
+63, 107, 116, 121, 122]. Furthermore, in practice, multiple objectives
+can also be combined and optimized simultaneously for multiple
+tasks [48, 60, 93, 94, 118]. These mechanisms make the rest neural
+network increasingly computation-intensive.
+Challenges. This paper is motivated by the challenges that we
+were facing when applying existing systems, e.g., XDL from Alibaba [38] and PaddlePaddle from Baidu [9], to the training of
+models at the 100 trillion parameter scale. This is a challenging
+task—as illustrated in Figure 1, most open source systems were only
+designed for a scale that is at least one order of magnitude smaller;
+even the largest proprietary systems such as the one reported by
+Facebook [62] just two month ago (September 2021) are still 8.3×
+smaller. The goal of this paper is to enable, to our best knowledge, the
+first open source system that is able to scale in this regime.
+As 100 trillion parameters require at least 200TB to simply store
+the model (even in fp16), a distributed training system at this scale
+often consists of hundreds of machines. As so, the communication
+among workers is often a system bottleneck. While state-of-the-art
+systems [38, 45, 63, 66, 70, 100, 114, 115] often employ a carefully
+designed heterogeneous architecture (e.g., CPU/GPU, DRAM/SSD)
+to accommodate the heterogeneity in a recommender model (as
+illustrated in Figure 2), all of them are using a homogeneous training
+algorithm (either synchronous or asynchronous stochastic gradient
+based algorithms), for the model as a whole. At the scale of 100
+trillion parameters and hundreds of workers, this homogeneity in
+the training algorithm starts to become a significant problem:
+(1) Synchronous algorithms always use the up-to-date gradient
+to update the model to ensure the model accuracy. However, the
+overhead of communications for synchronous algorithms starts to
+become too expensive to scale out the training procedure, causing
+inefficiency in running time.
+(2) While asynchronous algorithm have better hardware efficiency, it
+often leads to a “significant” loss in model accuracy at this scale—for
+production recommender systems (e.g., Baidu’s search engine [114]).
+Recall that even 0.1% drop of accuracy would lead to a noticeable
+loss in revenue—this is also consistent with our observation at Kwai.
+Motivated by these challenges, we ask:
+Q1. Can we design an algorithm that can take benefits from both synchronous and asynchronous updates
+avoiding their disadvantages, to further scale up a recommender system with 100 trillion parameters?
+Q2. How can we design, optimize, and implement a
+system to efficiently support such an algorithm?
+Persia. In this paper, we describe Persia, an open source distributed training system developed at Kwai to support models at
+the scale of 100 trillion parameters. As we will show in Section 6,
+this is only possible given its significant speed-up over state-ofthe-art systems including both XDL and PaddlePaddle, achieved by
+the careful co-design of both the training algorithm and the training system. Open Source and Reproducibility: We also believe that
+the ability to train such a large model should be made easily and
+widely available to everyone instead of just being locked in the
+hands of a handful of largest companies. We make Persia open
+
+Task 1
+Prediction
+
+Task 2
+Prediction
+
+Task M
+Prediction
+
+…
+
+Loss Function
+
+Neural Network
+Parameter:
+50+ Million;
+Computation:
+100+ TFLOP.
+
+Dense Neural Network
+Feature Interaction (e.g., aggregate or concatenate)
+
+Embedding Layer
+Parameter:
+100+ Trillion;
+Computation:
+10+ MFLOP.
+
+Embedding
+Shard 1
+
+Embedding
+Shard 2
+
+…
+
+ID Type Features
+
+Embedding
+Shard N
+
+Non-ID Type Features
+
+Labels
+
+Figure 2: An example of a recommender models with 100+
+trillions of parameter in the embedding layer and 50+
+TFLOP computation in the neural network.
+
+source so that everyone who has access to cloud computing service,
+e.g., Google cloud platform (where we perform Persia’s capacity
+test) can easily setup a distributed training system to reproduce our
+100-trillion-parameter model test and to train their own models at
+this scale1 .
+Contributions. Persia is enabled by a set of technical contributions. The core technical hypothesis of Persia is that, by using a
+hybrid and heterogeneous training algorithm, together with a heterogeneous system architecture design, we can further improve the
+performance of training recommender systems over state-of-the-arts.
+Our first contribution is a natural, but novel hybrid training
+algorithm to tackle the embedding layer and dense neural network
+modules differently—the embedding layer is trained in an asynchronous fashion to improve the throughput of training samples,
+while the rest neural network is trained in a synchronous fashion
+to preserve the statistical efficiency. We also provide a rigorous theoretical analysis on its convergence behavior and further connect
+the characteristics of a recommender model to its convergence to
+justify its effectiveness.
+This hybrid algorithm requires us to revisit some decisions with
+respect to the system architecture and optimizations, to unleash
+its full potential. Our second contribution is on the system side.
+We design a distributed system to manage the hybrid computation resources (CPUs and GPUs) to optimize the co-existence of
+asynchronicity and synchronicity in the training algorithm. We further implement a wide range of system optimizations for memory
+management and communication optimization—such system optimizations are the key to fully unleash the potential of our hybrid
+training algorithm. We also develop a fault tolerance strategy to
+handle various potential failures during the training procedure.
+Last but not least, we evaluate Persia using both publicly available benchmark tasks and real-world tasks at Kwai. We show that
+Persia scales out effectively and leads to up to 7.12× speedup
+1 One can follow our detailed configuration of Persia over Google cloud platform at
+
+this link: https://github.com/PersiaML/tutorials/blob/main/src/kubernetes-integration/
+index.md).
+
+Persia: An Open, Hybrid System Scaling Deep Learning-based Recommenders up to 100 Trillion Parameters
+
+compared to alternative state-of-the-art approaches [9, 38]. We further conduct larger-scale scalability experiments up to 100 trillion
+parameters on public clouds to ensure public reproducibility.
+Overview. The rest of the paper is organized as follows. We first
+provide some preliminaries for deep learning recommender systems
+in Section 2. We introduce our hybrid training algorithm in Section
+3 and discuss Persia system design and implementation in Section 4.
+We show the theoretical analysis of the hybrid algorithm in Section
+5, present the experimental results in Section 6, summarize related
+work in Section 7, and conclude in Section 8.
+
+2
+
+PRELIMINARIES
+
+This section introduces the basic principle of a typical deep learning based recommendation system (e.g., DLRM [62]) illustrated in
+Figure 2. We first formalize the distributed recommender training
+problem; and then give an anatomy of the existing architectures.
+
+2.1
+
+It is worth mentioning that while the wnn involved computation
+can be 107 × more than the wemb involved computation, the size of
+wemb can be 107 × larger than that of wnn , especially when wemb
+contains many cross features. The imbalance between model scale
+and model computation intensity is one of the fundamental reasons
+why the recommender system needs an elaborate training system
+other than a general purpose deep learning system. Formally, the
+training system essentially solves the following optimization
+min
+w
+
+where 𝜉 denotes the index of the sample in the whole dataset. x𝜉ID :=
+{𝑥 1;𝜉 , 𝑥 2;𝜉 , . . .} is the collection of ID type features in the sample,
+x𝜉ID denotes the number of IDs, x𝜉NID denotes the Non-ID type
+features, and y𝜉 denotes the label. The ID type feature is the sparse
+encoding of large-scale categorical information. For example, one
+may use a group of unique integers to record the microvideos (e.g.,
+noted as ⟨VideoIDs⟩) that have been viewed by a user; similar
+ID type features may include location (⟨LocIDs⟩), relevant topics
+(⟨TopicIDs⟩), followed video bloggers (⟨BloggerIDs⟩), etc. In our
+formalization, xID is the collection of all ID type features—for the
+above example, it can be considered as:
+xID := [⟨VideoIDs⟩, ⟨LocIDs⟩, ⟨TopicIDs⟩, ⟨BloggerIDs⟩, ...]
+The Non-ID type feature xNID can include various visual or audio
+features. And the label y may include one or multiple value(s)
+corresponding to one or multiple recommendation task(s).
+The parameter w of the recommender system usually has two
+components:
+h
+i
+emb
++𝑁 nn
+w := wemb, wnn ∈ R𝑁
+emb
+
+where wemb ∈ R𝑁
+is the parameter of the embedding layer and
+nn
+wnn ∈ R𝑁 is the parameter
+of the rest dense neural network. We
+
+
+use: lookupwemb xID to denote the concatenation of all embedding vectors that has correspondence in xID ; NNwnn (·) to denote
+a function parameterized by wnn implemented by a deep neural
+network that takes the looked up embeddings and Non-ID features
+as input and generates the prediction. In the remaining part of
+this paper, “NN” is short for “neural network”. The recommender
+system predicts one or multiple values y
+^ by:
+
+
+
+
+y
+^𝜉 = NNwnn lookupwemb x𝜉ID , x𝜉NID
+
+(1)
+
+if we use L to denote some loss function over the prediction and
+the true label(s) y, 𝐹 can be materialized as:
+
+
+
+
+
+
+𝐹 (w; 𝜉) := L NNwnn lookupwemb x𝜉ID , x𝜉NID , y𝜉 .
+Lastly, we use
+
+
+′
+𝐹𝜉emb := ∇wemb 𝐹 wemb, wnn ; 𝜉
+
+
+𝐹𝜉nn ′ := ∇wnn 𝐹 wemb, wnn ; 𝜉
+
+Problem Formalization
+
+A typical recommender system takes the training sample in the
+form:
+h
+i
+x𝜉ID, x𝜉NID, y𝜉
+
+𝑓 (w) :=E𝜉 [𝐹 (w; 𝜉)] .
+
+to denote the gradients of wemb and wnn respectively.
+
+2.2
+
+Anatomy of Existing Architectures
+
+Existing distributed systems for deep learning based recommender
+models are usually built on top of the parameter server (PS) framework [47], where one can add elastic distributed storage to hold the
+increasingly large amount of parameters of the embedding layer. On
+the other hand, the computation workload does not scale linearly
+with the increasing parameter scale of the embedding layer—in fact,
+with an efficient implementation, a lookup operation over a larger
+embedding table would introduce almost no additional computations. Thus, a fundamental goal of these systems is to resolve the
+inconsistency between the computation-intensive neural network
+and the memory-intensive embedding layer.
+One natural solution is to deploy the training task over a hybrid infrastructure as an extension of the original PS framework:
+the large number of embedding parameters can be sharded across
+multiple CPU PS nodes for storage and update, whilst the intensive FLOP computation can be assigned to GPU nodes. Thus, the
+optimization in these systems focuses on avoiding frequent communications of the memory-intensive embedding layer. Towards this
+end, different designs have been proposed. For example, Alibaba
+proposes XDL [38] that moves the computation of the embedding
+layer from the GPU worker to the CPU PS node so that only the
+embedding outputs (instead of all parameters) are transformed
+to the GPU workers along with the neural network parameters;
+Baidu designs a hierarchical PS framework [59] using a hierarchical
+storage to cache the frequently used parameter close to the GPU
+workers—only the infrequently used parameters would trigger the
+slow communication from SSD to GPU.
+Our Motivation. Existing systems such as XDL and PaddlePaddle update the model in either the pure synchronous fashion or
+the pure asynchronous fashion. Both generally perform well on
+training small models. However, when training a large-scale model,
+the synchronous updating suffers from low hardware efficiency
+while the asynchronous updating usually incurs low accuracy (recall that a tiny loss in accuracy often means a huge loss in revenue
+
+Lian et al.
+
+in the recommender system). Therefore, it motivates us to design a
+(sync-async) hybrid algorithm and an efficient system that is able
+to take benefits from both synchronous and asynchronous updates
+but avoid their disadvantages.
+
+3
+
+HYBRID TRAINING ALGORITHM
+
+This section starts with explaining the intuition of the proposed
+hybrid algorithm, followed by the detailed algorithm description.
+
+3.1
+
+Why Hybrid Algorithm?
+
+Training a recommendation mode requires the following essential
+steps in each iteration as shown in Figure 3-left:
+• Preparation of embedding for the training sample(s);
+• Forward propagation of the neural network;
+• Backward propagation of the neural network;
+• Synchronization of the parameters of the neural network;
+• Update of embedding based on the corresponding gradients.
+One illustration of the training workflow is shown on in Figure 3left. Note that a homogeneous view of the embedding layer and NN
+would set obstacles for either hardware or statistical efficiency. For
+example, consider the fully synchronous mode that we illustrate in
+Figure 3-right, the above five steps have to happen sequentially—it
+would be hard to speed up the training procedure based on this
+mechanism with low hardware efficiency.
+Asynchronous distributed training. It is important to consider appropriate system relaxations for stochastic gradient-based optimizations2 deployed in a hybrid distributed runtime. There are two
+key observations from the ML community about asynchronous
+distributed training of neural networks:
+• Asynchronous updating is efficient with sparse access. When individual updating (e.g., SGD iteration) only modifies a small portion of the model’s parameters, overwrites are rare and introduce
+barely no bias into the computation when they do occur [55, 65].
+• Staleness limits the scalability and convergence of asynchronous
+SGD. On the other hand, when the updates are heavily overlapped
+(e.g, dense neural networks), the bias introduced by the discrepancy would limit SGD’s scalability and convergence [19, 52].
+Without considering the statistical efficiency, the fully asynchronous mode (second row in Figure 3-right) would provide the optimal
+hardware efficiency for distributed recommender model training,
+where the time of preparing embeddings, synchronizing dense parameters, and updating embedding parameters can be hidden within
+the computation time for forward and backward propagations of
+the dense neural network. Unfortunately, as we will illustrate in Section 6.2, the asynchronicity would hurt the statistical efficiency and
+diminish the generalization performance, which is not acceptable
+for production recommender models [114].
+Hybrid training algorithm. Based on these observations, one
+may consider to design different mechanisms for the embedding
+and dense neural network separately to optimize the training efficiency. For this purpose, we introduce a natural, but novel syncasync hybrid algorithm, where the embedding module trains in
+2 This category of optimization includes SGD, Adam[43], etc. We slightly abuse the
+
+term “SGD” to generally refer such optimizations for the rest of the paper.
+
+Algorithm 1 Asynchronous updating algorithm for wemb .
+Context: Forward task for embedding layer.
+Input: Embedding layer 𝑙𝑜𝑜𝑘𝑢𝑝 ( ·), training data D.
+while Not converge do
+/* Without any lock: */
+Select a sample from the training set: x𝜉ID ∼ D;
+
+
+Get embedding vector(s) w.r.t the sample: w𝜉emb ← get x𝜉ID ;
+Send the embedding vector(s) to proceeding units: w𝜉emb ↓.
+end while
+Context: Backward task for embedding layer.
+Input: Embedding layer 𝑙𝑜𝑜𝑘𝑢𝑝 ( ·), optimizer Ω emb .
+while Activation’s gradients keeps arriving do
+/* Without any lock: */
+′
+Receive gradient of embedding: 𝐹𝜉emb ;
+
+
+′
+Send gradients to parameter storage: put x𝜉ID , 𝐹𝜉emb ;
+
+
+emb − Ω emb 𝐹 emb ′ {𝜉 } .
+Update embedding parameter: wtemb
++1 ← wt
+𝜉
+end while
+
+an asynchronous fashion while the dense neural network is updated synchronously. Considering the inherited heterogeneity of
+deep learning based recommender systems, this design would exploit the strength whilst avoid the weaknesses of asynchronous
+SGD from the algorithmic perspective. Briefly, as we illustrate in
+the third and forth rows in Figure 3-right, a naive hybrid mode is
+able to hide the steps of preparing embeddings, and updating embedding parameters within the synchronous training of the dense
+neural network; further, with some advanced system optimizations
+(e.g., overlapping computation and communication listed in Section 4.2.3), the synchronization of the dense parameters would also
+be able to mostly hidden within the backward propagation of the
+dense neural network. Thus, the hybrid algorithm would achieve
+almost similar hardware efficiency as the fully asynchronous mode
+without sacrificing the statistical efficiency.
+
+3.2
+
+Asynchronous updating for wemb
+
+To discuss the asynchronous algorithm to update embedding parameter wemb , given training sample indexed by 𝜉, we introduce
+the following operations:
+
+
+• get x𝜉ID : fetch the subset of parameters to generate the embedding of the ID type feature x𝜉ID —we use the notation w𝜉emb to
+represent
+this subset
+of parameters activated by the sample.
+
+
+′
+
+′
+
+• put x𝜉ID, 𝐹𝜉emb : communicate the gradient 𝐹𝜉emb w.r.t x𝜉ID to
+the storage of parameter wemb .
+Algorithm 1 shows the asynchronous updating algorithm for
+the embedding layer wemb . Both forward computation task and
+backward computation task will be executed without any lock for
+synchronization: the forward computation task takes training samples, retrieves the embedding vectors, and sends the corresponding
+embedding vectors to the proceeding compute units (which handle
+the NN SGD computation); the backward computation task will
+receive the gradients of the embedding vectors, and sends it to the
+parameter storage for parameter updates.
+
+Persia: An Open, Hybrid System Scaling Deep Learning-based Recommenders up to 100 Trillion Parameters
+
+Parameter Server
+
+Worker
+
+(CPU nodes)
+
+(GPU nodes)
+
+…
+
+Fully Sync
+(Ideal Statistical Efficiency)
+
+GE
+FC
+
+FC
+
+GE
+
+Fully Async
+
+PEG
+
+GE
+
+FC
+
+BC
+
+BC
+
+(Ideal Hardware Efficiency)
+BC
+
+Dsync
+
+Dsync PEG GE
+
+GE
+FC
+Dsync
+PEG
+
+FC
+
+BC
+
+Dsync PEG
+
+BC
+Dsync
+PEG
+
+…
+FC
+GE
+
+…
+
+Naive Hybrid
+
+GE
+FC
+
+Persia
+
+GE
+FC
+
+BC
+
+Dsync
+PEG
+
+GE
+FC
+
+BC
+
+Dsync
+PEG
+
+BC
+
+PEG
+
+Dsync
+
+……
+……
+
+(Optimized Hybrid)
+FC
+
+BC
+Dsync
+
+GE
+FC
+PEG
+
+BC
+Dsync
+PEG
+
+GE
+
+…
+PEG
+
+BC
+
+GE Get embedding PEG Put embedding gradient
+FC Forward computation BC Backward computation Dsync Synchronize dense NN
+
+Figure 3: Left: deep learning based recommender model training workflow over a heterogeneous cluster. Right: Gantt charts to
+compare fully synchronous, fully asynchronous, raw hybrid and optimized hybrid modes of distributed training of the deep
+learning recommender model.
+Algorithm 2 Synchronous updating algorithm for wnn .
+Context: A task for dense module (indexed by 𝑘, 𝑘 = 1, 2, ..., 𝐾).
+Input: Neural network NNwnn ( ·), embeddings wemb
+, optimizer Ωnn .
+(·)
+while Not converge do
+Randomly select 𝑏 buffered embeddings: w𝜉emb , ..., w𝜉emb ∼ wemb
+;
+(·)
+1
+b
+𝑏
+
+
+
+
+∑︁
+Forward of batch B: 𝐹𝐵 =
+L NNwnn w𝜉emb
+, x𝜉NID
+, y𝜉𝑖 ;
+𝑖
+i
+𝑖=1
+
+/* With locks as synchronization barrier: */
+′
+Backward of batch B: compute gradient 𝐹𝐵nn ′ , and 𝐹𝜉emb ;
+𝑖
+𝐾
+∑︁
+ nn ′ 
+𝐹𝐵 𝑘
+Sync gradients with optimization: 𝐹𝐵nn ′ ← 𝐾1
+𝑘=
+1
+
+nn
+nn 𝐹 nn ′ .
+Update dense parameter: wtnn
++1 ← wt − Ω
+𝐵
+h
+i
+′
+′
+′
+Send back activation’s gradients: 𝐹𝜉emb , 𝐹𝜉emb ...𝐹𝜉emb ↑
+1
+2
+𝑏
+end while
+
+3.3
+
+Synchronous updating for wnn
+
+Our training algorithm for the rest neural network looks similar to
+the standard distributed training of deep neural networks—the key
+difference is that our algorithm concatenates the embedding activations as part of input. The algorithm is illustrated in Algorithm 2.
+Notice that we adopt a mini-batch based SGD algorithm in contrast
+to the sample-based SGD in the asynchronous counterpart.
+Since the hybrid algorithm is quite different from what has been
+assumed by existing systems [9, 38, 47, 59, 73]. To fully unleash its
+potential, we have to carefully design the system and optimize its
+performance—we introduce the system design and implementation
+of Persia in Section 4. On the other hand, it is also important to
+understand the statistical efficiency of the proposed hybrid training algorithm, thus we provide a theoretical analysis about the
+convergence guarantee of the hybrid algorithm in Section 5.
+
+4
+
+SYSTEM DESIGN AND IMPLEMENTATION
+
+In this section, we first introduce the design of Persia to support the
+hybrid algorithm; then we discuss a wide range of implementations
+to optimize the computation and communication utilization.
+
+4.1
+
+System Design
+
+The system design includes two main fundamental aspects: i) the
+placement of the training workflow over a heterogeneous cluster,
+and ii) the corresponding training procedure over the hybrid infrastructure. To enlighten the system implementation, we also list the
+implementation goals of the Persia system here.
+Workflow placement over heterogeneous cluster. To support the distributed training of deep learning based recommender
+model, a straightforward utilization of the PS paradigm (provided
+by general purpose deep learning frameworks, e.g., TensorFlow
+[11]) would place the storage and update of both embedding and
+NN parameters in a group of PS nodes (i.e., CPU machines) and
+the computation of forward and backward propagations in a group
+of worker nodes (i.e., GPU machines). However, this would be far
+from efficient and even impossible for deployment. For example,
+such recommender model would easily exceed the GPU RAM; and
+the uniform view of embedding and NN modules would introduce
+a large amount of unnecessary network traffic.
+Some optimized PS architectures are proposed to optimize the
+training of deep learning recommender models by rearrange the
+functionalities in the PS paradigm. For example, XDL [38] designs
+the advanced model server to extend the original functionality of
+PS node to manage the learning (forward and backward propagations) of the embedding module. The hierarchical PS architecture
+proposed by Baidu [114] adopts a colocated PS framework with a
+sophisticated caching schema to reduce the communication overhead.
+New challenges for the layout of 100-trillion-parameter models.
+In order to support the recommender models with one or two magnitude larger models, Persia should provide efficient autoscaling.
+Thus, we introduce the following modules, where each module
+
+Lian et al.
+Embedding Worker
+
+Embedding PS
+
+(3) Once a NN worker receives this incomplete training sample,
+it will issue a request to pull the ID type features’ (x𝜉ID ) em-
+
+(CPU nodes)
+
+(CPU nodes)
+
+…
+
+Raw 𝐅𝛏𝐞𝐦𝐛 ′
+
+Aggregated
+𝐅𝛏𝐞𝐦𝐛 ′
+
+NN Worker
+(GPU nodes)
+
+…
+
+FC
+
+BC
+
+…
+……
+……
+
+Raw 𝒘𝒆𝒎𝒃
+𝝃
+
+FC
+
+Aggregated
+𝒘𝝃𝒆𝒎𝒃
+
+BC
+
+……
+…
+
+FC
+
+𝒙𝑰𝑫
+𝝃
+
+Data Loader
+(HDFS/Kalfa)
+
+BC
+
+(𝐱 𝛏𝐍𝐈𝐃, 𝐲)
+
+Run Algorithm 2
+
+……
+
+Figure 4: The architecture of Persia. Persia includes a data
+loader module, an embedding PS module, a group of embedding workers over CPU nodes, and a group of NN workers
+over GPU instances.
+can be dynamically scaled for different model scales and desired
+training throughput:
+• A data loader that fetches training data from distributed storages such as Hadoop, Kafka, etc;
+• An embedding parameter server (embedding PS for short) that
+manages the storage and update of the parameters in the embedding layer wemb ;
+• A group of embedding workers that runs Algorithm 1 for getting the embedding parameters from the embedding PS; aggregating embedding vectors (potentially) and putting embedding
+gradients back to embedding PS;
+• A group of NN workers that runs the forward-/backward- propagation of the neural network NNwnn (·).
+Considering the heterogeneity between the embedding and NN
+modules, Persia adopts different communication paradigms for
+training process: i) the PS paradigm between embedding PS and
+embedding workers (running on CPU nodes) to manage the training
+of the embedding layer, while ii) the AllReduce paradigm among
+NN workers (running on GPU nodes) for the NN.
+Distributed training procedure. Logically, the training procedure is conducted by Persia in a data dispatching based paradigm
+as below (see Figure 4):
+(1) The data loader will dispatch the ID type feature xID
+to an em( ·)
+bedding worker—the embedding worker will generate a unique
+sample ID3 𝜉 for this sample, buffer this sample ID with the
+ID type feature x𝜉ID locally, and return this ID 𝜉 back the data
+loader; the data loader will associate this sample’s Non-ID type
+features and labels with this unique ID.
+(2) Next, the data loader
+ will dispatch the Non-ID type feature and
+label(s) x𝜉NID, y𝜉 to a NN worker.
+
+3 Note that the unique ID 𝜉 will be used to locate the embedding worker that generates
+
+this ID—this could simply be implemented by using the first byte to encode the rank
+of this embedding worker.
+
+bedding w𝜉emb from some embedding worker according to the
+sample ID 𝜉—this would trigger the forward propagation in
+Algorithm 1, where the embedding worker will use the buffered
+ID type feature x𝜉ID to get the corresponding w𝜉emb from the
+embedding PS.
+(4) Then the embedding worker performs some potential aggregation of original embedding vectors. When this computation
+finishes, the aggregated embedding vector w𝜉emb will be transmitted to the NN worker that issues the pull request.
+(5) Once the NN worker gets a group of complete inputs for the
+dense module, it will create a mini-batch and conduct the training computation of the NN according to Algorithm 2. Note that
+the parameter of the NN always locates in the device RAM of the
+NN worker, where the NN workers synchronize the gradients
+by the AllReduce Paradigm.
+(6) When the iteration of Algorithm 2 is finished, the NN worker
+′
+will send the gradients of the embedding (𝐹𝜉emb ) back to the
+embedding worker (also along with the sample ID 𝜉).
+(7) The embedding worker will query the buffered ID type feature
+′
+x𝜉ID according to the sample ID 𝜉; compute gradients 𝐹𝜉emb
+of the embedding parameters and send the gradients to the
+embedding PS, so that the embedding PS can finally compute
+the updates according the embedding parameter’s gradients by
+its SGD optimizer and update the embedding parameters.
+System implementation goals. To efficiently support the hybrid training algorithm, we listed the following system design goals
+for Persia:
+Fill the asynchronicity and synchronicity gap. One central functionality of Persia system is to handle the heterogeneity inherited
+from the hybrid training algorithm. This would request Persia to
+seamlessly connect the forward- and backward- propagation during
+the training phase—the coordination of embeddings and gradients
+transmitted in a large-scale cluster is a unique challenge for Persia.
+Utilize the heterogeneous clusters efficiently. To achieve the actual
+performance gain, Persia needs to include different mechanisms
+to fully utilize the computation resources (e.g., CPUs, GPUs) given
+diversified link connections. This demands an efficient memory
+management and a group of optimized communication mechanisms.
+Provide effective fault tolerance. With the large number of machines
+that training requires, effective fault tolerance is necessary. Furthermore, the hybrid algorithm would request more complex mechanisms to manage the heterogeneous computation and communication, which poses additional challenges for fault tolerance.
+
+4.2
+
+System Optimizations and Design Decisions
+
+We enumerate the implementation details to fulfill the design goals.
+4.2.1 Fill the Async/Sync Gap. To fill the gap between synchronous and asynchronous updates, both embedding and NN workers
+implement some buffering mechanisms.
+NN worker buffer mechanism. Since we adopt a GPU-pull
+based schema for the hybrid training procedure between the NN
+
+Persia: An Open, Hybrid System Scaling Deep Learning-based Recommenders up to 100 Trillion Parameters
+
+worker and the embedding worker, each NN worker will locally
+maintain an input sample hash-map keyed on the sample ID 𝜉
+and valued on tuples of Non-ID type feature x𝜉NID and label y𝜉 .
+In the forward propagation, once a NN worker receives the NonID
+it will first insert the key-value pair
+ type feature and
+ label, 
+key : 𝜉, value : x𝜉NID, y𝜉 to the input sample hash-map; and
+then send the request of the embedding vector to the embedding
+worker. Later, when the embedding vector w𝜉emb arrives in the NN
+worker from an
+the NN
+ embedding worker,
+
+ worker will pop the
+key-value pair key : 𝜉, value : x𝜉NID, y𝜉
+
+from the input sample
+
+hash-map, consume w𝜉emb , x𝜉NID , y𝜉 in the mini-batch for the SGD
+computation within the GPU. In the backward propagation, once
+the computation is done, the NN worker will use the sample ID 𝜉
+to locate the embedding worker, and then send the gradient of the
+′
+embedding 𝐹𝜉emb to this embedding worker.
+Embedding worker buffering mechanism. To support the
+pull request from NN worker, an embedding worker also needs
+to locally maintain a ID type feature hash-map that is keyed on
+sample ID 𝜉 and valued on ID type feature x𝜉ID . In the forward
+propagation, when the embedding worker receives a new ID type
+feature, it will
+ generate a unique ID for this sample, store the key-
+
+value pair key : 𝜉, value : x𝜉ID in the ID type feature hash-map.
+Then the embedding worker will get the corresponding embedding
+parameter w𝜉emb from embedding PS and return it to the NN worker.
+In the backward propagation, once the embedding worker receives
+′
+the gradient of the embedding vector 𝐹𝜉emb from a NN worker,
+the embedding worker will find the corresponding ID type feature
+x𝜉ID . Note that this is implemented as a local search in the ID type
+
+feature hash-map—the sample ID 𝜉 serves as the key to retrieve x𝜉ID .
+Later, the embedding worker can put the gradient of the embedding
+parameters back to the embedding PS.
+4.2.2 Persia Memory Management. Memory management is an
+important component for Persia to efficiently utilize the hybrid infrastructure, especially for the embedding PS which is responsible
+for maintaining trillions of embedding parameters. Comprehensively, the embedding PS works like a standard PS, which is not
+significantly different from a distributed key-value store. As we
+illustrated in Figure 5, when retrieving the embedding parameters,
+an embedding worker first runs an identical global hashing function
+to locate the embedding PS node that stores the parameters; once
+the request arrives in the PS node, the parameter can be acquired
+in an LRU cache as we explain below.
+LRU cache implementation. Persia leverages LRU cache4 to
+maintain the embedding parameters in RAM. We use array-list and
+hash-map to implement the LRU. Instead of a doubly linked list
+where the pointer stores a memory address, we adopt an arraylist design where the pointer stores the index of the pre- or postentrance in the array; similarly, the hash-map’s value also stores the
+corresponding embedding parameter’s index in the array instead
+of the memory address. Besides the pre- and post- indices, each
+item in the array also includes two fields: the embedding vector
+4 Standard LRU implementation is based on hash-map and doubly linked list, e.g., [5].
+
+Global Hash Function
+
+Global Hash Function
+
+Global Hash Function
+
+Global Hash Function
+
+Key: embedding hash
+
+Key: embedding hash
+
+Key: embedding hash
+
+Key: embedding hash
+
+Value: sparse PS rank
+
+Value: sparse PS rank
+
+Value: sparse PS rank
+
+Value: sparse PS rank
+
+Local Hashmap
+Key: embedding hash
+
+Head:0
+
+Value: arrayList index
+
+post-index: 1
+embedding
+entrance
+
+optimizer
+state
+
+pre-index: -1
+
+post-index: 2
+embedding
+entrance
+
+optimizer
+state
+
+pre-index: 0
+
+post-index: 4
+embedding
+entrance
+
+optimizer
+state
+
+pre-index: 1
+
+Embedding Workers
+
+Embedding PS Node
+Tail:3
+
+post-index: -1
+embedding
+entrance
+
+optimizer
+state
+
+pre-index: 4
+
+post-index: 3
+embedding
+entrance
+
+optimizer
+state
+
+pre-index: 2
+
+Figure 5: Memory management of Persia’s embedding PS
+node. The design is based on a LRU cache implemented by
+hash-map and array-list.
+and the optimizer states corresponding to this embedding vector.
+There are two advantages by utilizing an array-based linked list:
+i) this mechanism avoids frequent allocation and deallocation of
+fragmented memory blocks—this cost is not negligible when each
+linked list may contain billions of entrances; ii) since pointer (that
+stores the memory address) does not exist in the data structure,
+serialization and deserialization become a straightforward memory
+copy, which is far more convenient and efficient—this is helpful
+for periodic saving and loading checkpoints for fault tolerance and
+model sharing. Note that to fully utilize the CPU cores and RAM
+in the embedding PS node, we utilize multiple threads in the LRU
+implementation. Each thread manages a subset of the local hashmap and the corresponding array-list; when there is a request of
+get or put, the corresponding thread will lock its hash-map and
+array-list until the execution is completed.
+4.2.3 Communication Optimization. To fully utilize the computation power in the heterogeneous cluster, Persia implements a range
+of system optimizations to decrease the communication overhead.
+Optimized communication among NN workers. The optimization of AllReduce communication paradigm among NN workers in Persia is the key for hiding communication overhead within
+the backward computation of the neural network. This functionality is implemented based on Bagua [29], an open-source generalpurposed distributed learning system optimized for data parallelism,
+also released by Kwai. Currently, Persia utilizes Bagua’s centralized synchronous full-precision communication primitive (equivalent to AllReduce) by default, in an attempt to preserve the accuracy.
+Persia leverages Bagua for the synchronization among NN workers because additional system optimization enabled by Bagua can
+be directly adopted, including tensor bucketing, memory flattening,
+hierarchical communications, etc. Notice that there are other communication primitives provided by Bagua which could potentially
+further improve the training throughput; however, it is unclear if
+these communication primitives would hurt the statistical efficiency,
+we leave this exploration as an interesting future work.
+Optimized remote procedure call. The point-to-point communication: i) between NN workers and embedding workers, and
+ii) between embedding workers and embedding PS is implemented
+by remote procedure call (RPC). Unlike the traditional usage of RPC,
+where the communication is mainly responsible for transmitting
+small objects with complex serialization and deserialization mechanism, Persia demands a RPC implementation that is efficient for
+communicating tensors stored in a large continuous memory space.
+
+Lian et al.
+
+As so, Persia abandons the protocol buffer based implementation
+(adopted by gRPC [4] and bRPC [2] for other learning systems),
+which introduces significant overhead for communicating tensors;
+instead, Persia adopts a simple but efficient zero-copy serialization
+and deserialization mechanism targeting for tensors which directly
+uses memory layout to serialize and deserialize tensors. Further,
+as we mentioned in Section 4.2.2, since tensors on host RAM are
+allocated in large pages, the TLB lookup time is also reduced significantly, which accelerates the copying procedure from host RAM
+to the RAM of the network adapter.
+Workload balance of embedding PS. The embedding parameter storage is implemented as a sharded PS to support the query
+and update of the parameter in the embedding layer. The key challenge in embedding PS implementation is about the workload balance of query and update about the embedding parameter. Initially,
+we adopt a straightforward design by distributing the embedding
+parameter according to the feature groups. A sub-group of CPU
+instances are allocated to manage a partition of semantic independent embeddings. We find that in practice, this would easily
+lead to congestion in the access of some feature groups during
+training—the access of training data can irregularly lean towards a
+particular embedding group during the online learning procedure
+in industrial-scale applications. We solve this issue by adopting an
+alternative partition of the embedding parameter: the embeddings
+inside a feature group are first uniformly shuffled and then evenly
+distributed across embedding PS nodes. We observe that this design
+effectively diminishes the congestion of the embedding parameter
+access and keeps a balanced workload for the embedding PS.
+Communication compression. To reduce the network traffic,
+we adopt both lossless and lossy compression mechanisms for the
+communication request between embedding and NN workers. The
+network bandwidth connecting GPU instances is limited—besides
+the AllReduce operation that leverages this bandwidth, another
+noticeable utility is the communication of embedding vectors in the
+4 in Figure 4) and its gradient in the backforward propagation (○
+6 in Figure 4). The communication between
+ward propagation (○
+GPUs enabled by advanced connections like GPUDirect RDMA is
+10× faster than that between GPU and CPU nodes through PCI-e
+[7], which could leave the communication of embedding activation and its gradients as a bottleneck. Note that although plenty
+of lossy compression schema has been proposed for distributed
+learning, one should be cautious of applying them in distributed
+recommender model training—for a commercial recommender system, as mentioned before, even a drop of 0.1% accuracy is not
+affordable [114]. To reduce such network traffic, we apply a lossless
+compression mechanism for the index component and a discreet
+lossy compression mechanism for the value component.
+Lossless compression. For the index component of the embedding,
+instead of representing a batch of samples as a list of vectors, where
+each vector containing all IDs (represented by int64) of a sample,
+we represent a batch as a hash-map, where the key is unique IDs
+in the whole batch, and the value corresponding to each unique
+ID is the indices of the samples in the batch containing this ID.
+Since the batch size is relatively small (≤ 65535), the indices can
+
+be represented using uint16 instead of int64 without losing any
+information.
+Lossy compression. For the value component, We adopt a discreet
+fp32 to fp16 compression. Notice that a uniform mapping from
+fp32 to fp16 would harm the statistic efficiency significantly, so we
+defines an nonuniform mapping method: suppose ∥·∥ ∞ represents
+the 𝐿∞ norm of a vector, 𝜅 represents a relatively large constant
+scalar. In the compression side, each fp32 vector block v is first
+scaled by ∥ v𝜅∥ and then converted to a fp16 block vector. In the
+∞
+decompression side, the compressed block vector ṽ communicated
+as fp16 is first converted back to a fp32 vector and then divided
+by ∥ v𝜅∥ .
+∞
+
+4.2.4 Fault Tolerance. Failure can happen frequently considering
+the large number of nodes that participate in the hybrid training.
+Towards this end, Persia implements a group of fault tolerance
+mechanisms to handle different failures in the cluster. Two observations are interesting:
+• The infrequent loss of parameter update of the embedding layer
+is usually negligible for convergence, while the responsive time
+of the embedding parameter query would be important for the
+end-to-end training time;
+• Any drop of the model synchronization by the NN worker that
+runs the dense synchronous training algorithm is vital for convergence. Based on these observations, Persia implements the
+following mechanisms for different components to handle different system failures.
+Since the data loader should be able to run on top of any other
+popular distributed storage systems (e.g., HDFS), Persia relies on
+their own recovery schema once an instance failure happens. Notice
+that Persia mainly considers the online training setting, where no
+shuffling schema is required by Persia’s data loader.
+The embedding PS should be responsive during the hybrid training execution. For this purpose, the embedding PS node will put
+in-memory LRU cache (introduced in Section 4.2.2) in a shared memory space—by this fashion, once a process-level failure happens,
+the process can automatically restart and attach to the consistent
+shared-memory space without influencing any other instances of
+the embedding PS. Additionally, embedding PS nodes will periodically save the in-memory copy of the embedding parameter shard,
+with the advance of our LRU implementation, check-pointing is
+very efficient (also see Section 4.2.2).
+The embedding worker has no fault recovery schema—once a
+failure happens, the local buffer of the ID type feature hash-map
+will be simply abandoned without any recovery attempts.
+By contrast, the dense module cannot afford any drop of model
+synchronization. As so, the NN worker would also periodically save
+the synchronized model as the checkpoint with the same frequency
+as the embedding PS. Once a failure of GPU instances happens,
+all the GPU instances will abandon their local copy of the model,
+load the latest checkpoint, and continue the execution of the dense
+synchronous training algorithm.
+
+Persia: An Open, Hybrid System Scaling Deep Learning-based Recommenders up to 100 Trillion Parameters
+
+5
+
+THEORETICAL ANALYSIS
+
+In this section, we show the convergence rate of the proposed
+hybrid algorithm adopted by Persia. In short, the proposed hybrid
+algorithm converges and admits a similar convergence rate (or total
+complexity equivalently) to the standard synchronous algorithm.
+That is to say that the hybrid algorithm takes a significant benefit
+from asynchronicity in the system efficiency but sacrifices very
+little for the convergence rate.
+To show the detailed convergence rate, we first provide the
+essential updating rule of the hybrid algorithm in Persia:
+emb
+wtemb
+− 𝛾𝐹𝑡emb
++1 =wt
+
+′
+
+′
+where 𝐹𝑡emb and 𝐹𝑡nn ′ are notations for gradients of wtemb and
+nn
+wt , short for respectively:
+
+
+′
+emb
+nn
+𝐹𝑡emb :=∇wemb 𝐹 wD
+( t ) , wt ; 𝜉 𝑡 ,
+
+𝐹𝑡nn ′ :=∇wnn 𝐹
+
+emb
+nn
+wD
+( t) , wt ; 𝜉𝑡
+
+• Existence of global minimum. Assume
+𝑓 ∗ := min 𝑓 (w)
+w
+
+exists.
+• Lipschitzian gradient. The stochastic gradient function 𝐹 ′ (·; 𝜉)
+is differentiable, and 𝐿-Lipschitzian for all 𝜉:
+𝐹 ′ (w; 𝜉) − 𝐹 ′ ( w̄; 𝜉) ⩽ 𝐿 ∥w − w̄∥ ,
++𝑁 nn
+
+.
+
+(3)
+
+• Bounded variance. The variance of the stochastic gradient is
+bounded: there exists a constant 𝜎 ⩾ 0 such that
+h
+i
+2
+E 𝐹 ′ (w; 𝜉) − 𝑓 ′ (w)
+⩽ 𝜎 2 ∀w.
+(4)
+• Bounded staleness. All sparse model update delays are bounded:
+there exists a constant 𝜏 ⩾ 0 such that
+𝑡 − 𝐷 (𝑡) ⩽𝜏,
+
+∀𝑡 .
+
+1
+√
+𝐿 + 𝑇 𝐿𝜎 + 4𝜏𝐿𝛼
+Persia admits the following convergence rate:
+𝛾=
+
+Í𝑇 −1
+
+𝑡 =0 E
+
+,
+
+Assumption 1. We make the following commonly used assumptions for analyzing the stochastic algorithm:
+
+emb
+
+Theorem 1. Denote 𝛼 to be the constant such that for each ID
+the probability of a sample containing it is smaller than 𝛼. Under
+Assumption 1, with learning rate 𝛾 in (2) as
+
+
+
+where 𝐷 (𝑡) ⩽ 𝑡 denotes some iterate earlier than the current iterate
+𝑡. This is because of the asynchronous update for the embedding
+layer. Since the dense neural network adopts the synchronous update, it always uses the up to date value of wtnn , while the used
+value of the embedding layer may be from some early iterate. This
+is the cost of using asynchronous updating, but we will see that the
+cost is very minor comparing to our gain in system efficiency.
+To ensure the convergence rate, we still need to make some
+commonly used assumptions as follows:
+
+∀𝜉 ∈ Ξ, ∀w, w̄ ∈ R𝑁
+
+Then we obtain the following convergence result:
+
+(2)
+
+nn
+nn ′
+wtnn
++1 =wt − 𝛾𝐹𝑡 ,
+
+
+
+same sample. In Persia this value of 𝜏 is less than 5 for most scenarios. The frequency assumption reflects the intrinsic property of the
+recommendation system. For each sample 𝜉, if every ID type feature
+1
+𝑥 has the same probability of being in x𝜉ID , then 𝛼 = 𝑁 emb
+. On the
+other hand, if an ID type feature 𝑥 is contained by every sample 𝜉’s
+ID type features x𝜉ID , then 𝛼 = 1.
+
+(5)
+
+In practice 𝜏 is the number of samples whose embeddings are retrieved but their gradients are not yet updated into the model parameters. In Persia this value is less than 5 for most cases.
+Remark 1. The assumptions of existence, bounded variance,
+and bounded staleness are commonly used ones. The bounded
+staleness assumption is due to the asynchronous update for wemb .
+In practice, 𝑡 − 𝐷 (𝑡) ⩽ 𝜏 means that any element in wemb is updated
+up to 𝜏 times between reading it and writing it within training the
+
+
+
+
+∥𝑓 ′ (w𝑡 ) ∥ 2
+≲
+𝑇
+
+𝜎
+1
+√ + +
+𝑇
+𝑇
+| {z }
+
+𝛼𝜏
+𝑇
+
+(6)
+
+rate of vanilla SGD
+
+where ≲ means “smaller than or equal to up to a constant factor”, and
+𝐿, 𝐺 are all treated as constants for simplicity. For example 𝑎𝑡 ≲ 𝑏𝑡
+means that there exists a constant 𝐶 > 0 such that 𝑎𝑡 ≤ 𝐶𝑏𝑡 for all 𝑡.
+The complete proof is provided in the preprint version of this
+paper [53]. Note that the first two terms in (6) are exactly the convergence rate of vanilla SGD [59]. The third (additional) term is
+caused by the staleness of the asynchronous update in the embedding layer of the model. The staleness upper bound 𝜏 is typically
+proportional to the number of workers. The ID frequency upper
+bound 𝛼 is a value smaller than 1. Notice that 𝛼 = 1 leads a convergence rate exactly matching the asynchronous SGD [59]. It indicates
+that Persia (the hybrid algorithm) guarantees to be no worse than
+the asynchronous algorithm in convergence rate. When 𝛼 ≪ 1,
+which is mostly always true in real recommendation systems, the
+hybrid algorithm—Persia—admits a very similar convergence rate
+to the synchronous algorithm, since the third term is dominated
+by the second term. Therefore, this theorem suggests that the hybrid algorithm follows the same convergence efficiency in terms of
+iterations.
+
+6
+
+EXPERIMENTS
+
+In this section, we introduce experiments to evaluate the design and
+implementation of Persia, focusing on the following questions:
+• Can Persia provide significant boost of end-to-end training time
+comparing with the state-of-the-art systems?
+• Is the hybrid training algorithm statistically efficient in terms of
+convergence w.r.t training iterations?
+• Can Persia provide high training throughput and scale out well
+especially for trillion-parameter scale models?
+Benchmark. We evaluate Persia over three open-source benchmarks and one real-world production microvideo recommendation
+workflow at Kwai:
+• Taobao-Ad (open source [10]): predict the advertisement CTR
+from Taobao’s website for 8 days with 26 million records.
+
+Lian et al.
+
+Figure 6: End-to-end training performance of four benchmarks: Taobao-Ad, Avazu-Ad, Criteo-Ad, Kwai-Video (from left to right).
+Sparse # parameter Dense # parameter
+Taobao-Ad
+29 Million
+12 Million
+Avazu-Ad
+134 Million
+12 Million
+Criteo-Ad
+540 Million
+12 Million
+Kwai-Video
+2 Trillion
+34 Million
+Criteo-Syn1
+6.25 Trillion
+12 Million
+Criteo-Syn2
+12.5 Trillion
+12 Million
+Criteo-Syn3
+25 Trillion
+12 Million
+Criteo-Syn4
+50 Trillion
+12 Million
+Criteo-Syn5
+100 Trillion
+12 Million
+Table 1: Model scales for the benchmarks.
+• Avazu-Ad (open source [1]): predict the advertisement CTR of
+Avazu’s log for 11 days with 32 million records.
+• Criteo-Ad (open source [3]): predict the advertisement CTR of
+Criteo’s traffic for 24 days with 44 million records. Note that we
+also extend this dataset (noted as Criteo-Syn) by synthesizing
+different number of random ID features for capacity and scalablity
+evaluation (see Section 6.3).
+• Kwai-Video (confidential production dataset): predict the explicit
+behavior of Kwai’s active users about the microvideo recommendation in 7 days with 3 billion records.
+For the three open source advertisement CTR benchmarks, we
+include 80% of the records as training set and the rest 20% of
+the records as test set, we consider a fully connected feed forward
+neural network (FFNN) as the deep learning model with five hidden
+layer dimensions of 4096, 2048, 1024, 512 and 256. For the Kwai
+production microvideo recommendation task, 85% of the data are
+included in the training set while the rest 15% are considered as
+the test set, we also use FFNN as the model to predict multiple user
+behaviors. We report test AUC to evaluate convergence. The model
+scale of the each benchmark is listed in Table 1
+Baseline systems. We consider two state-of-the-art baselines:
+XDL [38] and PaddlePaddle [9]—XDL is a specialized distributed
+recommendation framework developed by Alibaba; PaddlePaddle is a general purpose deep learning framework from Baidu
+with a special Heter mode that implements the design of AIBox
+[115], Baidu’s recommendation training system, according to private communications we had with members of the PaddlePaddle
+development community.
+Cluster setup. We conduct experiments on two clusters. Most of
+the training is conducted over heterogeneous clusters inside Kwai’s
+production data center—for Persia, we include up to 64 Nvidia V100
+GPUs, and 100 CPU instances (each with 52 cores and 480GB RAM).
+The instances are connected by a network with the bandwidth of 100
+
+Gbps. The baseline systems (XDL and PaddlePaddle) are equipped
+with the same amount of computation resources for each individual
+setting.
+We further conduct larger-scale scalability experiments over
+Google cloud platform, for both capacity and public reproducibility
+reasons5 with a heterogeneous cluster including:
+• 8 a2-highgpu-8g instances (each with 8 Nvidia A100 GPUs) as
+NN workers;
+• 100 c2-standard-30 instances (each with 30vCPUs, 120GB RAM)
+as embedding workers;
+• 30 m2-ultramem-416 instances (each with 416vCPUs, 12TB RAM)
+as embedding PS.
+
+6.1
+
+End-to-end Evaluation
+
+We first compare the end-to-end training time that each system
+needs to achieve a given AUC, using the three open source benchmarks over a heterogeneous cluster with 8 GPU workers. We report
+the results of both synchronous and asynchronous modes of XDL,
+we conduct a careful trial of different modes in PaddlePaddle
+and report the result under the optimal setting. Figure 6 illustrates
+significant performance improvements from Persia: e.g., for the
+Taobao-Ad benchmark, Persia is 7.12× and 8.4× faster than that
+of the synchronous and asynchronous modes of XDL, and 1.71×
+faster than PaddlePaddle–same level of speedup also appears in
+the Avazu-Ad and Criteo-Ad benchmark.
+On our production Kwai-Video dataset, XDL fails to run the
+task to convergence in 100 hours—we compare the training sample throughput and find that Persia’s throughput is 19.31× of
+XDL). For PaddlePaddle, we fail to run the training task since
+PaddlePaddle does not support some deep learning operators (e.g.,
+batch normalization) required in our model.
+
+6.2
+
+Evaluation of Hybrid Algorithm
+
+The hybrid algorithm is one of the main reasons behind Persia’s
+scalability. Here, we evaluate its convergence behavior and leave it
+scalability and performance to the next section. Figure 7 illustrates
+the convergence behaviors of different systems. We see that the
+hybrid algorithm shows almost identical convergence when comparing with the fully synchronous mode, converging to comparable
+AUC as illustrated in Table 2 (but as we will see in the next section, the hybrid algorithm is much faster compared with the fully
+synchronous algorithm). We see that test AUC gap between the
+hybrid mode and synchronous mode is always less than 0.1% in
+the three open-source benchmarks, and less than 0.001% in the
+5 We appreciate Google’s great support for coordinating the computation resources for
+
+this experiment.
+
+Persia: An Open, Hybrid System Scaling Deep Learning-based Recommenders up to 100 Trillion Parameters
+
+Figure 7: Convergence of four benchmarks: Taobao-Ad, Avazu-Ad, Criteo-Ad, Kwai-Video.
+
+Taobao-Ad
+Avazu-Ad
+Criteo-Ad
+Kwai-Video
+
+Persia-Hybrid
+Sync
+Async
+PaddlePaddle
+65.86%
+65.93% (XDL) 65.66% (XDL)
+59.14%
+77.93%
+78.02% (XDL) 77.10% (XDL)
+73.19%
+80.47%
+80.51% (XDL) 80.01% (XDL)
+77.08%
+72.63%
+72.63%
+72.16%
+Table 2: Final test AUC of four benchmarks.
+
+production Kwai-video benchmark; by contrast, the gap between
+the asynchronous mode and the synchronous mode is much higher
+(from 0.5% to 1.0%); further, as we allow more aggressive asynchronicity in PaddlePaddle, the gap is more significant. We want
+to emphasize that even 0.1% decrease of accuracy for the production recommender model might lead to a loss of revenue at the
+scale of a million dollar—this is NOT acceptable.
+
+7
+
+We briefly discuss the relevant recommender systems and system
+relaxations for distributed large scale learning. Detailed discussion can be found in more comprehensive surveys (e.g., [110] for
+recommender system, and [59] for distributed deep learning).
+
+7.1
+
+6.3
+
+Scalability and Capacity
+
+We first evaluate the scalability of Persia over clusters with different
+scales of GPUs in terms of training sample throughput, as illustrated
+in Figure 8. We see that Persia, with a hybrid algorithm, achieves
+much higher throughput compared to all other systems. On three
+open source benchmarks, Persia reaches nearly linear speedup
+with significantly higher throughput comparing with XDL and
+PaddlePaddle. For the Kwai-video benchmark, Persia achieves
+3.8× higher throughput compared with the fully synchronous algorithm. Note that the fully asynchronous algorithm can achieve
+faster throughput than the hybrid algorithm; however, as illustrated
+in the previous section, it incurs a lower AUC compared with the
+hybrid algorithm.
+We further investigate the capacity of Persia for training different scales of trillion-parameter models in Google cloud platform.
+Figure 9-left illustrates that the throughput of Persia when varying the number of entrances in the embedding table and fixing the
+embedding output dimension to 128—this is corresponding to the
+model scale of Criteo-Syn in Table 1. We see that Persia shows
+stable training throughput when increasing the model size even up
+to 100 trillion parameters. This can be viewed as concrete evidences
+that Persia has the capacity to scale out to the largest recommender
+model that is never reported before. Figure 9-right shows that for
+the 100 trillion-parameter model, Persia also achieves 2.6× higher
+throughput than the fully synchronous mode; on the other hand,
+asynchronous mode introduces further speedup (1.2× faster than
+that of the hybrid algorithm)—this generally would introduce statistical inefficiency for convergence, which is not revealed by the
+capacity evaluation.
+
+RELATED WORK
+
+Recommender Systems
+
+Recommender systems are critical tools to enhance user experience and promote sales and services [110], where deep learning
+approaches have shown great advance recently and been deployed
+ubiquitously by tech companies such as Alibaba [121], Amazon [70],
+Baidu [114], Facebook [63], Google [24, 118], Kuaishou [103], Pinterest [58], Netflix [30], etc. Generally, deep learning based approaches take the sparse ID type features to generate dense vectors
+through an embedding layer, and then feed the embedding activations into the proceeding neural components to expose the correlation and interaction. Diversified features are included to power
+recommender systems [111], such as sequential information (e.g.,
+session based user id [79, 85, 86]), text [109, 117, 125], image [95, 98],
+audio [87, 96], video [20, 46], social network [27, 33], etc. Additionally, various neural components have been explored for recommender systems, including multi-layer perceptron (MLP) [105, 106],
+convolutional neural network (CNN) [72, 85], recurrent neural
+network (RNN) [101, 102], Autoencoder [71, 124], and deep reinforcement learning [117, 119]. Furthermore, multiple relevant goals
+for recommendation can be learned simultaneously by multi-task
+learning [24, 63, 107, 116, 121, 122].
+Due to the massive scale of both training data and recommender
+models, distributed learning techniques are applied to train industrialscale recommender systems [63, 70, 114, 118, 121]. The heterogeneity in computation naturally leads to the idea of utilizing heterogeneous distributed computation resources to handle such training
+procedure [38, 45, 61, 63, 66, 70, 100, 114, 115]. For example, XDL
+[38] adopts the advanced model server to replace classic parameter
+server to reduce the traffic between CPU nodes and GPU nodes;
+Baidu proposes a hierarchical PS architecture [114] to implement a
+sophisticated caching schema to reduce the communication overhead; HET [61] adopts an advanced cache mechanism at the GPU
+worker side to leverage the skewness of embeddings by caching
+
+Lian et al.
+
+Figure 8: Scalability and performance of four benchmarks: Taobao-Ad, Avazu-Ad, Criteo-Ad, Kwai-Video (from left to right).
+
+Figure 9: Capacity test of Persia for Criteo-Syn benchmark
+the over Google cloud platform.
+
+frequently updated entrances in the worker’s limited local memory.
+However, as far as we know, there is a lack of a carefully designed
+distributed training solution to support the heterogeneity inherited from the training data (sparse vs. dense) and gradient decent
+based optimization (memory bounded vs. computation bounded)
+over mixed hardwares and infrastructures (CPU instances vs. GPU
+instances).
+
+7.2
+
+Distributed Deep Learning
+
+Distributed deep learning can be categorized as data parallelism
+and model parallelism. In data parallel distributed deep learning,
+two main categories of systems are designed—parameter server [26,
+35, 40, 47, 112] and AllReduce [21, 39, 73, 113]. In a PS architecture,
+models are stored in a single node or distributively in multiple
+nodes; during the training phase, workers periodically fetch the
+model from PS, conduct forward/backward propagation, and push
+the gradients to the PS, while the PS aggregates the gradients and
+updates the parameters. With an AllReduce paradigm, all workers collaborate with their neighbors for model/gradient exchanges.
+Different strategies are proposed to speed up the expensive parameter/gradient exchange phase. To reduce communication volumes,
+lossy communication compression methods are introduced, such as
+quantization [13, 16, 99, 108], sparsification [14, 88, 91, 97], sketching [36], and error compensation [82]). In an attempt to get rid of
+the latency bottleneck, decentralized communication approaches
+are proposed [44, 49, 54, 56, 81]. Additionally, local SGD is discussed
+to optimize for the number of communication rounds during training [31, 57, 77, 90]. To remove the synchronization barrier, asynchronous update methods are proposed [52, 64, 68, 76, 120, 123].
+There are also approaches that combines multiple strategies listed
+above [15, 17, 44, 56, 80]. On the other hand, researches about model
+parallelism attempt to study how to allocate model parameters and
+
+training computation across compute units in a cluster to maximize training throughput and minimize communication overheads.
+Optimizations are proposed for both operation partitioning approach [37, 74, 75, 92] and pipeline parallel approach [32, 34, 84].
+Recently, there are also approaches that combine both data and
+model parallelism [51, 67, 70].
+General purpose deep learning systems have been one of the
+main driving forces behind the rapid advancement of machine learning techniques with the increasing scalability and performance for
+distributed deep learning. Popular options include TensorFlow [11],
+PyTorch [8], MXNet [22], PaddlePaddle [9], MindSpore [6], etc. Extensions and modifications have been made based on these general
+purpose learning systems for efficient distributed learning (e.g.,
+Horovod [73], BytePS [41], Bagua [29], Megatron [75], ZeRO [69],
+SageMaker [42], etc.). However, even including these extensions,
+the current general purpose deep learning systems do not consider
+the challenges about handling the heterogeneity over a hybrid infrastructure. Thus, it is difficult to directly use these general purpose
+learning systems for the training tasks of industrial-scale recommender systems over a heterogeneous cluster.
+
+8
+
+CONCLUSION
+
+We introduce Persia, a distributed system to support efficient and
+scalable training of recommender models at the scale of 100 trillion
+parameters. We archive the statistical and hardware efficiency by
+a careful co-design of both the distributed training algorithm and
+the distributed training system. Our proposed hybrid distributed
+training algorithm introduces elaborate system relaxations for efficient utilization of heterogeneous clusters, while converging as
+fast as vanilla SGD. We implement a wide range of system optimizations to overcome the unique challenges raised by the hybrid
+algorithmic design. We evaluate Persia using both publicly available benchmark tasks and production tasks at Kwai. We show that
+Persia leads to up to 7.12× speedup compared to alternative stateof-the-art approaches; additionally, Persia can also scale out to
+100-trillion-parameter model on Google cloud platform.
+Persia has been released as an open source project on github
+with concrete instructions about setup over Google cloud platform—
+we hope everyone from both academia and industry would find
+it easy to train 100-trillion-parameter scale deep learning recommender models.
+
+REFERENCES
+[1] [n.d.]. Avazu Advertisement CTR.
+prediction.
+
+https://www.kaggle.com/c/avazu-ctr-
+
+Persia: An Open, Hybrid System Scaling Deep Learning-based Recommenders up to 100 Trillion Parameters
+
+[2] [n.d.]. bRPC Industrial-grade RPC framework used throughout Baidu. http:
+//incubator.apache.org/clutch/brpc.html.
+[3] [n.d.]. Criteo Advertisement CTR. https://ailab.criteo.com/download-criteo1tb-click-logs-dataset/.
+[4] [n.d.]. gRPC A high performance, open source universal RPC framework.
+https://grpc.io/.
+[5] [n.d.]. How to implement LRU cache using HashMap and Doubly Linked
+List.
+https://krishankantsinghal.medium.com/my-first-blog-on-medium583159139237.
+[6] [n.d.]. MindSpore AI computing Framework Bridge the gap between AI research
+and application. https://www.paddlepaddle.org.cn/.
+[7] [n.d.]. NVIDIA GPUDirect. https://developer.nvidia.com/gpudirect.
+[8] [n.d.]. An open source machine learning framework that accelerates the path
+from research prototyping to production deployment. https://pytorch.org/.
+[9] [n.d.]. Parallel Distributed Deep Learning: Machine Learning Framework from
+Industrial Practice. https://www.paddlepaddle.org.cn/.
+[10] [n.d.]. Taobao Advertisement CTR. https://www.kaggle.com/pavansanagapati/
+ad-displayclick-data-on-taobaocom.
+[11] Martín Abadi, Paul Barham, Jianmin Chen, Zhifeng Chen, Andy Davis, Jeffrey
+Dean, Matthieu Devin, Sanjay Ghemawat, Geoffrey Irving, Michael Isard, et al.
+2016. Tensorflow: A system for large-scale machine learning. In 12th {USENIX }
+symposium on operating systems design and implementation ( {OSDI } 16). 265–
+283.
+[12] Bilge Acun, Matthew Murphy, Xiaodong Wang, Jade Nie, Carole-Jean Wu, and
+Kim Hazelwood. 2020. Understanding Training Efficiency of Deep Learning
+Recommendation Models at Scale. arXiv preprint arXiv:2011.05497 (2020).
+[13] Dan Alistarh, Demjan Grubic, Jerry Li, Ryota Tomioka, and Milan Vojnovic. 2016.
+QSGD: Communication-efficient SGD via gradient quantization and encoding.
+arXiv preprint arXiv:1610.02132 (2016).
+[14] Dan Alistarh, Torsten Hoefler, Mikael Johansson, Sarit Khirirat, Nikola Konstantinov, and Cédric Renggli. 2018. The convergence of sparsified gradient
+methods. In Proceedings of the 32nd International Conference on Neural Information Processing Systems. 5977–5987.
+[15] Debraj Basu, Deepesh Data, Can Karakus, and Suhas Diggavi. 2019. Qsparselocal-SGD: Distributed SGD with quantization, sparsification, and local computations. arXiv preprint arXiv:1906.02367 (2019).
+[16] Jeremy Bernstein, Yu-Xiang Wang, Kamyar Azizzadenesheli, and Animashree
+Anandkumar. 2018. signSGD: Compressed optimisation for non-convex problems. In International Conference on Machine Learning. PMLR, 560–569.
+[17] Aleksandr Beznosikov, Samuel Horváth, Peter Richtárik, and Mher Safaryan.
+2020. On biased compression for distributed learning. arXiv preprint
+arXiv:2002.12410 (2020).
+[18] Wei-Cheng Chang, Daniel Jiang, Hsiang-Fu Yu, Choon Hui Teo, Jiong Zhang, Kai
+Zhong, Kedarnath Kolluri, Qie Hu, Nikhil Shandilya, Vyacheslav Ievgrafov, et al.
+2021. Extreme multi-label learning for semantic matching in product search.
+In Proceedings of the 27th ACM SIGKDD Conference on Knowledge Discovery &
+Data Mining. 2643–2651.
+[19] Jianmin Chen, Xinghao Pan, Rajat Monga, Samy Bengio, and Rafal Jozefowicz.
+2016. Revisiting distributed synchronous SGD. arXiv preprint arXiv:1604.00981
+(2016).
+[20] Jingyuan Chen, Hanwang Zhang, Xiangnan He, Liqiang Nie, Wei Liu, and TatSeng Chua. 2017. Attentive collaborative filtering: Multimedia recommendation
+with item-and component-level attention. In Proceedings of the 40th International
+ACM SIGIR conference on Research and Development in Information Retrieval.
+335–344.
+[21] Tianqi Chen and Carlos Guestrin. 2016. Xgboost: A scalable tree boosting system.
+In Proceedings of the 22nd acm sigkdd international conference on knowledge
+discovery and data mining. 785–794.
+[22] Tianqi Chen, Mu Li, Yutian Li, Min Lin, Naiyan Wang, Minjie Wang, Tianjun
+Xiao, Bing Xu, Chiyuan Zhang, and Zheng Zhang. 2015. Mxnet: A flexible and
+efficient machine learning library for heterogeneous distributed systems. arXiv
+preprint arXiv:1512.01274 (2015).
+[23] Heng-Tze Cheng, Levent Koc, Jeremiah Harmsen, Tal Shaked, Tushar Chandra,
+Hrishi Aradhye, Glen Anderson, Greg Corrado, Wei Chai, Mustafa Ispir, et al.
+2016. Wide & deep learning for recommender systems. In Proceedings of the 1st
+workshop on deep learning for recommender systems. 7–10.
+[24] Paul Covington, Jay Adams, and Emre Sargin. 2016. Deep neural networks
+for youtube recommendations. In Proceedings of the 10th ACM conference on
+recommender systems. 191–198.
+[25] James Davidson, Benjamin Liebald, Junning Liu, Palash Nandy, Taylor Van Vleet,
+Ullas Gargi, Sujoy Gupta, Yu He, Mike Lambert, Blake Livingston, et al. 2010.
+The YouTube video recommendation system. In Proceedings of the fourth ACM
+conference on Recommender systems. 293–296.
+[26] Jeffrey Dean, Greg S Corrado, Rajat Monga, Kai Chen, Matthieu Devin, Quoc V
+Le, Mark Z Mao, Marc’Aurelio Ranzato, Andrew Senior, Paul Tucker, et al. 2012.
+Large scale distributed deep networks. In Proceedings of the 25th International
+Conference on Neural Information Processing Systems-Volume 1. 1223–1231.
+
+[27] Shuiguang Deng, Longtao Huang, Guandong Xu, Xindong Wu, and Zhaohui Wu.
+2016. On deep learning for trust-aware recommendations in social networks.
+IEEE transactions on neural networks and learning systems 28, 5 (2016), 1164–
+1177.
+[28] Chantat Eksombatchai, Pranav Jindal, Jerry Zitao Liu, Yuchen Liu, Rahul Sharma,
+Charles Sugnet, Mark Ulrich, and Jure Leskovec. 2018. Pixie: A system for
+recommending 3+ billion items to 200+ million users in real-time. In Proceedings
+of the 2018 world wide web conference. 1775–1784.
+[29] Shaoduo Gan, Xiangru Lian, Rui Wang, Jianbin Chang, Chengjun Liu, Hongmei Shi, Shengzhuo Zhang, Xianghong Li, Tengxu Sun, Jiawei Jiang, et al.
+2021. BAGUA: Scaling up Distributed Learning with System Relaxations. arXiv
+preprint arXiv:2107.01499 (2021).
+[30] Carlos A Gomez-Uribe and Neil Hunt. 2015. The netflix recommender system:
+Algorithms, business value, and innovation. ACM Transactions on Management
+Information Systems (TMIS) 6, 4 (2015), 1–19.
+[31] Farzin Haddadpour, Mohammad Mahdi Kamani, Mehrdad Mahdavi, and
+Viveck R Cadambe. 2019. Local sgd with periodic averaging: Tighter analysis and adaptive synchronization. arXiv preprint arXiv:1910.13598 (2019).
+[32] Aaron Harlap, Deepak Narayanan, Amar Phanishayee, Vivek Seshadri, Nikhil
+Devanur, Greg Ganger, and Phil Gibbons. 2018. Pipedream: Fast and efficient
+pipeline parallel dnn training. arXiv preprint arXiv:1806.03377 (2018).
+[33] Cheng-Kang Hsieh, Longqi Yang, Honghao Wei, Mor Naaman, and Deborah
+Estrin. 2016. Immersive recommendation: News and event recommendations
+using personal digital traces. In Proceedings of the 25th International Conference
+on World Wide Web. 51–62.
+[34] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Xu
+Chen, HyoukJoong Lee, Jiquan Ngiam, Quoc V Le, Yonghui Wu, et al. 2019.
+GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism..
+In NeurIPS.
+[35] Yuzhen Huang, Tatiana Jin, Yidi Wu, Zhenkun Cai, Xiao Yan, Fan Yang, Jinfeng
+Li, Yuying Guo, and James Cheng. 2018. Flexps: Flexible parallelism control in
+parameter server architecture. Proceedings of the VLDB Endowment 11, 5 (2018),
+566–579.
+[36] Nikita Ivkin, Daniel Rothchild, Enayat Ullah, Ion Stoica, Raman Arora, et al.
+2019. Communication-efficient distributed sgd with sketching. In Advances in
+Neural Information Processing Systems. 13144–13154.
+[37] Zhihao Jia, Matei Zaharia, and Alex Aiken. 2019. Beyond Data and Model
+Parallelism for Deep Neural Networks. SysML 2019 (2019).
+[38] Biye Jiang, Chao Deng, Huimin Yi, Zelin Hu, Guorui Zhou, Yang Zheng, Sui
+Huang, Xinyang Guo, Dongyue Wang, Yue Song, et al. 2019. XDL: an industrial
+deep learning framework for high-dimensional sparse data. In Proceedings of
+the 1st International Workshop on Deep Learning Practice for High-Dimensional
+Sparse Data. 1–9.
+[39] Jiawei Jiang, Bin Cui, Ce Zhang, and Fangcheng Fu. 2018. Dimboost: Boosting
+gradient boosting decision tree to higher dimensions. In Proceedings of the 2018
+International Conference on Management of Data. 1363–1376.
+[40] Jiawei Jiang, Bin Cui, Ce Zhang, and Lele Yu. 2017. Heterogeneity-aware distributed parameter servers. In Proceedings of the 2017 ACM SIGMOD International
+Conference on Management of Data. 463–478.
+[41] Yimin Jiang, Yibo Zhu, Chang Lan, Bairen Yi, Yong Cui, and Chuanxiong Guo.
+2020. A Unified Architecture for Accelerating Distributed {DNN } Training in
+Heterogeneous GPU/CPU Clusters. In 14th {USENIX } Symposium on Operating
+Systems Design and Implementation ( {OSDI } 20). 463–479.
+[42] Can Karakus, Rahul Huilgol, Fei Wu, Anirudh Subramanian, Cade Daniel, Derya
+Cavdar, Teng Xu, Haohan Chen, Arash Rahnama, and Luis Quintela. 2021.
+Amazon SageMaker Model Parallelism: A General and Flexible Framework for
+Large Model Training. arXiv preprint arXiv:2111.05972 (2021).
+[43] Diederik P Kingma and Jimmy Ba. 2014. Adam: A method for stochastic optimization. arXiv preprint arXiv:1412.6980 (2014).
+[44] Anastasia Koloskova, Sebastian Stich, and Martin Jaggi. 2019. Decentralized
+stochastic optimization and gossip algorithms with compressed communication.
+In International Conference on Machine Learning. PMLR, 3478–3487.
+[45] Suresh Krishna and Ravi Krishna. 2020. Accelerating Recommender Systems
+via Hardware" scale-in". arXiv preprint arXiv:2009.05230 (2020).
+[46] Joonseok Lee, Sami Abu-El-Haija, Balakrishnan Varadarajan, and Apostol Natsev. 2018. Collaborative deep metric learning for video understanding. In Proceedings of the 24th ACM SIGKDD International Conference on Knowledge Discovery
+& Data Mining. 481–490.
+[47] Mu Li, David G Andersen, Jun Woo Park, Alexander J Smola, Amr Ahmed,
+Vanja Josifovski, James Long, Eugene J Shekita, and Bor-Yiing Su. 2014. Scaling
+distributed machine learning with the parameter server. In 11th {USENIX }
+Symposium on Operating Systems Design and Implementation ( {OSDI } 14). 583–
+598.
+[48] Pengcheng Li, Runze Li, Qing Da, An-Xiang Zeng, and Lijun Zhang. 2020.
+Improving Multi-Scenario Learning to Rank in E-commerce by Exploiting Task
+Relationships in the Label Space. In Proceedings of the 29th ACM International
+Conference on Information & Knowledge Management. 2605–2612.
+
+Lian et al.
+
+[49] Youjie Li, Mingchao Yu, Songze Li, Salman Avestimehr, Nam Sung Kim, and
+Alexander Schwing. 2018. Pipe-SGD: a decentralized pipelined SGD framework for distributed deep net training. In Proceedings of the 32nd International
+Conference on Neural Information Processing Systems. 8056–8067.
+[50] Zhi Li, Hongke Zhao, Qi Liu, Zhenya Huang, Tao Mei, and Enhong Chen. 2018.
+Learning from history and present: Next-item recommendation via discriminatively exploiting user behaviors. In Proceedings of the 24th ACM SIGKDD
+International Conference on Knowledge Discovery & Data Mining. 1734–1743.
+[51] Zhuohan Li, Siyuan Zhuang, Shiyuan Guo, Danyang Zhuo, Hao Zhang, Dawn
+Song, and Ion Stoica. 2021. TeraPipe: Token-Level Pipeline Parallelism for
+Training Large-Scale Language Models. arXiv preprint arXiv:2102.07988 (2021).
+[52] Xiangru Lian, Yijun Huang, Yuncheng Li, and Ji Liu. 2015. Asynchronous parallel
+stochastic gradient for nonconvex optimization. Advances in Neural Information
+Processing Systems 28 (2015), 2737–2745.
+[53] Xiangru Lian, Binhang Yuan, Xuefeng Zhu, Yulong Wang, Yongjun He,
+Honghuan Wu, Lei Sun, Haodong Lyu, Chengjun Liu, Xing Dong, et al. 2021.
+Persia: A Hybrid System Scaling Deep Learning Based Recommenders up to
+100 Trillion Parameters. arXiv preprint arXiv:2111.05897 (2021).
+[54] Xiangru Lian, Ce Zhang, Huan Zhang, Cho-Jui Hsieh, Wei Zhang, and Ji Liu.
+2017. Can decentralized algorithms outperform centralized algorithms? a case
+study for decentralized parallel stochastic gradient descent. In Proceedings of
+the 31st International Conference on Neural Information Processing Systems. 5336–
+5346.
+[55] Xiangru Lian, Huan Zhang, Cho-Jui Hsieh, Yijun Huang, and Ji Liu. 2016. A
+Comprehensive Linear Speedup Analysis for Asynchronous Stochastic Parallel
+Optimization from Zeroth-Order to First-Order. NIPS (2016).
+[56] Xiangru Lian, Wei Zhang, Ce Zhang, and Ji Liu. 2018. Asynchronous decentralized parallel stochastic gradient descent. In International Conference on Machine
+Learning. PMLR, 3043–3052.
+[57] Tao Lin, Sebastian U Stich, Kumar Kshitij Patel, and Martin Jaggi. 2019. Don’t
+Use Large Mini-batches, Use Local SGD. In International Conference on Learning
+Representations.
+[58] David C Liu, Stephanie Rogers, Raymond Shiau, Dmitry Kislyuk, Kevin C Ma,
+Zhigang Zhong, Jenny Liu, and Yushi Jing. 2017. Related pins at pinterest:
+The evolution of a real-world recommender system. In Proceedings of the 26th
+international conference on world wide web companion. 583–592.
+[59] Ji Liu and Ce Zhang. 2020. Distributed Learning Systems with First-Order
+Methods. Foundations and Trends® in Databases 9, 1 (2020), 1–100.
+[60] Yichao Lu, Ruihai Dong, and Barry Smyth. 2018. Why I like it: multi-task
+learning for recommendation and explanation. In Proceedings of the 12th ACM
+Conference on Recommender Systems. 4–12.
+[61] Xupeng Miao, Hailin Zhang, Yining Shi, Xiaonan Nie, Zhi Yang, Yangyu Tao,
+and Bin Cui. 2022. HET: Scaling out Huge Embedding Model Training via
+Cache-enabled Distributed Framework. Proc. VLDB Endow. https://doi.org/10.
+14778/3489496.3489511
+[62] Dheevatsa Mudigere, Yuchen Hao, Jianyu Huang, Andrew Tulloch, Srinivas
+Sridharan, Xing Liu, Mustafa Ozdal, Jade Nie, Jongsoo Park, Liang Luo, et al.
+2021. High-performance, distributed training of large-scale deep learning recommendation models. arXiv preprint arXiv:2104.05158 (2021).
+[63] Maxim Naumov, John Kim, Dheevatsa Mudigere, Srinivas Sridharan, Xiaodong
+Wang, Whitney Zhao, Serhat Yilmaz, Changkyu Kim, Hector Yuen, Mustafa
+Ozdal, et al. 2020. Deep learning training in facebook data centers: Design of
+scale-up and scale-out systems. arXiv preprint arXiv:2003.09518 (2020).
+[64] Lam Nguyen, Phuong Ha Nguyen, Marten Dijk, Peter Richtárik, Katya Scheinberg, and Martin Takác. 2018. SGD and Hogwild! convergence without the
+bounded gradients assumption. In International Conference on Machine Learning.
+PMLR, 3750–3758.
+[65] Feng Niu, Benjamin Recht, Christopher Re, and Stephen J Wright. 2011. HOGWILD! a lock-free approach to parallelizing stochastic gradient descent. In
+Proceedings of the 24th International Conference on Neural Information Processing
+Systems. 693–701.
+[66] Heng Pan, Zhenyu Li, JianBo Dong, Zheng Cao, Tao Lan, Di Zhang, Gareth
+Tyson, and Gaogang Xie. 2020. Dissecting the Communication Latency in Distributed Deep Sparse Learning. In Proceedings of the ACM Internet Measurement
+Conference. 528–534.
+[67] Jay H Park, Gyeongchan Yun, M Yi Chang, Nguyen T Nguyen, Seungmin Lee,
+Jaesik Choi, Sam H Noh, and Young-ri Choi. 2020. HetPipe: Enabling Large
+{DNN } Training on (Whimpy) Heterogeneous {GPU } Clusters through Integration of Pipelined Model Parallelism and Data Parallelism. In 2020 {USENIX }
+Annual Technical Conference ( {USENIX } {ATC } 20). 307–321.
+[68] Hao Peng, Shandian Zhe, Xiao Zhang, and Yuan Qi. 2017. Asynchronous distributed variational Gaussian process for regression. In International Conference
+on Machine Learning. PMLR, 2788–2797.
+[69] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. 2020. Zero:
+Memory optimizations toward training trillion parameter models. In SC20:
+International Conference for High Performance Computing, Networking, Storage
+and Analysis. IEEE, 1–16.
+
+[70] Parameswaran Raman, Sriram Srinivasan, Shin Matsushima, Xinhua Zhang,
+Hyokun Yun, and SVN Vishwanathan. 2019. Scaling multinomial logistic regression via hybrid parallelism. In Proceedings of the 25th ACM SIGKDD International
+Conference on Knowledge Discovery & Data Mining. 1460–1470.
+[71] Suvash Sedhain, Aditya Krishna Menon, Scott Sanner, and Lexing Xie. 2015.
+Autorec: Autoencoders meet collaborative filtering. In Proceedings of the 24th
+international conference on World Wide Web. 111–112.
+[72] Sungyong Seo, Jing Huang, Hao Yang, and Yan Liu. 2017. Interpretable convolutional neural networks with dual local and global attention for review
+rating prediction. In Proceedings of the eleventh ACM conference on recommender
+systems. 297–305.
+[73] Alexander Sergeev and Mike Del Balso. 2018. Horovod: fast and easy distributed
+deep learning in TensorFlow. arXiv preprint arXiv:1802.05799 (2018).
+[74] Noam Shazeer, Youlong Cheng, Niki Parmar, Dustin Tran, Ashish Vaswani,
+Penporn Koanantakool, Peter Hawkins, HyoukJoong Lee, Mingsheng Hong,
+Cliff Young, et al. 2018. Mesh-TensorFlow: Deep Learning for Supercomputers.
+Advances in Neural Information Processing Systems 31 (2018), 10414–10423.
+[75] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared
+Casper, and Bryan Catanzaro. 2019. Megatron-lm: Training multi-billion parameter language models using model parallelism. arXiv preprint arXiv:1909.08053
+(2019).
+[76] Umut Simsekli, Cagatay Yildiz, Than Huy Nguyen, Taylan Cemgil, and Gael
+Richard. 2018. Asynchronous stochastic quasi-Newton MCMC for non-convex
+optimization. In International Conference on Machine Learning. PMLR, 4674–
+4683.
+[77] Sebastian U Stich. 2018. Local SGD Converges Fast and Communicates Little.
+In International Conference on Learning Representations.
+[78] Yuhan Su, Zhongming Jin, Ying Chen, Xinghai Sun, Yaming Yang, Fangzheng
+Qiao, Fen Xia, and Wei Xu. 2017. Improving click-through rate prediction accuracy in online advertising by transfer learning. In Proceedings of the International
+Conference on Web Intelligence. 1018–1025.
+[79] Yong Kiam Tan, Xinxing Xu, and Yong Liu. 2016. Improved recurrent neural
+networks for session-based recommendations. In Proceedings of the 1st workshop
+on deep learning for recommender systems. 17–22.
+[80] Hanlin Tang, Xiangru Lian, Shuang Qiu, Lei Yuan, Ce Zhang, Tong Zhang, and
+Ji Liu. 2019. Deepsqueeze: Parallel stochastic gradient descent with double-pass
+error-compensated compression. arXiv preprint arXiv:1907.07346 (2019).
+[81] Hanlin Tang, Xiangru Lian, Ming Yan, Ce Zhang, and Ji Liu. 2018. D2: Decentralized training over decentralized data. In International Conference on Machine
+Learning. PMLR, 4848–4856.
+[82] Hanlin Tang, Chen Yu, Xiangru Lian, Tong Zhang, and Ji Liu. 2019. Doublesqueeze: Parallel stochastic gradient descent with double-pass errorcompensated compression. In International Conference on Machine Learning.
+PMLR, 6155–6165.
+[83] Jiaxi Tang and Ke Wang. 2018. Personalized top-n sequential recommendation
+via convolutional sequence embedding. In Proceedings of the Eleventh ACM
+International Conference on Web Search and Data Mining. 565–573.
+[84] Jakub M Tarnawski, Amar Phanishayee, Nikhil Devanur, Divya Mahajan, and
+Fanny Nina Paravecino. 2020. Efficient Algorithms for Device Placement of
+DNN Graph Operators. Advances in Neural Information Processing Systems 33
+(2020).
+[85] Trinh Xuan Tuan and Tu Minh Phuong. 2017. 3D convolutional networks
+for session-based recommendation with content features. In Proceedings of the
+eleventh ACM conference on recommender systems. 138–146.
+[86] Bartłomiej Twardowski. 2016. Modelling contextual information in sessionaware recommender systems with neural networks. In Proceedings of the 10th
+ACM Conference on Recommender Systems. 273–276.
+[87] Aäron Van Den Oord, Sander Dieleman, and Benjamin Schrauwen. 2013. Deep
+content-based music recommendation. In Neural Information Processing Systems Conference (NIPS 2013), Vol. 26. Neural Information Processing Systems
+Foundation (NIPS).
+[88] Hongyi Wang, Scott Sievert, Zachary Charles, Shengchao Liu, Stephen Wright,
+and Dimitris Papailiopoulos. 2018. ATOMO: communication-efficient learning
+via atomic sparsification. In Proceedings of the 32nd International Conference on
+Neural Information Processing Systems. 9872–9883.
+[89] Jizhe Wang, Pipei Huang, Huan Zhao, Zhibo Zhang, Binqiang Zhao, and Dik Lun
+Lee. 2018. Billion-scale commodity embedding for e-commerce recommendation
+in alibaba. In Proceedings of the 24th ACM SIGKDD International Conference on
+Knowledge Discovery & Data Mining. 839–848.
+[90] Jianyu Wang and Gauri Joshi. 2019. Adaptive Communication Strategies to
+Achieve the Best Error-Runtime Trade-off in Local-update SGD. In Systems and
+Machine Learning (SysML) Conference.
+[91] Jialei Wang, Mladen Kolar, Nathan Srebro, and Tong Zhang. 2017. Efficient distributed learning with sparsity. In International Conference on Machine Learning.
+PMLR, 3636–3645.
+[92] Minjie Wang, Chien-chin Huang, and Jinyang Li. 2019. Supporting very large
+models using automatic dataflow graph partitioning. In Proceedings of the Fourteenth EuroSys Conference 2019. 1–17.
+
+Persia: An Open, Hybrid System Scaling Deep Learning-based Recommenders up to 100 Trillion Parameters
+
+[93] Nan Wang, Hongning Wang, Yiling Jia, and Yue Yin. 2018. Explainable recommendation via multi-task learning in opinionated text data. In The 41st
+International ACM SIGIR Conference on Research & Development in Information
+Retrieval. 165–174.
+[94] Shanfeng Wang, Maoguo Gong, Haoliang Li, and Junwei Yang. 2016. Multiobjective optimization for long tail recommendation. Knowledge-Based Systems
+104 (2016), 145–155.
+[95] Suhang Wang, Yilin Wang, Jiliang Tang, Kai Shu, Suhas Ranganath, and Huan
+Liu. 2017. What your images reveal: Exploiting visual contents for point-ofinterest recommendation. In Proceedings of the 26th international conference on
+world wide web. 391–400.
+[96] Xinxi Wang and Ye Wang. 2014. Improving content-based and hybrid music recommendation using deep learning. In Proceedings of the 22nd ACM international
+conference on Multimedia. 627–636.
+[97] J Wangni, J Liu, J Wang, and T Zhang. 2018. Gradient sparsification for
+communication-efficient distributed optimization. Advances in Neural Information Processing Systems 31 (2018), 1299.
+[98] Jiqing Wen, James She, Xiaopeng Li, and Hui Mao. 2018. Visual background
+recommendation for dance performances using deep matrix factorization.
+ACM Transactions on Multimedia Computing, Communications, and Applications (TOMM) 14, 1 (2018), 1–19.
+[99] Wei Wen, Cong Xu, Feng Yan, Chunpeng Wu, Yandan Wang, Yiran Chen, and Hai
+Li. 2017. TernGrad: ternary gradients to reduce communication in distributed
+deep learning. In Proceedings of the 31st International Conference on Neural
+Information Processing Systems. 1508–1518.
+[100] Mark Wilkening, Udit Gupta, Samuel Hsia, Caroline Trippel, Carole-Jean Wu,
+David Brooks, and Gu-Yeon Wei. 2021. RecSSD: Near Data Processing for Solid
+State Drive Based Recommendation Inference. arXiv preprint arXiv:2102.00075
+(2021).
+[101] Caihua Wu, Junwei Wang, Juntao Liu, and Wenyu Liu. 2016. Recurrent neural
+network based recommendation for time heterogeneous feedback. KnowledgeBased Systems 109 (2016), 90–103.
+[102] Sai Wu, Weichao Ren, Chengchao Yu, Gang Chen, Dongxiang Zhang, and Jingbo
+Zhu. 2016. Personal recommendation using deep recurrent neural networks in
+NetEase. In 2016 IEEE 32nd international conference on data engineering (ICDE).
+IEEE, 1218–1229.
+[103] Minhui Xie, Kai Ren, Youyou Lu, Guangxu Yang, Qingxing Xu, Bihai Wu, Jiazhen
+Lin, Hongbo Ao, Wanhong Xu, and Jiwu Shu. 2020. Kraken: memory-efficient
+continual learning for large-scale real-time recommendations. In SC20: International Conference for High Performance Computing, Networking, Storage and
+Analysis. IEEE, 1–17.
+[104] Xing Xie, Jianxun Lian, Zheng Liu, Xiting Wang, Fangzhao Wu, Hongwei Wang,
+and Zhongxia Chen. 2018. Personalized recommendation systems: Five hot
+research topics you must know. Microsoft Research Lab-Asia (2018).
+[105] Zhenghua Xu, Cheng Chen, Thomas Lukasiewicz, Yishu Miao, and Xiangwu
+Meng. 2016. Tag-aware personalized recommendation using a deep-semantic
+similarity model with negative sampling. In Proceedings of the 25th ACM International on Conference on Information and Knowledge Management. 1921–1924.
+[106] Carl Yang, Lanxiao Bai, Chao Zhang, Quan Yuan, and Jiawei Han. 2017. Bridging
+collaborative filtering and semi-supervised learning: a neural approach for
+poi recommendation. In Proceedings of the 23rd ACM SIGKDD International
+Conference on Knowledge Discovery and Data Mining. 1245–1254.
+[107] Caojin Zhang, Yicun Liu, Yuanpu Xie, Sofia Ira Ktena, Alykhan Tejani, Akshay
+Gupta, Pranay Kumar Myana, Deepak Dilipkumar, Suvadip Paul, Ikuhiro Ihara,
+et al. 2020. Model Size Reduction Using Frequency Based Double Hashing for
+Recommender Systems. In Fourteenth ACM Conference on Recommender Systems.
+521–526.
+[108] Hantian Zhang, Jerry Li, Kaan Kara, Dan Alistarh, Ji Liu, and Ce Zhang. 2017.
+Zipml: Training linear models with end-to-end low precision, and a little bit of
+deep learning. In International Conference on Machine Learning. PMLR, 4035–
+4043.
+
+[109] Qi Zhang, Jiawen Wang, Haoran Huang, Xuanjing Huang, and Yeyun Gong.
+2017. Hashtag Recommendation for Multimodal Microblog Using Co-Attention
+Network.. In IJCAI. 3420–3426.
+[110] Shuai Zhang, Lina Yao, Aixin Sun, and Yi Tay. 2019. Deep learning based
+recommender system: A survey and new perspectives. ACM Computing Surveys
+(CSUR) 52, 1 (2019), 1–38.
+[111] Yongfeng Zhang, Qingyao Ai, Xu Chen, and W Bruce Croft. 2017. Joint representation learning for top-n recommendation with heterogeneous information
+sources. In Proceedings of the 2017 ACM on Conference on Information and Knowledge Management. 1449–1458.
+[112] Zhipeng Zhang, Bin Cui, Yingxia Shao, Lele Yu, Jiawei Jiang, and Xupeng Miao.
+2019. Ps2: Parameter server on spark. In Proceedings of the 2019 ACM SIGMOD
+International Conference on Management of Data. 376–388.
+[113] Zhipeng Zhang, Jiawei Jiang, Wentao Wu, Ce Zhang, Lele Yu, and Bin Cui. 2019.
+Mllib*: Fast training of glms using spark mllib. In 2019 IEEE 35th International
+Conference on Data Engineering (ICDE). IEEE Computer Society, 1778–1789.
+[114] Weijie Zhao, Deping Xie, Ronglai Jia, Yulei Qian, Ruiquan Ding, Mingming Sun,
+and Ping Li. 2020. Distributed hierarchical gpu parameter server for massive
+scale deep learning ads systems. arXiv preprint arXiv:2003.05622 (2020).
+[115] Weijie Zhao, Jingyuan Zhang, Deping Xie, Yulei Qian, Ronglai Jia, and Ping
+Li. 2019. AIBox: CTR prediction model training on a single node. In Proceedings of the 28th ACM International Conference on Information and Knowledge
+Management. 319–328.
+[116] Xiangyu Zhao, Chong Wang, Ming Chen, Xudong Zheng, Xiaobing Liu, and
+Jiliang Tang. 2020. Autoemb: Automated embedding dimensionality search in
+streaming recommendations. arXiv preprint arXiv:2002.11252 (2020).
+[117] Xiangyu Zhao, Liang Zhang, Zhuoye Ding, Long Xia, Jiliang Tang, and Dawei
+Yin. 2018. Recommendations with negative feedback via pairwise deep reinforcement learning. In Proceedings of the 24th ACM SIGKDD International Conference
+on Knowledge Discovery & Data Mining. 1040–1048.
+[118] Zhe Zhao, Lichan Hong, Li Wei, Jilin Chen, Aniruddh Nath, Shawn Andrews,
+Aditee Kumthekar, Maheswaran Sathiamoorthy, Xinyang Yi, and Ed Chi. 2019.
+Recommending what video to watch next: a multitask ranking system. In Proceedings of the 13th ACM Conference on Recommender Systems. 43–51.
+[119] Guanjie Zheng, Fuzheng Zhang, Zihan Zheng, Yang Xiang, Nicholas Jing Yuan,
+Xing Xie, and Zhenhui Li. 2018. DRN: A deep reinforcement learning framework
+for news recommendation. In Proceedings of the 2018 World Wide Web Conference.
+167–176.
+[120] Shuxin Zheng, Qi Meng, Taifeng Wang, Wei Chen, Nenghai Yu, Zhi-Ming Ma,
+and Tie-Yan Liu. 2017. Asynchronous stochastic gradient descent with delay
+compensation. In International Conference on Machine Learning. PMLR, 4120–
+4129.
+[121] Guorui Zhou, Na Mou, Ying Fan, Qi Pi, Weijie Bian, Chang Zhou, Xiaoqiang
+Zhu, and Kun Gai. 2019. Deep interest evolution network for click-through rate
+prediction. In Proceedings of the AAAI conference on artificial intelligence, Vol. 33.
+5941–5948.
+[122] Guorui Zhou, Xiaoqiang Zhu, Chenru Song, Ying Fan, Han Zhu, Xiao Ma,
+Yanghui Yan, Junqi Jin, Han Li, and Kun Gai. 2018. Deep interest network for
+click-through rate prediction. In Proceedings of the 24th ACM SIGKDD International Conference on Knowledge Discovery & Data Mining. 1059–1068.
+[123] Zhengyuan Zhou, Panayotis Mertikopoulos, Nicholas Bambos, Peter Glynn,
+Yinyu Ye, Li-Jia Li, and Li Fei-Fei. 2018. Distributed asynchronous optimization
+with unbounded delays: How slow can you go?. In International Conference on
+Machine Learning. PMLR, 5970–5979.
+[124] Fuzhen Zhuang, Zhiqiang Zhang, Mingda Qian, Chuan Shi, Xing Xie, and Qing
+He. 2017. Representation learning via Dual-Autoencoder for recommendation.
+Neural Networks 90 (2017), 83–89.
+[125] Yi Zuo, Jiulin Zeng, Maoguo Gong, and Licheng Jiao. 2016. Tag-aware recommender systems based on deep neural networks. Neurocomputing 204 (2016),
+51–60.
+
+Lian et al.
+
+APPENDIX
+emb
+
+Lemma 1. Under Assumption 1, for any 𝛿 ∈ R𝑁
+the following inequality holds:
+
+
+
+
+emb
+nn
+𝑓 ′ wemb + 𝛿, wnn − 𝑓 ′ wemb, wnn ⩽ 𝛼𝐿 ∥𝛿 ∥ , ∀wemb ∈ R𝑁
+, wnn ∈ R𝑁 .
+
+(7)
+
+Proof. Define Hessian matrix w.r.t. the sparse weights wemb :
+𝜕 2 𝐹 wemb ,wnn ;𝜉
+
+
+𝜕 2 𝐹 wemb ,wnn ;𝜉
+emb
+emb
+𝜕 w1 𝜕 w2
+
+𝜕 2 𝐹 wemb ,wnn ;𝜉
+ emb  2
+𝜕 w2
+
+
+
+
+2
+©
+𝜕 w1emb
+­
+
+­ 𝜕2 𝐹 wemb
+,wnn ;𝜉
+­
+­ 𝜕wemb 𝜕wemb
+2
+1
+­
+Hemb
+𝐹𝜉 := ­
+..
+­
+­
+.
+
+­ 2
+­ 𝜕 𝐹 wemb ,wnn ;𝜉
+emb
+emb
+« 𝜕w𝑛 𝜕w1
+𝜕 2 𝑓 wemb ,wnn
+
+..
+.
+
+···
+···
+..
+
+.
+
+
+𝜕 2 𝐹 wemb ,wnn ;𝜉
+emb
+emb
+𝜕 w1 𝜕 w emb
+𝑁
+
+𝜕 2 𝐹 wemb ,wnn ;𝜉
+𝜕 w2emb 𝜕 wemb
+emb
+
+ª
+®
+®
+®
+®
+®,
+𝑁
+®
+..
+®
+®
+.
+ ®
+𝜕 2 𝐹 wemb ,wnn ;𝜉 ®
+
+2
+𝜕 w𝑛emb
+¬
+
+𝜕 2 𝐹 wemb ,wnn ;𝜉
+···
+𝜕 w𝑛emb 𝜕 w2emb
+
+
+𝜕 2 𝑓 wemb ,wnn
+𝜕 2 𝑓 wemb ,wnn
+···
+emb
+emb
+emb
+emb
+𝜕 w1 𝜕 w2
+𝜕 w1 𝜕 w emb
+𝑁
+
+
+𝜕 2 𝑓 wemb ,wnn
+𝜕 2 𝑓 wemb ,wnn
+···
+ emb  2
+𝜕 w2emb 𝜕 wemb
+𝜕 w2
+emb
+
+
+
+
+
+2
+©
+ª
+𝜕 w1emb
+­
+®
+
+­ 𝜕2 𝑓 wemb
+®
+nn
+,w
+­
+®
+­ 𝜕wemb 𝜕wemb
+®
+emb
+2
+1
+®.
+𝑁
+H 𝑓 := ­­
+®
+..
+..
+..
+..
+­
+®
+.
+­
+®
+.
+.
+.
+
+
+ ®
+­ 2
+emb ,wnn
+2
+emb ,wnn
+2
+emb ,wnn
+𝜕
+𝑓
+w
+𝜕
+𝑓
+w
+𝜕
+𝑓
+w
+­
+®
+···
+
+2
+emb
+emb
+𝜕 w𝑛emb 𝜕 w2emb
+𝜕 w𝑛emb
+« 𝜕w𝑛 𝜕w1
+¬
+From the Lipschitzian assumption (3) and the stochastic gradient function 𝐹 ′ (·; 𝜉) is differentiable, we obtain the Hessian matrix of 𝐹 (·; 𝜉)
+is ≼ 𝐿𝐼 , where 𝐼 is the identity matrix. Noting that since for each sample, the wemb is used by a lookup operation (??) where only a subset of
+the weights get used. For any element w𝑖emb , if 𝑖 ∉ Ω𝜉 , w𝑖emb will have no effect on the value of 𝐹 ′ (·; 𝜉). This implies the corresponding
+elements are zero in 𝐹 (·; 𝜉)’s Hessian matrix, and the following inequality holds:
+
+Hemb
+𝐹𝜉 ≼𝐿𝐼𝜉 ,
+where
+
+(𝐼𝜉 )𝑖,𝑗 =
+
+1,
+0,
+
+if 𝑖 = 𝑗 and 𝑖 ∈ Ω𝜉 ,
+.
+otherwise.
+
+Note that from the definition of 𝑓 in (1), we obtain the Hessian of 𝑓 is the expectation of the Hessian of 𝐹 :
+=E𝜉 Hemb
+Hemb
+𝐹𝜉 ≼ 𝐿E𝜉 𝐼𝜉 .
+𝑓
+Finally following the definition of 𝛼, we obtain Hemb
+≼ 𝐿E𝜉 𝐼𝜉 ≼ 𝐿𝛼, which leads to the 𝛼𝐿 Lipschitzian continuity in the sparse weights
+𝑓
+(7).
+□
+Proof to Theorem 1
+Proof. Since 𝑓 is defined as the average of 𝐹 , from Lipschitzian gradient assumption (3), it can be derived that 𝑓 is also Lipschitzian:
+𝑓 ′ (w) − 𝑓 ′ (w + 𝛿) ⩽ 𝐿 ∥𝛿 ∥ ,
+
+∀w, 𝛿 ∈ R𝑁
+
+emb
+
++𝑁 nn
+
+(8)
+
+.
+
+From the algorithm update rule (2) and the Lipschitzian property (8), we obtain
+
+
+
+
+nn
+emb
+𝑓 wtemb
+, wtnn
++1 , wt+1 − 𝑓 wt
+
+E 𝐿
+(8) D 
+2
+nn
+emb
+− wtnn +
+wtemb
++ wtnn
+− wtemb − wtnn
+⩽ 𝑓 ′ wtemb, wtnn , wtemb
++1 + wt+1 − wt
++
+1
++
+1
+2
+D 
+
+E 𝐿𝛾 2
+2
+(2)
+emb
+nn
+emb ′
+nn ′
+′
+emb ′
+= − 𝛾 𝑓 wt , wt , 𝐹𝑡
++ 𝐹𝑡
++
+𝐹𝑡
++ 𝐹𝑡nn ′
+2
+D 
+
+E 𝐿𝛾 2
+′
+emb
+nn
+′
+′ 2
+= − 𝛾 𝑓 wt , wt , 𝐹𝑡 +
+𝐹𝑡 .
+2
+Taking the expectation on both sides, we obtain
+h 
+
+
+i
+hD 
+
+Ei 𝐿𝛾 2 h
+i
+2
+nn
+emb
+E 𝑓 wtemb
+, wtnn ⩽ −𝛾 E 𝑓 ′ wtemb, wtnn , 𝐹𝑡′ +
+E 𝐹𝑡′
+.
++1 , wt+1 − 𝑓 wt
+2
+|
+{z
+}
+| {z }
+=:𝑇1
+
+=:𝑇2
+
+(9)
+
+Persia: An Open, Hybrid System Scaling Deep Learning-based Recommenders up to 100 Trillion Parameters
+
+We show the bound for the terms 𝑇1 and 𝑇2 respectively, in the following paragraphs. For 𝑇2 , from the unbiased property of stochastic
+gradients (1) and the bounded variance assumption (4) we obtain
+
+𝑇2 =E
+
+h
+
+𝐹𝑡′
+
+
+
+
+
+
+ 2
+emb
+nn
+′
+emb
+nn
+𝐹𝑡′ − 𝑓 ′ wD
+,
+w
++
+𝑓
+w
+,
+w
+t
+t
+( t)
+D ( t)
+
+
+
+
+ 2
+
+ 2
+hD
+
+
+
+Ei
+emb
+nn
+′
+emb
+nn
+′
+′
+emb
+nn
+′
+emb
+nn
+𝐹𝑡′ − 𝑓 ′ wD
+,
+w
++
+𝑓
+w
+,
+w
++
+2
+E
+𝐹
+−
+𝑓
+w
+,
+w
+,
+𝑓
+w
+,
+w
+𝑡
+t
+t
+t
+t
+( t)
+D ( t)
+D ( t)
+D ( t)
+|
+{z
+}
+
+=E
+=E
+
+2
+
+i
+
+=0, from (1)
+
+(4)
+
+⩽𝜎 2 + E
+
+
+
+
+
+emb
+nn
+𝑓 ′ wD
+( t) , wt
+
+ 2
+(10)
+
+.
+
+For 𝑇1 , we have
+
+
+Ei
+
+𝑓 ′ wtemb, wtnn , 𝐹𝑡′
+
+Ei
+hD
+(1)
+emb
+nn
+,
+w
+= E 𝑓 ′ (wtemb, wtnn ), 𝑓 ′ wD
+t
+( t)
+
+
+ 2
+
+ 2
+
+
+
+ 2
+1
+′
+emb
+nn
+′
+emb
+nn
+′
+emb
+nn
+′
+emb
+nn
+= E 𝑓 wt , wt
++ 𝑓 wD ( t ) , wt
+− 𝑓 wt , wt − 𝑓 wD ( t) , wt
+,
+2
+
+𝑇1 =E
+
+hD
+
+(11)
+
+where the last step comes from the fact that for any a, b the following equality holds: ⟨a, b⟩ = 21 ∥a − b∥ 2 − 21 ∥a∥ 2 − 12 ∥b∥ 2 .
+Using the bounds for 𝑇1 (11) and 𝑇2 (10) in (9), we obtain
+
+h 
+
+
+i
+nn
+emb
+E 𝑓 wtemb
+, wtnn
++1 , wt+1 − 𝑓 wt
+
+
+ 2
+
+ 2
+
+
+
+ 2
+𝛾
+emb
+nn
+′
+emb
+nn
+′
+emb
+nn
++ 𝑓 ′ wD
+,
+w
+𝑓
+−
+w
+,
+w
+⩽ − E 𝑓 ′ wtemb, wtnn
+−
+𝑓
+w
+,
+w
+]
+t
+t
+t
+t
+( t)
+D ( t)
+2
+
+
+
+
+2
+2
+2
+𝐿𝛾 2
+𝐿𝛾
+emb
+nn
+E 𝑓 ′ wD
+𝜎
++
++
+( t) , wt
+2
+2
+
+
+
+
+
+ 2
+
+ 2  𝐿𝛾 2
+
+
+
+ 2
+𝛾
+𝛾
+emb
+nn
+2 𝛾
+′
+emb
+nn
+′
+emb
+nn
+= − E 𝑓 ′ wtemb, wtnn
+− (1 − 𝛾𝐿) E 𝑓 ′ wD
+,
+w
++
+𝜎
++
+E
+𝑓
+w
+,
+w
+−
+𝑓
+w
+,
+w
+t
+t
+t
+t
+( t)
+D ( t)
+2
+2
+2
+2
+
+
+
+
+
+
+
+
+
+
+2
+2
+2
+𝛾
+𝐿𝛾 2 𝛾
+emb
+nn
+,
++
+𝜎 + E 𝑓 ′ wtemb, wtnn − 𝑓 ′ wD
+⩽ − E 𝑓 ′ wtemb, wtnn
+( t ) , wt
+2
+2
+2
+|
+{z
+}
+=:𝜔𝑡
+
+where the last inequality is obtained by choosing a sufficiently small learning rate 𝛾 satisfying 1 ⩾ 𝛾𝐿.
+We then bound 𝜔𝑡 in order to get the final convergence rate result. Denoting
+
+𝐿emb := min {1, 𝛼 } 𝐿,
+
+
+′
+emb
+emb
+𝐹𝑡emb (𝑡) :=∇wemb 𝑓 wD
+,
+w
+,
+t
+( t)
+
+
+emb
+emb
+𝐹𝑡nn ′ (𝑡) :=∇wnn 𝑓 wD
+,
+( t) , wt
+
+(12)
+
+Lian et al.
+
+it follows from Lemma 1 that
+
+𝜔𝑡 =E
+(7)
+
+
+
+
+ 2
+emb
+nn
+𝑓 ′ wtemb, wtnn − 𝑓 ′ wD
+,
+w
+t
+( t)
+
+2
+⩽𝐿emb
+E
+
+
+
+emb
+wtemb − wD
+( t)
+
+
+
+
+(2) 2 2
+=𝛾 𝐿emb E 
+
+𝑡∑︁
+−1
+
+′
+𝐹𝑘emb
+
+2
+
+
+
+2
+
+
+
+
+
+
+
+ 𝑘=D (𝑡 )
+
+2
+ 𝑡∑︁
+𝑡∑︁
+−1
+𝑡∑︁
+−1
+ −1 emb ′
+
+′
+′
+2 2
+emb
+emb
+
+=𝛾 𝐿emb E 
+𝐹𝑘
+−
+𝐹𝑘
++
+𝐹𝑘
+
+ 𝑘=D (𝑡 )
+
+𝑘=
+D
+(𝑡
+)
+𝑘=
+D
+(𝑡
+)
+
+
+2
+2
+ 𝑡∑︁
+
+−
+1
+𝑡
+−
+1
+−1
+∑︁
+
+
+ 𝑡∑︁
+
+2 2
+emb ′
+2 2
+emb ′ 
+emb ′ 
+
+
+=𝛾 𝐿emb E 
+𝐹𝑘
+−
+𝐹𝑘
+𝐹𝑘
+ + 𝛾 𝐿emb E 
+
+ 𝑘=D (𝑡 )
+
+ 𝑘=D (𝑡 )
+
+𝑘=D (𝑡 )
+
+
+
+
+2
+ 𝑡∑︁
+
+−
+1
+(4)
+
+′ 
+2
+2
+⩽𝛾 2 𝐿emb
+𝜏𝜎 2 + 𝛾 2 𝐿emb
+E 
+𝐹𝑘emb 
+ 𝑘=D (𝑡 )
+
+
+
+ 𝑡∑︁
+
+−1
+
+2
+′ 
+2
+2
+⩽𝛾 2𝜏𝐿emb
+𝜏𝜎 2 + 𝛾 2 𝐿emb
+E 
+𝐹𝑘emb  ,
+𝑘=D (𝑡 )
+
+
+
+
+(13)
+
+where the third last step and the last step come from the fact that for any 𝑎 1, 𝑎 2, . . . 𝑎𝑛 , we have the following inequality: ∥𝑎 1 + 𝑎 2 + · · · + 𝑎𝑛 ∥ 2 ⩽
+Í
+𝑛 𝑛𝑖=1 ∥𝑎𝑖 ∥ 2 . We then bound the right side of (13) with 𝜔𝑡 itself:
+ 𝑡∑︁
+
+ −1
+′ 2
+𝜔𝑡 ⩽𝛾 2 𝐿𝜏2𝜏𝜎 2 + 𝛾 2𝜏𝐿𝜏2 E 
+𝐹𝑘emb 
+𝑘=D (𝑡 )
+
+
+
+ 𝑡∑︁
+−
+1
+
+
+
+ 2 
+
+′
+=𝛾 2 𝐿𝜏2𝜏𝜎 2 + 𝛾 2𝜏𝐿𝜏2 E 
+𝐹𝑘emb − ∇wemb 𝑓 wkemb, wknn + ∇wemb 𝑓 wkemb, wknn 
+
+𝑘=D (𝑡 )
+
+
+ 𝑡∑︁
+𝑡
+−
+1
+−
+1
+
+ 2 
+
+ 2
+∑︁
+
+′
++
+∇wemb 𝑓 wkemb, wknn 
+⩽𝛾 2 𝐿𝜏2𝜏𝜎 2 + 2𝛾 2𝜏𝐿𝜏2 E 
+𝐹𝑘emb − ∇wemb 𝑓 wkemb, wknn
+
+𝑘=D (𝑡 )
+𝑘=D (𝑡 )
+
+
+
+ 𝑡∑︁
+−
+1
+𝑡
+−
+1
+∑︁
+
+2
+⩽𝛾 2 𝐿𝜏2𝜏𝜎 2 + 2𝛾 2𝜏𝐿𝜏2 E 
+𝜔𝑘 +
+𝑓 ′ (w𝑘 ) 
+
+𝑘=D (𝑡 )
+𝑘=D (𝑡 )
+
+
+" 𝑡 −1
+#
+𝑡∑︁
+−1
+∑︁
+2
+⩽𝛾 2 𝐿𝜏2𝜏𝜎 2 + 2𝛾 2𝜏𝐿𝜏2 E
+𝜔𝑘 +
+𝑓 ′ (w𝑘 )
+.
+𝑘=𝑡 −𝜏
+
+(14)
+
+𝑘=𝑡 −𝜏
+
+Summing (14) from 𝑡 = 0 to 𝑡 = 𝑇 − 1 we obtain
+𝑇∑︁
+−1
+
+𝜔𝑡 ⩽𝛾 2 𝐿𝜏2𝜏𝜎 2𝑇 + 2𝛾 2𝜏 2 𝐿𝜏2 E
+
+𝑡 =0
+
+"𝑇 −1
+∑︁
+𝑡 =0
+
+𝜔𝑘 +
+
+𝑇∑︁
+−1
+
+#
+2
+
+′
+
+𝑓 (w𝑡 )
+
+.
+
+𝑡 =0
+
+Rearranging the terms, we obtain
+
+
+2
+1 − 2𝛾 2𝜏 2 𝐿emb
+
+−1
+ 𝑇∑︁
+
+2
+2
+𝜔𝑡 ⩽𝛾 2 𝐿emb
+𝜏𝜎 2𝑇 + 2𝛾 2𝜏 2 𝐿emb
+E
+
+𝑡 =0
+
+"𝑇 −1
+∑︁
+
+#
+′
+
+𝑓 (w𝑡 )
+
+.
+
+𝑡 =0
+
+By choosing a sufficiently small learning rate 𝛾 satisfying 1/2 ⩾ 𝛾𝜏𝐿emb , it follows that
+"𝑇 −1
+#
+𝑇∑︁
+−1
+∑︁
+2
+2
+2
+𝑓 ′ (w𝑡 )
+𝜔𝑡 ⩽2𝛾 2 𝐿emb
+𝜏𝜎 2𝑇 + 4𝛾 2𝜏 2 𝐿emb
+E
+.
+𝑡 =0
+
+2
+
+𝑡 =0
+
+(15)
+
+Persia: An Open, Hybrid System Scaling Deep Learning-based Recommenders up to 100 Trillion Parameters
+
+Now we get back to (12). Summing (12) from 𝑡 = 0 to 𝑡 = 𝑇 − 1 we obtain
+h 
+
+
+i
+E 𝑓 wtemb, wtnn − 𝑓 w0emb, w0nn
+𝑇 −1
+
+𝑇 −1
+
+ 2  𝐿𝛾 2
+𝛾 ∑︁
++
+𝑓 ′ wtemb, wtnn
+𝜔𝑡
+𝜎 2𝑇 +
+2
+2 𝑡 =0
+"𝑇 −1
+#
+−1 
+
+ 2  𝐿𝛾 2
+
+ 2
+∑︁
+(15) 𝛾 𝑇∑︁
+′
+emb
+nn
+2
+3 2
+2
+3 2 2
+′
+emb
+nn
++
+E 𝑓 wt , wt
+⩽ −
+𝜎 𝑇 + 𝛾 𝐿emb𝜏𝜎 𝑇 + 2𝛾 𝜏 𝐿emb E
+𝑓 wt , wt
+2 𝑡 =0
+2
+𝑡 =0
+𝑇 −1 
+
+ 2  𝐿𝛾 2
+𝛾 ∑︁
+2
+E 𝑓 ′ wtemb, wtnn
++
+𝜎 2𝑇 + 𝛾 3 𝐿emb
+𝜏𝜎 2𝑇 ,
+⩽−
+4 𝑡 =0
+2
+
+⩽−
+
+𝛾 ∑︁
+E
+2 𝑡 =0
+
+
+
+where the last step comes from choosing a sufficiently small learning rate 𝛾 satisfying 1/4 ⩾ 𝛾𝜏𝐿emb . Rearranging the terms we obtain:
+
+
+ 2
+Í𝑇 −1
+′ wemb , wnn
+E
+𝑓
+t
+t
+𝑡 =0
+
+⩽
+
+⩽
+
+⩽
+
+𝑇 
+h 
+
+i
+emb
+4E 𝑓 w0 , w0nn − 𝑓 wtemb, wtnn
+𝛾𝑇
+h 
+
+
+i
+emb
+nn
+4E 𝑓 w0 , w0 − 𝑓 wtemb, wtnn
+𝛾𝑇
+i
+h 
+
+emb
+nn
+4E 𝑓 w0 , w0 − 𝑓 ∗
+
+2
++ 2𝐿𝛾𝜎 2 + 4𝛾 2 𝐿emb
+𝜏𝜎 2
+
++ 2𝐿𝛾𝜎 2 + 𝛾𝐿emb 𝜎 2
+
++ 3𝐿𝛾𝜎 2,
+
+𝛾𝑇
+
+where the last step comes from the definition of 𝐿emb and the second last step still comes from the our choosing a sufficiently small learning
+rate 𝛾 satisfying 1/4 ⩾ 𝛾𝜏𝐿emb .
+, we obtain
+By choosing the learning rate 𝛾 to be the same as the optimal learning rate for SGD √ 1
+𝐿+ 𝑇 𝐿𝜎+4𝜏𝐿emb
+
+
+
+
+2
+Í𝑇 −1
+′
+emb , wnn
+t
+𝑡 =0 E 𝑓 wt
+𝑇
+√
+𝐿𝜎 𝐿 𝜏𝐿emb
+≲ √ + +
+𝑇
+𝑇
+𝑇
+√
+𝐿𝜎 𝐿 𝜏 min {1, 𝛼 }
+⩽ √ + +
+𝑇
+𝑇
+𝑇
+completing the proof.
+
+□
+

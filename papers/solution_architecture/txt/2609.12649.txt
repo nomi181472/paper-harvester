@@ -1,0 +1,784 @@
+Hybrid Monitoring for Early Fault Detection in
+Cloud-Native 5G Systems
+Anton Andersson1,2 , Sai Akshara Naineni1,2 , Mats Jansborg2 , Yixing Zhang1 ,
+Romaric Duvignau1
+Department of Computer Science and Engineering, Chalmers University of
+Technology and University of Gothenburg, SE-412 96 Gothenburg, Sweden
+{antonand,akshara}@student.chalmers.se, {yixing,duvignau}@chalmers.se
+2
+Ericsson AB, Gothenburg, Sweden
+mats.jansborg@ericsson.com
+
+arXiv:2609.12649v1 [cs.NI] 11 Sep 2026
+
+1
+
+Abstract. This paper presents the design, implementation, and evaluation of NetMon, a hybrid network monitoring system designed for
+Kubernetes-based 5G packet core deployments, specifically evaluated on
+Ericsson’s Access and Mobility Management Function (AMF) clusters.
+NetMon combines eBPF-based passive kernel-level traffic observation
+with active TCP probing and centralized correlation to detect and localize network degradation within seconds. The evaluation results demonstrate that the system detects faults as subtle as 10ms of added latency
+or 5% packet loss, correctly attributes them to the affected infrastructure component, and maintains this capability under application loads
+up to 50% simulated UE load. The total resource overhead of 3.4 millicores CPU and 4.5 MiB memory per pod suggests that the approach is
+promising for further validation without impacting the monitored workload. The hybrid approach addresses a gap in existing monitoring tools:
+standard health checks cannot detect partial degradation, scrape-based
+systems introduce detection delays measured in tens of seconds, and
+purely passive tools cannot verify idle network paths. By combining these
+complementary techniques and centralizing the analysis, the system provides the early detection and fault localization capabilities required for
+maintaining service quality in cloud-native 5G infrastructure.
+Keywords: Kubernetes · eBPF · Observability · Monitoring · Computer
+Networks · Cluster Networks · 5G.
+
+1
+
+Introduction
+
+Monitoring distributed systems is challenging because interacting components
+fail in subtle, non-obvious ways. As systems scale, determining whether issues
+originate in application logic, shared resources, or the network becomes increasingly difficult [1]. These challenges are amplified in cloud-native 5G core networks, where microservice-based network functions deployed on Kubernetes create dynamic communication paths where small degradations propagate across
+
+2
+
+A. Andersson, S. A. Naineni et al.
+
+components [4]. Early indicators such as higher jitter, slower tail latency, and
+dropped packets appear before visible faults.
+The 5G core network is functionally decoupled into two main structural layers: a control plane that handles administrative and state logic, and a user plane
+that processes data packet forwarding [12].
+The control plane comprises three primary service functions that interact via
+service-based interfaces (SBIs):
+– The Access and Mobility Management Function (AMF) manages terminal registration, authentication, and mobility tracking across radio nodes.
+– The Session Management Function (SMF) handles network address
+allocation, session establishment, and user plane node policy enforcement.
+– The Policy Control Function (PCF) delivers routing, Quality of Service
+(QoS), and subscriber-specific policy rules to the control operations.
+In contrast, the user plane is represented by the User Plane Function
+(UPF), which acts as the data-plane anchor routing traffic between the Radio
+Access Network (RAN) and the external Data Networks (DN).
+Crucially, the control plane and the user plane interact via well-defined reference points rather than inline service busses. One of these points of interaction
+is the N4 interface, which forms a direct reference link between the SMF and
+the UPF. Through this interface, the SMF programmatically pushes Packet Forwarding Control Protocol (PFCP) rules down to the UPF, mapping session-state
+logic to raw data plane instructions. In our monitoring framework, verifying the
+integrity and latency of this inter-plane communication path is paramount, as
+impairments along the N4 interface directly degrade session handling and userplane forwarding performance across the 5G core infrastructure.
+1.1
+
+Related Work
+
+Existing approaches leave significant gaps. Active probing does not scale well [2].
+Metrics-based tools (e.g., Prometheus) operate on large scrape intervals, missing
+transient degradation. Logging is reactive. Distributed tracing misses kernel-level
+issues. Current AMF monitoring relies mostly on liveness checks that cannot
+detect early-stage degradation within inter-microservice communication paths,
+and passive telemetry alone struggles to distinguish genuine degradation from
+normal variation [8].
+The core problem is therefore detecting subtle network degradation such as
+latency shifts, jitter increases, and intermittent packet loss, before it cascades
+into visible failures, while keeping overhead acceptable for production 5G deployments. This paper presents NetMon, a hybrid tool that addresses this gap by
+combining passive eBPF-based kernel-level observation with active TCP probing between pods [16]. Lightweight agents on each pod probe peers and collect
+kernel-measured RTT, jitter, retransmission rates, and TCP anomalies, reporting to a central correlator that identifies failure patterns and localizes their source
+without modifying application code [15].
+
+Hybrid Monitoring for Early Fault Detection in Cloud-Native 5G Systems
+
+1.2
+
+3
+
+Research Questions
+
+The research is guided by the following question:
+– How can early-stage network degradation in cloud-native 5G systems be
+detected and localized using a lightweight hybrid approach combining passive
+kernel-level monitoring with active probing?
+Supported by sub-question:
+– How can independently observed anomalies be correlated to distinguish podlevel faults, worker issues, and partitions?
+1.3
+
+Contributions
+
+To answer these research questions, we present the design, implementation, and
+evaluation of NetMon, delivering the following concrete contributions:
+– Hybrid monitoring architecture: To address our primary research question, we design a hybrid monitoring architecture that combines eBPF passive
+telemetry with active TCP probing, enabling early fault detection through
+a general-purpose Kubernetes tool evaluated on a 5G AMF deployment.
+– Cluster-wide correlation engine: To address the correlation of distributed
+anomalies, we develop an engine that aggregates local reports to identify
+failure patterns such as peer down, latency source, worker isolation, internode failure, and pod isolation thereby distinguishing pod-level issues from
+infrastructure-level faults.
+– Visualization pipeline: To ensure operator visibility, we implement a monitoring pipeline integrated with Prometheus and a custom dashboard to export per-pod and per-link health metrics in real time.
+– Live evaluation: To validate our approach under realistic conditions, we
+conduct a live evaluation of detection timeliness, accuracy, and resource overhead on a multi-worker AMF cluster, successfully extending monitoring coverage to previously unmonitored internal communication paths.
+
+2
+
+System Design
+
+This section presents the design of NetMon, including its overall architecture,
+distributed monitoring agents, local anomaly-detection mechanisms, and centralized correlation process. To ensure the system is viable for production 5G
+environments, the architecture is engineered to fulfill four primary design objectives:
+– Early detection: NetMon aims to detect network degradation within seconds, identifying infrastructure faults before standard application-level health
+checks surface visible problems [7].
+
+4
+
+A. Andersson, S. A. Naineni et al.
+
+– Lightweight operation: The monitoring components are designed to run
+with a minimal resource footprint to avoid interfering with production workloads under high stress.
+– Cluster-wide correlation: The architecture isolates faults by distinguishing localized pod-level failures from worker-node issues and broader network
+partitions.
+– Transparent deployment: The system is deployed seamlessly as sidecar
+containers without requiring any modifications to the monitored application’s source code.
+2.1
+
+Architecture Overview
+
+The system follows a distributed architecture with two components: agents deployed as sidecars on each monitored pod, and a central server running on the
+controller pod.
+
+Fig. 1: Architecture overview of centralized network monitoring for 5G pods in
+Kubernetes.
+
+The agent actively probes all peers, passively monitors traffic via eBPF, performs local anomaly detection, and reports findings every 5 seconds via JSON
+over TCP. The central server aggregates reports, performs correlation analysis, maintains per-pair baselines using CUSUM change-point detection, maps
+cluster topology, and tracks pod and worker health states. Communication relies
+on Kubernetes service discovery via a headless service that resolves to current
+pod IPs [11], enabling automatic adaptation as pods are added, removed, or
+rescheduled [10].
+
+Hybrid Monitoring for Early Fault Detection in Cloud-Native 5G Systems
+
+2.2
+
+5
+
+Distributed Monitoring Agent
+
+To gather high-fidelity network telemetry directly from the data plane, the NetMon agent runs as a sidecar container that monitors its local pod environment
+using three primary mechanisms: active probing, passive eBPF monitoring, and
+local anomaly detection.
+Active Probing: The monitoring agents resolve the headless service name
+during each probe cycle to discover active peer pods within the cluster [11].
+Every 5 seconds, each agent probes each peer via a TCP connection with a
+3-second timeout. The probe uses a ping-pong protocol that exchanges worker
+node names, verifying connectivity and enabling topology discovery. Failures
+are tracked per peer: each failure generates a PROBE_FAILURE anomaly, and ≥3
+consecutive failures generate CONSECUTIVE_FAILURES. A 60-second peer grace
+period ensures that terminated pods are detected via probe failures rather than
+silently disappearing from the monitoring set.
+eBPF Passive Monitoring: To capture network behavior directly from the
+Linux kernel without incurring userspace scheduling overhead, three custom
+eBPF programs are attached to the pod’s primary network interface.
+eXpress Data Path(XDP) Program: This program runs at the earliest
+ingress point [6], inspecting packets from known peers. It maintains per-peer
+counters (TCP/UDP packets, bytes, per-flag counts, retransmissions) in BPF
+maps. Potential retransmission detection uses an LRU hash of (source IP, source
+port, TCP sequence number) with a 50ms minimum age floor to avoid false positives from kernel packet batching. RST and retransmission events are forwarded
+via a ring buffer for userspace processing.
+TC Programs: A pair of egress and ingress programs measure the endto-end probe latency. The egress program timestamps outgoing SYN packets
+destined for the probe port, while the ingress program calculates latency when
+the first data-bearing reply segment arrives from the peer, emitting the RTT (in
+microseconds) via a ring buffer. This captures the full round-trip from connection
+initiation to application response, including network traversal, TCP handshake
+completion, and remote processing time. Because timestamping occurs in the
+kernel’s TC layer, local userspace scheduling between send and receive does not
+affect the measurement, though the remote peer’s application processing time
+is included. The TC egress program additionally tracks per-flow traffic counters
+for cluster-wide application traffic analysis.
+Local Anomaly Detection: The agent processes the kernel metrics collected
+using two main local detection strategies.
+Z-score detection. This is the first strategy used to analyze latency metrics. For latency metrics, an Exponential Moving Average (EMA, α = 0.2) [5]
+serves as the adaptive baseline. The running standard deviation is computed as
+the square root of an EMA of squared deviations (αvar = 0.05) with a minimum
+
+6
+
+A. Andersson, S. A. Naineni et al.
+
+floor of 0.5ms. An anomaly is raised when the z-score exceeds 5.0 and the absolute deviation is ≥2ms. Detection requires ≥20 samples and is performed before
+updating the EMA and variance, ensuring that the z-score reflects deviation
+from the pre-existing baseline.
+Relative and absolute thresholds. This is the second strategy designed
+to monitor traffic anomalies. For traffic statistics, RST and retransmission rates
+are flagged when exceeding 5× their EMA baseline or absolute thresholds of 5%
+(RST) and 10% (retransmissions).
+Using these strategies, the agent evaluates the incoming data points to detect
+and report the following concrete anomaly types:
+– The agent triggers KERNEL_RTT_SPIKE and JITTER_SPIKE anomalies when
+the z-score of the round-trip time or jitter exceeds 5.0 with an absolute
+deviation of at least 2ms.
+– It reports PROBE_FAILURE and CONSECUTIVE_FAILURES anomalies to track
+immediate or sustained active connection failures between peer pods.
+– It flags HIGH_RST and HIGH_RETRANSMIT anomalies when the absolute ratio
+of TCP resets exceeds 5% or packet retransmissions exceed 10%.
+– It raises RST_SPIKE and RETX_SPIKE anomalies when the short-term rate of
+resets or retransmissions exceeds five times the historical EMA baseline.
+– It registers a HIGH_PPS anomaly when the incoming packet-per-second rate
+spikes to more than five times its expected historical baseline.
+– It generates a TRAFFIC_SILENCE anomaly when an active peer pod fails to
+send any detectable network traffic for more than 30 seconds.
+2.3
+
+Central Server Design
+
+The central server aggregates reports from all agents, performs cluster-wide correlation, maintains topology information, and tracks pod and worker health
+states.
+Pod State and Health Classification: The central server maintains per-pod
+state including lifetime metrics, current peer states, and health classification
+determined by counting probe failures and anomalies targeting the pod within
+a 30-second window:
+– DOWN: no report for > 60s
+– FAILING: ≥9 probe failures
+– WARNING: ≥3 failures or ≥30 anomalies
+– DEGRADED: ≥1 failure or ≥20 anomalies
+– HEALTHY: none of the above
+The health state is based on what other pods report about a pod, which
+enables detection of problems that are invisible to the pod itself. The precedence
+of the health states are sequential, so a pod that is both WARNING and FAILING,
+would show up as FAILING only.
+
+Hybrid Monitoring for Early Fault Detection in Cloud-Native 5G Systems
+
+7
+
+Correlation Engine: The correlation engine analyzes anomaly history within
+a 30-second sliding window, recomputed on every incoming report. Nine correlation patterns are identified in three categories.
+Pod-level correlations:
+– PEER_DOWN: ≥9 probe failures target the same peer
+– LATENCY_SOURCE: ≥15 RTT/jitter anomalies target the same pod
+– ANOMALY_HOTSPOT: ≥30 anomalies target the same pod
+Connectivity correlations:
+– WORKER_ISOLATED: pod fails to reach ≥3 peers on the same worker
+– INTER_NODE_FAILURE: worker link < 50% success while other links remain
+healthy
+– POD_ISOLATED: pod < 10% success rate while other pods on same worker
+remain healthy
+Worker-level correlations:
+– WORKER_HOTSPOT: ≥2 external workers report anomalies and health score is
+≥ 10 below average
+– WORKER_HIGH_LATENCY: > 50% of inter-worker links have RTT > 10ms
+– WORKER_SOURCE_HOTSPOT: worker reports ≥ 40 anomalies about ≥ 3 others
+and ≥ 2× the cluster average
+Online Change-Point Detection (CUSUM): For each source-destination
+pod pair, the central server maintains running mean and variance using Welford’s
+online algorithm (numerically stable, constant memory per metric). CUSUM
+(Cumulative Sum) detects distributional shifts by accumulating standardized
+deviations from the learned mean, with slack parameter k = 0.5 controlling
+sensitivity and decision threshold h = 4.0. Upon detection, the accumulators
+reset and the mean updates to the current value, adapting to the new operating
+point. A warmup of 30 samples and a minimum 5ms (for RTT only) absolute
+deviation are required.
+The system generates three CUSUM-based anomalies (CUSUM_RTT_SHIFT,
+CUSUM_JITTER_SHIFT, and CUSUM_RETX_SHIFT).
+Topology Awareness and Worker Health: Worker node assignments obtained through probe handshakes enable topology-aware analysis. Each worker
+receives a health score combining probe success rate (weight 0.6) and anomaly
+rate (weight 0.4) within a 30-second window, expressed on a 0–100 scale.
+Traffic baselines between worker pairs are also maintained to detect traffic
+drops (< 40% of baseline) and traffic spikes (> 3× baseline).
+2.4
+
+Reporting and Visualization
+
+The server exposes a Prometheus endpoint with metrics including pod health
+states, per-peer RTT, jitter, throughput, worker health scores, CUSUM statistics, and active correlations. These metrics are scraped and visualized through
+Ericsson’s CNOM (Cloud Native Operations Manager) dashboard platform.
+
+8
+
+3
+
+A. Andersson, S. A. Naineni et al.
+
+Implementation and Deployment
+
+The system is implemented in C using libbpf for eBPF program loading. eBPF
+programs are compiled with Clang targeting BPF and loaded via the skeleton
+mechanism. Deployment requires CAP_BPF and CAP_NET_ADMIN [3]. Key tradeoffs: eBPF over packet capture (lower overhead, requires Linux 5.8+), pushbased reporting (lower latency, single point of failure), O(N 2 ) full-mesh probing
+(complete coverage, limits scalability), sensitivity over precision (mitigated by
+multi-source correlation), statistical methods over ML (no training data needed,
+interpretable).
+3.1
+
+Evaluation Methodology
+
+All experiments are conducted on a live Kubernetes cluster since live tests capture realistic kernel and network behavior.
+Environment: The test environment consists of a virtual 5G AMF deployed
+across four worker nodes with ten pods spanning four microservice types (controller, SCTP transport, forwarding, mobility management), with 2–3 pods per
+worker.
+
+Fig. 2: Cluster topology with 10 pods across 4 worker nodes.
+
+Fault Injection: Controlled faults were injected using tc and iptables on a
+single target worker, with the central server on a separate worker. Each scenario
+was repeated ≥5 times at 0% simulated UE load, and 2 times at 20%, and 50%
+simulated UE load. Injections lasted 2 minutes with 5-minute recovery periods.
+Table 1 summarizes the configurations of each scenario of fault injection.
+Metrics: To evaluate the performance, efficiency, and diagnostic accuracy of
+NetMon under various fault injection scenarios, we track three primary categories
+of metrics:
+
+Hybrid Monitoring for Early Fault Detection in Cloud-Native 5G Systems
+
+9
+
+– Detection latency: Time from fault injection to the first relevant anomaly
+observed at the central server involving the affected worker.
+– Correlation latency: Time to the first worker-level correlation that correctly localizes the fault.
+– Resource overhead: CPU usage (kubectl top and bpftool statistics),
+memory usage (RSS), and network traffic (N (N − 1) probes and N reports
+per cycle).
+Table 1: Fault injection scenarios and configurations.
+Scenario
+
+Method
+
+Configurations
+
+Target Detection
+
+Latency
+
+tc netem delay
+
+10–100 ms, 0/20/50%
+
+KERNEL_RTT_SPIKE,
+WORKER_HIGH_LATENCY
+
+Jitter
+
+tc netem delay 5 ms ±20 ms 0/20/50%
+
+JITTER_SPIKE,
+WORKER_HIGH_LATENCY
+
+Packet loss
+
+tc netem loss
+
+5–50%, 0/20/50%
+
+RETX_SPIKE,
+WORKER_SOURCE_HOTSPOT
+
+Bandwidth
+
+tc tbf rate
+
+1 and 5 Mbit/s, 0%
+
+WORKER_SOURCE_HOTSPOT
+
+Partition
+
+iptables
+
+Full isolation, 0%
+
+PEER_DOWN,
+WORKER_ISOLATED
+
+Link failure
+
+iptables
+
+Worker pair, 0%
+
+PEER_DOWN,
+WORKER_ISOLATED
+
+Pod termination kubectl delete
+
+Single pod, 0%
+
+PROBE_FAILURE, PEER_DOWN
+
+Gradual
+
+1 and 5
+0/20/50%
+
+tc netem stepped
+
+4
+
+Evaluation
+
+4.1
+
+CNOM Dashboard Visualization
+
+ms
+
+steps, CUSUM_RTT_SHIFT,
+WORKER_HIGH_LATENCY
+
+Figure 3 shows the dashboard during a 20ms latency injection on worker-2:
+latency spikes (bottom right) generate anomalies (top two widgets), which trigger
+WORKER_HIGH_LATENCY and WORKER_HOTSPOT correlations (bottom-left), causing
+worker health scores and pod states to drop (middle two widgets), all returning
+to baseline after fault removal. The two-level presentation, raw anomalies and
+correlations, allows operators to identify faults without manually inspecting perpod metrics.
+4.2
+
+Resource Overhead
+
+Resource consumption is approximately constant across all tested conditions.
+Each agent consumes 3.4 millicores (3m userspace + 0.4m eBPF kernel-side)
+and 4.5 MiB memory. The central correlator uses <1 millicore and 2.6 MiB.
+For 10 pods, total overhead is <35 millicores and 47.6 MiB, representing 0.5–
+8.7% of application CPU and 0.5–0.9% of application memory depending on
+simulated load (lower load = higher percentage). The resulting network overhead
+comprises 90 active probes of less than 200 bytes each and 10 metrics reports of
+approximately 4–5 KB each, which are transmitted every 5 seconds.
+
+10
+
+A. Andersson, S. A. Naineni et al.
+
+Fig. 3: CNOM dashboard widgets during 20ms latency injection showing
+anomaly detection, correlation, and health state response.
+
+4.3
+
+Baseline Behavior
+
+Table 2 characterizes the system during 18 hours of normal operation (0% load,
+no faults).
+The observed ∼2900 anomalies per hour reflect real deviations of the RTT
+in the virtualized environment. The hard-failure correlations PEER_DOWN and
+WORKER_ISOLATED produced zero activations during baseline measurements, providing unambiguous signals when they fire. Reducing anomaly volume would require raising detection thresholds and increasing detection latency, a deliberate
+trade-off favoring sensitivity. The observed 423 correlations per hour are dominated by WORKER_HOTSPOT and WORKER_SOURCE_HOTSPOT which are generated
+purely from the amount of anomalies generated. So while these two correlations
+provide some information about cluster stability, they should be paired with
+other signals in order to more accurately diagnose faults.
+4.4
+
+Experiment Results
+
+Six fault categories were evaluated at 0%, 20%, and 50% load. Only anomalies
+concerning the injected worker count toward detection latency.
+
+Hybrid Monitoring for Early Fault Detection in Cloud-Native 5G Systems
+
+11
+
+Table 2: Anomaly and correlation rates during normal operation (18 hours, no
+faults).
+Metric
+Total Rate (/hr)
+CUSUM_RTT_SHIFT
+16156
+893
+JITTER_SPIKE
+15812
+874
+KERNEL_RTT_SPIKE
+14383
+795
+CUSUM_JITTER_SHIFT
+3484
+192
+RST_SPIKE
+1628
+90
+HIGH_RST
+1051
+58
+Total anomalies
+52514
+2902
+WORKER_HOTSPOT
+4084
+225
+WORKER_SOURCE_HOTSPOT
+2770
+153
+LATENCY_SOURCE
+563
+31
+WORKER_HIGH_LATENCY
+197
+10
+ANOMALY_HOTSPOT
+38
+2
+PEER_DOWN / WORKER_ISOLATED
+0
+0
+Total correlations
+7652
+423
+
+Latency Injection (Table 3): Detection within 0–10s across all magnitudes.
+Correlation improves under load (6–10s at 50% vs 13–20s at 0%) because elevated
+baseline RTT pushes measurements further above the 10ms threshold.
+Table 3: Detection and correlation latency for latency injection (seconds). Correlation = WORKER_HIGH_LATENCY. R1-5=0%, R6-7=20%, R8-9=50%
+0% load
+20% 50%
+Delay R1 R2 R3 R4 R5 R6 R7 R8 R9
+Detection latency
+10ms 10 2 7 6 5 2 4 2 2
+25ms 3 9 0 7 3 4 3 2 7
+50ms 0 5 3 3 7 3 3 3 3
+100ms 4 3 3 3 3 5 2 3 3
+Correlation latency
+10ms 20 19 17 20 17 14 18 10 10
+25ms 13 15 19 17 16 14 14 8 10
+50ms 15 18 15 18 16 7 15 8 8
+100ms 14 13 14 13 13 11 4 6 6
+
+Jitter Injection (Table 4): Detection within 0–5s; correlation within 6–19s
+correctly identifying the affected worker in all runs.
+
+12
+
+A. Andersson, S. A. Naineni et al.
+
+Table 4: Detection and correlation latency for jitter injection (5ms ± 20ms). All
+values in seconds.
+0% load
+20% 50%
+R1 R2 R3 R4 R5 R6 R7 R8 R9
+Detection (s) 5 1 2 2 2 0 5 0 1
+Correlation (s) 15 18 19 16 17 8 6 7 8
+
+Table 5: Detection and correlation latency for packet loss (seconds). Correlation
+= WORKER_SOURCE_HOTSPOT; – = did not fire (1/9 runs at 50% loss).
+0% load
+20% 50%
+Loss R1 R2 R3 R4 R5 R6 R7 R8 R9
+Detection latency
+5%
+7 7 7 10 5 11 10 10 6
+10% 4 16 5 10 12 3 6 4 5
+20% 7 9 8 13 12 6 17 7 5
+50% 22 58 19 17 26 19 14 6 17
+Correlation latency
+5% 35 37 35 37 71 22 37 39 71
+10% 13 46 42 22 34 21 32 11 10
+20% 24 10 22 25 25 14 20 11 16
+50% 133 98 19 47 – 24 129 24 43
+
+Packet Loss (Table 5): Detection in 3–17s at 5–20% loss, increasing to 6–
+58s at 50% (fault drops metric reports). Correlation latency is higher than for
+latency faults due to the probabilistic nature of retransmission-based detection.
+Bandwidth Throttle, Link Failure, Pod Termination, and Gradual
+Degradation: Bandwidth throttling at 5 Mbit/s was detected in 0–9s with
+correlation in 7–27s. At 1 Mbit/s, metric report starvation reduced correlation
+reliability; experiments under load were invalid as the constraint was insufficient
+for both application and monitoring traffic.
+Link failure (worker-2 ↔ worker-3) detected in 5–9s, WORKER_ISOLATED in 14–
+19s, PEER_DOWN in 22–25s. Full network partition (worker-2 isolated): detected
+and correlated simultaneously in 9–11s, succeeding even when the partitioned
+side cannot report.
+Pod termination detected in 3–9s (9/10 runs, one 29s outlier from extended
+graceful shutdown), PEER_DOWN in 10–15s. A peer grace period ensures terminated pods remain monitored until confirmed unreachable.
+Gradual Degradation With 5ms steps, detection and correlation within 2–9s.
+With 1ms steps applied every 30s, WORKER_HIGH_LATENCY fires consistently at the
+5ms accumulated level (∼133s after injection start), representing the minimum
+detectable gradual degradation via correlation at thi step interval.
+
+Hybrid Monitoring for Early Fault Detection in Cloud-Native 5G Systems
+
+13
+
+With 1ms steps, WORKER_HIGH_LATENCY fires consistently at the 5ms accumulated level ( 133s), representing the minimum detectable gradual degradation
+via correlation.
+Table 6: Detection and correlation latency for gradual latency increase (seconds).
+0% load
+20%
+50%
+Step size R1 R2 R3 R4 R5 R6 R7 R8 R9
+5ms steps (0–50ms)
+Detection
+2 4 2 2 7 5 4 5 5
+Correlation 8 8 8 6 9 7 8 7 8
+1ms steps (0–20ms)
+Detection
+4 1 2 2 0 7 8 6 1
+Correlation 133 135 133 134 134 133 135 133 133
+
+4.5
+
+Summary
+
+Figure 4 presents detection and correlation latencies across all fault types at
+0% load. Results at 20% and 50% load show equal or improved performance
+due to elevated baseline RTT pushing measurements further above correlation
+thresholds.
+140
+120
+
+Summary of experiments with 0% load
+
+Detection Latency
+Correlation Latency
+
+100
+80
+60
+40
+20
+0
+
+ms) ms) ms) ms) tter 5%) 0%) 0%) 0%) it/s) it/s) ure art erm ms) ms)
+LI(10 LI(25 LI(50 LI(100 Ji PL( PL(1 PL(2 PL(5 BT(1MbBT(5Mblink fail N/w p Pod t GD(1 GD(5
+
+Fig. 4: Detection and correlation latencies at 0% load. LI: Latency Injection,
+PL, Packet Loss, BT: Bandwidth Throttle, N/w part: Network Partition, GD:
+Gradual Degradation.
+The system detects faults as subtle as 10ms latency or 5% packet loss, localizes them to the affected worker within seconds, maintains this capability under
+50% load, and introduces negligible resource overhead. The main limitations
+are baseline anomaly volume in virtualized environments, self-limiting visibility
+under severe bandwidth constraints, and O(N 2 ) probe scaling.
+
+5
+
+Discussion and Limitations
+
+5.1
+
+Discussion
+
+Detection and localization performance: The system detects latency and
+jitter faults within 2–10 seconds and localizes them to the correct worker within
+
+14
+
+A. Andersson, S. A. Naineni et al.
+
+6–20 seconds. In the tested configurations, this is comparable to or faster than
+typical Kubernetes liveness probe intervals of 10–30 seconds [9].This addresses
+the “gray failure” scenario [7] where components remain alive but perform poorly,
+a condition standard liveness probes cannot detect.
+Comparison with existing approaches: Prometheus with Blackbox Exporter [13] typically requires at least one scrape cycle plus alerting rule evaluation before firing an alert, with end-to-end latency depending on the configured
+scrape interval (commonly 15–60s [14]) and evaluation frequency. Furthermore, it
+probes from an external vanatage point, lacking the internal data-plane perspective. Purely passive eBPF tools [16] cannot verify connectivity on idle paths,
+critical in 5G where traffic is bursty and silent partitions between low-traffic
+pods would go undetected. NetMon’s active probing verifies every path every 5
+seconds regardless of traffic patterns.
+Resource overhead: At 3.4 millicores CPU and 4.5 MiB memory per pod
+(<1% of application resources at 50% load), the system demonstrated low measured overhead in this setup during periods of stress when monitoring is most
+critical. Overhead remains constant regardless of load or fault state.
+Correlation accuracy: PEER_DOWN and WORKER_ISOLATED produced no false
+positives during the 18-hour baseline. Softer correlations such as WORKER_HOTSPOT
+and WORKER_SOURCE_HOTSPOT provide useful indicators but require operator judgment. The full partition experiment correctly identified the fault within 10s using
+only observations from the non-partitioned side.
+Threshold sensitivity and portability: Detection thresholds (z-score: 5.0,
+CUSUM slack: 0.5, minimum deviation: 2ms, correlation triggers) were tuned iteratively on preliminary baseline runs rather than dedicated validation splits.
+While this iterative tuning was tailored for this environment, it carries a risk of
+overfitting to the specific test cluster’s noise characteristics. Different infrastructure would likely require recalibration, a inherent property of static thresholdbased detection that favors interpretability and operator control over automatic
+adaptation. The CUSUM component partially mitigates this limitation through
+online baseline learning.
+5.2
+
+Limitations
+
+– Baseline noise: The virtualized environment’s 2–5ms RTT variance generates 2900 anomalies/hour during normal operation, producing supplementary correlations requiring operator judgment. Bare-metal deployments
+would probably exhibit a lower noise floor.
+– O(N 2 ) probe scaling: Full-mesh probing is manageable at the evaluated
+cluster scale (10 pods), but O(N 2 ) network and CPU overhead bounds its
+scalability in larger deployments, requiring probe sampling or hierarchical
+aggregation.
+– Single point of failure: The central correlator is a single instance; its loss
+disables cluster-wide correlation until rescheduled, though agents continue
+local detection.
+
+Hybrid Monitoring for Early Fault Detection in Cloud-Native 5G Systems
+
+15
+
+– Bandwidth throttle visibility: Severe throttling starves metric reports,
+reducing visibility when monitoring is most needed, a limitation inherent to
+any in-band monitoring approach.
+– Elevated capabilities: eBPF requires CAP_BPF and CAP_NET_ADMIN, which
+may conflict with hardened production security policies.
+– Visualization constraints: CNOM limits time-series to 20 lines per widget
+and offers fewer capabilities than Grafana. The detection engine is independent of the visualization layer and could be paired with a more capable
+frontend.
+
+6
+
+Conclusion and Future Work
+
+6.1
+
+Conclusion
+
+This paper presented a hybrid network monitoring system for Kubernetes-based
+5G deployments combining eBPF passive observation, active TCP probing, and
+centralized correlation. Evaluation on a live AMF deployment demonstrated detection of faults as subtle as 10ms latency or 5% packet loss within 2–10 seconds, correct localization within 6–20 seconds, and zero false positives for highconfidence correlations across 18 hours. Full network partitions are detected and
+correlated within 9–11 seconds. Total overhead of 3.4 millicores CPU and 4.5 MiB
+per pod suggests that the approach is feasible at scale in production.
+The hybrid approach addresses a gap where standard health checks cannot detect partial degradation, scrape-based systems introduce tens-of-seconds
+delays, and passive tools cannot verify idle paths. By combining these complementary techniques, the system provides early detection and fault localization
+for maintaining service quality in cloud-native 5G infrastructure.
+6.2
+
+Future Work
+
+– Expanded detection patterns: Asymmetric latency detection, traffic flow
+correlation with probe failures, and temporal pattern recognition for recurring degradation.
+– Adaptive threshold learning: Inferring thresholds from observed baseline
+variance per environment, reducing manual tuning when deploying to new
+clusters.
+– ML/AI integration: Neural networks for complex baseline modeling, classification models to distinguish fault-induced correlations from noise, and
+LLM-based root cause summarization.
+– Probe scaling: Hierarchical per-worker aggregation changing scaling from
+O(N 2 ) to O(W 2 ) where W is the worker count, requiring per-worker leader
+election.
+– Central server fault tolerance: Leader election among agents to remove
+dependency on a dedicated controller pod.
+
+16
+
+A. Andersson, S. A. Naineni et al.
+
+References
+1. Bailis, P., Kingsbury, K.: The network is reliable: An informal survey of real-world
+communications failures. Queue 12(7), 20–32 (2014)
+2. Bergström, H., Fredriksson, O.: Detecting Network Partitioning in Cloud Native 5G
+Mobile Network Applications. Master’s thesis, Chalmers University of Technology
+(2022), https://odr.chalmers.se/items/3f122906-5e46-46c6-8031-f878eacc502a
+3. capabilities(7) - linux manual page. https://www.man7.org/linux/man-pages/
+man7/capabilities.7.html, accessed: 2026-01-22
+4. Ericsson: Building a cloud-native infrastructure. Tech. rep., Ericsson
+(2025),
+https://www.ericsson.com/497b81/assets/local/core-network/guides/
+cloud-native-infrastructure.pdf
+5. Heckert, N.A., Filliben, J.J., Croarkin, C.M., Hembree, B., Guthrie, W.F., Tobias,
+P., Prinz, J.: Handbook 151: Nist/sematech e-handbook of statistical methods.
+Tech. rep., NIST (2002)
+6. Høiland-Jørgensen, T., Brouer, J.D., Borkmann, D., Fastabend, J., Herbert, T.,
+Ahern, D., Miller, D.: The eXpress data path: Fast programmable packet processing in the operating system kernel. In: Proceedings of the 14th International Conference on Emerging Networking Experiments and Technologies (CoNEXT ’18).
+ACM (2018)
+7. Huang, P., Guo, C., Zhou, L., Lorch, J.R., Dang, Y., Chintalapati, M., Yao, R.:
+Gray failure: The achilles’ heel of cloud-scale systems. In: Proceedings of the 16th
+Workshop on Hot Topics in Operating Systems. pp. 150–155 (2017)
+8. Ibidunmoye, O., Hernández-Rodriguez, F., Elmroth, E.: Performance anomaly detection and bottleneck identification. ACM Computing Surveys (CSUR) 48(1),
+1–35 (2015)
+9. Kubernetes liveness, readiness, and startup probes. https://kubernetes.io/docs/
+concepts/configuration/liveness-readiness-startup-probes/, accessed: 2026-05-25
+10. Kubernetes pod lifecycle. https://kubernetes.io/docs/concepts/workloads/pods/
+pod-lifecycle/, accessed: 2026-03-18
+11. Kubernetes services. https://kubernetes.io/docs/concepts/services-networking/
+service/, accessed: 2026-03-18
+12. Nunziati, G., Fiandrino, C., Foschini, L., Bellavista, P.: Monitoring 5g core
+networks vulnerabilities with eBPF. IEEE Networking Letters 7(3), 220–223
+(2025). https://doi.org/10.1109/LNET.2025.3577184, https://ieeexplore.ieee.org/
+document/11027604/
+13. Prometheus Authors: Blackbox exporter. https://github.com/prometheus/
+blackbox_exporter, accessed: 2026-03-19
+14. Prometheus
+configuration.
+https://prometheus.io/docs/prometheus/latest/
+configuration/configuration/, accessed: 2026-05-25
+15. Rice, L.: Learning eBPF. "O’Reilly Media, Inc." (2023), https://isovalent.com/
+books/learning-ebpf/
+16. Soldani, D., Nahi, P., Bour, H., Jafarizadeh, S., Soliman, M.F., Di Giovanna, L.,
+Monaco, F., Ognibene, G., Risso, F.: eBPF: A new approach to cloud-native observability, networking and security for current (5g) and future mobile networks
+(6g and beyond). IEEE Access 11, 57174–57202 (2023). https://doi.org/10.1109/
+ACCESS.2023.3281480, https://ieeexplore.ieee.org/document/10138542/
+

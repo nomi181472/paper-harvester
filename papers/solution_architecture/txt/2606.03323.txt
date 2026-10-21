@@ -1,0 +1,1034 @@
+Implement Kubernetes Pod-Level Remote Attestation
+for Confidential Workloads on dstack
+Yang Yang, Kevin Wang† , Yuanhai Luo, Hang Yin† , Jie Cai, Shunfan Zhou† , Wenfeng Wang†
+
+arXiv:2606.03323v2 [cs.CR] 3 Jun 2026
+
+OPPO, † Phala
+{yangyang1, null.luo, Gload}@oppo.com
+†
+{kvinwang, hangyin, shelvenzhou, wfwang}@phala.network
+
+Abstract
+
+1
+
+Introduction
+
+1.1
+
+Motivation
+
+Cloud-native confidential computing has become essential for AI inference, financial analytics, and healthcare workloads handling sensitive data. In the LLM-asa-Service paradigm, users submit proprietary prompts
+to cloud providers expecting their data to remain confidential during processing—a guarantee that conventional cloud infrastructure cannot provide. Regulatory frameworks increasingly mandate cryptographic
+protection for data in use, complementing existing
+encryption for data at rest and in transit.
+Trusted Execution Environments (TEEs), particularly Intel Trust Domain Extensions (TDX), provide
+hardware-isolated execution contexts with built-in
+remote attestation capabilities [1]. These enable a
+fundamental guarantee: a remote verifier can cryptographically confirm that a specific, untampered software stack executes on genuine hardware. However,
+bridging this hardware primitive to the Kubernetes
+abstraction layer—where workloads are dynamically
+scheduled, scaled, and migrated—introduces architectural challenges that existing solutions have not fully
+resolved [2].
+
+The rise of LLM-as-a-Service and other confidential
+cloud workloads demands cryptographic proof that
+user data is processed in a trusted, untampered environment. Existing solutions, notably Confidential
+Containers (CoCo), enforce a strict “one Pod per VM”
+model that attests only the Guest OS stack, leaving container-level identity unverified and incurring
+prohibitive per-VM resource overhead. We present
+dstack-capsule, a Kubernetes platform that enables
+Pod-level remote attestation on Intel TDX by
+allowing multiple Pods to share a single Confidential
+VM while each retains independent, hardware-backed
+proof of identity. Our key insight is a two-layer attestation architecture: static platform measurements
+are frozen in RTMR[3] via an irreversible privilege
+fuse, while dynamic Pod identities (pod_uid, pod_
+spec_hash, workload_id) are embedded in the TDX
+Quote’s report_data field and signed by hardware
+on every request. dstack-capsule introduces (1) a
+Pod-level attestation protocol binding Pod spec digests to hardware-signed Quotes; (2) a privilege fuse
+mechanism that atomically transitions a node from
+setup mode to secure mode; (3) a multi-layer sandbox
+spanning storage, runtime, admission, API, and network isolation layers; and (4) a complete open-source
+implementation based on Kubernetes 1.32, Intel TDX,
+and Sysbox. We evaluate the security properties, attestation correctness, and performance characteristics
+of dstack-capsule, demonstrating that it achieves Podgranularity verification without the resource overhead
+of per-VM isolation.
+
+1.2
+
+Problem Statement
+
+Confidential Containers (CoCo) represents the current
+state-of-the-art for deploying confidential workloads
+on Kubernetes [3]. CoCo integrates Kata Containers with TEEs to launch each Pod inside its own
+lightweight VM [4], with an attestation agent running
+within the VM’s Guest OS. While providing strong
+isolation, this design suffers from three fundamental
+challenges:
+Challenge 1: VM-level attestation granularity. CoCo attests the Guest OS stack (kernel, initrd,
+1
+
+Implement Kubernetes Pod-Level Remote Attestation for Confidential Workloads on dstack
+
+rootfs) but does not measure container image content,
+Pod specifications, or workload identity. A verifier can
+confirm that “a trusted Linux kernel is running” but
+cannot cryptographically verify that “this specific Pod
+with these exact container images and environment
+variables is executing.”
+Challenge 2: Resource overhead. The “one Pod =
+one VM” model means each Pod carries the full memory and CPU cost of a guest kernel, VM management
+layer, and attestation agent. For high-density Kubernetes workloads, this overhead becomes prohibitive:
+a 64 GB host can accommodate approximately 30
+CoCo Pods before memory exhaustion, substantially
+fewer than what the same hardware can support for
+non-TEE workloads.
+Challenge 3: No Pod-level network isolation
+proof. CoCo provides no mechanism to cryptographically prove that a specific Pod’s network connectivity
+is restricted to a declared whitelist.
+These challenges motivate our core research
+question: How can we provide independent,
+hardware-backed, Pod-granularity remote attestation while allowing multiple Pods to efficiently share a single TEE resource?
+
+1.3
+
+Key Insight and Contributions
+
+Our key insight is that TEE hardware measurement
+registers (RTMR) are append-only and immutable,
+making them fundamentally unsuitable for measuring
+dynamic, short-lived Kubernetes Pods. Instead, we
+decouple attestation into two layers:
+• Static platform attestation (RTMR[3]):
+Proves that the CVM runs an expected, unmodified OS and system software stack. This is measured once at boot and frozen by an irreversible
+privilege fuse.
+• Dynamic Pod attestation (report_data):
+Each Pod’s identity (pod_uid, pod_spec_hash,
+workload_id) is embedded in the TDX Quote’s
+64-byte report_data field, which the CPU signs
+on every attestation request.
+This two-layer design enables multiple Pods to
+share a single CVM while each retains independent,
+hardware-backed cryptographic proof of identity. We
+make four contributions:
+1. Pod-level remote attestation protocol. We
+present the first system that binds Pod-specific
+identifiers to hardware-signed TDX Quotes via
+the report_data field, with verification covering
+Pod spec digests, caller identity via UDS peer
+credentials combined with cgroup parsing, and
+four independent validation steps.
+
+2
+
+2. Privilege fuse mechanism. We design an irreversible, atomic state transition (compare-andswap plus persistent marker file) that moves a
+Kubernetes node from a privileged setup phase to
+a secure runtime phase, with RTMR[3] frozen at
+the transition point and all subsequent privileged
+Pods rejected.
+3. Multi-layer sandbox. We integrate five isolation layers—storage (ZFS per-Pod encryption),
+runtime (Sysbox user namespaces), admission
+(privilege rejection), API (default-deny with
+opt-in), and network (WireGuard VPC with
+whitelists)—to contain the blast radius of Pod
+compromise within a shared CVM.
+4. Complete implementation and evaluation.
+We implement dstack-capsule based on Kubernetes 1.32, Intel TDX, and Sysbox (∼7,700 LoC
+in Rust across core binaries, ∼660 LoC in Go),
+and evaluate its security properties, attestation
+correctness, and performance against the CoCo
+baseline.
+
+2
+
+Background and Threat Model
+
+2.1
+
+Intel TDX Primer
+
+Intel Trust Domain Extensions (TDX) provides
+hardware-based isolation for virtual machines called
+Trust Domains (TDs) [1]. Each TD executes in a
+CPU-protected memory region inaccessible to the
+hypervisor, the host OS, or other TDs.
+Measurement Registers. TDX maintains two
+types of measurement registers:
+• MRTD (Measurement Register of Trust
+Domain): A 48-byte SHA-384 hash computed
+by hardware during TD creation, measuring the
+OVMF firmware. MRTD is immutable for the
+TD’s lifetime.
+• RTMR[0–3] (Runtime Measurement Registers): Four 48-byte append-only registers.
+Each extend operation computes RTMRnew =
+SHA-384(RTMRold ∥ data). Once extended,
+measurements cannot be removed or modified.
+Quote Generation. A TDX Quote is a cryptographically signed attestation report generated by the
+CPU. It contains MRTD, all four RTMR values, a
+64-byte report_data field (caller-provided), and a
+hardware signature verifiable via Intel’s Data Center
+Attestation Primitives (DCAP) [5].
+dm-verity and UKI. The root filesystem is protected by dm-verity (device-mapper integrity), which
+maintains a Merkle hash tree over all filesystem blocks.
+The root hash is embedded in the UKI (Unified Kernel
+Image)—a single EFI executable combining the kernel,
+
+Implement Kubernetes Pod-Level Remote Attestation for Confidential Workloads on dstack
+
+Threat Capability
+
+Defense Mechanism
+
+Hypervisor compromise
+OS image tampering
+Malicious agent injection
+Malicious Pod scheduling
+Container escape
+Host network access
+Cross-Pod data access
+Attestation forgery
+Privilege re-enablement
+
+TEE hardware isolation (TDX memory encryption)
+dm-verity + MRTD/RTMR[0–2] verification
+RTMR[3] measures agent config + Ed25519 key
+KMS workload authorization + spec digest check
+Sysbox user namespace (UID 0 → 65536)
+Privilege fuse: deny hostNetwork/hostPath
+Per-Pod ZFS AES-256-GCM encryption
+UDS peer credentials + cgroup parsing
+Irreversible fuse (CAS + persistent marker)
+
+3
+
+Table 1: Threat model: capabilities and corresponding defense mechanisms.
+
+initrd, and boot parameters—which is measured into source, auditable OS image protected by dm-verity;
+RTMR[1] during boot.
+and the KMS running in an independent TEE.
+Out of Scope. Side-channel attacks, applicationlayer protocol vulnerabilities, hardware microcode
+2.2 Confidential Containers and De- bugs, or denial-of-service attacks.
+sign Challenges
+Data Leakage Vectors and Defenses. Table 1
+maps
+each threat capability to its corresponding deConfidential Containers (CoCo) is a CNCF sandbox
+fense
+mechanism.
+project that enables TEE-based confidential computing for Kubernetes [3]. Its architecture uses Kata
+Containers to launch each Pod inside a dedicated
+lightweight VM [4]. An attestation agent runs within
+each VM’s Guest OS and generates TEE attestation
+reports.
+Attestation Granularity. CoCo attests the Guest
+OS stack but does not measure container image content. The rationale is practical: container images can
+be large, and measuring them into RTMR would be
+prohibitively slow. However, this means a verifier can
+only confirm that “a trusted OS is running”—not “the
+expected application container is running.”
+Resource Model. The “one Pod = one VM” design creates significant overhead. Each VM requires
+dedicated memory for the guest kernel, user-space
+runtime, and attestation agent, approximately 2 GB
+per Pod.
+Network Isolation. CoCo does not provide any
+mechanism to cryptographically prove network isolation policies at Pod granularity.
+
+3
+
+System Design
+
+3.1
+
+Architecture Overview
+
+Figure 1 depicts the hybrid cluster architecture.
+dstack-capsule deploys TEE-enabled nodes alongside
+regular Kubernetes nodes under a shared control plane.
+The system comprises four core components:
+• dstack-agent: Runs on each TEE node. It mediates Pod admission, computes Pod spec digests,
+generates TDX Quotes with embedded report_
+data, and serves as the Authorizer gRPC backend.
+• dstack-kms: Runs in a separate TEE and provides key management through RA-TLS mutual
+attestation.
+• dstack-csi-driver: Creates per-Pod encrypted
+ZFS datasets and binds storage keys to attested
+workload identity.
+• Modified Kubelet: Adds Authorizer Hook
+2.3 Threat Model
+points for Pod admission, lifecycle events, measurement queries, and Kubelet API authorizaAdversary. We consider a powerful adversary comtion.
+prising: (1) the cloud platform operator, who controls
+the hypervisor, host OS, and Kubernetes control plane;
+and (2) the Pod developer, who provides the container 3.2 Two-Phase Node Lifecycle
+image and may attempt to extract user data or escalate privileges. We assume the adversary may control Figure 2 illustrates the state machine. The node
+lifecycle splits into two irreversibly separated phases:
+both entities simultaneously (collusion).
+Trust Assumptions. Our security guarantees rely
+Phase 1: Privileged Mode. When a node first
+on: Intel TDX hardware and microcode; the open- boots:
+
+Implement Kubernetes Pod-Level Remote Attestation for Confidential Workloads on dstack
+
+4
+
+Figure 1: dstack-capsule hybrid cluster architecture.
+
+1. dstack-agent starts and extends RTMR[3] with
+its configuration, node ID, system workload ID,
+and Ed25519 public key.
+2. Agent requests node-level encryption keys from
+KMS via RA-TLS (Remote Attestation TLS, a
+mutual attestation protocol where both parties
+prove TEE identity).
+3. Agent mounts ZFS encrypted storage.
+4. Kubelet starts and registers with the control
+plane.
+5. The node admits privileged DaemonSets (CSI,
+Sysbox, VPC, DNS), each with a matching
+workload-id annotation.
+Phase 2: Fused Mode. Once system components
+are deployed:
+1. The cluster controller triggers the privilege fuse.
+2. Agent performs an atomic CAS (compare-andswap) on an internal flag and writes a persistent
+marker file. This transition is irreversible.
+3. RTMR[3] is frozen—no further extensions occur.
+4. The node rejects all new Pods requesting
+privileged capabilities (hostNetwork, hostPID,
+hostIPC, hostPath, privileged).
+5. All new Pods are automatically injected with
+Sysbox runtime and the Pod API Unix Domain
+Socket (UDS).
+
+Figure 2: Two-phase node lifecycle state machine. Phase
+1 (Privileged Mode) allows privileged DaemonSets; Phase
+2 (Fused Mode) irreversibly freezes RTMR[3] and rejects
+all privileged Pods.
+
+RTMR values; (2) verifiers would need complete Pod
+admission history; (3) RTMR accumulation causes
+unbounded log growth and violates the append-only
+invariant’s intended semantics.
+3.3.2
+
+Two-Layer Attestation Design
+
+Figure 3 shows the trust chain. Attestation operates
+at two independent layers:
+• Layer 1 (Platform Trust): MRTD and
+RTMR[0–3] prove the CVM runs an expected
+OS and agent. The agent’s Ed25519 public key
+is recorded in RTMR[3], binding all subsequent
+agent signatures to the hardware measurement.
+3.3 Pod-Level Remote Attestation
+• Layer 2 (Pod Identity): report_data con3.3.1 Why Pods Are Not Measured into
+tains SHA-256 of {user_report_data, pod_
+RTMR
+uid, pod_spec_hash, workload_id}. This 64byte field is signed by the CPU alongside the
+A naïve approach would extend RTMR[3] with each
+RTMR values, creating a hardware-backed bindPod’s spec digest. We reject this for three reasons:
+ing between Pod identity and platform state.
+(1) Pod lifecycle is dynamic, constantly changing
+
+Implement Kubernetes Pod-Level Remote Attestation for Confidential Workloads on dstack
+
+5
+
+security_policy_digest and security_policy_
+schema_version fields bind the Pod’s network isolation policy to the proof; wg_pubkey and wg_endpoint
+support WireGuard VPC network isolation verification.
+3.3.5
+
+Figure 3: TDX trust chain — MRTD/RTMR[0–2] measure static platform; RTMR[3] measures dstack-agent and
+freezes at the Fuse Boundary; report_data carries dynamic Pod identity above.
+
+3.3.3
+
+Pod Spec Digest
+
+1. Canonicalization: Pod spec digests use JCS
+(JSON Canonicalization Scheme, RFC 8785)
+via an embedded QuickJS engine, which produces a deterministic byte representation independent of JSON key ordering or whitespace [6]. The report_data payload construction
+uses serde_json_canonicalizer, a pure-Rust
+JCS implementation, for the attestation path.
+2. Hashing: SHA-384 produces a 48-byte digest
+covering all Pod fields (containers, images, environment variables, volumes, commands, resource
+limits).
+3. Customization:
+Custom canonicalization
+scripts are supported via the dstack.org/
+canonicalize-script annotation for workloads
+with specialized digest requirements.
+Determinism Guarantee. JCS (RFC 8785) guarantees deterministic output for any valid JSON input,
+independent of parser-specific serialization behavior.
+The SHA-384 hash over the JCS output therefore produces a consistent digest regardless of how the Pod
+spec was originally formatted. We verify this property in our test suite by canonicalizing the same Pod
+spec through multiple JSON encoders and confirming
+identical digests.
+3.3.4
+
+Pod Proof
+
+An Ed25519 signature over the colon-separated concatenation of 11 fields:
+namespace : workload_id : pod_uid : digest :
+security_policy_digest :
+s e c u r i t y _ p o l i c y _ s c h e m a _ v e r s i o n : wg_pubkey :
+wg_endpoint :
+node_id : issued_at : expires_at
+
+Attestation Generation
+
+Figure 4 shows the sequence. The attestation flow
+proceeds as follows:
+1. Pod calls Attest API via read-only UDS (Unix
+Domain Socket) at /var/run/dstack.sock.
+2. Agent identifies caller via UDS peer credentials (SO_PEERCRED) combined with cgroup parsing (/proc/{pid}/cgroup)—a two-step kernelenforced mechanism that returns the actual process identity, unforgeable even by root inside the
+container.
+3. Agent constructs report_data and requests TDX
+Quote from hardware.
+4. Returns the TDX Quote, associated event log,
+and plaintext report_data to the caller.
+3.3.6
+
+External Verification
+
+Verification requires four independent checks: (1)
+Quote signature via Intel DCAP; (2) OS image via
+MRTD/RTMR[0–2] against a whitelist; (3) Node boot
+events via RTMR[3] + event log; (4) Pod identity via
+report_data SHA-256 match against independently
+computed pod_spec_hash.
+
+3.4
+
+KMS and Key Derivation
+
+Keys are derived using HKDF (HMAC-based Extractand-Expand Key Derivation Function, RFC 5869) [7].
+All info input uses 4-byte little-endian length-prefixed
+encoding per HKDF best practices:
+KMS Master Key
++ - - Node Key = HKDF ( master , " node " ,
+|
+node_id || s y s t e m _ w o r k l o a d _ i d || mrtd
+)
+|
++ - - disk_key = HKDF ( node_key , " disk ")
+|
++ - - im a ge _c a ch e _k ey = HKDF ( node_key , "
+image - cache ")
++ - - Workload Storage Key = HKDF ( master , "
+workload - storage " ,
+node_id || workload_id || spec_digest
+)
+
+Note that workload storage keys are scoped pernode (using node_id rather than namespace), ensuring that a workload’s encryption key is bound to both
+its identity and the specific TEE node hosting it.
+The signing key’s public component is bound via
+KMS gRPC APIs:
+RTMR[3], and KMS verifies this signature be- GetMeta , GetKmsKey , GetAppKey ,
+fore returning any workload-specific keys. The
+GetAppEnvEncryptPubKey ,
+
+Implement Kubernetes Pod-Level Remote Attestation for Confidential Workloads on dstack
+
+6
+
+Figure 4: Pod-level attestation flow: Pod → Agent → TDX, with SO_PEERCRED caller binding and four-stage
+verification.
+GetTempCaCert , SignCert , C le ar I ma ge C ac he
+
+All key requests require RA-TLS mutual attestation:
+both the requesting agent and the KMS prove TEE
+identity via TDX Quote exchange.
+
+4
+
+Sandbox Design
+
+The sandbox design isolates Pods within a shared
+CVM. Figure 5 depicts the five isolation layers.
+
+4.1
+
+Multi-Layer Isolation
+
+Storage Layer: Per-Pod ZFS datasets with AES256-GCM encryption. Each dataset uses a unique key
+derived from the workload-specific HKDF chain. Pod
+A cannot mount or read Pod B’s dataset even with
+host root access inside the CVM.
+Runtime Layer: Sysbox user namespaces map
+container root (UID 0) to a host non-privileged UID
+(e.g., 65536) [8]. Processes inside the container believe
+they run as root, but the kernel maps all operations to
+an unprivileged host identity. This prevents container
+escapes that rely on host UID 0.
+Admission Layer: Post-fuse rejection of hostNetwork, hostPID, hostIPC, hostPath, and privileged security contexts. The admission decision occurs at the
+Kubelet before container creation, providing defensein-depth beyond runtime enforcement.
+API Layer: Kubelet default-deny for exec, attach,
+logs, and port-forward operations. Workloads may
+opt-in via dstack.org/allow-exec annotations, but
+the default posture prevents data exfiltration through
+Kubelet API channels.
+
+Figure 5: Multi-layer sandbox — five isolation layers
+(Storage → Runtime → Admission → API → Network)
+contain the blast radius of Pod compromise.
+
+Network Layer: WireGuard VPC with specdeclared connection whitelists [9]. Each Pod declares
+its allowed egress destinations in the Pod spec; the
+VPC controller enforces these restrictions via eBPF
+or iptables rules. Unlike conventional Kubernetes network policies, these declarations are included in the
+Pod spec digest and thus covered by the hardware
+attestation.
+
+4.2
+
+Kubelet Authorizer Design
+
+The modified Kubelet exposes a gRPC Authorizer
+interface to dstack-agent with four hook points:
+1. Pod Admission (CheckPodAdmission): Admits or rejects Pods, automatically injects Sysbox runtime class and mounts the Pod API Unix
+socket.
+2. Container Lifecycle: OnContainerLifecycle
+forwards PreStart, PostStart, PreStop, and PostStop events to agent for measurement and policy
+
+Implement Kubernetes Pod-Level Remote Attestation for Confidential Workloads on dstack
+
+enforcement.
+3. Pod Measurement (GetPodMeasurement): Returns spec digest on demand for external verification.
+4. API Authorization: CheckAPIAuthorization
+intercepts all Kubelet HTTP requests through
+a unified ServeHTTP middleware, with policy
+decisions delegated to dstack-agent.
+The gRPC interface is defined as follows:
+service A u t h o r i z e r S e r v i c e {
+rpc C h e c k P o d A d m i s s i o n ( P o d A d m i s s i o n R e q u e s t )
+returns ( P o d A d m i s s i o n R e s p o n s e ) ;
+rpc O n C o n t a i n e r L i f e c y c l e (
+C o n t a i n e r L i f e c y c l e R e q u e s t ) returns (
+ContainerLifecycleResponse );
+rpc G e t P o d M e a s u r e m e n t ( P o d M e a s u r e m e n t R e q u e s t
+) returns ( P o d M e a s u r e m e n t R e s p o n s e ) ;
+rpc C h e c k A P I A u t h o r i z a t i o n (
+A P I A u t h o r i z a t i o n R e q u e s t ) returns (
+APIAuthorizationResponse );
+}
+
+All calls use Unix Domain Sockets for zero-overhead
+local communication.
+The Kubelet blocks on
+CheckPodAdmission until the agent responds, ensuring no Pod bypasses admission checks.
+
+4.3
+
+Privilege Fuse
+
+The privilege fuse addresses a fundamental tension:
+system components (CSI driver, Sysbox, VPC controller, DNS) require privileges during node setup,
+but user workloads must never retain them. The fuse
+provides an irreversible separation:
+• Pre-fuse: Privileged DaemonSets with matching
+dstack.org/workload-id are admitted.
+• Post-fuse: Atomic CAS on an internal flag plus
+persistent marker file. The fuse event is recorded
+in the RTMR event log for external audit. All
+subsequent privileged capability requests are rejected with <5 ms response time.
+• Survives reboot: The persistent marker ensures
+the node cannot accidentally re-enter privileged
+mode after restart.
+
+reproducible: identical inputs produce bit-forbit identical UKI binaries, ensuring deterministic
+MRTD values.
+• Test Environment: Docker Compose with
+QEMU VMs (KMS + Master + Workers) enables local development without TDX hardware.
+• Onboarding: Automatic via DaemonSet: detect
+TEE capability → install sysbox → trigger fuse
+→ mark node ready. Zero manual SSH required.
+• Updates: Any change to privileged components
+requires CVM restart to remeasure and re-fuse,
+ensuring the attestation chain remains intact.
+
+6
+
+Evaluation
+
+6.1
+
+Experimental Methodology
+
+All experiments run on Intel TDX-enabled servers
+(Ice Lake, 64 GB RAM, 16 vCPU per CVM) with Kubernetes 1.32 and Sysbox 0.6.2. We compare dstackcapsule against CoCo v0.15.0 with Kata Containers
+3.2 (kata-qemu-tdx runtime). Pod startup latency is
+measured from Pod creation API call to container
+Ready status (mean of 5 runs, warm images). Attestation latency measures the end-to-end duration
+from Pod API call to Quote return, excluding network transmission to external verifiers (mean of 20
+runs after 3 warmup). Resource efficiency tests deploy
+progressively more Pods using idle busybox sleep
+workloads to isolate platform overhead from application memory.
+We note that WireGuard VPC throughput and ZFS
+storage encryption benchmarks are not included in
+this evaluation. The compose-based test environment
+uses co-hosted QEMU VMs sharing a single physical NIC, producing misleading throughput numbers;
+production-valid numbers require bare-metal deployment. ZFS fio benchmarks on sparse qcow2 backing
+disks similarly introduce artifacts not representative
+of production storage performance.
+
+6.2
+
+5
+
+Implementation
+
+5.1
+
+Components
+
+Table 2 lists the core system components and their
+code size.
+
+7
+
+Security Analysis
+
+Table 3 maps each threat model item to its defense
+mechanism, demonstrating defense-in-depth across
+hardware, OS, agent, and sandbox layers.
+
+6.3
+
+Privilege Fuse Effectiveness
+
+We verify three properties of the fuse mechanism:
+• Pre-fuse admission: A privileged DaemonSet
+• OS Image: mkosi builds reproducible Rocky
+with matching workload_id is admitted successLinux with dm-verity + UKI. The build is fully
+fully and its configuration is recorded.
+
+5.2
+
+Build and Deployment
+
+Implement Kubernetes Pod-Level Remote Attestation for Confidential Workloads on dstack
+
+Component
+
+Lang.
+
+LoC
+
+Function
+
+dstack-agent
+dstack-kms
+dstack-csi-driver
+pod-digest
+Modified Kubelet
+
+Rust
+Rust
+Rust
+Rust
+Go
+
+∼6.9k
+∼0.5k
+∼0.2k
+∼0.1k
+∼0.7k
+
+Node agent, Authorizer gRPC, attestation
+Key management, RA-TLS, HKDF
+CSI driver, ZFS encryption
+JCS canonicalization + SHA-384 CLI
+Authorizer Hook, API middleware
+
+8
+
+Table 2: System components and code size.
+
+• Post-fuse rejection: A Pod with hostNetwork:
+true is rejected. The agent’s internal decision
+completes in < 5 ms; the end-to-end user-visible
+latency is approximately 1.2 seconds, dominated
+by kubelet and CRI-O event propagation.
+• Irreversibility: A second fuse attempt returns
+AlreadyFused; the persistent marker file survives
+CVM restart and prevents re-entry to privileged
+mode.
+
+6.4
+
+Attestation Correctness
+
+We verify attestation correctness through three experiments:
+• End-to-end verification: Three distinct Pods
+with different container images and environment
+variables are deployed. All generated Quotes are
+successfully verified via Intel DCAP, with each
+report_data correctly containing the respective
+pod_uid and spec_hash.
+• Forgery resistance: A manual UID impersonation attempt (forging the pod_uid field in
+the attestation request body) fails; the agent
+returns the actual caller identity derived from
+SO_PEERCRED + cgroup parsing, ignoring the
+forged claim.
+• RTMR stability: 20 Pods are deployed postfuse. RTMR[3] remains byte-identical throughout, confirming that dynamic Pod lifecycle does
+not affect the hardware measurement chain. Extending to 50 or more Pods is unnecessary: the
+append-only RTMR property guarantees stability
+once established.
+
+6.5
+
+Performance Overhead
+
+Figure 6 compares performance metrics between CoCo
+and dstack-capsule.
+Pod Startup Latency. We measure startup latency using identical registry.k8s.io/pause:3.10
+images (5 runs each, warm image cache):
+• dstack-capsule: 6.25 seconds (mean), comprising admission check, Sysbox container creation,
+and container Ready transition.
+
+• CoCo (kata-qemu-tdx): 8.85 seconds (mean),
+dominated by VM boot and guest kernel initialization.
+The startup gap is modest (∼30%) because dstackcapsule’s full security path—Sysbox user namespace
+setup, Authorizer admission, and Pod API socket
+injection—adds approximately 3–4 seconds beyond
+bare container creation. Systems that bypass these
+checks can achieve the ∼2.5 s figure sometimes cited,
+but this would disable the security model.
+Memory Overhead. We measure platform memory by deploying idle busybox sleep Pods and subtracting the CVM baseline:
+• dstack-capsule: 793 MB baseline (agent, Sysbox, Kubelet, containerd, ZFS, WireGuard).
+Each additional idle Pod adds approximately
+2 MB.
+• CoCo: ∼2,075 MB per Pod (guest kernel, attestation agent, user-space runtime per VM). On
+a 64 GB host, this limits density to approximately
+30 Pods before memory exhaustion.
+The architectural advantage is clear: dstack-capsule
+amortizes platform overhead across all Pods on the
+node, while CoCo multiplies it per Pod. For idle workloads, dstack-capsule uses three orders of magnitude
+less incremental memory per Pod.
+Attestation Latency. We measure end-to-end
+attestation over 20 runs after 3 warmup requests via
+the HTTP /v1/attestation/pod endpoint:
+• Agent processing: 17 ms (mean, p50=17 ms,
+p95=20 ms).
+• Hardware TDX Quote generation: ∼7 ms.
+• Total end-to-end: ∼24 ms, well below the 60–
+110 ms range previously reported. This improvement stems from the lightweight in-process attestation path that avoids external Quote Generation Service (QGS) queue contention under low
+load.
+Storage Encryption Overhead. ZFS AES-256GCM encryption benchmarks require bare-metal storage to produce valid results. The compose test environment uses sparse qcow2 backing disks inside co-hosted
+QEMU VMs, which introduces artifacts not representative of production storage performance. We defer
+these measurements to future work on production
+
+Implement Kubernetes Pod-Level Remote Attestation for Confidential Workloads on dstack
+
+Threat Actor
+
+Capability
+
+Defense
+
+Platform operator
+Platform operator
+Platform operator
+Platform operator
+Pod developer
+Pod developer
+Pod developer
+Pod developer
+Colluding attacker
+
+Compromise hypervisor
+Tamper with OS image
+Inject malicious agent
+Schedule malicious Pod
+Escape container
+Access host network
+Read other Pod’s data
+Forge attestation
+Re-enable privileges
+
+TDX hardware isolation
+dm-verity + MRTD/RTMR[0–2]
+RTMR[3] measures agent binary
+KMS workload authorization
+Sysbox user namespace
+Privilege fuse
+Per-Pod ZFS encryption
+UDS peer credentials + cgroup
+Irreversible fuse
+
+9
+
+Table 3: Security analysis: threat actors, capabilities, and defenses.
+
+hardware.
+
+6.6
+
+Scalability
+
+Pod Density. On a 64 GB CVM, we deployed increasingly large numbers of idle busybox sleep Pods
+to determine the scaling limit. The system reaches
+86 Pods before hitting Kubernetes’ –max-pods=110
+limit (inclusive of 24 system Pods), not memory exhaustion. At 86 Pods, the CVM uses only 1.1 GB of
+its 64 GB capacity (1.7%), confirming that platform
+overhead—not per-Pod memory—dominates density.
+The practical ceiling for this workload class is therefore set by the kubelet’s pod count limit rather than
+node memory. For memory-intensive workloads (e.g.,
+1 GB RSS per Pod), the per-Pod overhead of ∼2 MB
+is negligible, and density is determined by application
+needs rather than platform tax.
+By contrast, CoCo’s per-VM memory model limits
+density to approximately 30 Pods on the same hardware before OOM. The key takeaway is that dstackcapsule’s shared-CVM architecture shifts the scaling
+bottleneck from memory to the Kubernetes scheduler
+limit, while CoCo remains firmly bounded by per-VM
+memory cost.
+
+7
+
+Related Work
+
+7.1
+
+Confidential Containers
+
+CoCo uses Kata Containers to run each Pod in a dedicated VM, with an attestation agent inside the Guest
+OS [3, 4]. Gramine and Occlum provide process-level
+TEE libraries for Intel SGX but are not Kubernetesnative and require application modification [10, 11].
+Unlike these approaches, dstack-capsule maintains
+Pod-level attestation without sacrificing Kubernetes
+compatibility or requiring per-VM overhead.
+Gap: VM-level attestation cannot prove container
+identity. dstack-capsule closes this gap by embedding
+pod_spec_hash in TDX report_data.
+
+7.2
+
+TEE in Kubernetes
+
+Azure Confidential VMs and GCP Confidential VMs
+provide VM-level attestation without Pod granularity [12, 13]. Dstack proposes a zero-trust framework for confidential containers, including dstack-OS,
+dstack-KMS, and dstack-Gateway, but does not address Kubernetes-native Pod-granularity attestation
+within a shared CVM [14]. Su et al. propose runtime
+attestation for LLM serving, focusing on continuous
+verification rather than Pod identity binding [15].
+Gap: Cloud-provider solutions stop at the VM
+boundary. dstack-capsule extends attestation to the
+Pod layer through modified Kubelet Authorizer Hooks
+and the two-layer attestation design.
+
+7.3
+
+Container Isolation
+
+gVisor and Firecracker provide sandboxing but lack
+TEE attestation integration [16, 17]. Sysbox enables
+user-namespace isolation without VMs, which we combine with TDX attestation to achieve both strong
+isolation and hardware-verifiable identity [8].
+Gap: Existing sandboxes cannot produce hardwaresigned proofs. dstack-capsule integrates Sysbox with
+TDX report_data to provide both isolation and attestation.
+
+7.4
+
+Remote Attestation
+
+Intel DCAP and AMD SEV-SNP provide hardware
+attestation primitives [1, 5, 12]. ARM CCA introduces
+Realm Management Extension for mobile and edge
+TEEs [18]. Our work builds on these primitives to
+provide Pod-granularity attestation in Kubernetes,
+addressing the dynamic workload problem through
+the RTMR/report_data decoupling.
+Gap: Standard TEE attestation binds measurements
+to static software stacks. dstack-capsule solves the
+dynamic workload problem by keeping RTMR[3] for
+
+Implement Kubernetes Pod-Level Remote Attestation for Confidential Workloads on dstack
+
+10
+
+Figure 6: Performance comparison — (a) Pod startup latency (dstack-capsule 6.25 s vs CoCo 8.85 s), (b) Memory
+overhead per Pod (dstack-capsule +2 MB vs CoCo +2,075 MB, log scale), (c) Attestation latency breakdown (agent
+17 ms + hardware 7 ms).
+
+static platform measurement and using report_data
+for per-Pod identity.
+Table 4 summarizes the comparison.
+
+8
+
+Future Work and Deployment
+Considerations
+
+8.1
+
+Design Trade-offs
+
+Shared CVM: Higher resource efficiency comes with
+a larger blast radius than per-VM isolation. We mitigate this through the multi-layer sandbox: even if one
+Pod is compromised, ZFS encryption prevents crossPod data access, Sysbox prevents container escape,
+and the privilege fuse prevents privilege escalation.
+Pod identity not in RTMR: This design choice
+supports dynamic workloads but places the burden
+of trustworthiness on dstack-agent. The agent’s integrity is proven by RTMR[3] (hardware-attested),
+and its behavior is constrained to well-defined gRPC
+interfaces—it never accesses Pod plaintext data.
+
+8.2
+
+Figure 7: CoCo vs dstack-capsule architecture comparison — VM-per-Pod (∼2 GB/Pod) vs N Pods per CVM
+with Pod-level attestation (∼0.8 GB/node shared across
+up to 86 Pods).
+
+security argument.
+
+8.3
+
+• Hybrid clusters: TEE and non-TEE nodes
+coexist via node labels and taints. Workloads
+specify nodeSelector for TEE nodes; the scheduler places non-confidential workloads on regular
+nodes.
+• Node updates: Any change to privileged components (agent, Kubelet hooks, system DaemonSets) requires CVM restart to remeasure and
+re-fuse. We recommend blue-green node pools
+for zero-downtime updates.
+
+Future Directions
+
+• AMD SEV-SNP support: The two-layer attestation architecture is hardware-agnostic. Porting
+to AMD SEV-SNP requires adapting the measurement register interface (VMSA/VMPCK) while
+preserving the RTMR/report_data design pattern.
+• GPU TEE integration: NVIDIA Confidential
+Computing provides TEE-isolated GPU execution. Extending Pod-level attestation to include
+GPU measurement registers would enable confidential ML training workloads.
+• Formal security proofs: We plan to develop a
+formal model of the two-layer attestation protocol using Tamarin or ProVerif to mechanize the
+
+Deployment Considerations
+
+9
+
+Conclusion
+
+We presented dstack-capsule, the first Kubernetes
+platform to provide Pod-level remote attestation for
+confidential workloads. By decoupling platform attestation (RTMR[3]) from Pod identity (report_data),
+we enable multiple Pods to share a single TEE resource
+
+Implement Kubernetes Pod-Level Remote Attestation for Confidential Workloads on dstack
+
+Dimension
+
+CoCo
+
+Cloud TEE
+
+gVisor/Firecr.
+
+dstack-capsule
+
+Attestation granularity
+Pod isolation
+Resource efficiency
+K8s-native
+Network isolation proof
+Privilege control
+
+VM-level
+1 Pod/1 VM
+Low (2 GB/Pod)
+Yes
+No
+VM isolation
+
+VM-level
+VM boundary
+Medium
+Partial
+No
+Hypervisor
+
+None
+Proc. sandbox
+High
+Partial
+No
+seccomp
+
+Pod-level
+N Pods/1 CVM + Sysbox
+High (0.8 GB/node)
+Yes
+Yes
+Fuse (irreversible)
+
+11
+
+Table 4: Comparison of confidential computing approaches for Kubernetes.
+
+while each retains independent, hardware-backed cryp- [7] Hugo Krawczyk and Pasi Eronen.
+Hmactographic proof. The privilege fuse mechanism enbased extract-and-expand key derivation function
+sures that the transition from setup to runtime is
+(hkdf). RFC 5869, 2010.
+irreversible, and the multi-layer sandbox contains the
+blast radius of potential compromise. Our evalua- [8] Nestybox Inc. Sysbox: A next-generation
+container runtime.
+https://github.com/
+tion demonstrates that dstack-capsule achieves Podnestybox/sysbox,
+2021.
+granularity verification with dramatically lower resource overhead than VM-per-Pod approaches: CoCo [9] Jason A Donenfeld. Wireguard: Next generation
+requires ∼2,075 MB per Pod, while dstack-capsule
+kernel network tunnel. In NDSS, 2017.
+adds only ∼2 MB per incremental idle Pod on a shared
+∼793 MB platform baseline. Attestation completes [10] Chia-Che Tsai, Bhushan Jain, Donald E Porter,
+in ∼24 ms end-to-end, an order of magnitude faster
+et al. Gramine: A lightweight os for sgx. In
+than previously reported estimates for TDX-based
+USENIX ATC, 2021.
+systems. On a 64 GB node, dstack-capsule scales to
+the kubelet’s pod count limit rather than hitting a [11] Youren Shen, Hongliang Tian, Yu Chen, Kang
+Chen, et al. Occlum: Secure and efficient mulmemory wall—a qualitative architectural advantage
+titasking inside a single enclave. In USENIX
+over the per-VM model.
+Security,
+2020.
+Future work includes AMD SEV-SNP support,
+GPU TEE integration, and formal security proofs [12] AMD. Amd sev-snp: Strengthening vm isolation
+of the two-layer attestation architecture.
+with integrity protection and more. Technical
+report, AMD, 2020.
+[13] Amogh Deshpande et al. Confidential vms explained: An empirical analysis of amd sev-snp
+and intel tdx. In ACM SIGMETRICS, 2025.
+[1] Intel Corporation. Intel trust domain extensions
+(tdx) architecture specification. Technical report,
+[14] Shunfan Zhou, Kevin Wang, and Hang Yin.
+Intel, 2023.
+Dstack: A zero trust framework for confidential
+containers, 2025.
+[2] Kubernetes Authors. Kubernetes documentation.
+
+References
+
+https://kubernetes.io/docs/, 2025.
+
+[15] Jinghao Su et al. Runtime attestation for secure
+llm serving in cloud-native environments. In
+[3] Confidential Containers Community. ConfiMLArchSys Workshop, 2025.
+dential containers: A cloud native computing foundation sandbox project.
+https:// [16] Google LLC.
+gvisor: Container sandbox
+confidentialcontainers.org, 2023.
+with user-space kernel. https://github.com/
+google/gvisor, 2018.
+[4] Kata Containers Community. Kata containers:
+An open source container runtime. https:// [17] Alexandru Agache, Marc Brooker, Alexandra Iordache, Anthony Liguori, Phil Neugebauer, Rolf
+katacontainers.io, 2018.
+Piwonka, and Diana-Maria Popa. Firecracker:
+Lightweight virtualization for serverless applica[5] Intel Corporation. Intel data center attestation
+tions. In NSDI, 2019.
+primitives (dcap). Technical report, Intel, 2020.
+[6] Anders Rundgren. Json canonicalization scheme
+(jcs). RFC 8785, 2020.
+
+[18] ARM Limited. Arm confidential compute architecture. Technical report, ARM, 2022.
+

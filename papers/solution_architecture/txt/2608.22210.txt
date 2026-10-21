@@ -1,0 +1,1022 @@
+Fleet-Scale Pod Deployment with VPC-Native
+Networking in Managed Kubernetes
+Sri Saran Balaji Vellore Rajakumar, Jayanth Varavani, Murat Parlakisik, Pavani Panakanti
+
+arXiv:2608.22210v1 [cs.NI] 23 Aug 2026
+
+Amazon Web Services
+
+Abstract—Managed Kubernetes pod deployment is often presented as a choice between VPC-native and overlay networking.
+Public EKS documentation describes prefix-mode capacity and
+configuration, while prior CNI studies primarily measure steadystate throughput and latency. This paper presents an operational
+measurement study of fleet-scale pod deployment across three
+VPC-native modes on Amazon EKS: individual secondary-IP
+allocation, ENI preallocation, and IPv4 prefix delegation, using
+Cilium and Calico as overlay baselines. We compare representative mode-specific warm-pool settings, so the results describe
+combined operating points. At 400 nodes, the tested three-address
+secondary-IP warm pool required 7,403 seconds to place 80,000
+pods. With the tested ENI-preallocation and prefix-delegation
+settings, the same workload completed in approximately 495
+seconds, moving address provisioning off the pod-creation critical
+path. In the reported 400-node runs, prefix delegation achieved
+approximately 162 pods/s, within the same observed range as
+the fastest overlay baseline and ENI-preallocation runs, while
+requiring fewer successful EC2 provisioning calls per pod than
+individual-IP allocation by allocating addresses in /28 blocks.
+Because each /28 contains 16 addresses and occupies one IPv4
+slot, an interface with 30 slots carries 29 prefixes, representing
+up to 464 potential pod addresses, compared with approximately
+30 IPv4 slots per ENI for individual-IP allocation when kubelet
+and CNI limits are configured accordingly. Prefix delegation
+also has lower documented network-address usage and retains
+direct VPC reachability and flow-log visibility; its trade-off is
+that /28 allocations require contiguous subnet space. Singlenode measurements confirm the density effect directly rather
+than from documented limits: under individual secondary-IP
+allocation the attainable pod count equalled the node’s address
+supply exactly on four instance types (27, 56, 232 and 232 pods),
+whereas prefix delegation provided up to sixteen times more
+potential pod addresses; on three of the four instance types,
+workload capacity stopped pod placement before that address
+supply was exhausted, leaving 104 to 1,312 addresses unused.
+Index Terms—Kubernetes, container networking, CNI, VPC,
+pod scalability, cloud infrastructure, IP address management,
+prefix delegation
+
+I. I NTRODUCTION
+Linux containers made it practical to package and deploy
+applications at high density [1], [2], while Kubernetes provided
+the orchestration layer for managing those applications across
+fleets [3]. Kubernetes does not implement pod networking
+itself. Instead, it delegates connectivity to external plugins
+through the Container Network Interface (CNI), so the operator’s choice of plugin influences the cluster’s addressing
+model, data path, and cloud integration [4], [6].
+As Kubernetes moved onto public clouds through managed
+offerings such as Amazon EKS, Google GKE, and Azure
+AKS [7], [18], [19], each provider had to reconcile the orches-
+
+trator’s flat networking model with the primitives of the underlying software-defined network. That reconciliation centers on
+how pods obtain IP addresses. An overlay model gives each
+pod an address from a cluster-internal range and tunnels podto-pod traffic over VXLAN or IP-in-IP. This decouples pod
+addressing from cloud limits at the cost of encapsulation and
+additional tunnel processing [5], [17]. A VPC-native model
+assigns each pod an address from the VPC address space.
+With prefix delegation, IPAMD requests /28 prefixes and EC2
+assigns them to ENIs; IPAMD then allocates individual pod
+addresses from those prefixes. Pods remain directly reachable
+through the cloud network and visible in VPC flow logs.
+The trade-off is that pod density and deployment behavior
+are coupled to cloud interface, address, and control-plane API
+limits [7], [18].
+That coupling becomes more consequential as clusters grow.
+Operationally, VPC CNI address management has evolved
+from small pools of individual secondary IPs, to ENI-level
+preallocation, and then to delegated prefixes. Each step keeps
+more capacity ahead of pod demand, but changes the unit in
+which the cloud control plane is asked to provide that capacity.
+On Amazon EKS, the resulting behavior is shaped by perinstance ENI limits, per-ENI address or prefix limits, accountlevel EC2 API limits, and finite IPv4 subnet capacity. Prior
+CNI studies have focused primarily on steady-state throughput and latency [4], [10]–[12], while deployment speed has
+received less attention. In production, however, autoscaling,
+rolling upgrades, and recovery from failure can make the time
+required to bring thousands of pods to Ready the binding
+operational constraint.
+This paper presents an operational, fleet-scale measurement
+on Amazon EKS. We compare representative mode-specific
+operating points rather than equal warm-address budgets, so
+the results characterize combined trade-offs rather than isolate
+allocation granularity. In the tested settings, small individualaddress pools leave allocation on the pod-creation critical
+path; ENI preallocation and prefix delegation move more work
+ahead of pod creation and reach the overlay range. Prefix delegation adds fewer interface attachments, higher documented
+address capacity, and retained direct VPC reachability and
+flow-log visibility.
+The remainder of this paper is organized as follows. Section II surveys pod networking models and related measurement work. Section III describes the system architecture
+and the interface-attachment call flow for each configuration.
+Section IV presents the measurement methodology. Section V
+
+reports the fleet deployment results across all configurations
+and scales. Section VI synthesizes the findings into practical
+configuration guidance. Section VII concludes with future
+work directions.
+II. BACKGROUND AND R ELATED W ORK
+Kubernetes delegates pod connectivity to CNI plugins that
+implement the ADD and DEL operations for attaching and
+detaching network interfaces to pod namespaces [6]. The two
+addressing models introduced in Section I differ in where that
+address comes from: an ENI in the cloud virtual network [7],
+or a cluster-internal pool whose traffic is encapsulated between
+hosts [16], [17].
+Either choice is independent of the forwarding engine, and
+both models can adopt an accelerated one. Modern CNIs
+increasingly move packet processing from the conventional
+iptables path to eBPF programs attached at the trafficcontrol or eXpress Data Path (XDP) hooks, which run in the
+kernel and process packets before, or in place of, the netfilter
+path [14], [15]. The advantage is most pronounced for policy
+and service lookups: an iptables chain is traversed linearly,
+so enforcement cost grows with rule count, whereas an eBPF
+map supports near-constant-time lookup that scales far better
+as policy and service counts grow. The engine is orthogonal
+to the addressing model, so the same data path can be paired
+with either an overlay or a VPC-native address source.
+Recent measurement studies have benchmarked CNI plugins
+on data-path metrics such as TCP throughput, UDP latency,
+and HTTP request rate [4], [5], [10]–[12], and system-tuning
+studies have examined how kernel and CNI configuration
+profiles affect these metrics [13]. These studies primarily evaluate steady-state performance, whereas this paper measures
+deployment-time scalability: how fast a cluster can provision
+addresses and bring pods to a Ready state under a fleetwide burst. Our operational measurements complement this
+literature by focusing on the address-provisioning path across
+the configurations studied here, rather than introducing a new
+networking mechanism.
+III. S YSTEM A RCHITECTURE
+EKS pod networking divides responsibility along a clean
+boundary: a node-local data plane performs fast IP wiring,
+while an EKS-managed control plane orchestrates the privileged cloud resources.
+A. CNI Components
+In the VPC CNI, the node-local IP Address Management
+Daemon (IPAMD) maintains a warm pool of preallocated IP addresses so that pod scheduling need not
+block on synchronous EC2 API calls. On node join,
+IPAMD attaches ENIs and pre-allocates secondary IPs
+or /28 prefixes according to the WARM_ENI_TARGET,
+WARM_IP_TARGET,
+MINIMUM_IP_TARGET,
+and
+WARM_PREFIX_TARGET knobs. A background loop,
+with a 5-second monitor interval, replenishes the pool by
+calling AssignPrivateIpAddresses for secondary IPs
+
+or delegated prefixes and creating and attaching an ENI when
+another interface is needed. Because the pool is the buffer
+between pod demand and the cloud API, its size and refill
+rate determine whether allocation stays off the pod-creation
+path.
+The overlay CNIs replace that cloud-coupled component
+with a cluster-internal one. Both Cilium and Calico draw
+pod addresses from a CIDR outside the VPC range, and
+in both a cluster-level controller delegates a per-node block
+from that range: Cilium’s operator carves a /24 per node
+from its cluster pool, while Calico’s IPAM assigns /26 blocks.
+Because the block arrives when the node joins, the nodelocal agent satisfies every subsequent pod request from it,
+so there is no per-pod cloud API call to rate-limit and no
+warm-pool target to size. The cost moves to the data path: pod
+addresses are not routable in the VPC, so cross-node traffic
+is VXLAN encapsulated and the host performs encapsulation
+and decapsulation on the pod’s behalf. The two overlays differ
+in how forwarding is implemented, with Cilium using eBPF
+programs and Calico the iptables-mode Felix dataplane; both
+retain kube-proxy in our configuration, which equalizes the
+service-proxy layer across all five arms.
+B. CNI Interface Attachment Call Flow
+CNI
+binary
+
+Kubelet
+
+IPAMD +
+warm pool
+
+EC2
+API
+
+1. ADD
+2. request IP
+3. pool hit: assign
+
+4. miss: assign or create
+Create+Attach
+IP(s)
+5. assign to veth
+
+Fig. 1. VPC-native CNI ADD call flow; only step 4 calls the EC2 API.
+
+When the Kubernetes scheduler assigns a pod to a node, the
+kubelet invokes the CNI plugin’s ADD operation. Figure 1
+traces this call flow as a message-sequence ladder; the subsequent path differs fundamentally between VPC-native and
+overlay configurations.
+The numbered sequence is: (1) kubelet calls the CNI binary
+with ADD; (2) the CNI binary requests an IP from the local
+IPAMD; (3) on a warm-pool hit the IP is returned immediately
+with no cloud interaction; and (4) on a miss, IPAMD uses
+the EC2 API. In secondary-IP mode, it assigns individual
+addresses with AssignPrivateIpAddresses. In prefixdelegation mode, the same API can assign a /28 prefix to an
+existing ENI; when another ENI is needed, IPAMD creates
+and attaches it before assigning the prefix. Finally, (5) the
+returned IP is wired to the pod’s veth interface. Step 4 is
+the scalability-critical path: when many nodes exhaust their
+warm pools simultaneously, they contend for shared EC2 API
+capacity. Prefix delegation softens this contention by allocating
+16 addresses at a time.
+
+The overlay configurations omit step 4 entirely. Their nodelocal agent draws the address from the block already delegated
+to the node and performs only the local veth wiring of step 5,
+so no cloud API call appears on the pod-scheduling path.
+C. Configurations Under Test
+TABLE I
+N ETWORKING CONFIGURATIONS AND WARM - POOL OPERATING POINTS .
+Config
+
+Model
+
+IPAM setting
+
+VPC-IP
+native
+WARM_IP_TARGET=3
+VPC-ENI native
+WARM_ENI_TARGET=3
+VPC-Prefix native WARM_PREFIX_TARGET=10
+Cilium
+overlay
+cluster-pool /24
+Calico
+overlay
+IPPool /26 blocks
+
+Warm IPs
+∼3
+∼87
+∼160
+local
+local
+
+Five configurations are evaluated, spanning both networking
+models and three VPC-native address-allocation strategies.
+Table I summarizes their addressing model, IPAM setting, and
+approximate capacity held ahead of pod demand.
+The three VPC-CNI configurations use representative modespecific operating points rather than equal warm-address budgets. We selected three spare individual addresses, three spare
+ENIs, and ten spare /28 prefixes to reflect the allocation units
+and warm-pool settings operators configure in these modes.
+The resulting warm capacities are approximately 3, 87, and
+160 pod addresses per node, respectively, against a workload
+target of 200 pods per node. Thus, the experiment evaluates
+whether each configured allocation unit keeps replenishment
+off the pod-creation critical path, rather than comparing
+equally sized warm pools or the best possible tuning of each
+mode.
+VPC-IP holds three spare secondary IPs per node. A
+burst consumes the pool after three pods, and subsequent
+requests can wait for replenishment. The replenishing call is
+batched rather than per-address: across the 400-node run 0.516
+successful calls per pod corresponds to about 1.94 addresses
+per call, so pods wait on a shared call rather than each on its
+own. VPC-ENI maintains three spare ENIs, so replenishment
+occurs at interface granularity and most pods find an address
+already attached. VPC-Prefix maintains ten /28 prefixes. Each
+prefix supplies 16 pod addresses, so one allocation serves 16
+pods.
+The two overlay configurations (Cilium, Calico) have
+no equivalent target, since the per-node block described in
+Section III is delegated at node join and never refilled
+from the cloud API. All arms run with kube-proxy enabled
+(Cilium’s kube-proxy-replacement disabled), equalizing the
+service-proxy layer.
+IV. M ETHODOLOGY
+A. Testbed
+The deployment testbed was Amazon EKS version 1.35
+in us-west-2 using c6i.4xlarge instances (16 vCPU, 32
+GiB RAM, 8 ENIs with 30 IPv4 addresses each). The
+pinned plugin versions are Amazon VPC CNI (aws-node)
+
+v1.22.4.eksbuild.3, Cilium v1.19.5, and Calico v3.29.1. Kubeproxy uses the EKS 1.35 default. IPAMD warm-pool behavior is controlled only by the environment variables stated
+per configuration; all other settings use their defaults. Every
+arm raises kubelet’s pod cap above the 200 pods per node
+the workload targets, using --use-max-pods=false with
+--max-pods set above 200; the documented EKS default is
+110 and upstream Kubernetes documents 110 pods per node
+as a design criterion, so this experiment is deliberately outside
+that guidance. All 400-node runs use c6i.4xlarge nodes, which
+also provide the basis for the capacity and data-path analysis.
+The VPC uses three /17 subnets, one per availability zone, with
+32,763 usable IPv4 addresses each after AWS reservations.
+Overlay configurations use 172.16.0.0/12 as the pod CIDR
+(1,048,576 addresses).
+B. Measurement Protocol
+At each cluster size (10, 50, 100, 200, and 400 nodes), we
+install the CNI configuration under test and verify that the cluster is healthy by checking cross-node pod-to-pod connectivity
+and ClusterIP service resolution. On the VPC-native arms we
+then wait for the IPAMD warm pool to stabilize, so that each
+node has finished pre-allocating its configured target and the
+deployment starts from a settled state rather than mid-fill. The
+node counts form a sweep of distinct fleet operating points.
+We then create a single Kubernetes Deployment, in one API
+call, targeting 200 replicas per node, or 80,000 pods at 400
+nodes. Every replica is the same pause container, requesting
+5m CPU and 8 MiB with no probes. The image and resource
+requests are held constant across configurations, making this
+a controlled pod-creation workload rather than an application
+startup benchmark. We use a watcher on the Deployment to
+record changes in the ready, creating, pending, and failed
+replica counts until the intended target is reached or the ready
+count stops advancing for two minutes.
+Finally we count the EC2 calls the deployment caused.
+AWS CloudTrail records the control-plane API calls made
+in an account, which lets us attribute address provisioning
+to the run rather than infer it. We read the trail’s delivered
+log objects directly rather than using the LookupEvents
+API, which is rate limited and pages fifty events per request:
+the 400-node VPC-IP window contains over 800,000 EC2
+events, which that path cannot retrieve in reasonable time.
+From each event we take the action name, the errorCode,
+and the calling principal, over the deployment window
+plus a 180-second buffer to capture throttled-retry tails
+that outlast the run. Delivery lag is separate: trail objects
+arrive several minutes after the events they contain, so
+we waited for delivery to quiesce before reading rather
+than relying on that buffer. The error code separates
+successful allocations from those rejected as throttled,
+and the principal separates IPAMD’s node-role calls from
+EKS control-plane interface management, which shares the
+same action names. We monitor the six mutating network
+actions
+(Assign/UnassignPrivateIpAddresses
+and
+Create/Delete/Attach/Detach-
+
+NetworkInterface). Runs are serialized with a quiet
+period between them and node-group scaling completes
+before the window opens, so the counted calls belong to pod
+creation and not to node join.
+
+TABLE II
+R EPEATED RUNS AT 400 NODES . “±” IS THE SAMPLE STANDARD
+DEVIATION ACROSS RUNS . P ODS / S IS THE MEAN OF THE PER - RUN RATES ,
+NOT 80,000 DIVIDED BY THE MEAN TIME ; THE TWO DIFFER WHERE
+VARIANCE IS HIGH . A COEFFICIENT OF VARIATION IS REPORTED ONLY
+WHERE THREE OR MORE RUNS ARE AVAILABLE .
+
+V. R ESULTS
+Config
+VPC-ENI
+VPC-Prefix
+Cilium
+Calico
+
+Runs Mean Time (s)
+
+CV
+
+Pods/s
+
+495.5 ± 0.7
+495 ± 1
+495 ± 1
+562 ± 62
+
+—
+0.2%
+0.2%
+10.9%
+
+161.5
+161.6
+161.5
+143.5
+
+2
+5
+5
+5
+
+150
+
+more variable at 10.9%. Every run in the table placed all
+80,000 pods.
+The per-second progress traces provide additional context
+for these aggregates. VPC-IP admits pods at a constant low
+rate for the entire run rather than slowing as the fleet grows.
+The other configurations instead admit pods at the rate the
+scheduler and kubelet can retire them.
+
+100
+
+50
+
+0
+
+10
+
+50
+
+100
+
+200
+
+400
+
+Cluster size (nodes)
+VPC-IP
+Cilium
+
+VPC-ENI
+Calico
+
+B. Deployment Time at Maximum Scale
+
+VPC-Prefix
+
+Fig. 2. Deployment throughput; the 400-node VPC-ENI point uses two runs
+and VPC-IP one, while the other 400-node points are repeated-run summaries.
+All smaller-scale points are single runs.
+
+At the tested operating points, deployment throughput separates the configurations into two regimes that differ by about
+an order of magnitude (Fig. 2). VPC-IP plateaus early and
+remains near a low rate as the cluster grows, while the other
+configurations reach a much higher band at the larger scale
+points. Because the separation occurs within the VPC-native
+configurations, it is not a simple distinction between VPCnative and overlay addressing. The rates track whether an
+address is available locally when a pod is scheduled under
+the selected warm-pool settings.
+VPC-IP’s behavior follows from the synchronous EC2 dependency of a depleted warm pool. Once its ∼3 spare IPs
+per node are consumed, each further pod waits for an EC2
+call before it is wired. The evolved configurations avoid this
+blocking through different mechanisms. At the larger scale
+points, VPC-ENI, VPC-Prefix, and both overlays fall in the
+same broad throughput range, although their individual curves
+are not identical. VPC-ENI pre-allocates enough IPs per node
+that most pods start from the local pool with no EC2 call on
+the critical path. Prefix delegation achieves the same effect
+by amortizing 16 IPs per call. Overlays bypass the EC2 API
+entirely by allocating from a local CIDR pool.
+Repeating the 400-node point separates the configurations
+by reproducibility as well as by rate (Table II). VPC-Prefix and
+Cilium are the most predictable, each with a 0.2% coefficient
+of variation across five runs, and their means differ by less than
+a second. On the retained testbed, the two deployment rates
+fall in the same observed range; this comparison is descriptive
+rather than a statistical equivalence test. Calico is slower and
+
+Time to deploy all pods (seconds)
+
+Deployment throughput (pods/s)
+
+A. Deployment Throughput at Scale
+
+104
+
+103
+
+102
+
+10
+
+50
+
+100
+
+200
+
+400
+
+Cluster size (nodes)
+VPC-IP
+Cilium
+
+VPC-ENI
+Calico
+
+VPC-Prefix
+
+Fig. 3. Deployment time (log scale); the 400-node VPC-ENI point uses
+two runs and VPC-IP one, while the other 400-node points are repeatedrun summaries. All smaller-scale points are single runs.
+
+At the largest cluster size, VPC-IP takes just over two hours
+to place 80,000 pods, while VPC-ENI, VPC-Prefix, and Cilium
+finish between 493 and 496 seconds (Fig. 3). The pre-allocated
+arms remain close across the scale points, so the observed
+gap is associated with the per-IP allocation strategy under
+the tested warm-pool settings rather than with VPC-native
+addressing in general.
+C. EC2 API Provisioning Work
+Figure 4 reports successful EC2 provisioning calls, excluding calls rejected as throttled. We count calls within
+the deployment window, with node-group scaling completed
+beforehand so that node-join calls fall outside it, and we
+classify each event by its CloudTrail errorCode. Overlay
+configurations generate no calls for pod IP assignment, as
+expected.
+
+Successful EC2 provisioning calls per pod
+
+TABLE IV
+P ODS PLACED PER NODE AND ADDRESSES LEFT UNUSED , BY
+ADDRESSING MODE . “R EACHED ” IS THE HIGHEST COUNT OF PODS
+SIMULTANEOUSLY HOLDING A NODE ADDRESS ACROSS AN ARM ’ S
+TRIALS , AND “U NUSED ” IS THE SUPPLY LESS THAT COUNT. n IS THE
+NUMBER OF INCLUDED TRIALS .
+
+0.6
+0.516
+
+0.4
+
+Secondary-IP
+Instance
+
+0.2
+
+c6i.large
+c6i.xlarge
+c6i.4xlarge
+c6i.8xlarge
+
+0.044
+0.014
+
+0
+
+0
+P
+C-I
+VP
+
+NI
+
+VP
+
+C-E
+
+VP
+
+C-P
+
+x
+refi
+
+ium
+Cil
+
+0
+
+27 3
+56 2
+232 3
+232 3
+
+328
+718
+2400
+3712
+
+432
+896
+3712
+3712
+
+104 3
+178 3
+1312 2
+0 2
+
+D. Attainable Pod Density per Node
+
+TABLE III
+D OCUMENTED CAPACITY AND NETWORK ADDRESS USAGE (NAU)
+ACCOUNTING FOR THE NATIVE MODES . T HESE ARE CAPACITY
+CALCULATIONS , NOT ADDITIONAL DENSITY MEASUREMENTS .
+Unit
+
+27
+56
+232
+232
+
+C
+
+In these runs, the provisioning-work count declines as the
+allocation unit grows. VPC-IP needs 0.516 successful calls
+per pod, because a depleted three-address pool leaves nearly
+every pod waiting on its own allocation. VPC-Prefix needs
+0.014, a factor of 37 fewer, because a single /28 covers
+sixteen pods. VPC-ENI sits between them at 0.044. This
+ordering matches the deployment-time ordering in Fig. 3.
+Raw CloudTrail counts include throttled retries, which can
+dominate under contention. We therefore report successful
+EC2 provisioning calls separately to isolate provisioning work
+from retry volume.
+
+Secondary-IP
+1 IPv4 address
+Prefix delegation /28 (16 addresses)
+
+Reached Supply n Reached Supply Unused n
+
+o
+alic
+
+Fig. 4. Successful EC2 provisioning calls per pod fall as the allocation unit
+grows.
+
+Mode
+
+Prefix delegation
+
+Per-ENI limit Capacity implication NAU
+30 slots
+29 prefixes
+
+232/node
+464/ENI
+
+240
+31
+
+Table III translates the documented interface and address
+limits into the capacity comparison used by this paper [7]–
+[9]. A delegated /28 contains 16 IPv4 addresses, and a prefix
+occupies one of the interface’s IPv4 slots, so an interface with
+30 slots carries 29 prefixes and provides 464 pod addresses
+when kubelet and CNI pod limits are configured to use them.
+In secondary-IP mode, the c6i.4xlarge instance limit leaves
+232 usable pod addresses per node across its eight ENIs; the
+documented max-pods figure of 234 for this instance is 8 ×
+29 + 2, where the two additional pods run on the host network
+and hold no node address. The same documented accounting
+assigns 31 NAU to a prefix-backed ENI and 240 NAU to the
+secondary-IP configuration. These figures provide documented
+context for the density and address-pressure trade-off, not a
+separate density benchmark. The rows use different scopes:
+secondary-IP is node-level for c6i.4xlarge, while prefix
+delegation is per-ENI.
+
+The deployment-time results above hold pods per node fixed
+at 200. A separate question is whether the pod address supply
+limits density at all, and whether prefix delegation changes
+that. We ramped pods onto a single node in batches on four
+instance types in each addressing mode, and recorded both
+the pods placed and the addresses left unused, as shown in
+Table IV. Density is counted as pods holding a routable VPC
+address; pods on the host network, such as the CNI agent and
+kube-proxy, hold no node address and are excluded.
+The supply itself is arithmetic. Writing E for interfaces per
+node and I for addresses per interface, secondary-IP allocation
+supplies E(I − 1) addresses, one per slot after the primary.
+Prefix delegation supplies E(I − 1) × 16, because a /28
+occupies one slot and carries sixteen addresses, so the mode
+multiplies the supply by exactly sixteen on every instance
+type. IPAMD reports the per-interface figure directly and it
+agrees: on c6i.xlarge, maxIPsPerENI = 224, which
+is (15 − 1) × 16, and 4 × 224 = 896.
+Both supplies are net of the primary address on each
+interface, which is also how the documented max-pods figure
+of 234 for c6i.4xlarge arises: it is 8 × 29 + 2, the two
+being host-network pods that hold no node address and are
+excluded here.
+Under secondary-IP allocation the address supply is the
+binding constraint, and it binds exactly: every trial placed
+27 = 3 × 9, 56 = 4 × 14 or 232 = 8× 29 pods, and in each the
+CNI reached the point of having no address left to give the
+next pod. One c6i.large trial addressed 25 workload pods
+with none left to allocate, so co-resident system pods, which
+draw from the same supply, held the other two. Density in this
+mode is therefore computable from the interface table before
+a node is provisioned, and because ENI preallocation draws
+from the same per-interface slots the same ceiling applies to
+it: warm-pool settings change how quickly addresses become
+available, not how many exist.
+Under prefix delegation the supply stops binding. On three
+of the four instance types the pod count stopped short of
+it, leaving between 104 and 1,312 addresses never assigned.
+Across trials the counts fell within 14 pods on c6i.large
+and six on c6i.xlarge.
+On c6i.8xlarge the supply is measured rather than
+derived. There 3,711 workload pods held an address and
+
+IPAMD reported all 3,712 assigned with none in cooldown, so
+a co-resident pod held the remaining one, and its per-interface
+figure of 464 is (30 − 1) × 16, giving 8 × 464 = 3712. That
+this is the only instance to reach its supply follows from node
+capacity and not from the mode: c6i.4xlarge has the same
+8 × 30 interface table and therefore the same 3,712 addresses
+but half the node, and the two fall either side of the point
+at which the raised supply becomes reachable, the smaller
+leaving 1,312 unassigned while the larger consumed it entire.
+Where the node can take up the additional addresses the
+density gain equals the supply gain: on c6i.8xlarge the
+measured ratio is 16.0, against 10.3 to 12.8 on the three
+instances that left addresses unused.
+
+the three arms is small enough that the figure’s vertical axis
+must be truncated to show it at all; on a zero-based scale the
+curves would be indistinguishable. The host interface, rather
+than the CNI, sets the aggregate bandwidth available to the
+two-node experiment. Adding pods subdivides that budget
+rather than increasing it.
+The data-path result therefore does not rank the configurations by throughput. It shows that prefix delegation retains
+the same saturated host-interface behavior as the overlay
+baselines under the tested conditions, while preserving VPCroutable pod addresses and flow-log visibility. Any differences
+at individual transfer sizes are small relative to the common
+interface ceiling and are not the basis for the deployment
+recommendation.
+
+E. Steady Cross-Node Data-Path Throughput
+
+Steady fleet throughput (Gbit/s)
+
+The preceding results measure how fast a fleet can be
+deployed. A separate question is what bandwidth those pods
+obtain once running, which matters because overlay pods do
+not hold their own routable ENI addresses and so share the
+host interface. This data-path comparison covers VPC-Prefix,
+Cilium, and Calico; VPC-IP and VPC-ENI are outside its
+scope. We measured this with a many-to-many experiment:
+200 iperf3 server pods on one host and 200 client pods
+on another host in the same availability zone, each client
+transferring a fixed byte count to its own paired server. All
+transfers were released simultaneously by a shared trigger so
+that pod-start skew did not enter the measurement. We used
+the same pod MTU and concurrency on every arm, allowing
+the configurations to be compared under otherwise matched
+conditions. We report the mean fleet rate over saturated
+seconds, defined as those in which at least 90% of pods were
+transmitting; this excludes the ramp-up and drain intervals,
+where partial per-pod samples inflate the apparent rate.
+
+12.55
+burst ceiling 12.5
+
+12.5
+
+VI. D ISCUSSION
+A. Allocation Granularity and the Pod-Creation Path
+The three VPC-native arms combine different allocation
+units with different warm-pool operating points. In these
+measurements, those choices shape both the deployment and
+provisioning-work results. One secondary IP serves one pod,
+one interface serves dozens, and one delegated prefix serves
+sixteen. VPC-IP holds a surplus of three addresses, so its pool
+is consumed after three pods and nearly every subsequent pod
+waits on its own synchronous call; it stays nearly flat as the
+fleet grows. VPC-ENI and VPC-Prefix add capacity in units
+large enough that most pods find an address already present,
+and both land in the same throughput range as the overlay
+configurations, which draw from a node-local block and never
+call the cloud API at all.
+The successful-call counts of Fig. 4 show the same ordering:
+in these runs, provisioning work per pod falls as the tested
+allocation unit becomes coarser. Together, the results suggest
+that the practical question is whether warm-pool replenishment
+stays ahead of pod demand. A pool need not hold the entire
+burst if its refill unit outpaces pod creation for the workload.
+
+12.45
+
+B. Overlay Trade-offs at Scale
+
+12.4
+12.35
+12.3
+50M
+
+100M
+
+500M
+
+1G
+
+2G
+
+5G
+
+Bytes transferred per pod
+VPC-Prefix (native)
+
+Cilium
+
+Calico
+
+Fig. 5. Fleet throughput for the three measured arms; all reach the same hostinterface burst rate under the tested conditions. c6i.4xlarge is documented
+at 6.25 Gbit/s baseline and 12.5 Gbit/s burst.
+
+All three configurations converge on the host interface limit
+rather than on any CNI-specific bound (Fig. 5), each reaching
+more than 98% of the instance type’s documented 12.5 Gbit/s
+burst rate for transfer sizes above 500 MB. The spread across
+
+Overlay configurations achieve consistent throughput without warm-pool tuning, but they do not remove the hostinterface constraint. In the saturated same-availability-zone
+experiment, overlay and VPC-native traffic all reached the
+same aggregate interface burst rate. As pod density increases,
+each pod receives a smaller share of that host budget, so
+bandwidth-sensitive workloads still require capacity planning
+at the instance level.
+The important distinction is integration. Overlay pods use
+cluster-internal addresses and are not directly visible as pod
+addresses in VPC flow logs. Encapsulation and tunnel management are reasonable trade-offs when that integration is not
+required. They are less suitable when workloads or operators
+depend on direct VPC reachability and VPC-level observability.
+
+C. Why Prefix Delegation Rather Than Interface Preallocation
+VPC-ENI and VPC-Prefix both keep allocation off the podcreation path, so deployment speed alone does not separate
+them. In the configurations studied here, their relevant distinction is the address supply each strategy can reach and
+what it spends to get there. The documented comparison in
+Table III makes the distinction explicit. A secondary-IP slot
+supplies one pod address, whereas a /28 supplies sixteen.
+On a c6i.4xlarge node, secondary-IP mode therefore provides
+232 usable pod addresses across the eight-ENI limit. Prefix
+delegation can provide 464 addresses on one ENI, since a
+prefix occupies one of the interface’s 30 IPv4 slots and 29
+remain, subject to the kubelet, CNI, and subnet configuration.
+These are capacity limits, not an additional density experiment,
+but they identify which constraint each mode exposes to an
+operator.
+The same asymmetry appears in the resources consumed to
+reach a given fleet size. Because one prefix covers sixteen
+pods, prefix delegation uses fewer occupied interface slots
+and fewer attached interfaces than ENI preallocation. The
+deployment runs are consistent with this difference: VPCENI attached roughly 2.7 times as many interfaces as VPCPrefix to place the same 80,000 pods. The documented NAU
+accounting in Table III captures the corresponding address
+pressure, with 31 NAU for a prefix-backed ENI and 240 NAU
+for the secondary-IP configuration.
+Prefix delegation’s cost is subnet capacity rather than speed.
+Each /28 must be a contiguous, correctly aligned block drawn
+from the node’s own subnet, so a subnet can hold ample
+free addresses in aggregate yet have no allocatable prefix left,
+and the assignment then fails for want of a free CIDR block
+rather than for want of addresses [8]. Two consequences follow
+for planning. First, the relevant headroom is per-subnet, not
+VPC-wide, because a pod can only draw from the subnet
+its node sits in; in our testbed this is why nodes had to be
+spread one subnet per availability zone per node group rather
+than concentrated. Second, the warm prefix target is the dial
+that sets how much capacity is committed before any pod
+schedules, and setting it too high can commit nearly all of
+a subnet’s usable addresses to warm pools in advance and
+strand pods that would otherwise have fit. Reserving CIDR
+space for prefixes, or dedicating a subnet to prefix-mode node
+groups, removes the fragmentation risk [8].
+D. Putting It Together
+The fleet results make the operational evolution concrete. At
+400 nodes, the three-address secondary-IP warm pool required
+7403 seconds to place 80,000 pods. Increasing the allocation
+unit to an ENI or a /28 prefix moved the deployment result
+to approximately 495 seconds, the same range as the Cilium
+baseline. The observed gap is consistent with how VPC-native
+capacity is replenished under the selected warm-pool settings,
+rather than with VPC-native addressing itself.
+For this burst, prefix delegation was the strongest tested
+VPC-native point. It supplies sixteen addresses per allocation,
+uses fewer ENI attachments than interface preallocation, and
+
+has the documented density and NAU advantages in Table III.
+It retains VPC reachability and flow-log visibility; the tradeoff is aligned, contiguous subnet planning. ENI preallocation
+remains useful when an existing design requires individual
+secondary IPs, at the cost of more interface attachments and a
+lower address ceiling. The small individual-address pool was
+unsuitable for the burst tested here.
+Overlays remain appropriate when direct VPC reachability
+and pod-level flow-log visibility are not requirements. They
+provide a local address pool without cloud API provisioning, but retain the integration and encapsulation trade-offs
+described in Section VI-B. The recommendation is therefore
+conditional: use prefix delegation when high-density bursts
+and VPC-native integration matter, and choose an overlay
+when those integration requirements do not justify subnet and
+interface planning.
+E. Limitations
+Several factors define the scope of these results. At 400
+nodes, VPC-Prefix, Cilium, and Calico were repeated five
+times each for the main large-scale comparison. VPC-IP has
+one run, while VPC-ENI has two runs. The smaller scale
+points are single runs, so the shape of each curve in Fig. 2
+should be read as one observation per point.
+All 400-node deployment arms use c6i.4xlarge nodes. The
+documented density and NAU values refer to that configuration. More generally, absolute rates can vary with instance
+capacity, software versions, subnet layout, and account-level
+capacity.
+Because warm-pool settings differ by mode, these measurements do not isolate allocation granularity from preallocated
+capacity; they characterize combined operating points.
+The density measurements in Section V-D are reported per
+node, on one node per instance type, so they say what a node
+accepts rather than how a scheduler distributes pods across
+a fleet at that density. They also depend on the workload:
+the counts follow from this pod’s 5 m CPU and 8 Mi memory requests, so a different request would place a different
+number of pods, and because instance size and the requestderived bound move together across the four instance types
+we cannot separate them from these arms alone. Each node’s
+maxPodsPerNode was raised above its address supply, to
+582, 1,046, 3,862 and 3,862, so that the kubelet pod cap could
+not bind before the addresses did; the documented EKS default
+is 110. The two addressing modes ran on separate clusters
+because ENABLE_PREFIX_DELEGATION is a DaemonSetlevel setting and therefore cluster-wide, with both clusters on
+EKS 1.35 and VPC CNI v1.22.4-eksbuild.3 so that
+the mode comparison is not confounded by plugin version.
+The deployment experiment uses a single bulk Kubernetes
+Deployment of identical pause containers targeting 200 pods
+per node. It isolates fleet-wide pod creation and address
+allocation rather than application startup, rolling updates, or
+mixed workload behavior. It does not measure per-pod launch
+latency or application readiness. The study evaluates IPv4 pod
+networking; IPv6 prefix delegation is left to future work.
+
+The data-path experiment measures aggregate sameavailability-zone throughput between one node pair at MTU
+8951 and fixed concurrency. It does not cover per-pod latency,
+cross-availability-zone traffic, network-policy processing, service traffic, or application-level performance. The conclusions
+are therefore best read as operational guidance for preserving
+VPC-native integration while provisioning address capacity
+ahead of a high-density deployment burst, rather than as a
+universal ranking of all CNI configurations or workload types.
+The overlay comparison is limited to Cilium and Calico in
+VXLAN mode.
+VII. C ONCLUSIONS AND F UTURE D IRECTIONS
+This study follows an operational evolution within VPCnative Kubernetes networking. At 400 nodes, a three-address
+secondary-IP warm pool required 7403 seconds to place
+80,000 pods. Under the reported 400-node configurations,
+ENI-preallocation runs and prefix delegation completed the
+same workload in approximately 495 seconds, as did Cilium.
+The observed difference is consistent with the allocation granularity and warm-pool settings used in these configurations. A
+node that receives one address at a time must repeatedly wait
+for the cloud control plane, while a node that receives ENIs
+or prefixes can satisfy most pod requests locally.
+For this burst, prefix delegation was the strongest tested
+VPC-native point. A /28 supplies sixteen addresses per allocation, and an interface with 30 IPv4 slots carries 29 prefixes
+for 464 pod addresses. The c6i.4xlarge secondary-IP
+configuration provides 232 usable pod addresses per node,
+while documented NAU accounting is 31 for the prefix-backed
+configuration versus 240 for secondary IPs. These are documented limits and accounting; the deployment measurements
+associate the larger allocation units and selected warm-pool
+settings with keeping provisioning off the critical path.
+The trade-off is subnet planning. Prefixes require aligned
+contiguous address blocks in each node subnet, but the
+measured data paths still reached the same host-interface
+ceiling as the overlay baselines, and the pods retained direct
+VPC reachability and flow-log visibility. Within this study’s
+scope, the practical configuration recommendation is to use
+prefix delegation when high-density bursts and VPC-native
+integration are both important; use ENI preallocation when
+the existing design requires secondary-IP addressing; and use
+an overlay when direct VPC pod integration is not required.
+For future work, we plan to evaluate dynamic route management overhead at scale (how route table size affects convergence time across CNI configurations) and Big TCP handling
+comparisons (how each CNI benefits from kernel support for
+larger TSO/GRO segments on high-throughput workloads). We
+will also extend the measurement to IPv6 prefix delegation,
+which assigns /80 prefixes and fundamentally changes the
+address-scarcity dimension.
+R EFERENCES
+[1] W. Felter, A. Ferreira, R. Rajamony, and J. Rubio, “An updated performance comparison of virtual machines and Linux containers,” in Proc.
+
+IEEE Int. Symp. Perform. Anal. Syst. Softw. (ISPASS), 2015, pp. 171–
+172.
+[2] S. Soltesz, H. Pötzl, M. E. Fiuczynski, A. Bavier, and L. Peterson, “Container-based operating system virtualization: A scalable,
+high-performance alternative to hypervisors,” in Proc. 2nd ACM
+SIGOPS/EuroSys Eur. Conf. Comput. Syst., 2007, pp. 275–287.
+[3] B. Burns, B. Grant, D. Oppenheimer, E. Brewer, and J. Wilkes, “Borg,
+Omega, and Kubernetes,” Commun. ACM, vol. 59, no. 5, pp. 50–57,
+2016.
+[4] S. Qi, S. G. Kulkarni, and K. K. Ramakrishnan, “Assessing container
+network interface plugins: Functionality, performance, and scalability,”
+IEEE Trans. Netw. Service Manag., vol. 18, no. 1, pp. 656–671, 2021.
+[5] N. Kapočius, “Performance studies of Kubernetes network solutions,”
+in Proc. IEEE Open Conf. Electr., Electron. Inf. Sci. (eStream), 2020,
+pp. 1–6.
+[6] F. Minna, A. Blaise, F. Rebecchi, B. Chandrasekaran, and F. Massacci,
+“Understanding the security implications of Kubernetes networking,”
+IEEE Security & Privacy, vol. 19, no. 5, pp. 46–56, 2021, doi:
+10.1109/MSEC.2021.3094726.
+[7] Amazon
+Web
+Services,
+“Amazon
+VPC
+CNI
+plugin
+for
+Kubernetes,”
+2024.
+[Online].
+Available:
+https://docs.aws.amazon.com/eks/latest/userguide/managing-vpccni.html
+[8] Amazon Web Services, “Prefix mode for Linux,” Amazon
+EKS
+Best
+Practices
+Guide,
+2024.
+[Online].
+Available:
+https://docs.aws.amazon.com/eks/latest/best-practices/prefix-modelinux.html
+[9] Amazon Web Services, “Amazon VPC quotas,” 2024. [Online].
+Available: https://docs.aws.amazon.com/vpc/latest/userguide/amazonvpc-limits.html
+[10] V. Dakić, J. Redžepagić, M. Bačić, and L. Zgrablić, “Performance and
+latency efficiency evaluation of Kubernetes container network interfaces
+for built-in and custom tuned profiles,” Electronics, vol. 13, no. 19, art.
+3972, 2024, doi: 10.3390/electronics13193972.
+[11] G. Budigiri, C. Baumann, J. T. Mühlberg, E. Truyen, and W. Joosen,
+“Network policies in Kubernetes: Performance evaluation and security analysis,” in Proc. Joint Eur. Conf. Netw. Commun. & 6G
+Summit (EuCNC/6G Summit), 2021, pp. 407–412, doi: 10.1109/EuCNC/6GSummit51104.2021.9482526.
+[12] A. Aziz Shah, G. Piro, L. Alfredo Grieco, and G. Boggia, “A quantitative cross-comparison of container networking technologies for virtualized service infrastructures in local computing environments,” Trans.
+Emerging Telecommun. Technol., vol. 32, no. 4, art. e4234, 2021, doi:
+10.1002/ett.4234.
+[13] S. Chippagiri, “Optimizing Kubernetes network performance: A study
+of container network interfaces and system tuning profiles,” Eur. J.
+Theor. Appl. Sci., vol. 2, no. 6, pp. 651–668, 2024, doi: 10.59324/ejtas.2024.2(6).58.
+[14] T. Høiland-Jørgensen et al., “The eXpress data path: Fast programmable
+packet processing in the operating system kernel,” in Proc. 14th Int.
+Conf. Emerging Netw. Exp. Technol. (CoNEXT), 2018, pp. 54–66, doi:
+10.1145/3281411.3281443.
+[15] S. Miano, M. Bertrone, F. Risso, M. Tumolo, and M. V. Bernal,
+“Creating complex network services with eBPF: Experience and lessons
+learned,” in Proc. IEEE Int. Conf. High Perform. Switching Routing
+(HPSR), 2018, pp. 1–8, doi: 10.1109/HPSR.2018.8850758.
+[16] Cilium Authors, “Cilium documentation, v1.19: IPAM and clusterpool addressing,” Cloud Native Computing Foundation, 2025. [Online].
+Available: https://docs.cilium.io
+[17] Project Calico Authors, “Calico documentation, v3.29: IP address management and block sizes,” 2024. [Online]. Available:
+https://docs.tigera.io/calico
+[18] Google Cloud, “GKE networking overview,” 2024. [Online]. Available:
+https://cloud.google.com/kubernetes-engine/docs/concepts/networkoverview
+[19] Microsoft Azure, “Azure CNI networking in AKS,” 2024. [Online].
+Available: https://learn.microsoft.com/en-us/azure/aks/concepts-network
+

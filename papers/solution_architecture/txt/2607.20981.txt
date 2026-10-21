@@ -1,0 +1,1525 @@
+Beyond Independent Optimization: Compression, MoE
+Routing, and Quantization Interactions in Multimodal Edge
+Intelligence
+Jay Gor
+
+23bce113@nirmauni.ac.in
+
+Nirma University
+
+Karm Dave
+
+23bce137@nirmauni.ac.in
+
+Nirma University
+
+Akshita Abrol
+
+akshita.abrol@singaporetech.edu.sg
+
+Singapore Institute of Technology, Singapore
+
+Rajesh Gupta
+
+rajesh.gupta@marwadieducation.edu.in
+
+arXiv:2607.20981v1 [cs.AI] 23 Jul 2026
+
+Department of CE-AI and Big Data, Marwadi University
+
+Sudeep Tanwar
+
+rajesh.gupta@marwadieducation.edu.in
+
+Department of CE-AI and Big Data, Marwadi University
+
+Zhengkui Wang
+
+zhengkui.wang@singaporetech.edu.sg
+
+Singapore Institute of Technology, Singapore
+
+Abstract
+Efficient multimodal inference is increasingly constrained not only by model quality or FLOP
+count, but by the cost of preserving, moving, routing, caching, and quantizing multimodal
+representations under low latency, memory, and energy budgets. This survey reviewed the
+recent works on efficient vision-language and multimodal large language models across visual
+token redundancy and compression, MLLM and video token management, KV-cache optimisation, Mixture-of-Experts routing and serving, low-bit quantization, edge deployment,
+and hardware-aware benchmarking. The central argument is that these techniques cannot
+be treated as independent optimisations. Visual token compression changes the evidence
+and feature distributions seen by downstream language layers and MoE routers; routing
+instability changes expert traffic and quantization sensitivity; quantized router logits can
+alter expert assignment; KV-cache policies determine which multimodal evidence remains
+available during generation; and edge hardware constraints can turn local FLOP savings
+into memory movement, cache pressure, or evidence loss. We therefore organize the literature around a failure-propagation chain that makes the interfaces between compression,
+routing, quantization, cache management, and hardware execution explicit. Beyond cataloging methods, the survey synthesizes recurring design tensions in deployable multimodal
+systems: accuracy versus token budget, static compression versus content-adaptive retention, sparse routing efficiency versus expert collapse, low-bit serving versus modality-specific
+degradation, and benchmark convenience versus end-to-end edge realism. We further introduced a Temporal Routing Consistency as a diagnostic for video MoE models and identify
+open problems in routing-aware compression, cross-modal cache retention, proactive failure
+detection, hardware-aware co-design, and unified multimodal edge benchmarking.
+
+1
+
+1
+
+Introduction
+
+The rapid scaling of vision-language models has produced systems of remarkable capability, but capability
+has come at a cost that is no longer simply computational: it is systemic. Models that jointly process highresolution image tiles, dense video frame sequences, OCR spans, and long text contexts routinely generate
+token sequences of tens of thousands of elements. Inference on consumer or edge hardware therefore requires
+visual token compression, KV-cache optimisation, Mixture-of-Experts (MoE) routing, quantization, and
+hardware-aware serving to operate together rather than as independent optimisations.
+This survey’s central finding is that these techniques have coupled failure modes. Visual token compression
+changes the distribution seen by downstream language layers and MoE routers; routing instability changes
+which experts receive compressed tokens; quantization perturbs both activation statistics and router logits;
+and edge-memory constraints force cache eviction or expert offloading that can remove information needed
+later in the reasoning chain (Shao et al., 2026; Liu et al., 2025a; Fu et al., 2026; Zhong et al., 2026; Yi et al.,
+2025b). This creates a failure propagation pathway, whereby an intervention intended for memory or latency
+savings at one stage becomes a distribution shift, a routing error, a quantization fault, or an evidence-deletion
+issue at the next. The existing literature often treats these stages independently, but effective deployment
+demands solving their interactions jointly.
+Three converging pressures make this problem urgent. First, token density: one image at size 336 × 336
+processed by CLIP-ViT-L/14 with a patch size of 14×14 creates 576 tokens, while tiling techniques produce
+thousands. Visual encodings contain less average information per token than text targets (Shao et al.,
+2026); however, deleting or merging those tokens changes the representation on which downstream routing,
+quantization, and caching policies were learned. Second, sparse-model overhead: in MoE architectures,
+only a fraction of parameters is active per token, but that sparsity creates irregular memory access, load
+imbalance, and collapse risk (Liu et al., 2025a; Sha, 2026). When compression precedes routing, this fragile
+balance is further perturbed by altered token statistics. Third, deployment constraints: mobile platforms (Li
+et al., 2025d), edge AI accelerators (Chitty-Venkata et al., 2024), and time-sensitive energy-constrained
+embedded systems impose tight constraints on latency, memory usage, and power consumption. As inference
+energy usage may scale super-linearly with the level of accuracy achieved, efficiency becomes a primary
+concern (Yang et al., 2024).
+The review traces this coupled landscape from foundational redundancy principles in Vision Transformers (He
+et al., 2022; Jaegle et al., 2021; Tong et al., 2022) through KV-cache management, MoE routing, quantization,
+edge deployment, and hardware-aware evaluation benchmarks (Kwon et al., 2023; Tschand et al., 2025; John
+et al., 2024; Sukthanker et al., 2024). The review is organized around five primary themes, summarised in
+Figure 1.
+These five themes are visual token compression, video and temporal redundancy, KV-cache optimisation,
+MoE routing with quantization and serving, and edge deployment with hardware-aware benchmarking.
+Figure 1 groups the literature along those lines, but the paper’s main argument is that these themes are not
+isolated topics: each one changes the operating conditions of the next.
+Contributions. This survey differs from prior surveys by treating compression, routing, quantization, cache
+management, and hardware constraints as a connected deployment pipeline rather than as parallel technique
+families. Its main contributions are:
+1. A unified failure-chain taxonomy. We connect compression-induced routing distribution shift,
+routing inconsistency under low-bit quantization, and modality-heterogeneous quantization degradation
+into a single propagation chain. This framing explains why optimising any one stage in isolation can
+leave downstream failure modes unaddressed; for example, routing-aware post-training quantization
+recovers 1.15%–2.28% average score in low-bit MoE settings (Fu et al., 2026), while modality-aware
+VLM quantization retains 93.5% of FP16 performance at W3A3 (69.5 vs. 74.3) (Zhong et al., 2026).
+2. A temporal routing diagnostic for video MoE models. We formalise Temporal Routing Consistency (TRC), the mean Jaccard overlap between expert sets activated by temporally adjacent frames,
+2
+
+Bipartite and SalienceAware Merging
+
+Representative methods: ToMe, ATM, AdaMerge, ToSA,
+MaMe/MaRe, VisionTrim
+(Bolya et al., 2023; Lee & Choi, 2025; Lee et al., 2026; Huang et al.,
+2025; Huo & Li, 2026; Yu et al., 2026)
+
+Vision Encoder
+Sparsification
+Self-Supervised Redundancy
+
+Redundancy evidence: MAE, VideoMAE, Perceiver
+(He et al., 2022; Tong et al., 2022; Jaegle et al., 2021; Wu et al.,
+2022; Li et al., 2023)
+
+Multi-Stage Dropping
+
+Pipeline-aware dropping: MustDrop, HiRED, ZipVL, SparseVLM
+(Liu et al., 2024; Arif et al., 2024; He et al., 2024; Zhang et al.,
+2025b)
+
+Search and Learned Pruning
+
+Selection policies: GreedyPrune, EvoComp, FastVID, CS-VLM
+(Pei et al., 2025; Song et al., 2026; Shen et al., 2025a; Kiruluta
+et al., 2025)
+
+Graph-Based KV Eviction
+
+Dependency-aware eviction: GraphKV, MadaKV, H2 O, SnapKV,
+PyramidKV
+(Li et al., 2025c,b; Zhang et al., 2023; Li et al., 2024; Cai et al.,
+2025)
+
+State-Space / Semantic Cache
+
+Cache compression: RetentiveKV, PagedAttention, ChunkKV,
+StreamingLLM
+(Liu et al., 2026a; Kwon et al., 2023; Liu et al., 2025b; Xiao et al.,
+2024)
+
+Routing Stability
+
+Stable routing: Auxiliary-free balancing, ReMoE, Eigen-router, Spectral regularization
+(Wang et al., 2024a, 2025c; Do et al., 2026; Delibasoglu, 2026)
+
+Temporal Routing Consistency
+
+Video routing pressure: DynTok, V2Drop, HERMES, LVC, MMViR
+(Zhang et al., 2025a; Chen et al., 2026; Faure et al., 2025; Wang
+et al., 2025d; Li et al., 2026)
+
+Efficient Multimodal
+Intelligence at
+Scale & Edge
+
+MLLM Sequence
+Compression
+
+KV-Cache
+Optimisation
+
+MoE Routing
+Dynamics
+
+Routing-Consistent PTQ
+
+Quantized routing: EAQuant, VSRAQ, MoQE, GEMQ, MoBiE,
+VLMQ
+(Fu et al., 2026; Park et al., 2026; Kim et al., 2023; Deng et al.,
+2026; Zhao et al., 2026; Xue et al., 2026)
+
+Hot/Cold Expert Storage
+
+On-device serving: EdgeMoE, D2MoE, ZipMoE, ExpertFlow, Janus
+(Yi et al., 2025b; Wang et al., 2025a; Yang et al., 2026; Shen et al.,
+2025b; Zhang et al., 2026)
+
+Edge Quantization
+& Systems
+
+Figure 1: The decoupled taxonomy of multimodal edge efficiency research. The literature is systematically
+categorized across five operational bottlenecks, showing the direct structural pipeline from raw visual input
+token compression down to hardware-constrained co-design evaluation metrics on device.
+
+as a diagnostic for expert jitter in video MoE pipelines. TRC makes the absence of recurrent state
+measurable rather than treating temporal expert continuity as an implicit assumption.
+3. A co-design view of multimodal efficiency. We characterise compression ratio, routing behaviour,
+quantization precision, KV-cache residency, and hardware capacity as mutually constrained variables
+that shape the achievable accuracy-efficiency Pareto frontier on a given deployment target.
+3
+
+Table 1: Master optimization matrix for efficient multimodal inference. The table maps the dominant model
+class to the phase where optimization is applied, the primary system bottleneck, and the survey sections
+where each design axis is analysed.
+Model class
+
+Optimization phase
+
+Dominant bottleneck
+
+Representative design
+axis
+
+Vision Transformers
+
+Encoder token processing
+Vision-to-language prefilling
+
+Quadratic attention over dense
+visual patches
+Visual-token overload inside the
+LLM context
+
+Merge, prune, or reweight
+redundant spatial tokens
+Stage-aware
+dropping,
+query-conditioned sparsification,
+positional
+preservation
+Dynamic frame budgets,
+variation-aware dropping,
+temporal routing consistency
+Graph-aware
+eviction,
+modality-adaptive cache
+policies,
+state-space
+memory
+Differentiable
+routing,
+batch-level
+balancing,
+expert scheduling
+Expert-aware calibration,
+structure-preserving routing, mixed precision
+Hot-cold
+storage,
+prefetching, cache-affinity
+scheduling,
+hardwareaware benchmarking
+
+Multimodal LLMs
+
+Video MLLMs
+
+Temporal token con- Redundant frames plus expert
+struction
+jitter across adjacent frames
+
+Long-context MLLMs
+
+Autoregressive decod- KV-cache memory growth and
+ing
+modality-heterogeneous attention
+
+MoE Transformers
+
+Routing and expert ex- Load imbalance, expert collapse,
+ecution
+and irregular memory movement
+
+Quantized VLM/MoE Deployment calibration Activation outliers,
+routing
+models
+inconsistency, and modalityspecific precision sensitivity
+Edge multimodal sys- On-device serving
+SRAM limits,
+flash/DRAM
+tems
+transfers, energy per byte, and
+thermal constraints
+
+4. Systematic coverage of recent efficient multimodal inference work. We survey over one hundred
+contributions from 2021–2026 across visual token compression, multi-stage MLLM token management,
+video redundancy, KV-cache optimisation, MoE routing and serving, quantization, edge deployment,
+and hardware-aware benchmarking.
+Compared with surveys focused on MoE inference (Liu et al., 2025a) or multimodal token compression (Shao
+et al., 2026), this survey emphasises the interfaces between techniques: how compressed tokens affect routing,
+how routing changes quantization sensitivity, how cache eviction affects multimodal reasoning evidence, and
+how hardware constraints determine which combinations are deployable.
+Table 1 provides the high-level map for this design space: it shows that the main efficiency bottlenecks differ
+by model class and deployment phase, which is why a single optimisation metric cannot describe the whole
+multimodal pipeline. Table 2 then narrows the focus to token reduction methods and already foreshadows
+the later failure-chain argument: many methods save FLOPs locally, but their interface impact determines
+whether those savings remain safe for downstream routing, cache retention, and quantized inference. The
+remainder of this survey is structured as follows. Section 2 provides foundational background. Sections 4–6
+cover token compression. Section 7 addresses video and temporal redundancy. Section 8 covers KV cache.
+Sections 9–12 cover MoE, quantization, and edge deployment. Section 13 reviews benchmarking. Section 14
+identifies open problems. Section 15 concludes.
+
+4
+
+Table 2: Comparison of visual token compression methods. Speedup figures are as reported in the respective
+papers and are not directly comparable across different base models and hardware. The interface-impact
+column indicates, per the failure-chain framework of Section 3, which interface(s) the method’s output most
+directly affects.
+Method
+
+Approach and stage
+
+Reported
+speedup
+
+Key limitation
+
+Interface impact
+
+ToMe
+(Bolya Bipartite merging in ViT 2× throughput Fixed threshold; no spatial Interface
+B:
+et al., 2023)
+encoder
+awareness
+merged-token
+routing untested
+ATM (Lee & Adaptive layer merging in >30% FLOP Depth-wise only; no query Interface B: depthChoi, 2025)
+ViT encoder
+reduction
+conditioning
+wise shift, no routing evaluation
+AdaMerge (Lee Salience-weighted merg- ∼2×
+Saliency heuristic may mis- Interface
+A/B:
+et al., 2026)
+ing in ViT encoder
+fire on texture-heavy inputs saliency
+errors
+propagate to router
+MaMe/MaRe
+Matrix-decomposition
+31% latency re- Designed for generative mod- Interface
+B:
+(Huo & Li, 2026) merge in ViT and diffu- duction
+els; limited MLLM evalua- untested for MoE
+sion models
+tion
+routers
+ToSa
+(Huang Spatial-aware merging in Comparable to Spatial penalty adds over- Interface A: preet al., 2025)
+ViT encoder
+ToMe
+head at high resolution
+serves spatial layout
+for downstream reasoning
+MustDrop (Liu Multi-stage dropping in Large FLOP Stage schedule requires per- Interface B: dropet al., 2024)
+MLLM pipeline
+reduction
+model tuning
+ping alters attention context per
+Observation 2
+HiRED
+(Arif Early-layer saliency prun- Substantial
+Saliency from early layers Interface A/B: early
+et al., 2024)
+ing in MLLM prefill
+throughput
+may miss semantic impor- miscalibration comgain
+tance
+pounds downstream
+GreedyPrune
+Marginal-gain selection in High accuracy Combinatorial search cost Interface
+B:
+(Pei et al., 2025) MLLM encoder
+at aggressive grows with token count
+retained-set statisratios
+tics shift untested
+EvoComp (Song Evolutionary
+learned Avoids
+posi- Additional training proce- Interface B: learned
+et al., 2026)
+compression in MLLM
+tional gaps
+dure required
+retention may coadapt with router
+CSVLM (Kiru- Compressed-sensing pro- Formal spar- Assumes sparse visual signal; Interface B: proluta et al., 2025) jection in MLLM encoder sity guarantees fails on dense scenes
+jected tokens are
+statistical artefacts
+DynTok (Zhang Dynamic frame budgeting Higher action- Complexity estimator adds Interface B + TRC:
+et al., 2025a)
+in video MLLM
+segment qual- per-clip overhead
+budget shifts affect
+ity
+frame-wise routing
+V2Drop
+(Chen Variation-based
+frame Large latency One-step window; no tempo- Interface B + TRC:
+et al., 2026)
+dropping in video MLLM reduction for ral memory
+dropped frames disvideo
+rupt expert continuity
+
+5
+
+2
+
+Background and Preliminaries
+
+Efficient multimodal deployment rests on three architectural facts: visual inputs are converted into dense
+token sequences, multimodal LLMs pass those tokens through language decoders, and MoE variants replace
+dense feed-forward computation with routed expert banks. These facts matter because they create the main
+efficiency levers studied in this survey: visual tokens can be compressed, expert computation can be sparsified,
+and hardware placement can reduce data movement. On edge devices, however, the same levers also create
+failure conditions: compression shifts the token distribution, sparse routing can become imbalanced under
+shifted inputs, and memory hierarchies can make expert and cache movement more expensive than arithmetic.
+This section fixes the architectural vocabulary used by the later failure analyses.
+2.1
+
+Vision Transformers and Multimodal Architectures
+
+Vision Transformers (ViTs) apply the multi-head self-attention mechanism to sequences of image patches,
+treating each patch as an independent token. The spatial redundancy of this representation is substantial:
+masked reconstruction pre-training produces competitive visual representations even when 75%–85% of input
+patches are hidden, because each visible patch carries information about its neighbours (He et al., 2022).
+Video data exhibits even stronger redundancy, with effective pre-training possible at masking ratios near 90%
+because temporal continuity makes adjacent frames highly predictable (Tong et al., 2022). An architectural
+alternative is to avoid full quadratic attention over the input sequence altogether by cross-attending a
+compact latent array to arbitrary high-dimensional inputs (Jaegle et al., 2021).
+Modern MLLMs couple a visual encoder with a pre-trained LLM decoder via a connector module. This
+architecture introduces a critical structural inefficiency: the LLM processes visual and textual tokens identically, allocating equal per-token compute to visually redundant background patches as to semantically dense
+text tokens. This inefficiency is the starting point for compression, but it is also the starting point for the
+interaction problem. When tokens are compressed before entering the LLM, the connector’s projection and
+the LLM’s attention mechanism both receive inputs whose statistical properties differ from those seen during
+training. The downstream effects on MoE routing and quantization behaviour are discussed in next section.
+2.2
+
+Mixture-of-Experts: Foundations and Fragility
+
+The key innovation of MoE is replacing a single FFN at each layer with a set of N expert sub-networks and
+a router, which selects a subset (usually Top-k, with k = 2) for each token. The benefits from a theoretical
+perspective are apparent: the number of parameters scales with N but the computation per token scales with
+k. (Du et al., 2024). However, the efficiency achieved through this process creates structural vulnerability
+which is key to this survey. Inference optimization for this regime thus emphasizes route efficiency, expertise
+location, batching, and memory transfer over solely focusing on reducing FLOPS. (Liu et al., 2025a).
+Formally, for an input token representation x, a router computes logits h(x) = Wr x and selects the active
+expert set through Top-k gating:
+Router(x) = TopK(softmax(h(x)), k).
+The gated MoE output is then
+y(x) =
+
+X
+
+gi (x)Ei (x),
+
+gi (x) = softmax(h(x))i ,
+
+i∈TopK(x)
+
+where Ei is the i-th expert FFN and gi (x) = 0 for unselected experts. Load balancing requires the empirical
+selection rate of each expert to remain close to the uniform allocation,
+Ex [1{i ∈ TopK(x)}] ≈
+
+k
+N
+
+∀i.
+
+This setup is brittle as the router function is learned from the token distribution seen during training, not
+a system built to be robust against distributions shifting. Three such shifts are particularly important
+6
+
+Figure 2: Architectural paradigms of multimodal efficiency. (Panel A) Dense baselines suffer from acute
+visual token inflation and high memory bottlenecks. (Panel B) Standard server-side MoE structures isolate active computational FLOPs but maintain prohibitive 7B+ parameter storage footprints and process
+uncompressed 4k+ token sequences. (Panel C) Edge-native MoE designs actively combine upstream token
+compression (merging and dropping) with downstream quantized (ternary/binary) experts to simultaneously
+resolve compute, VRAM, and storage constraints at the edge.
+
+for efficient deployment of multimodal architectures. Firstly, token compression before the router causes
+merging of tokens and hence a different token distribution seen by the router, or dropping of some tokens
+from the stream completely. Secondly, quantizing the logits of the router function adds noise (Fu et al.,
+2026). Third, compression and quantization cause a combined shift effect that cannot be additive, since
+quantization distortion is added to router inputs which have themselves undergone statistical alteration via
+the compression process.
+The primary training-time manifestation of this fragility is load imbalance: without regularisation, routers
+tend to route tokens to a small subset of experts, a failure mode termed expert collapse (Sha, 2026; Do et al.,
+2026). An expert is effectively collapsed when its utilisation rate falls below 1/N of the uniform allocation;
+for a 64-expert model, this threshold is 1.5625%. Empirically, collapse can propagate layerwise, with roughly
+one-third of sparse MoE layers drifting toward single-expert behaviour if routing is left poorly controlled
+(Sha, 2026). Classical auxiliary load-balancing losses address collapse through explicit regularisation, but
+they introduce training instability and loss-weight tuning; recent work therefore explores auxiliary-loss-free
+balancing (Wang et al., 2024a). Understanding how compression and quantization interact with these
+already-fragile routing dynamics is one of the central open problems this survey identifies.
+2.3
+
+Edge Deployment: A Hierarchy of Constraints
+
+Deploying large models on resource-constrained hardware is not simply a scaled-down version of cloud serving.
+It is a qualitatively different problem governed by a hierarchy of binding constraints that interact with every
+upstream design decision.
+At the tightest level, SRAM capacity determines what can reside in fast on-chip memory during a single
+forward pass. Mobile SoCs typically expose only a few to tens of megabytes of such storage, far below the
+expert FFN weights of even moderately sized MoE models, so expert parameters must be dynamically loaded
+7
+
+from slower memory. At the next level, DRAM bandwidth determines how quickly those weights can be
+transferred: mobile-class bandwidth is far below server-GPU bandwidth, making memory movement rather
+than arithmetic the dominant energy and latency cost (Chung et al., 2026). This has direct implications
+for quantization strategy, because reducing precision reduces transfer volume approximately proportionally.
+At the outermost level, the energy budget and thermal envelope constrain sustained throughput; peakperformance measurements can therefore overstate what a mobile or embedded device can maintain after
+throttling.
+These constraints interact with upstream choices in non-obvious ways. Aggressive token compression reduces
+the number of router decisions per forward pass and can therefore reduce the number of expert transfers.
+But if compression disrupts routing locality, previously co-activated experts may diverge, lowering expertcache hit rate and increasing effective transfer volume despite fewer tokens. Quantization reduces per-weight
+transfer cost, but it can also change which experts are selected, disrupting prefetch predictions that depend
+on routing stability (Fu et al., 2026). These hardware-level interaction effects make the co-design problem
+non-decomposable: optimising compression, routing, and quantization independently on server hardware and
+then deploying the combined system on edge hardware does not necessarily produce the expected efficiency.
+Evaluation therefore separates into mobile compressed-model benchmarking (Li et al., 2025d), architecturelevel accelerator simulation (Sukthanker et al., 2024), direct power-performance characterisation (John et al.,
+2024), and energy-aware measurement spanning µWatt embedded targets to MWatt datacentres (Tschand
+et al., 2025). Figure 2 summarises the resulting architectural progression from dense baselines to server-side
+MoE models and edge-native sparse systems that combine compression with low-precision experts.
+
+3
+
+Cross-Technique Interactions and the Efficiency Co-Design Problem
+
+This section establishes a unified framework for understanding the interactions among token compression,
+MoE routing, quantization, and edge deployment. The three pressures introduced in the Introduction reappear here as four operational stages: token density motivates compression, sparse-model overhead unfolds
+through routing and precision decisions, and deployment constraints culminate in hardware execution, with
+the interfaces marking where these pressures begin to interact. Each technique addresses a distinct computational bottleneck: token count, active parameter count, numerical precision, or hardware resource constraints;
+and has consequently been studied under separate optimization objectives and evaluation protocols. In deployed multimodal systems, however, these techniques do not operate independently. Instead, they form a
+sequential inference pipeline in which the output distribution of one stage becomes the input distribution of
+the next. As a result, optimization decisions made at one stage can induce downstream effects, including
+distribution shift, routing instability, quantization errors, and hardware resource contention. We refer to
+this causal dependency structure as the failure propagation chain, which serves as the organizing framework
+for the remainder of this survey.
+3.1
+
+The Failure Propagation Chain
+
+Figure 3 illustrates the four-stage inference pipeline and highlights the three critical interfaces at which
+cross-technique failures may emerge. The KV cache is drawn outside the main left-to-right chain because it
+is not an independent transformation stage; instead, it is a persistent state created during inference whose
+footprint later couples quantized inference to hardware execution.
+Formally, the inference process can be represented as the composition of four parameterized stages:
+P = H◦Qπ ◦Rθ ◦Cϕ ,
+
+(1)
+
+where Cϕ is the compression operator with parameters ϕ (compression ratio, merging strategy, positional
+encoding policy), Rθ is the routing operator with parameters θ (routing temperature, load balancing objective, expert capacity), Qπ is the quantization operator with parameters π (bit-width per component,
+calibration set, precision allocation policy), and H is the hardware execution context (memory hierarchy,
+8
+
+bandwidth, thermal envelope). Most existing studies implicitly assume that the optimization of (ϕ, θ, π)
+can be performed independently:
+
+ϕ∗ = arg min L(Cϕ ) ,
+ϕ
+
+θ ∗ = arg min L(Rθ ) ,
+θ
+
+π ∗ = arg min L(Qπ ) .
+π
+
+(2)
+
+The central argument of this survey is that Equation (2) holds only under an assumption of statistical
+independence between stages. Specifically, it requires that token compression does not alter the input distribution seen by the router and that routing decisions do not affect the sensitivity profile of subsequent
+quantization. These assumptions rarely hold in practical multimodal systems. Consequently, local optimizations may propagate and amplify errors throughout the inference pipeline. The remainder of this section
+examines these dependencies in detail. Each interface is characterised by three quantities: what it transfers
+(the information transferred between stages), how it can fail (the mechanisms through which failures arise),
+and what has and has not been studied (the extent to which these interactions have been studied in the
+existing literature.).
+Interface A - Visual Input to Compression. Transfer: A full-resolution visual token sequence containing spatial structure, positional information, and contextual dependencies. Failure modes: Salient visual
+tokens may be incorrectly removed or merged, spatial coherence may be disrupted by similarity-based compression strategies, and positional information may be distorted, degrading downstream spatial reasoning.
+State of literature: This interface has been extensively studied in isolation, particularly in the context of
+token-density analysis, Vision Transformer (ViT) compression techniques, and MLLM sensitivity studies
+(Sections 4–6). However, the downstream impact of compression-induced representation changes on MoE
+routing behavior remains largely unexplored. This gap motivates the analysis of Interface B and the MoE
+routing analysis in Section 9.
+Interface B - Token Compression to MoE Routing. Transfer: A compressed token sequence whose
+length, feature distribution, or both differ from the distribution observed during router training. Failure
+modes: Compression-induced distribution shift can degrade load balancing, increase expert-collapse tendencies, and disrupt expert specialization when merged representations occupy regions of the feature space not
+encountered during training. State of literature: This interface remains largely uncharacterized. Among
+all cross-technique interactions considered in this survey, it represents the most significant research gap.
+Section 3.2 examines the implications of compression-induced routing instability and its consequences for
+efficient multimodal inference.
+Interface C - MoE Routing to Quantized Inference. Transfer: Expert activation patterns, including
+selected experts and their associated gating weights, which determine the weight tensors that must be loaded
+and the precision at which they are executed. Failure modes: Quantized router logits may alter expert
+assignments, leading to routing inconsistency and measurable performance degradation. Recent studies
+show that routing-aware post-training quantization can recover 1.15%–2.28% average score on low-bit MoE
+benchmarks, indicating that these routing perturbations are not negligible (Fu et al., 2026). Additional
+failure modes include expert-importance miscalibration and interactions between routing-induced activation
+patterns and modality-specific quantization outliers. State of literature: This interface has been partially
+investigated in isolation (Fu et al., 2026; Park et al., 2026). However, the extent to which routing instability
+originating at Interface B amplifies quantization errors at Interface C remains unknown. Section 3.3 explores
+this interaction.
+3.2
+
+Interface B: The Compression-Routing Interaction
+
+Interface B is the least studied of the three and structurally the most consequential, because it is the earliest
+point at which cross-technique failure originates and failures here propagate through every downstream stage.
+9
+
+Figure 3: Failure propagation chain for efficient multimodal edge inference. Each stage receives the output
+distribution produced by the previous stage, so local efficiency optimisations can become downstream failure
+modes: compression may remove visual evidence, compressed representations may shift MoE routing, quantized router logits may change expert assignments, and hardware limits may feed back into compression,
+routing, and precision choices. The KV cache is shown outside the main chain because it stores past states
+created during inference rather than acting as a separate processing stage; nevertheless, its size and retention policy convert upstream token, routing, and precision decisions into later memory stalls and hardware
+pressure.
+
+3.2.1
+
+How Compression Shifts the Router’s Input Distribution
+
+Token compression operates on the visual token sequence before or during the LLM prefill stage. The two
+dominant paradigms affect the router’s input distribution through distinct mechanisms:
+Token dropping removes tokens entirely, reducing sequence length. The surviving tokens retain their
+original representations, so their marginal distribution is unchanged relative to training. However, the joint
+distribution of the sequence changes: dropped tokens contributed to the multi-head self-attention context
+that shapes the key and value projections of surviving tokens in later encoder layers. When those tokens
+are absent, the surviving tokens’ contextualised representations differ from those produced at training time.
+The magnitude of this context shift grows with the compression ratio and is largest when dropped tokens
+are spatially adjacent to retained ones precisely the regime targeted by background-dropping methods.
+Token merging replaces pairs of similar tokens with their weighted average. Merged tokens are statistical
+artefacts: they are convex combinations of source tokens whose representations may occupy low-density
+regions of the router’s learned token space. The router, trained on a distribution of individual patch embeddings, has no explicit mechanism for handling such combinations. In the best case, merged tokens are
+routed similarly to their source tokens and the routing distribution is approximately preserved. In the
+worst case when merged tokens fall near decision boundaries between expert subspaces, small perturbations
+in the merge weights produce large changes in routing assignments, amplifying sensitivity to the merging
+hyperparameters.
+3.2.2
+
+Bounding the Magnitude of the Interaction
+
+The magnitude of compression-induced routing disruption has not been directly measured in the literature.
+The closest evidence comes from recent studies on routing-consistent quantization.
+10
+
+Fu et al. (2026) demonstrate that quantization-induced perturbations to router logits are sufficient to disrupt
+top-k expert assignment, and that preserving routing consistency via KL divergence alignment between fullprecision and quantized routing probabilities recovers accuracy on reasoning benchmarks across three MoE
+architectures. Park et al. (2026) independently show that explicitly constraining quantized routing decisions
+to match full-precision routing improves accuracy beyond standard calibration procedures. Together, these
+results establish that even the relatively small perturbations introduced by post-training quantization are
+sufficient to produce measurable, task-relevant routing changes.
+Compression introduces perturbations through two channels that differ from quantization. First, token merging modifies token representations directly, potentially moving them away from the training distribution.
+Second, token dropping changes the attention context available to surviving tokens, altering their contextualized representations. Unlike quantization, which primarily perturbs activation magnitudes, compression
+can modify both representations and sequence structure. These observations suggest that compression may
+induce routing shifts comparable to, or potentially larger than, those observed under quantization. However,
+this remains a hypothesis rather than an established result. Quantifying routing assignment changes under
+compression is therefore an important open problem and a necessary step toward compression-aware MoE
+design. This is identified as a priority open problem in Section 14.
+3.2.3
+
+Implications for Routing Objectives
+
+Current token-compression methods are typically evaluated using accuracy-efficiency trade-offs such as
+FLOPs reduction, latency, and task performance. To the best of our knowledge, routing stability is not
+reported as a standard evaluation metric. This omission is notable because compression directly alters the
+inputs to the router. A routing-aware compression objective should therefore incorporate a stability term
+that penalizes deviations between routing distributions on compressed and uncompressed inputs. One natural formulation is to minimise the KL divergence between the corresponding expert-assignment distributions,
+analogous to routing-consistency objectives used in recent quantization studies.
+3.3
+
+Interface C: Routing Instability and Quantization Sensitivity
+
+Interface C captures the interaction between routing decisions and quantization. The relationship is bidirectional: quantization can alter routing by perturbing router logits, while routing behaviour influences
+quantization by determining which experts require higher precision. The first direction is partially characterised (Fu et al., 2026; Park et al., 2026); whereas the latter remains largely unexplored.
+3.3.1
+
+How Routing Decisions Shape Quantization Sensitivity
+
+Several recent quantization methods allocate precision according to expert importance, assigning higher
+bit-widths to experts that receive more routing traffic during calibration (Deng et al., 2026). This strategy
+assumes that expert activation patterns remain stable between calibration and deployment. However, this
+assumption may not hold when routing distributions shift for two resons.
+First, if the set of high-traffic experts at calibration time differs from the set at deployment time due to
+compression-induced distribution shift at Interface B the precision allocation is miscalibrated to the actual
+deployment routing. The experts that receive degraded precision are not the least important ones in absolute
+terms; they are the ones whose importance was underestimated at calibration because the compressed input
+distribution suppressed their activation frequency.
+Second, the experts most affected by this miscalibration are low-frequency experts—those activated only by
+rare or highly specific input patterns. These are precisely the experts that routing inconsistency research
+identifies as most informationally critical. Fu et al. (2026) show that the assignments that change under
+W4A8 quantization disproportionately involve low-frequency expert-token combinations with high information content. A compression policy that further suppresses the activation of these experts during calibration
+therefore creates a compounding failure: the most important rare-expert activations receive both unstable
+routing and insufficient quantization precision.
+11
+
+3.3.2
+
+The Amplification Relationship
+
+We characterise the joint failure as an amplification relationship: routing instability introduced at Interface B
+increases the probability that Interface C failures already present under quantization alone will manifest and
+produce observable accuracy degradation.
+Let ∆Q denote the routing assignment change rate under quantization alone, and let ∆C denote the additional
+assignment change rate induced by upstream compression. The joint change rate ∆CQ satisfies: ∆CQ ≥
+∆Q + ∆C − ∆Q · ∆C , where the right-hand side is the inclusion-exclusion lower bound under the assumption
+that the two perturbation sources affect disjoint subsets of assignments. In practice, both perturbation
+sources are more likely to affect the same marginal assignments those closest to decision boundaries so
+the actual joint change rate likely exceeds this bound. We discuss a first-order characterisation and a
+tighter bound would require empirical measurement of the correlation between compression-induced and
+quantization-induced routing changes, which does not yet exist in the literature and is identified as an open
+problem in Section 14.
+3.4
+
+The Non-Decomposable Pareto Frontier
+
+The interaction effects at Interfaces B and C have a direct consequence for the efficiency optimisation
+problem. Compression, routing, and quantization are typically studied as separate accuracy-efficiency tradeoffs. Compression reduces token count at the cost of information loss, routing balances expert utilization
+against computational overhead, and quantization reduces memory and energy consumption at the cost of
+numerical precision.
+Most existing optimization strategies implicitly assume that these trade-offs can be optimized independently
+and then combined. However, the interactions discussed in previous sub-sections suggest that this assumption
+is often invalid. Compression changes routing behaviour, routing influences quantization sensitivity, and
+quantization can in turn affect routing decisions. As a result, the optimal operating point of the full system
+cannot generally be obtained by independently optimizing its components. A configuration that appears
+optimal when evaluated in isolation may become suboptimal once deployed within the complete inference
+pipeline. The discrepancy arises from cross-stage dependencies rather than poor parameter tuning.
+This observation motivates a shift from component-level optimization toward joint or co-designed optimization strategies that explicitly account for interactions among compression, routing, and quantization. The
+discrepancy is not a tuning failure; it is a structural consequence of ignoring cross-stage dependencies. The
+only remedies are joint optimisation of the pipeline parameters or, at minimum, sequential optimisation that
+holds upstream parameters fixed while tuning downstream ones.
+3.4.1
+
+Hardware Constraints as Additional Pareto Pressure
+
+On edge hardware, the non-decomposability of the Pareto frontier is further tightened by hardware-specific
+constraints that interact with all three upstream stages. The energy cost of a forward pass on edge hardware
+is dominated by memory transfer volume, not arithmetic throughput (Chung et al., 2026). This transfer
+volume depends jointly on: quantization precision (lower precision reduces bytes per weight), expert activation patterns (which experts are loaded determines transfer volume), and token count (which determines
+how many routing decisions and expert activations occur per forward pass). These quantities are jointly
+determined by the pipeline parameters (ϕ, θ, π) and cannot be minimised independently.
+A compression policy that reduces token count but disrupts routing locality causing previously co-activated
+experts to diverge may increase net transfer volume despite fewer tokens, because it forces loading of a
+more diverse set of expert weights per forward pass. Similarly, a quantization policy that reduces per-weight
+transfer cost but destabilises routing may increase transfer volume by forcing prefetch misses on experts
+that routing predictions failed to anticipate. These are concrete, measurable hardware-level consequences
+of the interaction effects at Interfaces B and C, and they are invisible to any evaluation methodology that
+benchmarks compression, routing, and quantization on separate hardware runs.
+12
+
+3.5
+
+Temporal Routing Consistency: A Diagnostic for Video MoE Models
+
+The interaction effects described above apply to all multimodal MoE models, but they take a specific and
+qualitatively distinct form in video understanding models. Video MoE models process temporally ordered
+token streams, and the failure chain acquires a temporal dimension that static image models do not exhibit.
+This subsection introduces a diagnostic metric for this temporal dimension.
+3.5.1
+
+The Temporal Continuity Problem in MoE Models
+
+Recurrent architectures such as LSTMs guarantee representational continuity across time steps by construction: the hidden state ht is computed as a function of ht−1 , ensuring that the representation of frame t
+is explicitly conditioned on the representation of frame t − 1. Transformer-based MoE models provide no
+analogous guarantee. The router assigns experts to tokens independently: given a token representation xt ,
+the router selects experts based solely on xt ’s current features, without knowledge of which experts were
+activated for temporally adjacent tokens.
+This independence is a feature for static inputs it enables parallelism and hardware efficiency but it is
+a potential failure mode for temporally ordered sequences. If consecutive frames are routed to entirely
+different expert subsets, the expert-specific representations for frames t and t+1 reside in different activation
+subspaces, disrupting the representational continuity that temporal reasoning requires. The shared token
+embedding space provides some continuity, but this is a soft constraint: routing collapse (Sha, 2026) or
+routing instability introduced by upstream token compression can disrupt even this implicit coherence.
+3.5.2
+
+Temporal Routing Consistency as a Metric
+
+Let Et ⊆ {1, . . . , N } denote the set of experts activated by all visual tokens from frame t under Top-k
+routing, where N is the total number of experts and T is the number of frames in the clip. The Temporal
+Routing Consistency (TRC) score is the mean Jaccard overlap between expert activation sets for all pairs of
+temporally adjacent frames:
+T −1
+1 X |Et ∩ Et+1 |
+.
+(3)
+TRC =
+T − 1 t=1 |Et ∪ Et+1 |
+TRC ∈ [0, 1], with TRC = 1 indicating perfect expert overlap between all adjacent frames (maximum
+temporal continuity) and TRC = 0 indicating completely disjoint expert activation across all adjacent frames
+(maximum expert jitter).
+TRC under compression. The interaction between Interface B and TRC is direct: upstream token compression that disrupts routing locality will lower TRC by causing adjacent frames’ compressed representations
+to be routed to more divergent expert subsets. A compression method that degrades TRC should be considered harmful for video understanding tasks even if its static accuracy-FLOPs tradeoff appears favourable,
+because the TRC degradation indicates a loss of temporal coherence that single-frame accuracy metrics do
+not capture. Jointly optimising compression and TRC would provide a principled training objective for video
+multimodal MoE models that is temporally coherent and routing-stable under compression. To the best of
+our knowledge, no existing method pursues this joint objective.
+3.6
+
+Implications of the Failure Chain
+
+The failure propagation chain and the three interfaces characterised above provide the organising framework
+for the remainder of this survey. The KV cache sits outside this four-stage diagram for the same reason it
+sits outside Figure 3: it is not a fifth processing stage. Instead, it stores intermediate states produced by
+the chain, and those stored states determine how earlier decisions reappear later as decoding-time memory
+pressure. Each subsequent section covers one or more stages of the chain; Table 3 maps survey sections to
+chain stages and identifies the specific interface interaction each section informs.
+Three implications of the chain analysis are as follows:
+13
+
+Table 3: Mapping of survey sections to failure chain stages. The Interaction informed column identifies
+which cross-stage interface each section’s content characterises or motivates.
+Section
+
+Chain stage
+
+§4
+§5
+§6
+§7
+
+Pre-compression evidence Uneven information density
+Interface A
+Stage 1: Compression
+ViT spatial redundancy
+Interface A, Interface B
+Stage 1: Compression
+MLLM pipeline sensitivity
+Interface A, Interface B
+Stage 1 + TRC
+Temporal redundancy, expert Interface B + TRC
+jitter
+Cache-to-reasoning
+KV memory growth, evidence Cache pressure + hardware
+boundary
+retention
+feedback
+Stage 2: Routing
+Load imbalance, collapse
+Interface B, Interface C
+Routing-to-systems
+Expert movement, cache inter- Interface C + hardware feedboundary
+ference
+back
+Stage 3: Quantization
+Activation outliers, routing Interface C
+drift
+Stage 4: Hardware
+SRAM, bandwidth, energy
+Model-to-hardware
+Pareto
+constraint
+Evaluation
+Benchmark gaps
+All interfaces
+
+§8
+§9
+§10
+§11
+§12
+§13
+
+Dominant bottleneck
+
+Interaction informed
+
+Implication 1: Compression quality has a routing dimension. Current compression benchmarks
+measure accuracy and FLOPs. They do not measure routing stability under compression. Section 5 and
+Section 6 review compression methods through this additional lens, noting where routing implications can
+be inferred from existing results and where they remain uncharacterised.
+Implication 2: Routing evaluation should condition on the compression policy. Current routing
+benchmarks measure load balance and expert utilisation on uncompressed inputs. A routing method that
+achieves good balance on full-resolution tokens may fail under compressed inputs with shifted statistics.
+Section 9 reviews routing methods with this conditionality in mind.
+Implication 3: Quantization calibration should account for upstream compression. Expertimportance quantization is calibrated on the token distribution seen during calibration runs. If those
+calibration runs use uncompressed inputs but deployment uses compressed inputs, the calibration is systematically mismatched. Section 11 identifies where existing quantization methods are and are not robust
+to this mismatch.
+
+4
+
+Token Redundancy in Multimodal Transformers
+
+Token redundancy is the starting point for almost every efficiency method in multimodal transformers. The
+topic asks which visual, temporal, or cross-modal tokens carry information that is predictable from context
+and can therefore be removed, merged, or down-weighted. Its importance for edge deployment is direct:
+redundant visual tokens expand every downstream cost, including encoder attention, LLM prefilling, KVcache memory, and MoE routing traffic. The failing mode here is that redundancy should not be viewed as
+irrelevance, as even low density patches, OCR spans, or frames can become important to support grounding
+or reasoning. This chapter thus approaches redundancy as something that should be quantified on a caseby-case basis, not as an opportunity to indiscriminately remove tokens.
+4.1
+
+Self-Supervised Evidence
+
+Quantitative proof of the visual token redundancy can be seen most clearly in reconstruction-based pretraining. If up to 75%-85% of patches can be masked and yet competitive features still learned, this means
+that much of the visible sequence is predictable based on context. (He et al., 2022). In this regard, video
+further reinforces the claim by showing that masking ratios around 90% work effectively as a consequence
+14
+
+of temporal continuity, which is another form of redundancy (Tong et al., 2022). Collectively, these findings
+demonstrate a quantitative baseline for the claim: at least 75% of visual tokens can be removed without any
+information loss. Instead of detecting redundancy as a post-hoc process, latent array-based models eliminate
+full-resolution token representations from the beginning while using iterative cross-attention to condense the
+input. (Jaegle et al., 2021).
+4.2
+
+Cross-Modal Redundancy
+
+In the case of video, an extra kind of redundancy arises, since most video tokens do not semantically align with
+any text token — they encode background, irrelevant transitions, and redundant information. Redundancy
+awareness for coarse pre-training mitigates alignment effort for non-relevant visual tokens and enhances
+retrieval by reducing noisy signals generated by non-aligning video tokens (Wu et al., 2022). Answering
+questions demands fine alignment, since many frames do not contain information relevant to the specific
+question posed even if those frames have saliency independent of the task. Question-guided frame selection
+helps focus computation on relevant frames that influence the answer (Li et al., 2023). This progression
+from sentence-to-video alignment to query-to-token alignment corresponds to the move from global token
+constraints in ViT to query conditioning in MLLMs.
+4.3
+
+The Information Density Framework
+
+Recently, new theories have brought together the three forms of redundancy mentioned above under the
+heading of token information density, which is defined as the information content of a token when conditioned
+on its context (Shao et al., 2026). When the token’s information density drops below a certain threshold, it
+may be eligible for elimination; however, both the threshold and the density itself depend on the modality
+(visuospatial tokens have lower average densities compared to text), and the context (background tokens
+tend to have lower density than object boundaries). The decision to apply these theories has become a choice
+between eliminating low density tokens or keeping them but with diminished weight; attention-based learning
+is a way to implement deletion, while position rescaling achieves the opposite conservatively (Mahajan et al.,
+2025).
+
+5
+
+Token Compression in Vision Transformers
+
+Token compression in Vision Transformers converts redundancy into raw efficiency gains within the visual
+encoder. The rationale behind this is that ViT self-attention depends on the number of image patches, and
+compressing visual sequences before they enter the LLM might lead to more efficient encoders as well as
+shorter multimodal context lengths. Yet compression on edge devices usually needs to be extreme, leading
+to unique sources of error, such as information loss due to dropping tokens, conflicts due to merging tokens,
+and overly harsh compression due to fixed compression limits. This is why approaches for token compression
+discussed in this section revolve around one key question: How does one compress tokens while not destroying
+the feature representation that other layers rely on?
+5.1
+
+From Token Dropping to Token Merging: A Design Dichotomy
+
+The basic conflict in ViT token compression can be stated as irreversibility and accuracy vs. efficiency and
+simplicity. Token pruning, where low importance tokens are dropped completely, offers maximum computational efficiency since less input elements are processed by subsequent layers, but sacrifices information which
+might turn out important later. By contrast, token merging preserves overall information at the expense
+of generating semantically inconsistent tokens; however, no information voids are created. Training-free bipartite soft matching provides a practical balance, where tokens are split into two subsets and similar token
+pairs from each subset are merged, leading to a speedup of up to 2× while suffering an accuracy loss of only
+0.2%–0.3% on ImageNet for DeiT, MAE and CLIP-like models (Bolya et al., 2023). The superiority of merging tokens over dropping them lies in the fact that the former technique preserves an average representation
+of the redundant patches while the latter causes loss of information. This is demonstrated in Figure 4.
+15
+
+Figure 4: Token reduction mechanisms through visual tokens. (Figure A) The concept of token dropping
+refers to the permanent removal of less salient regions (e.g., background) from the input image, which
+increases the extent of Flops saving, but at the same time, destroys the aggregate information as well as
+continuity of position indexing. (Figure B) The token merging process makes use of bipartite matching.
+
+5.2
+
+Layer-Wise and Spatial Failure Modes in Token Merging
+
+A fixed global similarity threshold creates two orthogonal failure modes. First, thresholds that are safe
+in late semantic layers can over-merge early layers where fine-grained texture differences still carry local
+information. Layer-specific adaptive thresholds address this depth-wise mismatch and can reduce DeiT
+FLOPs by over 30% while preserving accuracy exactly, not approximately (Lee & Choi, 2025). Second,
+feature similarity alone can merge visually distant regions that happen to share embedding statistics, such
+as sky and sea patches with similar colour distributions. Adding spatial distance to the merge criterion
+protects layout information and is especially important for tasks such as scene understanding and visual
+question answering (Huang et al., 2025). A complete merging policy must therefore satisfy both depth-wise
+calibration and spatial coherence; optimising only one leaves a distinct failure channel open.
+5.3
+
+Extending Compression Beyond Accuracy: Generativity and Throughput
+
+Once basic merging is effective, the next trade-off is whether to improve the accuracy-throughput frontier
+by protecting salient tokens, changing the algebra of merging, or sparsifying attention without changing the
+token count. Salience-weighted similarity scoring protects foreground and edge tokens while adaptive perlayer ratios control how aggressively each depth is compressed, reducing high-compression Top-1 degradation
+to about half that of fixed matching baselines (Lee et al., 2026). A matrix-decomposition formulation shifts
+the bottleneck from pairwise matching to GPU-friendly batched operations and can pair token merging with
+restoration, reducing Stable Diffusion generation latency by 31% while preserving visual quality (Huo & Li,
+2026). Attention sparsification follows a complementary axis: rather than reducing token count, it reshapes
+attention-score statistics and retains only significant token-token connections, lowering attention density over
+the existing sequence (Chen et al., 2025).
+
+6
+
+Token Management in Multimodal LLMs
+
+Token management for multimodal LLMs is concerned with choosing which visual tokens to preserve, in
+what order, and after how many have been fed into the language model pipeline. This subject is important
+since the LLM considers visual and textual tokens as one single context, meaning that all saved visual tokens
+will take up attention compute, KV-cache, and decoding memory. In the edge failure scenario, the concern
+becomes stage sensitivity; compress too early and you lose visual detail, compress too late and there is very
+little gain in compute saved, and reindex poorly and positional information may be lost despite retaining
+proper visual content.
+16
+
+6.1
+
+The Pipeline Sensitivity Problem: Where to Compress?
+
+A critical question that Visual Transformers’ compression does not consider is at what point in the MLLM
+processing pipeline would be the best time to apply token pruning. This is because at various stages of the
+process, having the same compression level comes at very different costs: encoder dropping reduces visual
+FLOPs while keeping computations on the LLM side intact, prefill dropping reduces memory consumption
+but disrupts attention patterns, and decoding dropping can be highly risky since every dropped token alters
+the generation probability. Multistage strategies take advantage of this asymmetry by employing aggressive
+dropping at encoding, moderate dropping at prefill, and mild dropping at decoding stages. (Liu et al.,
+2024). The other force that becomes relevant is high-resolution tiling, since a single scene may contain
+up to 2,000-5,000 visual tokens. Given such parameters, early attention allows us to produce an efficient
+saliency signal that would allow one to prune some tokens prior to executing the computationally heavy ViT
+layers. (Arif et al., 2024).
+6.2
+
+The Compression Approach Spectrum: Greedy, Structural, and Learned
+
+Given a fixed number of tokens to be preserved, there are three general approaches to deciding which tokens
+to keep: greedily selecting the tokens based on the information gain they provide, signal-theoretic projection
+in which no information is lost, and learning from performance. Greedy combinatorial selection selects tokens
+so as to maximize marginal gain and can preserve accuracy even when the pruning ratio is very large. (Pei
+et al., 2025); query-conditioned sparsification creates a budget that is dependent on the ongoing query of
+the text by employing cross-modal attention for determining relevant visual tokens (Zhang et al., 2025b);
+while compressive sensing projections offer formal guarantees for the preservation of signals of the sparse
+visual representation, beyond empirical accuracy gains (Kiruluta et al., 2025). Finally, learned compression
+is another dimension that occupies the spectrum: evolutionary pseudo-labeling enables training an efficient
+compressor whose decisions are guided by performance of the task at hand without positional gaps created by
+token dropping. (Song et al., 2026). The resulting trade-off is clear: greedy, query-conditioned, and structural
+methods are largely training-free but less adaptive, while learned compressors adapt to task statistics at the
+cost of an additional training procedure.
+6.3
+
+Positional Integrity Under Compression
+
+In all types of compression mechanisms, there exists an additional form of failure where: once the tokens have
+been removed or combined, the remaining tokens possess erroneous or inconsistent positional indices leading
+to poor performance in spatial tasks. This can be addressed by encoding spatiotemporal information in
+the compressed tokens rather than renumbering surviving tokens for better performance in token dropping
+regimes (Huang et al., 2026). In general, a training free approach that combines positionality with the
+use of viewpoint tiles and merging tokens based on text input becomes especially relevant during intensive
+compression and spatial queries. (Yu et al., 2026). A complementary alternative leaves indices intact but
+changes positional encoding magnitudes, amplifying informative tokens so they exert greater influence on
+attention scores (Huang & Yuan, 2026). Positional encoding integrity is therefore a first-class constraint in
+MLLM compression, not an afterthought.
+
+7
+
+Video Understanding and Temporal Redundancy
+
+Video understanding extends token redundancy from space into time. The topic is important because video
+inputs can multiply image-token costs by hundreds or thousands of frames, making uncompressed processing
+infeasible for edge devices. Yet temporal data also changes the failure landscape: static background tokens
+are highly compressible, but motion, event boundaries, and temporally separated evidence may be lost if
+compression is applied frame by frame without respecting sequence structure. When MoE routing is added,
+another edge condition appears: adjacent frames may be sent to inconsistent expert subsets, creating expert
+jitter instead of temporal continuity. This section examines video compression as a temporal-reasoning
+problem rather than as static image compression repeated over frames.
+17
+
+7.1
+
+Why Video Compression Requires More Than Static Token Reduction
+
+Applying standard image token compression independently to each video frame misses the central structure
+of video data: temporal continuity. A background region that is uninformative in frame t is equally uninformative in frames t−1 and t+1, and removing it independently in each frame is wasteful—it should be
+identified once and suppressed throughout the clip. Conversely, a region undergoing motion is maximally
+informative precisely because it changes across frames, and suppressing it would lose the most task-relevant
+signal. This interplay between static redundancy and temporal variation creates compression challenges
+qualitatively different from the image case.
+7.2
+
+The Temporal Sequencing Challenge: MoE Parallel Routing vs. Recurrent Constraints
+
+One significant structural challenge in using MoE-based architectures for video token streams stems from
+MoE routers assigning expert functions independently to individual tokens. Specifically, given a token embedding, the router determines which expert functions to employ according to the features of this particular
+token, without regard for whether any experts are activated for adjacent tokens. While this property is beneficial for processing of static data, it introduces a possible point of failure for processing of time-ordered data:
+if two consecutive frames are mapped to non-overlapping sets of expert functions, the respective expert-based
+representations will live in distinct activation spaces, disrupting representational consistency across frames
+necessary for temporal reasoning. This can be understood as the fundamental difference between MoE-based
+and recurrent-based architectures like LSTM networks (Hochreiter & Schmidhuber, 1997), where the presence of an explicit hidden state guarantees that the representation of frame t+1 is a function of the hidden
+state of frame t.
+This can be assessed directly via the Temporal Routing Consistency (TRC) measure described in Section 3.5,
+which evaluates the mean overlap (using the Jaccard metric) between the sets of experts invoked by temporally neighboring frames. TRC is high when adjacent frames are handled using an overlapping set of
+experts, maintaining a consistent subspace of experts for temporal inference; otherwise, if the value is low,
+there is “expert jitter,” i.e., adjacent frames use disjoint sets of experts, requiring temporal continuity to be
+recovered from the latent embedding space alone.
+Practically, however, the amount of routing continuity of video tokens has yet to be characterised systematically. The fact that motion information can be extracted and disassociated from per-frame content
+embeddings indirectly suggests that rapid changes in motion tokens are distinct from static content tokens (Zhang & Fu, 2025). In this scenario, a well-trained MoE router will route motion tokens to specific
+“motion experts” and static tokens to other experts designated as “content experts,” thereby roughly preserving the temporal consistency. However, such specialisation cannot always be taken for granted, since
+routing collapse (Sha, 2026) and routing instability resulting from token compression prior to the router (Fu
+et al., 2026) can impede this specialisation process. Adaptive video token compression provides some remedy
+against a lack of recurrent structure by assigning higher budgets to complex action segments relative to the
+simpler, static shots (Zhang et al., 2025a). The opposite lever is token removal on the basis of low temporal
+variation: feature comparison across consecutive frames allows tokens with very little temporal variation to
+be removed, resulting in far greater latency savings when dealing with videos as inputs compared to images
+due to the high amount of zero variation in the video stream (Chen et al., 2026). This approach does not
+benefit from the existence of recurrence, which means that it cannot rely on hidden state accumulation like
+an LSTM would; it is cheaper, but lacks the ability to maintain temporal context beyond a single step.
+The upshot of all this is that video MoE models at present operate under the implicit assumption that there
+exists enough temporal coherence both in the token embedding space and in expert specialisation, unlike
+LSTM-based architectures, which provided such guarantees. Architectural choices can allow the testing of
+such an assumption via optimisation of T RC or addition of the routing consistency loss, forcing a low Jaccard
+overlap penalty on consecutive frames’ expert selection to keep the expert jitter in check during training(see
+Section 14).
+State-space models such as Mamba occupy a middle ground between the two extremes described above:
+they maintain a compressed recurrent state that is updated across the sequence, providing some of the
+18
+
+representational continuity that LSTMs guarantee by construction, but without the sequential step-by-step
+computation that limits LSTM throughput. Whether SSM-based video backbones exhibit higher TRC than
+attention-based MoE models—that is, whether their compressed recurrent state induces more consistent
+expert routing across adjacent frames than the shared-embedding-space mechanism available to Transformerbased MoE routers—is an open empirical question that the TRC diagnostic is well suited to answer.
+7.3
+
+Long-Form Video: From Frame-Level Compression to Scene-Level Abstraction
+
+As video length extends from seconds to hours, frame-level token compression becomes insufficient: even compressing each frame to a single token would leave thousands of tokens for an hour-long video. Long-video efficiency therefore shifts from local token pruning toward hierarchical and memory-augmented abstraction (Zou
+et al., 2024). Scene-level hierarchies segment videos into semantic episodes, summarise each episode into a
+compact representation, and perform long-range temporal reasoning over the episode sequence rather than
+raw frames (Faure et al., 2025). This hierarchy introduces a new sequencing constraint: episode order must
+be preserved for causal reasoning, and summaries must retain enough scene context for downstream queries.
+Multi-granularity representations extend the hierarchy by combining frame-, clip-, and scene-level features
+into a unified multi-scale token sequence, trading richer context for higher token cost (Li et al., 2026).
+The efficiency-understanding tension at the long-form scale is sharpest for real-time video. Online pruning
+can bound latency by using a lightweight preliminary attention pass to estimate token importance before
+committing to full-attention computation (Jin et al., 2025). A complementary approach compresses the
+temporal token sequence directly inside the VLM context window without retraining, exploiting the fact
+that abstract predictive video representations already encode temporal redundancy structurally and are
+therefore cheaper to compress (Wang et al., 2025d; Drozdov et al., 2024).
+7.4
+
+Self-Supervised Foundations for Efficient Video Representations
+
+The efficiency of downstream compression depends critically on the structure of pre-trained video representations. Reconstruction-based pre-training with 90% masking forces each visible token to carry high information content, structurally reducing temporal redundancy before any downstream pruning is applied (Tong
+et al., 2022). Predicting abstract representations rather than pixels pushes this effect toward semantically
+organised temporal encodings that are inherently more compressible (Drozdov et al., 2024). Cross-modal
+redundancy can also be reduced during video-language pre-training by weakening alignment to visual regions
+that carry little text-relevant information (Wu et al., 2022).
+
+8
+
+KV Cache Optimisation
+
+The KV cache enables efficient autoregressive generation by storing the key and value states produced by
+causal self-attention (Vaswani et al., 2017). This avoids recomputing attention projections for the full prefix
+at every decoding step, but it moves the bottleneck from arithmetic to memory residency. In multimodal
+edge inference this topic is crucial because image patches, video frames, OCR spans, and text tokens all leave
+cached states behind during generation. For a decoder with batch size B, retained token length T , number
+of layers N , KV heads H, head dimension d, and element size p bytes, the cache footprint is approximately
+2BT N Hdp bytes,
+where the factor of two comes from storing both keys and values. In words, KV memory grows linearly
+with tokens, layers, heads, hidden dimension, precision, and batch size. Long-sequence transformer variants
+reduce attention complexity architecturally (Beltagy et al., 2020; Zaheer et al., 2020), and efficient-NLP
+surveys place such methods within a broader compression toolkit (Treviso et al., 2023); however, they do not
+by themselves solve the deployment-time failure condition that every retained prefix token still occupies cache
+memory. KV-cache optimisation therefore asks which cached states must remain exactly addressable during
+prefill and decoding, and which can be virtualised, compressed, or evicted before the edge memory budget is
+exceeded. In the terminology of Section 3, this is why KV-cache optimisation sits at the cache-to-reasoning
+boundary rather than inside the four-stage chain: it stores states created after upstream compression, routing,
+19
+
+Figure 5: KV-cache growth under edge memory constraints. During autoregressive multimodal inference,
+each retained token contributes key and value states across transformer layers, attention heads, batch elements, and numerical precision. Therefore, the KV cache grows with the effective multimodal context length,
+including image patches, video frames, OCR tokens, and text tokens. The dashed horizontal line represents
+the available edge-device memory budget. Once the cache footprint crosses this budget, inference enters
+a cache pressure zone where latency, memory movement, and energy cost increase sharply. This motivates
+KV-cache optimisation methods that compress, evict, or selectively retain cache entries for long-context edge
+deployment.
+
+and precision decisions, then turns those earlier choices into later memory and evidence-retention constraints.
+Figure 5 visualises this memory-pressure curve for multimodal contexts under an edge-device budget.
+8.1
+
+Serving-Level Cache Virtualisation
+
+Before making decisions about which tokens should be pruned out, the serving system must also ensure
+that its efforts in preserving tokens do not waste any cache resources on those very tokens it decides to
+keep. Contiguous cache allocation does not fit the autoregressive serving paradigm well because the length
+of the incoming requests increases dynamically, stops at some point in time, and usually shares prefixes.
+The idea behind PagedAttention (Kwon et al., 2023) is that in order to overcome such limitation of the
+serving infrastructure, KV caches could behave more similarly to virtual memory: the caches for different
+requests can be partitioned into blocks of equal sizes and allocated non-contiguously, allowing dynamic
+allocation, prefix sharing, and copy-on-write mechanisms in decoding branches. This way, the semantics of
+cache contents remain intact while fragmentation and duplication of data in cache are avoided.
+8.2
+
+Streaming Retention and Heavy-Hitter Eviction
+
+Having dealt with efficient memory allocation, another issue is that token age is a bad measure for token
+importance. While the naive approach uses the sliding window which always keeps the latest state while
+removing the oldest one, streaming generation becomes difficult when the early position of tokens functions
+as an attention sink. The combination of keeping both the initial attention sink tokens and the sliding
+window helps improve streaming performance without tuning (Xiao et al., 2024). This is still not enough,
+because tokens that have historical importance do not necessarily come from the front part of the prompt.
+The heavy hitter eviction approach keeps the small number of historical tokens that attract large amounts
+of attention mass along with the sliding window (Zhang et al., 2023). This leads us to a more accurate
+principle: the KV eviction should focus on attentional structure, not only recency.
+That principle becomes fragile in multimodal reasoning. Multi-hop benchmarks such as HotpotQA,
+MuSiQue, and 2WikiMultiHopQA require evidence to be composed across separated facts (Yang et al.,
+20
+
+2018; Trivedi et al., 2022; Ho et al., 2020); the analogous MLLM case may involve a small visual region,
+an OCR token, and a distant text query. Such evidence can be low-frequency or temporarily low-attention
+before it becomes decisive. Thus the same attention-based heuristics that reduce cache size also create a
+failure mode: latent evidence may be deleted before the model has reached the reasoning step that requires
+it.
+8.3
+
+Prompt-Aware and Layerwise Cache Compression
+
+Global eviction rules also ignore that attention behaviour varies across heads and layers. If a short observation window near the end of the prompt already reveals which positions a head will rely on during
+generation, then compression can be made prompt-aware rather than static. SnapKV operationalises this
+observation by clustering and retaining important KV positions per attention head, reducing long-context
+memory and decoding cost without fine-tuning (Li et al., 2024). Yet head-level selection still allocates cache
+uniformly across depth, even though lower layers tend to distribute attention broadly while upper layers
+funnel information into fewer critical positions. PyramidKV turns this layerwise asymmetry into a cache
+schedule, retaining more entries in lower layers and fewer in upper layers (Cai et al., 2025).
+The other weakness is that of granularity. Token-based eviction may retain plenty of individual salient states
+while breaking the semantic units they form. This is especially problematic when considering MLLMs, where
+the semantics of visual patches, OCR chunks, subtitles, and dialogues are derived collectively rather than
+on an individual token basis. ChunkKV uses semantic chunks rather than individual tokens as the basis for
+compression (Liu et al., 2025b). In our efficiency discussion, this change is significant due to its impact on
+retaining the information structure rather than reducing the number of tokens.
+8.4
+
+Graph-Based and Hybrid Eviction
+
+Chunkwise retention is still prone to missing dependencies which are not local within the flattened sequence.
+A visual patch, an OCR span, and a token from a question may be distantly separated within the stream but
+highly dependent as evidence. Graph-based eviction solves this problem by modelling the dependency structure between different tokens and evicting those that are replaceable considering the dependency graph (Li
+et al., 2025c). Thus, the use of a graph representation is not just a more advanced scoring scheme, but
+corresponds to the evidence dependency induced by multimodal prompts.
+This same problem arises in optimisation of different stages. For example, if upstream compression has
+already reduced the visual tokens by eliminating redundancy, then the remaining visual KV entries come
+from a completely different distribution compared to a naive decompressed prompt. Downstream cache
+management with a fixed eviction strategy will over-evict the very tokens that were kept due to informative
+reasons. Sparsification and cache compression that coordinates across stages addresses this mismatch by
+distributing compression across attention heads, accelerating prefilling by 2.3× and improving decoding
+throughput by 2.8× with only a 0.5% VQAv2 accuracy reduction (He et al., 2024).
+8.5
+
+Cross-Modal and State-Space Cache Compression
+
+The largest gap exists between the two modalities themselves. While tokens from text usually possess logical
+structure, tokens in the image modality might be based on distributed perceptual evidence; applying the
+same eviction condition to both results in the over-retention of repeated evidence from images, but loss
+of rare information needed for reasoning tasks. Modality-adaptive eviction resolves this issue by using a
+different criterion for each modality, resulting in a 1.3×–1.5× reduction in decoding latency (Li et al., 2025b).
+Consequently, modality-based caching becomes a multimodal resource allocation problem, where allocating
+resources depends not only on the amount of attention paid, but its form.
+Finally, if exact KV storage remains too expensive even after modality-aware eviction, the cache need not
+be represented entirely as discrete key-value states. A compact state-space memory can absorb part of the
+history, while entropy-based eviction preserves entries with the most unique information. This hybrid cachememory design achieves 5× KV compression with 1.5× decoding acceleration on MLLM benchmarks (Liu
+et al., 2026a). The broader implication is that KV-cache optimisation is no longer a systems afterthought.
+21
+
+It is a modelling decision that determines which parts of a multimodal context remain addressable during
+generation, and therefore which reasoning chains can survive under edge-memory constraints.
+The reported speedups and compression ratios throughout this section—2.3× prefilling acceleration with 2.8×
+decoding-throughput improvement at a 0.5% VQAv2 loss (He et al., 2024), 1.3×–1.5× decoding gains (Li
+et al., 2025b), and 5× compression with 1.5× acceleration (Liu et al., 2026a)—are typically measured as small
+benchmark-level losses or accuracy parity on the benchmarks used to evaluate the method, most commonly
+single-hop QA and standard long-context perplexity. This is a narrower claim than “no information loss.”
+The multi-hop evidence-deletion failure mode described above operates on low-frequency cached states that
+may not be exercised by these benchmarks at all, so a method can report accuracy parity while still discarding
+entries that would matter for a held-out multi-hop or fine-grained visual query. The accuracy cost of KVcache efficiency is therefore best understood as conditional on the evaluation distribution: aggressive eviction
+is cheap in accuracy terms for the queries a benchmark happens to ask, and potentially expensive for the
+queries it does not.
+
+9
+
+Mixture-of-Experts: Architectures and Routing
+
+Mixture-of-Experts architectures improve scaling by activating only a small subset of expert feed-forward
+networks for each token. Their appeal is that sparse activation can increase model capacity without increasing per-token arithmetic in the same proportion, making MoE models attractive for efficient multimodal
+inference. The edge failure case is that routing is not merely a mathematical selection rule: each expert
+assignment becomes a memory-access and scheduling decision, and shifted token distributions can produce
+load imbalance, expert collapse, or unstable specialisation. This section therefore examines routing not only
+as an accuracy mechanism, but as the control surface that determines whether sparse capacity remains usable
+under compression, quantization, and hardware constraints.
+9.1
+
+The Routing Design Space: Differentiability, Balance, and Collapse Avoidance
+
+The main difficulty with MoE routing is balancing three somewhat conflicting goals, namely differentiability
+(gradients must flow through the routing layer in order to facilitate proper specialisation of the experts), load
+balance (all experts need to be roughly equally active in terms of token stream traffic to avoid inefficiency),
+and non-collapse (the router cannot fall into the habit of choosing just a few experts all the time). The
+classical Top-k router with additional balancing losses achieves the latter goal using regularisation, but fails
+in differentiability due to the discontinuity introduced by the argmax operation.
+Differentiability, balancing, and collapse avoidance are achieved using different approaches; however, different risks remain even after achieving such improvements. First, Continuous ReLU Routing replaces the hard
+Top-k argmax approach to allow backpropagation while still needing proper handling to avoid relaxation
+routing problems (Wang et al., 2025c). Second, load balancing approaches solve the problem without introducing auxiliary losses and tuning their weights but fail to address the differentiability issue (Wang et al.,
+2024a). Third, eigenvector routing eliminates the problem of collapsing by mapping the input tokens to the
+eigenvectors of the expert matrices in a way that guarantees non-collapse assignments without changing the
+training process. (Do et al., 2026). A unified routing system would therefore combine continuous optimisation, structural load balance, and collapse-resistant expert geometry rather than treating them as separate
+fixes.
+9.2
+
+Expert Collapse: Quantitative Diagnosis and Failure Mode Taxonomy
+
+EXpert collapse—the router continuously selects a small number of experts while underutilising other
+experts—is the key failure mode for training MoEs. It is critical to understand what collapse means in
+terms of defining its mitigation mechanisms, since “collapse” can refer to different concepts with varying
+thresholds and implications. An expert is considered collapsed when its utilisation rate becomes less than
+1/N of the allocation to uniform distribution across experts, with N being the total number of experts.
+In a model with 64 experts, this threshold amounts to 1.5625%; thus, any expert with less than this utilisation rate makes an ineffective contribution and can be seen as wasted capacity. Empirically, collapse
+22
+
+can spread across depth, with roughly one-third of sparse MoE layers drifting toward single-expert routing
+when balancing is weak (Sha, 2026). When it comes to conditional generation, there appears another form
+of collapse—selective deadlock, which happens when tokens of a certain class are routed to a single expert
+leading to its capacity overflow and 8%–15% loss in class-conditioned FID scores (Sha, 2026).Since post hoc
+utilisation statistics identify failure only when harm occurs, spectral characteristics of the route probability
+distribution become a more preventive measure: a high routing probability Gini coefficient (i.e., above 0.7)
+indicates network collapse, regardless of the topology (Delibasoglu, 2026).
+Hierarchical expert architecture provides a scaling solution to the problem: gate networks based on task
+specialization create soft limits that enhance load balancing and specialized task performance, thus ensuring
+that no expert takes control over all tasks (Wang et al., 2024b).
+9.3
+
+Representation Collapse in Tokenisation
+
+Analogous collapse behaviors emerge within vector quantization (VQ) architectures, where codebook collapse
+refers to the phenomenon wherein a few codebook elements become the exclusive choice of the model while
+the rest remain unused. Codebook collapse exhibits a rich-get-richer behavior, whereby codebook elements
+with assignment probabilities greater than the mean assignment probability experience norm growth, receive
+an increasing number of assignments, and thereby further contribute to the disparity (Zhao et al., 2024). The
+use of a simple linear layer on codebook elements may counteract such a feedback mechanism by ensuring
+linear independence among codebook elements (Zhu et al., 2025). Nevertheless, this static solution does
+not carry over into the domain of MoE since the MoE utilization problem involves determining a probability
+distribution dynamically over expert weight matrices based on the input token mini-batch; unlike the fixed
+codebook structure of VQ, no combination of expert weight matrices and the token mini-batch can produce
+an orthogonal or linearly independent set of experts.
+9.4
+
+MoE in Vision and Multimodal Models
+
+Whether MoE routing benefits visual tasks is dependent on the computational regime. Sparse routing is
+optimal when the dense backbone is inadequate to model all token types, such that specialized experts
+complement the backbone representation; otherwise, memory access and load imbalance due to routing can
+become dominant (Sun et al., 2026). This is particularly relevant for compression, where strongly compressed architectures, due to their smaller backbone capacity, stand to benefit more from routing compared
+to uncompressed networks. CosMoES proposes compact sparse architectures to minimize MoE routing overhead when operating with few parameters (Huber et al., 2025), and lookup-based experts, which share an
+embedding table to drastically lower expert parameter costs (Jie et al., 2025).
+
+10
+
+High-Throughput MoE Serving
+
+High-performance MoE serving turns routing into a systems problem. Sparse models become efficient if
+the set of chosen experts can be efficiently loaded, cached, and executed without spending too much effort
+on memory stall or cache eviction. It is particularly important for edge and near-edge execution where
+the weights of the experts are very heavy, expert traffic varies based on inputs, and the performance of
+the model depends as much on data accesses as on FLOPS performed. The failure mode is that while
+conceptually sparse, such a model could run inefficiently due to being memory bound because of uncertain
+routing, imbalance in the number of requests to different experts, and competition of the attention and
+execution cache spaces.
+10.1
+
+System-Level Analysis and Scheduling
+
+The throughput limit for high-throughput MoE serving is not constrained by any one bottleneck, but rather
+by the point at which the task shifts from compute-bound to memory bandwidth-bound. Such a model can
+be used to optimize batching, scheduling, and offloading, providing speedup of up to 25.5× (4.6× on average)
+relative to an unsophisticated dense baseline model. (Yuan et al., 2025).
+23
+
+Memory stalls can be reduced either by predicting routing paths early enough to prefetch required experts,
+or by continuously adapting the prefetch policy as workload statistics change. Predictive routing paths hide
+memory latency and can yield large GPU memory savings with 2–10× inference speedups (He et al., 2024);
+adaptive prefetching then reduces residual stall time to near-zero levels under changing loads (Shen et al.,
+2025b).
+Serving efficiency can also be improved before memory management begins. Sensitivity- based gating skips
+low-sensitivity experts for compatible token types, reducing the average number of activated experts by
+25% and achieving a 1.35× speedup without memory-management overhead (Zhong et al., 2024). When
+workload heterogeneity is the dominant issue, task-aware expert loading adapts memory allocation to request
+characteristics and improves utilisation across diverse tasks (Tairin et al., 2025).
+10.2
+
+Disaggregated Serving
+
+Co-locating attention and expert modules creates cache interference because attention benefits from full KV
+residency while experts benefit from parallel weight movement. Disaggregating the two module types onto
+separate GPU sub-clusters preserves fast KV access for attention and lets expert execution proceed without
+cache interference, achieving up to 3.9× higher per-GPU throughput than co-located serving (Zhang et al.,
+2026).
+
+11
+
+Quantization for Efficient Inference
+
+Quantization lowers the precision of weights and activations so that models take up less space in memory,
+transfer less data, and are cheaper to compute. It is crucial for edge deployment when bandwidth and
+storage are the dominating factors in terms of energy consumption, meaning that lowering precision can
+yield advantages that are not achievable by just reducing FLOPs. However, with multimodal and MoE
+models, quantization adds new failure modes: extreme activation values cause computing to fail; router
+logits get corrupted and experts change; and vision and language models can accept different precisions.
+Table 4 condenses the main quantization failure regimes discussed in this section and makes explicit that
+not all failures are recoverable by the same kind of calibration strategy.
+11.1
+
+Quantization Failure Modes: A Quantitative Taxonomy
+
+Before exploring quantization techniques separately, we first need to understand their failure mechanisms
+using evidence that the cited papers actually report. One useful distinction separates gradual signal degradation from catastrophic computation collapse, because the two modes require different remedies (Zhou et al.,
+2026). Signal degradation is the regime in which quantization perturbs computation while preserving the
+overall processing pattern, whereas computation collapse is the regime in which key operations fail and the
+forward pass breaks down. For LLaMA-style transformers, Zhou et al. (2026) show that these regimes separate cleanly in practice: 4-bit quantization is usually the workable trade-off, while pushing to 2-bit typically
+triggers a catastrophic performance cliff. The practical significance of this taxonomy is that gradual degradation can often be mitigated by calibration or lightweight fine-tuning, whereas collapse usually requires
+architectural intervention such as clipping, mixed precision, or structural repair.
+MoE quantization adds a third failure mode: routing inconsistency, where noise in router logits changes
+expert assignments post-deployment. Rather than claiming a universal assignment-change threshold, the
+clearest source-backed evidence is outcome-based: routing-aware post-training quantization recovers 1.15%–
+2.28% average score across three MoE architectures under W4A4 and W3A4 settings, implying that preserving routing structure matters empirically even when aggregate quantization error appears modest (Fu
+et al., 2026). Figure 6 recasts these failure modes as a side-by-side comparison of three regimes. Rather than
+presenting a decision path, the figure highlights what breaks in each case, what evidence marks the regime,
+and which mitigation is most appropriate, making clear that quantization can perturb signal fidelity, sparse
+routing, or numerical stability at different levels of severity.
+24
+
+Table 4: Taxonomy of quantization failure modes in VLMs and MoE models. Rec. = recoverable via
+calibration/fine-tuning without architectural changes (∼ = partial).
+Failure mode
+
+Representative
+dence
+
+Signal degradation (Zhou
+et al., 2026)
+
+evi-
+
+Rec.
+
+Mitigation
+
+Scope
+
+Gradual degradation in
+the 4-bit regime
+
+✓
+
+Calibration or fine-tuning
+
+VLM, MoE
+
+Computation
+collapse
+(Zhou et al., 2026)
+
+Catastrophic cliff in the 2bit regime
+
+✗
+
+Mixed precision / clipping /
+structural repair
+
+VLM, MoE
+
+Routing inconsistency (Fu
+et al., 2026)
+
+Routing-aware
+PTQ
+recovers
+1.15%–2.28%
+average
+score
+at
+W4A4/W3A4
+
+∼
+
+Calibration- (Fu et al., 2026) or
+constraint-centric (Park et al.,
+2026)
+
+MoE only
+
+Modality-heterogeneous
+degradation (Zhong et al.,
+2026)
+
+SplitQ retains 93.5% of
+FP16 at W3A3 (69.5 vs.
+74.3)
+
+∼
+
+Modality-separated quantization (Xue et al., 2026)
+
+VLM only
+
+Speculative decoding interaction (Zhang et al., 2025c)
+
+Hierarchical
+design
+reaches 2.78× speedup
+and 1.31× over EAGLE-2
+on 4-bit Llama-3-70B
+
+✓
+
+Joint drafter–target design
+
+VLM, MoE
+
+Figure 6: Comparison of three quantization failure regimes in VLM and MoE inference. Signal degradation
+is the gradual regime in which outputs remain valid but noisier and can often be mitigated by calibration.
+Routing inconsistency is the structural MoE-specific regime in which quantized router logits perturb expert
+selection; the evidence shown in the figure reflects outcome-based recovery from routing-aware post-training
+quantization (1.15%–2.28% average score under W4A4/W3A4 settings). Computation collapse is the catastrophic regime in which low-bit quantization breaks numerical stability, motivating mixed-precision or other
+architectural repair.
+
+11.2
+
+Addressing Routing Inconsistency: Structure-Preserving Quantization
+
+Two complementary strategies address routing inconsistency. Calibration-centric quantization exposes the
+router to token distributions that most frequently produce assignment changes and then minimises logit perturbation on those distributions (Fu et al., 2026). Constraint-centric quantization instead preserves the full25
+

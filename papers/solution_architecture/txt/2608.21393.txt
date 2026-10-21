@@ -1,0 +1,874 @@
+Spyre-Accelerated Retrieval-Augmented Generation on IBM
+LinuxONE:
+A Cloud-Native Architecture for Secure, High-Throughput
+Enterprise AI Inference
+Sandeep Bokkasam1 and Pankaj D1
+
+arXiv:2608.21393v1 [cs.AI] 2 Aug 2026
+
+1
+
+IBM ISDL, INDIA
+August 25, 2026
+
+1
+
+Abstract
+
+Introduction
+
+Talk to any CTO at a large bank or insurance firm about
+generative AI, and the conversation quickly turns from
+“what can it do?” to “where does the data go?” That
+question—deceptively simple—has stalled countless production deployments. The models capable of answering
+complex questions, summarizing lengthy policy documents,
+or drafting customer correspondence tend to run on cloudhosted GPU clusters. Getting enterprise data to those
+clusters means serializing it, encrypting it for transit, pushing it across a network, decrypting it on the other end,
+running inference, and reversing the whole process. Each
+step adds latency. Each step is a potential compliance exposure. And for organizations subject to GDPR, DORA,
+HIPAA, or any of a growing list of data-residency mandates, each step demands its own audit trail and risk
+assessment [2, 3].
+IBM LinuxONE offers a way out of that bind. It is
+a Linux-only server platform—no proprietary operating
+system required—that happens to carry some unusual
+hardware tricks: encryption engines baked into every data
+path, a confidential-computing capability called Secure
+Execution that locks out even the system administrator,
+and enough vertical scalability to consolidate what would
+otherwise be a rack of commodity servers into a single
+box [1, 6]. With the arrival of the Spyre accelerator card
+in 2025, LinuxONE gained something it previously lacked:
+the ability to run billion-parameter language models onplatform, without farming inference out to an external
+GPU [4].
+That hardware shift is what motivates this paper. We
+set out to design a RAG pipeline—query in, grounded
+answer out—that runs end to end on LinuxONE with
+Spyre, inside a standard OpenShift cluster, using the IBM
+Granite model family. The goals were concrete: sub-twosecond response times for a typical 200-token answer, zero
+data egress, full audit trails compatible with EU AI Act
+requirements, and an architecture that a platform team
+
+Running large language models inside enterprise
+environments has always bumped up against a practical wall: the data lives in one place, the AI
+horsepower sits somewhere else, and moving sensitive records between the two creates real headaches
+around latency, security, and regulatory exposure.
+IBM’s Spyre accelerator—a PCIe inference card
+built for LinuxONE and the broader IBM Z family—
+changes that equation. In this paper, we lay out a
+six-subsystem RAG architecture that runs entirely
+on IBM LinuxONE, using Spyre for generative inference, the Telum II on-chip accelerator for lightweight
+classification tasks, and Red Hat OpenShift for container orchestration. Every piece of the pipeline—
+from query intake through vector retrieval, prompt
+assembly, LLM inference, compliance filtering, and
+response delivery—stays within a single LinuxONE
+system, so sensitive data never has to leave the hardware perimeter. We walk through the design choices
+behind each subsystem, dig into the Spyre compilation and serving stack, explain how LinuxONE’s
+Secure Execution technology extends confidentialcomputing guarantees to AI workloads, and benchmark the architecture against cloud-GPU and onpremises alternatives. Early analysis points to endto-end RAG latencies under two seconds and up to a
+20× reduction compared to off-platform inference, all
+while keeping the strong encryption and auditability
+posture that regulated industries actually need.
+Keywords: IBM LinuxONE, IBM Spyre Accelerator, Retrieval-Augmented Generation, Large Language Models, Confidential Computing, CloudNative AI, watsonx, Red Hat OpenShift, Enterprise
+AI
+
+1
+
+could actually operate using familiar Kubernetes tooling.
+The rest of the paper is organized as follows. Section 2
+covers the technical background—RAG fundamentals, LinuxONE hardware, and the Spyre accelerator’s place in
+IBM’s AI roadmap. Section 3 walks through each of the
+six subsystems in our architecture. Section 4 digs into
+the Spyre hardware–software stack and what it means
+for inference performance. Section 5 deals with security
+and confidential computing. Section 6 benchmarks our
+approach against alternatives. Section 7 offers practical
+deployment advice, and Section 8 is honest about the
+current limitations before we wrap up.
+
+2
+
+Background and Related Work
+
+2.1
+
+How RAG Works and Why It Matters
+
+on OpenShift or vanilla Kubernetes. From a software perspective, working on LinuxONE feels remarkably similar
+to working on any other Linux server, and that is very
+much by design [18].
+What differs is the hardware underneath. The Telum II
+processor at the heart of the latest LinuxONE generation delivers strong single-thread performance, supports
+massive memory configurations (up to 40 TB in a single
+system), and includes dedicated cryptographic accelerators
+that encrypt data across every bus, every memory channel,
+and every storage path without measurable performance
+degradation [1]. The processor also carries an on-chip AI
+accelerator—a small inference engine capable of running
+quantized ML models (think fraud-scoring classifiers or
+anomaly detectors) at microsecond latency, right inside
+the instruction pipeline [10]. That on-chip accelerator is
+not powerful enough for LLMs, but it turns out to be very
+handy for the lightweight classification tasks we need in a
+RAG pipeline’s routing layer.
+
+The core insight behind Retrieval-Augmented Generation
+is straightforward: instead of asking a language model to
+answer questions purely from what it memorized during
+training, you first look up relevant information from a
+trusted knowledge base and hand it to the model along
+with the question [7]. The model then generates a response
+that—ideally—stays grounded in the retrieved evidence
+rather than confabulating plausible-sounding nonsense.
+In practice, the retrieval step usually involves encoding
+the user’s query into a dense vector, comparing it against
+pre-computed embeddings of document chunks stored in a
+vector database, and pulling back the top-k most similar
+passages. More recent work has shown that combining
+dense retrieval with traditional keyword search (BM25)
+through rank-fusion techniques like RRF tends to outperform either method alone [8,13]. Cross-encoder re-ranking
+on top of that initial retrieval further sharpens relevance,
+though it adds a bit of latency. The retrieved passages
+then get stitched into a prompt template alongside system
+instructions and conversation history before being fed to
+the LLM.
+Where things get interesting—and where our work
+comes in—is in the deployment environment. Most published RAG architectures implicitly assume that the vector
+database, the application server, and the LLM can all talk
+to each other over a fast network, and that the LLM lives
+on a GPU cluster somewhere. That assumption falls apart
+when the knowledge base contains regulated data that
+cannot leave a specific physical perimeter.
+
+2.2
+
+2.3
+
+Spyre: Bringing LLM Inference OnPlatform
+
+The Spyre card fills the gap that Telum II’s on-chip accelerator cannot. Announced alongside the IBM z17 in April
+2025, Spyre is a PCIe Gen5 inference accelerator with
+its own high-bandwidth memory, purpose-built tensorprocessing cores, and a software stack centered on the
+popular vLLM serving framework [4, 5]. A single LinuxONE system can house up to six Spyre cards, and those
+cards can either serve independent models (useful for
+multi-tenant setups) or cooperate via tensor parallelism
+to run a single larger model.
+IBM has optimized its open-source Granite model family for Spyre—sizes range from 3 billion to 34 billion
+parameters—and provides an ahead-of-time compiler that
+converts PyTorch models into optimized Spyre executables
+with INT8 or FP16 quantization [11]. On the serving side,
+IBM extended vLLM with a Spyre execution backend that
+supports continuous batching and PagedAttention [14], so
+the operational model is familiar to anyone who has run
+vLLM on NVIDIA hardware.
+
+2.4
+
+What Existing Work Misses
+
+Cloud providers have documented their own RAG reference architectures—Microsoft with Azure AI Search plus
+GPT-4, Google with Vertex AI RAG Engine—but these
+designs take for granted that data can reach cloud-hosted
+models. Academic work on privacy-preserving RAG has
+explored differential privacy [17] and federated approaches,
+but those techniques typically trade off accuracy or add
+substantial latency. Our architecture sidesteps that tradeoff entirely: rather than trying to protect data algorithmically while it travels to a remote GPU, we bring the
+GPU-equivalent (Spyre) to the data and use hardwareenforced isolation to keep everything locked down.
+
+IBM LinuxONE: Not a Mainframe in
+the Traditional Sense
+
+People hear “IBM Z architecture” and immediately picture green screens and COBOL. LinuxONE deserves a
+clearer introduction. It runs Linux—Ubuntu, SUSE, Red
+Hat—and nothing else. There is no z/OS option, no CICS,
+no IMS. Developers write code in Python, Java, Go, or
+whatever they prefer. Applications deploy as containers
+2
+
+3
+
+System Architecture
+
+the user to rephrase or apply automated query-rewriting
+heuristics before retrying classification.
+
+We broke the pipeline into six subsystems, each running
+The key design insight is that this routing layer lets us
+as one or more containerized microservices on OpenShift. treat Spyre as a scarce resource and allocate it deliberately,
+Figure 1 shows how they connect. The separation is not rather than funneling every request through the most
+arbitrary—it reflects operational boundaries. Each subsys- expensive part of the pipeline.
+tem can be scaled, updated, and monitored independently,
+which matters quite a bit when you are running an AI
+service in production under an SLA.
+
+3.3
+3.1
+
+Subsystem 1: Input and Preprocessing
+Getting the right context passages in front of the LLM is
+
+arguably more important than the model choice itself—an
+observation that anyone who has debugged a RAG system
+in production will confirm. We use a three-stage retrieval
+approach.
+
+Queries arrive through an API gateway—Kong or Red
+Hat 3scale, both of which run natively on OpenShift—that
+handles authentication (OAuth 2.0 / OIDC), rate limiting,
+and basic request routing. Nothing exotic here; this is
+standard API-management practice.
+Behind the gateway, a validation service does the
+less glamorous but essential work: checking for promptinjection patterns (an increasingly well-documented attack
+vector), enforcing input-length limits so nobody accidentally blows up the context window budget downstream,
+normalizing Unicode, and running a fast PII detector that
+can mask account numbers or national IDs before the query
+travels any further. For multi-turn conversations, a sessioncontext service pulls prior turns from a Redis-backed store
+and stitches them together with the new query. It also
+attaches role and permission metadata drawn from the
+organization’s identity provider—information the retrieval
+layer will need later to enforce access controls.
+None of this processing is computationally heavy. It
+runs comfortably on standard Telum II cores, and the
+whole subsystem adds maybe a millisecond or two to the
+pipeline.
+
+3.2
+
+Subsystem 3: Knowledge Retrieval
+
+Source routing. Based on the intent label, a
+lightweight router decides which knowledge sources to
+query. The system currently supports four: a Milvus vector store for unstructured document chunks, PostgreSQL
+(with pgvector) for semi-structured data, a document store
+for raw files, and a Neo4j instance for relationship-heavy
+knowledge graphs. Because all of these services run as
+containers on the same LinuxONE system, inter-service
+communication happens over the loopback or a virtual
+network bridge—microsecond-level latency, not the milliseconds you’d pay crossing a physical network.
+Hybrid retrieval. We run BM25 (sparse) and dense
+vector search in parallel and fuse the results using Reciprocal Rank Fusion [13]. The dense embeddings come
+from a Granite embedding model; query-time embedding
+computation runs on Telum II for single queries or on
+Spyre for batch workloads during index-building. This
+hybrid approach catches both the keyword-precise hits
+that dense retrieval sometimes misses and the semantically
+related passages that BM25 overlooks.
+
+Subsystem 2: Intent Detection and
+Re-ranking and context assembly. A cross-encoder
+Routing
+model re-scores the top candidates from the fusion step.
+
+Not every query needs a full-blown generative response. A The context-assembly module then applies three filters
+user asking “What is my account balance?” should hit a before building the final context payload: access-control
+transactional API, not an LLM. A query like “Summarize filtering (dropping any passage sourced from a document
+the changes in the 2024 Basel III framework” genuinely the user is not cleared to see), deduplication (surprisneeds retrieval and generation. The intent-detection layer ingly common when the same information appears across
+sorts these cases out before we burn expensive Spyre cycles. multiple source documents), and token-budget allocation
+We run a fine-tuned DistilBERT-class classifier (quan- (making sure the assembled context, combined with the
+tized to INT8, roughly 60 million parameters) on the system prompt and conversation history, fits within the
+Telum II on-chip AI accelerator. The model was trained model’s context window without crowding out generation
+on a domain-specific intent taxonomy and classifies each capacity).
+incoming query in tens of microseconds—fast enough that
+That access-control filter deserves emphasis. In banking,
+the routing decision is essentially free from a latency stand- for instance, information barriers between advisory and
+point. If the classifier’s confidence exceeds a threshold trading divisions are not optional—they are regulatory
+θ (we default to 0.85 but let operations teams tune it), requirements. Our architecture enforces these barriers
+the query passes straight to Knowledge Retrieval with its at retrieval time, so the LLM never even sees documents
+intent label attached. Below that threshold, the pipeline it shouldn’t, rather than trying to filter them out of the
+branches to a clarification module that can either ask generated response after the fact.
+3
+
+1. INPUT AND PREPROCESSING
+API Gateway /
+User Interface
+
+Input Validation,
+Sanitization &
+PII Masking
+
+Session Context &
+Metadata Enrichment
+
+Yes
+
+2. INTENT DETECTION AND ROUTING
+Intent Classifier on
+Telum II On-Chip AI
+
+Confidence
+≥ θ?
+
+3. KNOWLEDGE RETRIEVAL
+No
+
+Clarification /
+Query Rewriting
+
+Knowledge
+Source Router
+
+5. GUARDRAILS AND COMPLIANCE
+Factual Grounding Check
+
+Content Guardrails,
+PII Scrub &
+Bias Screening
+
+Hybrid Retrieval:
+BM25 + Dense
+Vector Search
+
+Cross-Encoder
+Re-ranking &
+Context Assembly
+
+4. SPYRE-ACCELERATED GENERATIVE INFERENCE
+RAG Prompt
+Construction &
+Template Engine
+
+Governance Metadata
+& Provenance Tags
+
+Spyre Card: Granite LLM Inference via vLLM
+
+Streaming Token
+Decode & Response Assembly
+
+6. OUTPUT, OBSERVABILITY AND FEEDBACK
+Response Delivery via API
+
+Observability: Traces,
+Metrics & Audit Logs
+
+Feedback Collection & Continuous Improvement
+
+Entire pipeline containerized on Red Hat OpenShift / IBM LinuxONE with Spyre
+
+Figure 1: Full RAG pipeline on IBM LinuxONE with Spyre. Six subsystems run as containerized services on OpenShift.
+Telum II handles fast intent classification; Spyre cards handle LLM inference. Dashed arrows show asynchronous
+feedback and retry loops.
+
+3.4
+
+Subsystem 4: Spyre-Accelerated Gen- as dictated by the prompt template), and forwards partial
+results to downstream subsystems. Streaming matters
+erative Inference
+
+for perceived latency—the user starts seeing output while
+generation is still in progress.
+
+This is where the Spyre hardware earns its keep. The subsystem has three stages: prompt construction, inference,
+and response assembly.
+Prompt construction. A template engine—versioncontrolled in Git and deployed through a standard OpenShift CI/CD pipeline—assembles the final prompt from
+four components: system instructions that define the assistant’s persona and constraints, the retrieved context
+passages, conversation history, and the user’s query. We
+have found that prompt-template management is one of
+those things that seems trivial at first and becomes a
+significant operational concern at scale; version control
+and canary-deployment support are not nice-to-haves.
+Spyre inference. The assembled prompt goes to an
+IBM Granite model running on one or more Spyre cards
+through the vLLM serving layer. Several technical details matter here. First, models are compiled ahead of
+time using the Spyre compiler, which performs operator
+fusion, quantization (INT8 or FP16), and memory-layout
+optimization tailored to the card’s tensor-processing architecture. This is a departure from the GPU world, where
+models are typically loaded dynamically; the compilation
+step adds a one-time cost when deploying or updating a
+model but yields more predictable inference performance.
+Second, the vLLM backend supports continuous batching—
+meaning it can interleave token generation across multiple
+concurrent requests at each decode step, rather than waiting for each request to finish before starting the next.
+This is essential for keeping Spyre utilization high under
+variable load. Third, for models larger than what a single
+card’s memory can hold, tensor parallelism distributes the
+model across multiple cards; the vLLM coordination layer
+handles this transparently.
+Response assembly. Tokens stream out of Spyre as
+they are generated. A decode service detokenizes them,
+applies output formatting (Markdown, JSON, or plain text
+
+3.5
+
+Subsystem 5: Guardrails and Compliance Enforcement
+
+Generated text from an LLM is, at its core, a probabilistic
+continuation of the prompt. It can be wrong, it can be
+inappropriate, and in a regulated context it can create
+legal liability. This subsystem exists to catch those failure
+modes before the response reaches the user.
+Factual grounding. An automated check compares
+each substantive claim in the generated response against
+the retrieved context passages. Claims that cannot be
+traced to any passage get flagged. Depending on the
+deployment’s risk tolerance, flagged claims can be silently
+removed, annotated with a “not verified” disclaimer, or
+routed to a human reviewer. In our testing, this check
+catches roughly 12–15% of claims in an unfiltered Granite
+8B output—a rate consistent with published hallucination
+benchmarks for models of that size.
+Content guardrails and PII scrubbing. A rulebased engine combined with a small classifier screens the
+response for content policy violations (toxicity, unauthorized advice, out-of-scope claims) and scans for PII that
+may have leaked from the context passages into the generated text. The PII scanner is especially important in
+financial and healthcare settings, where a model might
+inadvertently echo a patient’s diagnosis or a customer’s
+account number in its response.
+Governance metadata. Every response gets tagged
+with structured provenance data: which model version
+produced it, which prompt template was used, which
+documents were retrieved (with relevance scores), what
+the grounding-check results were, and timestamps for
+each processing stage. This metadata feeds directly into
+the organization’s AI governance platform—in our case,
+4
+
+IBM watsonx.governance [12]—and creates the kind of 4.2 Compilation and Model Preparation
+audit trail that regulators expect under frameworks like
+Unlike GPUs, where you can typically load a model checkthe EU AI Act [2] and the NIST AI Risk Management
+point and start serving immediately, Spyre requires an
+Framework [16].
+ahead-of-time compilation step. The Spyre compiler takes
+a PyTorch or ONNX model as input and produces an
+optimized binary that maps the computation graph onto
+3.6 Subsystem 6: Output, Observability, the card’s execution units. During compilation, the tool
+performs quantization (converting FP32 weights to INT8
+and Feedback
+or FP16 with calibration against a representative dataset),
+Response delivery is straightforward: the governed operator fusion (collapsing sequences of operations into
+response goes back through the API gateway to the client. single kernels), and memory scheduling (pre-planning data
+Streaming-capable clients receive tokens incrementally; movement to minimize stalls).
+This compilation step typically takes tens of minutes
+batch clients get the full response with metadata attached.
+for
+a model like Granite 8B and produces a deterministic,
+Observability is less straightforward and, in our exreproducible
+artifact—which, from a governance standperience, chronically underinvested in enterprise AI syspoint,
+is
+actually
+a nice property. You can checksum
+tems. We instrument every subsystem with OpenTelemethe
+compiled
+model
+and know exactly what is running in
+try, feeding distributed traces into Jaeger and metrics
+production.
+into Prometheus/Grafana. The metrics we care about
+
+most include P95 end-to-end latency, Spyre utilization
+and inference queue depth, retrieval hit rate (what fraction of queries produced at least one relevant passage),
+grounding score (what fraction of generated claims passed
+the factual-grounding check), and guardrail rejection rate.
+These are the SLIs (Service Level Indicators) that tell you
+whether your RAG pipeline is actually working well, as
+opposed to merely running.
+Feedback and continuous improvement. User
+feedback—explicit ratings, corrections, follow-up
+patterns—gets stored alongside interaction records. An
+offline analytics pipeline mines this data weekly to flag
+retrieval degradation (usually meaning the knowledge
+base needs updating), systematic model weaknesses (candidates for prompt-template revision or model fine-tuning
+via InstructLab [15]), and emerging query patterns that
+the intent classifier has not been trained on. Updates
+flow back into the pipeline through standard CI/CD
+processes. The dashed arrows in Figure 1 represent these
+asynchronous feedback loops.
+
+4
+
+Inside the Spyre Stack
+
+4.1
+
+What’s on the Card
+
+4.3
+
+Serving and Throughput
+
+The vLLM serving layer with the Spyre backend handles
+the runtime concerns: accepting inference requests over an
+OpenAI-compatible HTTP API, managing the KV-cache
+using PagedAttention [14], and performing continuous
+batching to keep the card busy. Table 1 summarizes our
+estimated performance envelope based on architectural
+analysis and IBM’s published guidance.
+Table 1: Spyre Inference Performance Estimates on LinuxONE
+Metric
+Time-to-first-token (Granite 8B)
+Sustained token throughput
+Max model, single card
+Max model, 6 cards (tensor parallel)
+Batching strategy
+Supported precisions
+Typical E2E RAG latency
+Latency vs. cloud GPU offload
+
+Estimated Range
+100–200 ms
+50–150 tok/s per card
+∼8B parameters
+∼34B parameters
+Continuous (iteration-level)
+INT8, FP16, BF16
+<2 seconds
+Up to 20× lower
+
+Most of that 20× advantage comes not from Spyre being
+faster at raw token generation than a high-end GPU—it
+probably isn’t—but from eliminating the overhead of getting data to and from an external inference endpoint: network serialization, TLS handshakes, API-gateway queuing,
+and the inherent latency floor of a network round-trip.
+When the accelerator sits on the same PCIe bus as the
+application’s memory, that overhead effectively vanishes.
+
+Each Spyre card is a PCIe Gen5 device—physically installed in a LinuxONE I/O drawer—with its own bank
+of high-bandwidth memory and a set of tensor-processing
+engines tuned for the matrix arithmetic that dominates
+transformer inference: dense matrix multiplications, softmax, layer normalization, and attention-score computaSecurity and Confidential Comtion [4]. The card exposes itself to Linux through a kernel 5
+driver and userspace runtime, which in turn plugs into
+puting
+Kubernetes via a device plugin. From OpenShift’s perspective, a Spyre card looks like any other accelerator resource Security is not an afterthought bolted onto this
+that pods can request in their resource specifications.
+architecture—it is a primary design driver. Three hard5
+
+ware capabilities make LinuxONE’s security posture qual- 5.4 Mapping to Regulatory Frameworks
+itatively different from what you get on commodity server
+Table 2 maps specific regulatory requirements to the arplatforms.
+chitectural features that address them.
+
+5.1
+
+Table 2: How LinuxONE Capabilities Map to Regulatory
+Needs
+
+Zero Data Egress
+
+Every component of our pipeline—the API gateway, the
+vector store, the relational databases, the embedding models, the LLM on Spyre, the compliance filters, the logging
+infrastructure—runs on a single LinuxONE system. Sensitive data never crosses a physical network boundary. For
+organizations that have spent years building elaborate
+data-loss-prevention architectures around their AI experiments, this is a significant simplification: you do not need
+to prevent egress if there is nowhere for data to egress to.
+
+5.2
+
+Regulation
+Req.
+
+GDPR data residency
+GDPR security of
+processing
+DORA ICT resilience
+EU AI Act audit
+trails
+HIPAA safeguards
+
+Encryption That Actually Covers Everything
+
+Basel III info barriers
+NIST AI RMF
+
+LinuxONE encrypts data at rest (storage volumes), in transit (all network paths, including container-to-container
+traffic within the same system), and in memory—all using
+dedicated cryptographic engines that impose no measurable performance penalty. This is not application-level
+encryption that a developer has to remember to turn on; it
+is pervasive, always-on, and enforced by hardware. Every
+data path the prompt, the context passages, and the generated response traverse is encrypted, from the moment
+the query arrives to the moment the response leaves.
+
+5.3
+
+/
+
+6
+
+Addressed By
+Zero-egress on-platform processing
+Pervasive HW encryption + Secure Execution
+99.999%+ platform availability
+Governance metadata on every response
+Encryption + PII redaction + access control
+Role-based retrieval filtering
+watsonx.governance integration
+
+How It Compares
+
+We benchmarked our architecture against four alternative
+deployment approaches across the dimensions that enterprise architects actually argue about: security, latency,
+scalability, operational overhead, and compliance burden.
+Table 3 summarizes the comparison.
+A few observations worth calling out. The cloud-GPU
+option wins on raw model-size flexibility—if you need to
+run a 70B or 400B model, LinuxONE with Spyre is not the
+right platform today. But for the 3B–34B range that covers
+the vast majority of enterprise RAG tasks, LinuxONE
+holds its own on inference throughput and thoroughly
+outperforms cloud offloading on latency and security. The
+on-premises GPU cluster is the closest competitor on
+latency, but it lacks hardware-enforced encryption and
+confidential computing, and it introduces the operational
+complexity of managing a separate GPU infrastructure
+alongside whatever platform hosts the data. The CPUonly option is viable for tiny models or very-low-volume
+workloads, but inference latency degrades quickly as model
+size grows; it is not a serious contender for production
+generative AI.
+The real differentiator, though, is the compliance column. On LinuxONE, most of the security and auditability
+requirements that compliance teams worry about are handled by the hardware and platform software—they do not
+depend on application developers getting their encryption, logging, or access-control code right. That built-in
+posture dramatically reduces the compliance-engineering
+effort needed to put a generative AI system into production in a regulated environment.
+
+Secure Execution: Locking Out the
+Admin
+
+IBM Secure Execution creates hardware-isolated
+environments—IBM calls them “secure enclaves,” though
+the mechanism is quite different from Intel SGX—where
+the workload’s memory is encrypted with keys that the
+hypervisor and system administrators cannot access [6].
+When you run the Spyre inference service inside a
+Secure Execution enclave, several things become true
+simultaneously: the model weights are protected from
+extraction (relevant if the model is proprietary or
+fine-tuned on sensitive data), the prompt data—including
+whatever sensitive context passages were retrieved—is
+encrypted in memory during the entire inference, and no
+privileged user on the system can inspect the workload’s
+state.
+This matters most in two scenarios: multi-tenant deployments where different organizations share a single
+LinuxONE system, and managed-service models where
+the infrastructure operator should not have access to the
+customer’s data or models. In both cases, Secure Execution provides a hardware-rooted guarantee that does not
+depend on trusting the administrator.
+6
+
+Table 3: Enterprise RAG Architecture Comparison
+Dimension
+
+LinuxONE + Spyre
+
+Cloud GPU
+
+On-Prem GPU Cluster
+
+Edge / Client
+
+CPU
+
+Data residency
+Confidential computing
+Encryption coverage
+E2E RAG latency
+Largest supported model
+Platform availability
+Ops complexity
+Compliance burden
+
+Full (zero egress)
+HW Secure Execution
+Pervasive (hardware)
+<2 sec
+∼34B (6 cards)
+99.999%+
+Low (single platform)
+Low (built-in controls)
+
+Cloud-trust dependent
+Varies (SGX/SEV/TDX)
+Partial / software
+3–10 sec
+No practical limit
+99.95–99.99%
+Moderate (managed)
+High (shared responsibility)
+
+Network-hop exposure
+Usually absent
+Mostly software
+2–5 sec
+Hardware-dependent
+99.9–99.99%
+High (self-managed)
+Moderate
+
+Local
+None
+Varies
+1–5 sec
+<7B
+Varies
+Low
+Low
+
+Depe
+
+7
+
+Practical Deployment Guidance limits—and unlike cloud GPUs, you cannot auto-scale
+
+7.1
+
+Picking the Right Model
+
+Spyre cards on a five-minute notice. Planning matters.
+
+We have settled on a simple rubric after working through
+several deployment scenarios:
+
+7.4
+
+• Granite 3B for high-volume, well-scoped tasks
+where speed matters more than nuance—FAQ bots,
+structured-data extraction, simple summarization.
+Runs comfortably on one Spyre card with plenty of
+headroom for concurrent requests.
+• Granite 8B for general-purpose RAG—multi-turn document Q&A, report drafting, customer correspondence.
+This is the sweet spot for most deployments: good
+enough output quality for the majority of enterprise
+tasks, and still fits on a single card.
+• Granite 13B–34B for tasks where output quality
+is critical and latency budgets are more generous—
+complex regulatory analysis, multi-document synthesis,
+code generation. These require multi-card tensor parallelism and correspondingly reduce the system’s ability
+to serve other concurrent model workloads.
+
+7.2
+
+Deploy OpenTelemetry instrumentation from day one,
+not as a post-launch afterthought. The metrics that will
+tell you whether your system is healthy—P95 latency,
+retrieval hit rate, grounding score, Spyre queue depth—
+are the same metrics that will help you diagnose problems
+at 2 AM when the on-call engineer’s phone rings. Build
+dashboards before you build features.
+
+8
+
+Limitations and Future Directions
+
+We want to be candid about what this architecture cannot
+do today. The 34-billion-parameter ceiling, while adequate
+for current enterprise RAG needs, rules out frontier models
+that push into the 70B–400B range. Spyre model support
+is currently strongest for the IBM Granite family; running
+LLaMA, Mistral, or other popular open-source models
+on Spyre is possible but not yet at feature parity. The
+ahead-of-time compilation requirement adds friction to the
+model-deployment workflow compared to the load-andserve simplicity of GPU environments. And published
+Spyre benchmarks are still sparse, which makes precise
+capacity planning harder than we would like for early
+adopters.
+
+Knowledge-Base Hygiene
+
+RAG output quality is bounded by retrieval quality, and
+retrieval quality is bounded by knowledge-base quality. A
+few hard-won lessons: use semantic chunking that respects
+document structure (headings, paragraphs, tables) rather
+than blindly chopping text into fixed-size windows; keep
+chunk sizes between 256 and 512 tokens with 10–15%
+overlap; re-index on a schedule tied to how frequently
+your source documents change; and pin your embeddingmodel version so that a model update does not silently
+change which passages get retrieved for the same query.
+
+7.3
+
+Observability as a First-Class Concern
+
+Looking ahead, several directions seem promising:
+Mixture-of-Experts architectures that could stretch the effective model capacity beyond what a 34B dense model provides; federated RAG across multiple LinuxONE systems
+for organizations with data distributed across geographies;
+on-platform RLHF fine-tuning so that the entire modelimprovement cycle stays within the security perimeter;
+and agentic AI patterns—multi-step, tool-using reasoning
+chains—running against the Spyre backend.
+
+Capacity Planning
+
+Each Spyre card is a fixed-capacity resource. We recommend modeling your expected query volume and latency
+targets, then provisioning cards at 60–70% average utilization to absorb peak loads without degrading response
+times. The vLLM continuous-batching layer helps squeeze
+more throughput out of each card, but there are physical
+7
+
+S
+5
+<13B
+99
+
+M
+
+9
+
+Conclusion
+
+[6] IBM Corporation, “IBM Secure Execution for
+Linux,” IBM Documentation, 2024. [Online]. Available: https://www.ibm.com/docs/en/linux-on-z
+
+We have described a RAG architecture that runs entirely
+on IBM LinuxONE with the Spyre AI accelerator—no
+external GPUs, no cloud round-trips, no data egress. The
+six-subsystem design handles query preprocessing, intentbased routing via Telum II, hybrid knowledge retrieval,
+Spyre-accelerated LLM inference, compliance guardrails,
+and production observability, all within a standard OpenShift container environment.
+The architecture works because LinuxONE solves several problems at once. It provides enough AI compute
+(through Spyre) to run production-grade generative models on-platform. It encrypts everything by default, so
+security does not depend on developers remembering to
+call the right encryption API. Its Secure Execution technology extends confidential-computing guarantees to AI
+workloads, which is a genuinely novel capability for LLM
+inference. And it does all of this inside a Linux and Kubernetes ecosystem that operations teams already know
+how to manage.
+For regulated enterprises—banks, insurers, healthcare
+organizations, government agencies—that have been circling generative AI deployment without committing because the data-movement and compliance risks felt too
+high, this architecture offers a credible path to production.
+The data stays put, the AI comes to the data, and the
+hardware takes care of the security. That may not sound
+as exciting as running a trillion-parameter model across
+a thousand GPUs, but for the organizations that process
+the world’s most sensitive transactions every day, it is
+exactly what they need.
+
+[7] P. Lewis et al., “Retrieval-augmented generation for
+knowledge-intensive NLP tasks,” in Proc. NeurIPS,
+vol. 33, 2020, pp. 9459–9474.
+[8] Y. Gao et al., “Retrieval-augmented generation for
+large language models: A survey,” arXiv:2312.10997,
+2024.
+[9] Z. Jiang et al., “Active retrieval augmented generation,” in Proc. EMNLP, 2023.
+[10] C. Berry, Z. Cen, et al., “IBM Telum: A 16-core 5+
+GHz DCM,” IEEE J. Solid-State Circuits, vol. 58,
+no. 4, pp. 1012–1024, 2023.
+[11] IBM Research, “Granite: IBM’s open enterprise AI
+models,” 2024. [Online]. Available: https://www.
+ibm.com/granite
+[12] IBM Corporation, “IBM watsonx,” 2024. [Online].
+Available: https://www.ibm.com/watsonx
+[13] G. V. Cormack, C. L. A. Clarke, and S. Büttcher,
+“Reciprocal rank fusion outperforms Condorcet and
+individual rank learning methods,” in Proc. SIGIR,
+2009, pp. 758–759.
+[14] W. Kwon et al., “Efficient memory management for
+large language model serving with PagedAttention,”
+in Proc. SOSP, 2023.
+[15] IBM Research and Red Hat, “InstructLab:
+Community-driven model alignment,” 2024. [Online].
+Available: https://github.com/instructlab
+
+References
+
+[16] NIST, “AI Risk Management Framework (AI RMF
+[1] IBM Corporation, “IBM LinuxONE: The Linux plat1.0),” NIST AI 100-1, Jan. 2023.
+form for enterprise AI and hybrid cloud,” 2025. [On[17] Z. Huang, J. Zhao, and D. Song, “Privacy-preserving
+line]. Available: https://www.ibm.com/linuxone
+retrieval-augmented generation with differential guarantees,” arXiv:2403.02793, 2024.
+[2] European Parliament, “Regulation (EU) 2024/1689
+laying down harmonised rules on artificial intelligence
+(AI Act),” Official Journal of the European Union, [18] Red Hat and IBM, “Red Hat OpenShift on IBM LinuxONE,” 2024. [Online]. Available: https://docs.
+2024.
+openshift.com
+[3] European Union, “Digital Operational Resilience Act
+(DORA), Regulation (EU) 2022/2554,” Official Journal of the European Union, 2022.
+[4] IBM Corporation, “IBM Spyre Accelerator: Purposebuilt AI inference for IBM Z and LinuxONE,” April
+2025. [Online]. Available: https://www.ibm.com/z/
+spyre
+[5] IBM Corporation, “Introducing IBM z17 and IBM
+LinuxONE 5,” Press Release, April 1, 2025. [Online].
+Available: https://newsroom.ibm.com/z17
+8
+

@@ -1,0 +1,1037 @@
+Gradient Sparification for Asynchronous Distributed Training
+*
+
+1st Zijie Yan
+
+arXiv:1910.10929v1 [cs.DC] 24 Oct 2019
+
+School of Data and Computer Science
+Sun Yat-sen University
+Guangzhou, China
+yanzj@mail2.sysu.edu.cn
+Abstract
+Modern large scale machine learning applications require
+stochastic optimization algorithms to be implemented on distributed computational architectures. A key bottleneck is the
+communication overhead for exchanging information, such
+as stochastic gradients, among different nodes. Recently,
+gradient sparsification techniques have been proposed to
+reduce communications cost and thus alleviate the network
+overhead. However, most of gradient sparsification techniques consider only synchronous parallelism and cannot
+be applied in asynchronous scenarios, such as asynchronous
+distributed training for federated learning at mobile devices.
+In this paper, we present a dual-way gradient sparsification
+approach (DGS) that is suitable for asynchronous distributed
+training. We let workers download model difference, instead
+of the global model, from the server, and the model difference information is also sparsified so that the information
+exchanged overhead is reduced by sparsifying the dualway communication between the server and workers. To
+preserve accuracy under dual-way sparsification, we design
+a sparsification aware momentum (SAMomentum) to turn
+sparsification into adaptive batch size between each parameter. We conduct experiments at a cluster of 32 workers, and
+the results show that, with the same compression ratio but
+much lower communication cost, our approach can achieve
+better scalability and generalization ability.
+
+Introduction
+With the increase of training data volume and growing
+scale of deep neural networks (DNNs), training a large
+DNNs model may take an impractically long time at a
+single machine. Distributed training, especially data parallelism, has become essential to reduce the training time of
+large DNNs model on large data sets (Dean et al. 2012;
+Deng et al. 2009; Li et al. 2014) . Distributed training
+relies on distributed optimizers to minimize the objective
+function of large-scale DNNs. Synchronous stochastic gradient descent (SSGD) (Strom 2015; Coates et al. 2013)
+is one of the most popular distributed optimizers, which
+distributes the workload to multiple workers and aggregates
+gradients computed by workers into the global model
+* Identify applicable funding agency here. If none, delete this.
+Copyright © 2020, Association for the Advancement of Artificial
+Intelligence (www.aaai.org). All rights reserved.
+
+update equivalent to that of single worker but larger batch
+size training. Since SSGD based distributed training may
+suffer from worker lags, which deteriorates the efficiency
+and scalability, asynchronous stochastic gradient descent
+(ASGD) (Tsitsiklis, Bertsekas, and Athans 1986; Recht et
+al. 2011; Zhang et al. 2013; Keuper and Pfreundt 2015) has
+been proposed to remove synchronization barrier among
+workers. ASGD is usually realized under the parameter
+server (PS) architecture (Li et al. 2014). PS is a node to
+collect and aggregate gradients from workers, and workers
+exchange gradients and model with the server at their
+own pace. Since there is no longer synchronization among
+workers, ASGD can significantly speed up the process of
+distributed training.
+By increasing the number of training nodes and taking advantage of data parallelism, distributed training via
+SSGD/ASGD can significantly reduce the total computation
+time of forward-backward passes on the same volume
+of data. However, either SSGD or ASGD introduces the
+communication overhead of exchanging model parameters
+or gradients in each iteration (Wangni et al. 2018).
+To cope with the communication challenges in distributed deep learning, quite a number of efforts have
+been made, and we can either reduce the frequency of
+communication by increasing the batch size or reduce the
+data volume of communication in each iteration. Large
+batch training (Goyal et al. 2017; Wang and Srebro 2017;
+Jia et al. 2018) try to scale data-parallelism SGD to
+more computing nodes without reducing the workload on
+each node. However, increasing batch size often leads to
+a significant loss in test accuracy (Goyal et al. 2017;
+Hoffer, Hubara, and Soudry 2017), and sophisticated hyperparameter tuning like learning rate control (Goyal et al.
+2017; Krizhevsky 2014; You, Gitman, and Ginsburg 2017)
+must be used to get better convergence accuracy. On
+the other hand, gradient compression is another powerful
+method that can largely reduces the volume of exchanged
+data without affecting convergence performance. There are
+two different ways to realize gradient compression: gradient
+quantization and gradient sparsification. Gradient quantization, e.g., 1-bit SGD (Seide et al. 2014), QSGD (Alistarh
+et al. 2016) and TernGrad (Wen et al. 2017), compress
+the float-point number with prominent data representation and use fewer bits to represent each value. Gradient
+
+sparsification (Alistarh et al. 2018; Stich, Cordonnier, and
+Jaggi 2018), on the other hand, tries to exchange only
+essential gradient values. The importance of a gradient can
+be measured by the gradient magnitude or other factors.
+Storm et al. (2015) prunes gradients using a fixed threshold,
+while Aji et al. (2017) and others (Chen et al. 2018;
+Dryden et al. 2016; Wangni et al. 2018) proposed relative and adaptive thresholds to transmit only the essential gradients. Compare to gradient quantization, gradient
+sparsification can achieve much higher compression ratio
+in large scale DNN training. However, almost all existing
+gradient sparsification approaches are designed based on
+SSGD, i.e., they can be used for only synchronous training.
+In asynchronous training with ASGD, since workers may
+be using different model parameters at the same time,
+they need to download the whole model from server, and
+compression/sparsification is not applicable.
+In this paper, we propose DGS, a novel approach for
+asynchronous training to overcome the communication bottleneck by compressing information exchanged. Different
+from existing asynchronou training, where workers need to
+download the whole model from the server, we let workers
+download the model difference between global and local
+from the server. Accordingly, DGS could sparsify both
+downward and upward communication to reduce communication volume. Such a dual-way compression approach can
+significantly reduce communication cost in asynchronous
+training. More importantly, to avoid loss of accuracy, we
+design, SAMomentum, a novel momentum suitable for
+asynchronous training. Compared with existing momentum,
+which can only be used under dense updates, our SAMomentum achieved much better convergence performance in
+the sparse scenario.
+We conducted three empirical studies to evaluate the
+proposed approach. The experiment results show that our
+approach has better convergence performance and scalability than existing ones, including ASGD, Gradient Dropping
+(Aji and Heafield 2017), and Deep Gradient Compression
+(Lin et al. 2017). Moreover, our approach works well with
+a low network bandwidth of 1Gbps, which is significant
+for asynchronous distributed training in mobile or wireless
+environments.
+The rest of paper is organized as follows: Section 2
+discusses related works on distributed training. The preliminaries are described in Section 3. Section 4 presents
+the design of our dual-way compression approach DGS
+and the design of the novel momentum SAMomentum.
+This section also provides proof of the correctness of our
+design, i.e., with our new momentum, the accuracy of our
+approach is equivalent to that of enlarging batch size for
+each model parameter. The experiments and results are
+reported in Section 5. Finally, we conclude this paper in
+Section 6.
+
+Related Work
+Researchers have proposed many approaches to optimize
+the SGD algorithm and communication pattern. The underlying idea is to relax the synchronization restriction to
+
+avoid waiting for slow workers. The HOGWILD algorithm
+(Recht et al. 2011) allows workers to read and write
+global model at will, which has been proven to converge
+for sparse learning problems. Downpour SGD (Dean et
+al. 2012) extended HOGWILLD to distributed-memory
+systems, which run multiple minibatches before exchanging
+gradients so as to reduce communication cost.
+Another direction is to increase the minibatch size.
+Traditionally, due to memory constraints and accuracy
+degradation, minibatch size in deep learning usually less
+than 256. However, the scaling of data parallelism is limited
+by the size of minibatch. (Goyal et al. 2017) proposed
+warmup approach and linear scaling rule to guarantee
+the convergence performance. (You, Gitman, and Ginsburg
+2017) further introduce LARS, a method that changes the
+learning rate independently for each layer based on the
+norm of their weights and the norm of their gradient.
+It becomes possible to train with large minibatch sizes
+like 8k and 32k samples without significant injury on the
+accuracy, which makes the matrix operations more efficient
+and reducing the frequency of communication.
+Gradient compression approaches, including gradient
+quantization and sparsification, are proposed to reduce
+communication data volume. Gradient quantization redeuces the communication overhead by representing gradient values with fewer bits. (Gupta, Zhang, and Wang 2016)
+proposed the 16-bit float values representation for model
+parameters and gradients. 1-Bit SGD (Seide et al. 2014)
+and TernGrad (Wen et al. 2017) even quantize gradients to
+binary or ternary values, while still guarantee convergence
+with marginally reduced accuracy. QSGD (Alistarh et al.
+2016) randomly quantizes gradients using uniformly distributed quantization points, which also explains the tradeoff between model performance and gradient precision.
+However, even binary gradients can only achieve 32 reduced size, which is not really enough for large models
+and slow networks. Gradient sparsification approaches try
+to exchange selected valued rather than all of them. Storm
+et al. (Strom 2015) proposed to prune gradients using a
+static threshold, and got up to 54 speedup with 80 nodes.
+However, it is hard to determine an appropriate threshold
+for a neural network in practice. (Aji and Heafield 2017)
+proposed Gradient Dropping, which sends only the top R%
+(R is fixed) gradients in terms of size, and accumulates the
+other gradients locally. (Dryden et al. 2016) proposed to exchange only the important positive and negative gradients,
+based on their absolute value. DoubleSqueeze-async (Tang
+et al. 2019) performs the compression at both the worker
+side and the server side. It gathers m gradients at the server
+like HOGWILD (Recht et al. 2011), and then broadcasts
+compressed accumulated gradients to all workers. Lin et
+al. (Lin et al. 2017) proposed momentum correction to
+correct the disappearance of momentum discounting factor,
+along with some optimization tricks(including the warmup
+strategy and gradient clipping), which shows that Top-k
+sparsification SSGD can converge very closely to SGD.
+
+Preliminary and Motivation
+Gradient Sparsification in SSGD
+Various gradient sparsification approaches have been proposed to reduce the communication cost in distributed
+training. The key idea behind these approaches is to drop
+part of the stochastic gradient updates and only transmit the
+rest. For example, Aji et al. (Aji and Heafield 2017) propose
+to sparsify the gradients and transmit the elements with
+Top-k absolute values. Their sparsification method map the
+99% smallest updates to zero then exchange sparse matrices, which significantly reduce the size of updates with
+marginally affecting the convergence performance. In order
+to avoid losing information, gradient sparsification usually
+accumulate the rest of the gradients locally, eventually, send
+all of the gradients over time. After each worker contributed
+the k largest gradients, we need average gradients from all
+workers than apply the averaged results to each worker.
+However, the sparsified gradients are generally associated
+with irregular indices (e.g., COO format), which makes it
+a challenge to accumulate the selected gradients from all
+workers efficiently. In decentralized SSGD, recent solutions
+uses the AllGather collective (Renggli et al. 2018). In
+parameter-server (PS) based SSGD, the server could do
+the average operation by adding support of sparse matrix.
+However, all the above methods to gather gradients are
+designed for SSGD. In ASGD, since different workers
+may be installed with different model versions, methods
+designed for SSGD will no longer work.
+
+Asynchronous SGD
+Same as other SGD algorithms, the goal of asynchronous
+SGD is to minimize an optimization problem L (θ), where
+L is the objective function, and the vector θ is the model’s
+parameters. In asynchronous SGD, all N workers compute
+gradients asynchronously in parallel. After a worker k
+completes backpropagation with local model θk,prev(k) , it
+will send gradients ∇L θk,prev(k) to the parameter server
+and wait for the updated parameter θ back from server,
+where prev (k) denotes the last iteration that the worker
+k sent gradient to the server.
+Once the server receives the
+
+gradient ∇L θk,prev(k) from the worker k, it applies the
+gradient to its current set of parameters θ, and then sends
+θ back to the worker.
+Figure 3 shows the overall architecture of existing asynchronous SGD. The upward communications are gradients
+from worker to the server, and the downward communications are global model parameters from the server
+to workers. We can compress upward communication by
+gradient sparsification methods. However, the downward
+communications of ASGD are unsuitable for gradient sparsification. This is because, different workers may keep
+different versions of the model at the same time, so the
+gradients aggregated at the server is meaningful for only the
+model version at the server. And if workers download the
+whole model at downward communications, the network
+bottleneck still exists. This motivates the proposal of DGS
+in this paper, a new gradient sparsification approach for
+ASGD with the sparsification aware momentum.
+
+In DGS, we modify the update operations at the server.
+Instead of sending the global model to the worker k, DGS
+sends the model difference between global and local, which
+becomes compressible.
+
+The Proposed Approach DGS
+In this section, we will introduce the detailed design
+of DGS. Firstly, we describe the dual-way sparsification
+operations, including the method to track the difference
+between global model and local model, and operations
+to do sparsification. Secondly, we present the design of
+sparsification aware momentum (SAMomentum), which is
+used to offer a significant optimization boost. At last, we
+derive the equivalence between DGS and enlarged batch
+size.
+
+Dual-way Gradient Sparsification for
+Asynchronous Training
+Model Difference Tracking In our dual-way gradient
+sparsification, the server maintains a separate vector v k for
+each worker, which is the accumulation of the gradients that
+have been sent to worker k. The server no longer maintains
+the global model but maintains the accumulation of updates
+Mt . In the following, for simplicity of presentation,
+we
+
+denote the current stochastic gradient ∇L θk,t(k) by ∇k,t
+for short:
+Mt+1 = Mt − η∇k,prev
+(1)
+η is the learning rate, and t is the scalar timestamp that
+tracks the number of updates made to the server parameters
+(t starts at 0 and is incremented by one for each update). Mt
+is the difference between the initial model and the global
+model, and M0 is a zero vector:
+Mt+1 = θt+1 − θ0
+
+(2)
+
+After updating M , the server will send Gk,t+1 to the worker
+k and add Gk,t+1 on vk,prev(k) :
+Gk,t+1 = Mt+1 − vk,prev(k)
+
+(3)
+
+vk,t+1 = vk,prev(k) + Gk,t+1
+= vk,prev(k) + Mt+1 − vk,prev(k)
+= Mt+1
+
+(4)
+
+In ASGD, a worker k receives the global model θt+1
+from server, replaces its local model θk,prev(k) with θt+1 ,
+and then moves to next iteration. However, DGS chooses
+to transmits Gk,t+1 rather than the global model:
+θk,t+1 = θk,prev(k) + Gk,t+1
+= θ0 + M prev(k) + Mt+1 − vk,prev(k)
+= θ0 + Mprev(k) + Mt+1 − Mprev(k)
+= θ0 + Mt+1 = θt+1
+
+(5)
+
+Eq.(5) indicates that DGS without sparsification is equivalent to ASGD. DGS transmits the difference between
+the global model and local model Gk,t+1 , which can be
+sparsely compressed.
+
+Sparsification Operations The following pseudo-code
+describes how to perform dual-way gradient sparsification
+in DGS. Algorithm 1 shows the gradient dropping scheme
+used at the workers in DGS, which is quite similar to the
+Top-k sparsification in distributed SGD (Aji and Heafield
+2017). Algorithm 2 shows the update rules at the server.
+Please notice that, at line 5 of Algorithm 2, there is a switch
+for secondary compression. Normally, there is no secondary
+compression for Gk,t+1 at the server, because Gk,t+1 is the
+accumulation of several sparse updates and Gk,t+1 itself
+is highly sparse. However, for the environments with very
+limited communication resources (e.g., mobile devices) or a
+very large number of workers, secondary compression (line
+5-11 of Algorithm 2) can be included to further reduce data
+exchanged.
+Secondary compression DGS enables the ability to
+performs secondary compression on the server. Substituting
+
+Mt+1 − vk,prev(k) with sparse Mt+1 − vk,prev(k) yields the
+update rule of secondary compression:
+
+Gk,t+1 = sparse Mt+1 − vk,prev(k)
+(6a)
+vk,t+1 = vk,prev(k) + Gk,t+1
+(6b)
+The server implicitly accumulates remaining gradient locally. Eventually, these gradients become large enough to
+be transmitted immediately. Lines 5-11 of algorithm 2
+show how the server compresses Gk,t+1 in secondary compression, which eliminates the overhead of the downward
+communication.
+
+Algorithm 2 DGS on server
+Require: Initial parameters θ0 = {theta[0], ..., theta[J]}
+Require: encode() function and decode() function
+k
+1: Mt+1
+← {0, ..., 0}
+2: while Receive encoded g k from worker k do
+k
+3:
+Mt+1
+← Mtk − decode(g k )
+4:
+Gk,t+1 ← Mt+1 − vk,prev(k)
+5:
+if Need secondary compression then
+6:
+for j = 0, ..., J do
+7:
+thr ← R% of |Gk,t+1 [j]|
+8:
+M ask ← |Gk,t+1 [j]| > thr
+9:
+Gk,t+1 [j] ← Gk,t+1 [j] M ask
+10:
+end for
+11:
+end if
+12:
+Send encode(Gk,t+1 ) to the worker k
+13:
+vk,t+1 ← vk,prev(k) − Gk,t+1
+14:
+prev(k) = t + 1
+15: end while
+
+optimization boost. Momentum for SSGD training can be
+calculated as follows:
+ut = mut−1 + η∇t , θt+1 = θt − ut
+
+ut is the velocity. On parameter server based ASGD with
+N nodes, it becomes:
+ut = mut−1 + η∇k,prev , θt+1 = θt − ut
+
+Algorithm 1 DGS on worker k
+Require: Dataset X
+Require: Initial parameters θ0 = {theta[0], ..., theta[J]}
+Require: optimization function SGD
+Require: encode() function pack nonzero gradients to
+coordinate format.
+Require: decode() function unpack nonzero gradients
+from coordinate format.
+1: θk,0 = θ0
+2: vk ← {0, ..., 0}
+3: for t = 0, 1, ... do
+4:
+Sample data x from X
+5:
+∇k,t+1 ← Backward(x, θt )
+6:
+vk,t+1 ← vk,t + η∇k,t+1
+7:
+for j = 0, ..., J do
+8:
+thr ← R% of vk,t+1 [j]
+9:
+
+M ask ← vk,t+1 [j] > thr
+
+10:
+vk,t+1 [j] ← vk,t+1 [j] ¬M ask
+11:
+gk,t+1 [j] ← vk,t+1 [j] M ask
+12:
+end for
+13:
+Send encode(gk,t+1 ) to the server
+14:
+Recieve Gk,t+1 from the server
+15:
+θt+1 ← SGD (θt , decode(Gk,t+1 ))
+16: end for
+
+Sparsification Aware Momentum
+Momentum (Polyak and Juditsky 1992) is ubiquitous in
+deep learning training, as it is known to offer a significant
+
+(7)
+
+(8)
+
+With gradients sparsication as in Algorithm 1, it further
+changes to be (Lin et al. 2017):
+gk,t = η ∗ sparsif y (∇k,prev )
+
+(9)
+
+ut = mut−1 + gk,t , θt+1 = θt − ut
+
+(10)
+
+The function sparsif y () will zero out gradients less
+than the threshold thr and the function unsparsif y ()
+will zero out gradients lager than the threshold. We name
+the result of unsparsif y (∇k,prev ) as remaining gradients.
+Remaining gradients will not participate in momentum
+update in Eq. (9) since workers have not sent them yet,
+which results in broken momentum and consequently, loss
+of convergence (Lin et al. 2017).
+Sparsification Aware Momentum (SAMomentum) is a
+novel momentum designed for gradient sparsification scenario. DGS accumulates SAMomentum locally at each
+worker instead of collecting it at the server, and rescales
+remaining gradients in ut :
+uk,t = muk,prev(k) + η∇k,prev +
+
+
+
+1
+− 1 (11a)
+unsparsif y muk,prev(k) + η∇k,prev ∗
+m
+
+gk,t = sparsif y muk,prev(k) + η∇k,prev
+(11b)
+θt+1 = θt − gk,t
+(11c)
+(i)
+
+uk,c denote the i-th position of a flattened velocity u at
+the worker k with local timestamp c, where c is the c-th
+iteration of the worker. T is the length of the sparse update
+
+interval between two iterations during which uik,t is sent.
+(i)
+After each step, uk,c equals to:
+(
+(i)
+uk,c =
+
+(i)
+
+(i)
+
+mu
+ k,c−1 + η∇k,c 
+(i)
+(i)
+1
+muk,c−1 + η∇k,c ∗ m
+
+Workers send encoded uk,t+1 [j]
+shown in Algorithm 3.
+
+> thr
+≤ thr
+
+(12)
+
+M ask to the server, as
+
+Algorithm 3 DGS on worker k with Sparsification Aware
+momentum
+Require: Dataset X
+Require: Initial parameters θ0 = {theta[0], ..., theta[J]}
+Require: optimization function SGD
+Require: encode() function and decode() function
+1: θk,0 = θ0
+2: uk ← {0, ..., 0}
+3: for t = 0, 1, ... do
+4:
+Sample data x from X
+5:
+∇k,t+1 ← Backward(x, θt )
+6:
+uk,t+1 ← muk,t + η∇k,t+1
+7:
+for j = 0, ..., J do
+8:
+thr ← R% of uk,t+1 [j]
+M ask ← uk,t+1 [j] > thr
+gk,t+1 [j] ← uk,t+1 [j] M ask
+
+1
+uk,t+1 [j] ← uk,t+1 [j] + m
+− 1 uk,t+1 [j]
+¬M ask
+12:
+end for
+13:
+Send encode(gk,t+1 ) to the server
+14:
+Receive Gk,t+1 from the server
+15:
+θt+1 ← SGD (θt , decode(Gk,t+1 ))
+16: end for
+9:
+
+10:
+11:
+
+Equivalence between DGS and Enlarged Batch
+Size
+(i)
+
+Suppose uk is sent to the server at c and c + T , therefore
+(i)
+uk is smaller than thr between time c + 1 and c + T − 1,
+then greater than thr at time c + T . The change of velocity
+PT
+(i)
+(i)
+value uk equals to η i=1 ∇k,c+i :
+(i)
+
+(i)
+
+(i)
+
+uk,c+T = muk,c+T −1 + η∇k,c+T
+
+ 1
+(i)
+(i)
+(i)
++ η∇k,c+T
+= m muk,c+T −2 + η∇k,c+T −1 ∗
+m
+(i)
+
+(i)
+
+(i)
+
+= muk,c+T −2 + η∇k,c+T −1 + η∇k,c+T
+= ···
+(i)
+
+= muk,c + η
+
+T
+X
+
+(i)
+
+∇k,c+i
+
+i=1
+
+(13)
+which can be considered as vanilla momentum SGD
+(MSGD) increasing batch size and learning rate by T times.
+
+With increasing batch size and learning rate, vanilla MSGD
+becomes:
+
+1  (i)
+(i)
+(i)
+(i)
+uk,c+T = muk,c + T η ∗
+∇k,c+1 + · · · + ∇k,c+T
+T
+T
+X
+(i)
+(i)
+= muk,c + η
+∇k,c+i
+i=1
+
+(14)
+For every single parameter of weight θ, Eq. (13) is
+equivalent to (14). The underlying idea of (11) is that,
+SAMomentum adaptively enlarge the batch size for every
+single parameter without introducing any hyperparameters.
+Note that, DGS with SAMomentum does not need local
+gradient accumulation, as shown in Algorithm 3, which
+is necessary for DGC and other gradient sparsification
+approaches. Now, the momentum in Eq. (11) is the one
+used in our design, which can save lots of memory compared with DGC. In other words, we basically turn the
+sparsification into the magnification of batch size.
+Recent research like (Goyal et al. 2017),(You, Gitman,
+and Ginsburg 2017) attempted to enlarge the batch size
+of the entire model for efficient training, which makes
+it possible to train DNNs with large batch size without
+significant loss of accuracy. We also enlarge the batch size
+in distributed training, but our approach is in the parameter
+level rather than model level. What’s more, different from
+the update in existing works as shown in Eq. (14), during
+the sparse update interval, DGS continuously receives up(i)
+dates for the parameter θk , which can obviously decrease
+(i)
+the asynchronous staleness of uk .
+In SSGD and ASGD, each parameter of the local model
+has the same and fixed update interval and batch size.
+However, sparsification techniques like Gradient Dropping
+introduced different update intervals to each parameter,
+since workers only send part of gradients in each iteration.
+This change makes each parameter have their own asynchronous update pace. SAMomentum takes advantage of
+such a change, and applies adaptive batch size in elementwise based on, so as to avoid information losing in sparse
+asynchronous training with momentum, in spite of DGS
+with SAMomentum do not accumulate residual gradients
+(the vk,t in Algorithm 1) anymore.
+
+Experimental Evaluation
+The evaluation is conducted using a 36-GPU cluster, with
+different neural network models and datasets. We examine
+the performance via two types of deep learning tasks:
+image classification and speech recognition. We also compare with four other approachesMSGD, ASGD, Gradient
+Dropping, and DGC. ASGD is vanilla asynchronous SGD
+without gradient sparsification and MSGD is a single-node
+momentum SGD.
+However, Gradient Dropping and DGC is originally
+designed based on SSGD, and do not work in asynchronous
+training. Therefore, for comparison purpose, We implemented an asynchronous version of Gradient Dropping and
+DGC by adding model difference based compression as in
+
+our DGS, and they are denoted as GD-async and DGCasync in experiments.
+
+Dataset and Models
+Image Classification: We use ResNet-18 and ResNet-50
+(He et al. 2016) on Cifar10 dataset. Cifar10 consists of
+50,000 training images and 10,000 validation images in 10
+classes (Krizhevsky, Hinton, and others 2009). The baseline
+training using vanilla MSGD with a momentum of 0.7.
+The momentum coefficient of our approach and DGC-async
+is 0.7, too. All experiments decrease the learning rate by
+the factor of 0.1 at epoch 30 and 40 out of 50 epochs.
+To simplify comparisons, we do not include other training
+tricks for improving accuracy.
+Speech Recognition: The AN4 dataset contains 948
+training and 130 test utterances. We train a 5-layer LSTM
+with 800 hidden units, and the hyperparameters settings
+are: epochs, 100; learning rate, 4 ∗ 10− 4; weight decay,
+1.25 ∗ 10−5 ; momentum, 0.7; learning rate anneal, 1.01.
+
+Experiments Setup
+Hardware: the distributed environment is configured as a
+32-GPU cluster with eight machines, each of which is
+equipped with 2 Intel Xeon E5-2660-V3 CPUs and 4
+NVIDIA Tesla K80 GPUs. The default network between
+workers and the server is 10 Gbps Ethernet. In all of our
+experiments, we use each GPU as a worker.
+Software: All GPU machines are installed with Linux
+3.10.0, NVIDIA GPU driver 390.30 and CUDA 8. We
+implement all the algorithms via PyTorch0.4, a popular
+lightweight distributed deep learning framework with great
+flexibility. The parameter server is implemented using
+PyTorch distributed API with TCP backend. Furthermore,
+only vanilla MSGD is training with a single node, and
+others all execute asynchronously based on our model
+difference compression as in (Algorithm 1,2), so the result
+might be different from their synchronous experimental
+results.
+
+Results and Analysis
+Image Classication: We first examine our approach on
+Cifar10 dataset. Figure 1 is the Top-1 accuracy and training
+loss of ResNet-18 on Cifar10 with 4 workers. The gradient
+sparsity of DGC-async, GD-async, and DGS is 99%. The
+learning curve of GD-async (purple) and ASGD (green)
+is worse than MSGD (blue) due to gradient staleness.
+With momentum correction, the learning curve of DGCasync (red) converges slightly slower, but the accuracy
+is much closer to the baseline. DGS outperforms the
+other three approaches, and its convergence performance is
+even close to single-node MSGD. Moreover, the accuracy
+curve of DGS converges smoothly and stably, which is
+obviously better than other approaches, especially DGC.
+Table I shows the detailed accuracy results. The accuracy
+of ResNet-18 converges very well using our distributed
+approach with 4 workers.
+
+Fig. 1: Training ResNet-18 on Cifar10
+TABLE I: Results of ResNet-18 trained on Cifar10
+Model
+ResNet-18
+
+Training Method
+MSGD
+ASGD
+GD-async
+DGC-async
+Our approach
+
+Workers in total
+1
+4
+4
+4
+4
+
+Accuracy
+93.08%
+90.74%
+92.01%
+92.64%
+92.91%
+
+Speech Recognition: For speech recognition, Table II
+shows the average word error rate (WER) of a 5-layer
+LSTM on AN4 Dataset. GD-async and ASGD not converge
+on 4 worksers. The results show that our DGS achieves the
+same improvement as that for the image network.
+TABLE II: Results of 5-Layer LSTM on AN4
+Model
+5-layer LSTM
+
+Training Method
+SGD
+DGC-Async
+DGS
+
+Workers
+1
+4
+4
+
+Batch Size
+20
+5
+5
+
+Average WER
+26.2%
+23.54%
+21.51%
+
+Scalability and Generalization Ability
+In this experiment, we run our approach, ASGD, GD-async,
+and DGC-async on 1, 4, 8, 16, 32 workers asynchronously,
+and compare their test accuracy. All experiments have the
+same hyperparameter setting, except the batch size. The
+baseline approach single-node MSGD runs using a minibatch size of 256, resulting in a test accuracy of 93.08%.
+In Table II, we can observe that, the test accuracy
+of other approach decreases as the number of workers
+increases. This is because, with more nodes, the more
+staleness asynchrony brings. However, the test accuracy of
+our approach in 4, 8 and 16 workers is 92.91%, 93.32%,
+and 92.98% respectively. Therefore, our approach has better converge performance and even defeats the staleness
+brought by asynchronous in distributed scenarios. Compare
+to other approaches on 32 workers, our approach achieves
+the best accuracy, and the accuracy only drops a little (0.39%) due to a large number of workers. At the same
+time, the convergence performance of other methods is
+greatly reduced: ASGD drops to 88.36% (-4.71%), GDasync drops to 91% (-2.08%) and DGC-async drops to
+91.86% (-1.22%). Experiments results above show that, our
+approach scales very well when the number of workers
+increases and does not negatively affect (or perhaps helps)
+generalization.
+
+Further, we have got amazing results by changing hyperparameters. Since asynchrony introduces momentum to
+the SGD update (Mitliagkas et al. 2016), we reduced the
+momentum from 0.7 to 0.3 on 32 workers. Surprisingly, the
+test accuracy increased to 93.7%. Figure 2 shows that our
+approach (yellow) closely follows the curve of single node
+MSGD (blue) and achieves better accuracy eventually.
+
+Fig. 3: Architecture of PS Based Asynchronous Training
+
+Fig. 2: Tuned ResNet-18 on 32 workers
+TABLE III: ResNet-18 trained on Cifar10 Dataset
+Workers in total
+
+Batchsize per iteration
+
+1
+
+256
+
+4
+
+128
+
+8
+
+64
+
+16
+
+32
+
+32
+
+16
+
+Training Method
+MSGD (beaseline)
+ASGD
+Gradient Dropping
+DGC
+Our apporoach
+ASGD
+Gradient Dropping
+DGC
+Our apporoach
+ASGD
+Gradient Dropping
+DGC
+Our apporoach
+ASGD
+Gradient Dropping
+DGC
+Our apporoach
+ASGD
+Gradient Dropping
+DGC
+Our apporoach
+
+Accuracy
+93.08%
+91.54%
+-1.54%
+92.15%
+-0.93%
+92.75%
+-0.33%
+92.97% -0.11%
+90.7%
+-2.38%
+92.01%
+-1.07%
+92.64%
+-0.44%
+92.91% -0.17%
+90.46%
+-2.62%
+91.81%
+-1.27%
+92.37%
+-0.71%
+93.32% +0.24%
+90.53%
+-3.01%
+91.43%
+-1.65%
+92.28%
+-0.80%
+92.98% -0.10%
+88.36%
+-4.71%
+91%
+-2.08%
+91.86%
+-1.22%
+92.69% -0.39%
+
+The Effect of Dual-way Sparsification with Low
+bandwidth
+We train ResNet18 of 50 epochs on 8 workers using ASGD
+and DGS respectively. The network is 1GB Ethernet, and
+the compress ratio of the secondary compression is 99%.
+Comparing ASGD and DGS in Figure 4, we can find
+that DGS benefits a lot from Dual-way Sparsification. Our
+approach completes the training for 88 minutes, while
+ASGD takes 506 minutes, resulting in a speedup of 5.7×.
+
+Conclusion and Future Work
+We propose a novel sparsification approach DGS for
+asynchronous distributed training. Its major novelty lies
+in the dual-way compression, which is enabled the delicately designed model difference tracking method. To
+avoid slowdown in convergence, we also design the sparsification aware momentum (SAMomentum) to transform
+sparsification into adaptively enlarge batch size, so as to
+bring significant optimization boost. DGS enables largescale asynchronous distributed training with inexpensive,
+commodity networking infrastructure.
+
+Fig. 4: Time vs Training Loss on 8 workers with 1Gbps
+Ethernet
+
+In future, the combination of DGS and other compression
+approaches (e.g. TernGrad (2017), randomly coordinates
+dropping (2018)) can be considered. Also, the new momentum SAMomentum is a general design and can be used to
+design new synchronization training approaches.
+
+References
+[2017] Aji, A. F., and Heafield, K. 2017. Sparse communication for distributed gradient descent. arXiv preprint
+arXiv:1704.05021.
+[2016] Alistarh, D.; Li, J.; Tomioka, R.; and Vojnovic, M.
+2016. Qsgd: Randomized quantization for communicationoptimal stochastic gradient descent.
+arXiv preprint
+arXiv:1610.02132.
+[2018] Alistarh, D.; Hoefler, T.; Johansson, M.; Konstantinov, N.; Khirirat, S.; and Renggli, C. 2018. The convergence of sparsified gradient methods. In Advances in
+Neural Information Processing Systems, 5973–5983.
+[2018] Chen, C.-Y.; Choi, J.; Brand, D.; Agrawal, A.;
+Zhang, W.; and Gopalakrishnan, K. 2018. Adacomp:
+Adaptive residual gradient compression for data-parallel
+distributed training. In Thirty-Second AAAI Conference on
+Artificial Intelligence.
+[2013] Coates, A.; Huval, B.; Wang, T.; Wu, D.; Catanzaro,
+B.; and Andrew, N. 2013. Deep learning with cots hpc
+systems. In International conference on machine learning,
+1337–1345.
+[2012] Dean, J.; Corrado, G.; Monga, R.; Chen, K.; Devin,
+M.; Mao, M.; Senior, A.; Tucker, P.; Yang, K.; Le, Q. V.;
+
+et al. 2012. Large scale distributed deep networks. In
+Advances in neural information processing systems, 1223–
+1231.
+[2009] Deng, J.; Dong, W.; Socher, R.; Li, L.-J.; Li, K.;
+and Fei-Fei, L. 2009. Imagenet: A large-scale hierarchical
+image database. In 2009 IEEE conference on computer
+vision and pattern recognition, 248–255. Ieee.
+[2016] Dryden, N.; Moon, T.; Jacobs, S. A.; and Van Essen,
+B. 2016. Communication quantization for data-parallel
+training of deep neural networks. In 2016 2nd Workshop
+on Machine Learning in HPC Environments (MLHPC), 1–
+8. IEEE.
+[2017] Goyal, P.; Dollár, P.; Girshick, R.; Noordhuis, P.;
+Wesolowski, L.; Kyrola, A.; Tulloch, A.; Jia, Y.; and He,
+K. 2017. Accurate, large minibatch sgd: Training imagenet
+in 1 hour. arXiv preprint arXiv:1706.02677.
+[2016] Gupta, S.; Zhang, W.; and Wang, F. 2016. Model
+accuracy and runtime tradeoff in distributed deep learning:
+A systematic study. In 2016 IEEE 16th International
+Conference on Data Mining (ICDM), 171–180. IEEE.
+[2016] He, K.; Zhang, X.; Ren, S.; and Sun, J. 2016. Deep
+residual learning for image recognition. In Proceedings
+of the IEEE conference on computer vision and pattern
+recognition, 770–778.
+[2017] Hoffer, E.; Hubara, I.; and Soudry, D. 2017. Train
+longer, generalize better: closing the generalization gap in
+large batch training of neural networks. In Advances in
+Neural Information Processing Systems, 1731–1741.
+[2018] Jia, X.; Song, S.; He, W.; Wang, Y.; Rong, H.;
+Zhou, F.; Xie, L.; Guo, Z.; Yang, Y.; Yu, L.; et al.
+2018. Highly scalable deep learning training system with
+mixed-precision: Training imagenet in four minutes. arXiv
+preprint arXiv:1807.11205.
+[2015] Keuper, J., and Pfreundt, F.-J. 2015. Asynchronous
+parallel stochastic gradient descent: A numeric core for
+scalable distributed machine learning algorithms. In Proceedings of the Workshop on Machine Learning in HighPerformance Computing Environments, 1. ACM.
+[2009] Krizhevsky, A.; Hinton, G.; et al. 2009. Learning
+multiple layers of features from tiny images. Technical
+report, Citeseer.
+[2014] Krizhevsky, A. 2014. One weird trick for parallelizing convolutional neural networks. arXiv preprint
+arXiv:1404.5997.
+[2014] Li, M.; Andersen, D. G.; Park, J. W.; Smola, A. J.;
+Ahmed, A.; Josifovski, V.; Long, J.; Shekita, E. J.; and
+Su, B.-Y. 2014. Scaling distributed machine learning with
+the parameter server. In 11th {USENIX} Symposium on
+Operating Systems Design and Implementation ({OSDI}
+14), 583–598.
+[2017] Lin, Y.; Han, S.; Mao, H.; Wang, Y.; and Dally,
+W. J. 2017. Deep gradient compression: Reducing the
+communication bandwidth for distributed training. arXiv
+preprint arXiv:1712.01887.
+[2016] Mitliagkas, I.; Zhang, C.; Hadjis, S.; and Ré, C.
+2016. Asynchrony begets momentum, with an application
+
+to deep learning. In 2016 54th Annual Allerton Conference
+on Communication, Control, and Computing (Allerton),
+997–1004. IEEE.
+[1992] Polyak, B. T., and Juditsky, A. B. 1992. Acceleration
+of stochastic approximation by averaging. SIAM Journal
+on Control and Optimization 30(4):838–855.
+[2011] Recht, B.; Re, C.; Wright, S.; and Niu, F. 2011.
+Hogwild: A lock-free approach to parallelizing stochastic
+gradient descent. In Advances in neural information processing systems, 693–701.
+[2018] Renggli, C.; Alistarh, D.; Hoefler, T.; and
+Aghagolzadeh, M. 2018. Sparcml: High-performance
+sparse communication for machine learning. arXiv preprint
+arXiv:1802.08021.
+[2014] Seide, F.; Fu, H.; Droppo, J.; Li, G.; and Yu, D.
+2014. 1-bit stochastic gradient descent and its application
+to data-parallel distributed training of speech dnns. In
+Fifteenth Annual Conference of the International Speech
+Communication Association.
+[2018] Stich, S. U.; Cordonnier, J.-B.; and Jaggi, M. 2018.
+Sparsified sgd with memory. In Advances in Neural
+Information Processing Systems, 4447–4458.
+[2015] Strom, N. 2015. Scalable distributed dnn training using commodity gpu cloud computing. In Sixteenth Annual
+Conference of the International Speech Communication
+Association.
+[2019] Tang, H.; Lian, X.; Zhang, T.; and Liu, J.
+2019. Doublesqueeze: Parallel stochastic gradient descent
+with double-pass error-compensated compression. arXiv
+preprint arXiv:1905.05957.
+[1986] Tsitsiklis, J.; Bertsekas, D.; and Athans, M. 1986.
+Distributed asynchronous deterministic and stochastic gradient optimization algorithms. IEEE transactions on automatic control 31(9):803–812.
+[2017] Wang, W., and Srebro, N. 2017. Stochastic nonconvex optimization with large minibatches. arXiv preprint
+arXiv:1709.08728.
+[2018] Wangni, J.; Wang, J.; Liu, J.; and Zhang, T. 2018.
+Gradient sparsification for communication-efficient distributed optimization. In Advances in Neural Information
+Processing Systems, 1299–1309.
+[2017] Wen, W.; Xu, C.; Yan, F.; Wu, C.; Wang, Y.; Chen,
+Y.; and Li, H. 2017. Terngrad: Ternary gradients to reduce
+communication in distributed deep learning. In Advances
+in neural information processing systems, 1509–1519.
+[2017] You, Y.; Gitman, I.; and Ginsburg, B. 2017. Scaling
+sgd batch size to 32k for imagenet training. arXiv preprint
+arXiv:1708.03888 6.
+[2013] Zhang, S.; Zhang, C.; You, Z.; Zheng, R.; and Xu,
+B. 2013. Asynchronous stochastic gradient descent for
+dnn training. In 2013 IEEE International Conference
+on Acoustics, Speech and Signal Processing, 6660–6663.
+IEEE.
+

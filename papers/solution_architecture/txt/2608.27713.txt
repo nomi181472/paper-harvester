@@ -1,0 +1,1455 @@
+DART-FL: Burst-Aware Multitask Federated Learning under
+Dynamic Inference Demand at the Edge
+Yiming Xie1 , Pinrui Yu1 , Geng Yuan2 , Xue Lin1 , Ningfang Mi1
+
+arXiv:2608.27713v1 [cs.LG] 27 Aug 2026
+
+1
+
+Department of Electrical and Computer Engineering, Northeastern University, Boston, MA, USA
+2
+School of Computing, University of Georgia, Athens, GA, USA
+1
+Email: {xie.yimi, yu.pin, xue.lin, n.mi}@northeastern.edu, 2 geng.yuan@uga.edu
+
+Abstract—Edge intelligence systems increasingly require model
+training and online inference to coexist on resource-constrained
+devices, while inference demand can vary substantially across
+tasks over time. This creates two coupled challenges: sufficient
+computation must be reserved for inference to maintain servicelevel objectives (SLOs), while the remaining training capacity
+should adapt to task-specific demand so that frequently requested
+tasks can improve earlier during training.
+We propose an SLO-aware, demand-driven multitask federated learning framework (DART-FL) that jointly adapts the
+inference–training resource split and task-level training emphasis.
+At each scheduling interval, DART-FL uses the inference backlog
+and profiled service capacity to determine the minimum resource allocation required for inference. The remaining training
+capacity is then distributed across tasks using a queue-aware
+DPP-inspired scheduler, and the resulting task allocations are
+mapped to dynamic loss weights. This allows tasks experiencing
+higher inference demand to receive greater training emphasis in
+earlier communication rounds. Clients train a shared backbone
+with task-specific heads, and the complete multitask model is
+aggregated through FedAvg.
+We evaluate DART-FL using Stanford Cars and Oxford
+Flowers 102 under both synthetic and real Alibaba trace-derived
+workloads. Results show that DART-FL dynamically adapts
+the inference-training resource split to time-varying inference
+demand and shifts the learning progress of high-demand tasks
+toward their burst periods, improving model accuracy when those
+tasks are frequently requested while maintaining comparable
+long-term multitask performance.
+
+I. I NTRODUCTION
+Edge devices are increasingly required to support both
+continuous model training and real-time inference services.
+Applications such as autonomous driving, mobile vision assistants, and on-device language understanding rely on models
+that must continuously adapt to newly collected data while
+simultaneously serving user requests [1], [2]. In such systems, computation resources are shared between training and
+inference, creating a fundamental tension: allocating more
+resources to inference reduces the capacity available for
+model improvement, whereas aggressive training may increase
+inference latency and lead to service-level objective (SLO)
+violations [2].
+This challenge becomes more significant in multitask edge
+applications. For example, an autonomous vehicle may simultaneously support object recognition, scene understanding, and
+traffic-related perception tasks. Similarly, mobile and embedded devices increasingly execute multiple vision or language
+services using a shared backbone with task-specific prediction
+
+heads. Such architectures enable parameter sharing and joint
+learning across related tasks, while the relative weighting of
+task objectives can substantially affect multitask optimization
+[3], [4].
+In practice, inference demand can also be highly bursty [5].
+A sudden increase in requests for one task can rapidly build up
+its inference queue, requiring additional computation resources
+to maintain the target SLO. Meanwhile, the remaining training
+resources must be distributed across multiple tasks. Treating
+all tasks uniformly under such workload changes can be
+inefficient: resources may continue to be allocated to tasks
+with low current inference demand while a highly requested
+task receives insufficient training resources. Therefore, a joint
+scheduling mechanism should address two coupled decisions:
+how much computation should be reserved for inference to
+satisfy the SLO, and how should the remaining training
+capacity be distributed among tasks according to their current
+demand?
+Several recent works have investigated the coexistence of
+training and inference on resource-constrained edge platforms.
+EdgeOL, for example, studies efficient in-situ online learning
+on edge devices under limited resources [1]. Other studies consider federated learning systems that simultaneously
+provide model inference services and optimize training and
+inference resource allocation across distributed clients [2].
+These studies demonstrate the importance of coordinating
+learning and serving workloads. However, existing approaches
+primarily focus on resource allocation, participation, or modelupdate decisions, and do not explicitly connect bursty taskspecific inference demand with the allocation of training effort
+across multiple tasks.
+In this paper, we study a multitask federated learning system
+in which online inference and local training share limited computation resources. Our key insight is that inference demand
+should influence not only the amount of computation allocated
+to inference, but also how the remaining capacity is distributed
+across training tasks. A burst in task-specific inference requests
+should therefore trigger two coordinated responses: sufficient
+resources should first be reserved for inference to control
+service delay and maintain SLOs, while the remaining training
+capacity should temporarily prioritize the high-demand task.
+By advancing the training progress of the high-demand task,
+the system can improve its model accuracy when that task is
+actively serving inference requests, while maintaining similar
+
+overall accuracy after training converges.
+To realize this idea, we propose an SLO-aware joint inference and training framework, DART-FL, with queue-aware
+scheduling inspired by Drift-Plus-Penalty (DPP) control [6].
+The framework operates in two stages. First, an SLO-aware
+resource allocator uses the current inference backlog and profiled device service capacity to determine the minimum ratio
+of computation resources required for inference, leaving the
+remaining capacity for local training. Second, a queue-aware
+DPP-inspired scheduler uses task-specific pre-service queues
+as demand signals and dynamically distributes the available
+training capacity among tasks. The resulting allocation is then
+mapped to adaptive task loss weights, therefore coupling realtime inference demand with local multitask optimization.
+This design provides a closed-loop interaction between
+inference serving and federated training. When inference demand increases, the system automatically reserves additional
+resources for request processing; when the demand becomes
+concentrated on particular tasks, their growing queue states
+increase their training priority. As demand changes over
+time, the scheduler dynamically adapts both the inferencetraining resource split and the task-level training allocation,
+while preserving shared representation learning through the
+multitask model. We further analyze the proposed framework
+theoretically. Specifically, we characterize the minimum inference resource allocation required to satisfy the SLO, establish
+inference queue stability under a supportable workload, analyze the properties of the queue-aware training allocation, and
+characterize the convergence behavior of federated multitask
+training under dynamic task weights.
+We evaluate the proposed framework using a multitask
+vision workload consisting of Stanford Cars [7] and Oxford
+Flowers 102 [8] with a shared ResNet backbone and taskspecific heads. The experiments emulate time-varying and
+bursty task-specific inference arrivals while federated training
+proceeds concurrently. The results demonstrate that DARTFL dynamically adapts the inference-training resource split
+to workload changes and reallocates training capacity toward
+high-demand tasks, improving model accuracy for actively
+requested tasks while maintaining overall multitask learning
+performance.
+The main contributions of this paper are summarized as
+follows:
+We formulate the coexistence of online inference and
+multitask federated training as a joint scheduling problem
+under time-varying and bursty task-specific inference
+demand.
+• We develop an SLO-aware resource allocation mechanism that uses inference queue states and profiled service
+capacity to determine the inference-training computation
+split while preserving the maximum feasible capacity for
+local training.
+• We design a queue-aware DPP-inspired training scheduler
+that distributes the remaining training capacity across
+tasks according to task-specific inference demand and
+
+•
+
+translates the resulting allocation into dynamic multitask
+loss weights.
+• We provide theoretical analysis of SLO-aware resource
+allocation, inference queue stability, and federated multitask convergence under dynamic task weights, and evaluate the framework on a multitask federated learning
+testbed under bursty inference workloads.
+II. R ELATED W ORK
+A. Federated Multitask Learning
+Federated learning (FL) enables distributed clients to collaboratively train models while keeping raw data local. FedAvg established the standard framework in which clients
+perform local optimization and the server aggregates their
+model updates into a global model [9]. Subsequent studies
+have extended FL to heterogeneous edge environments and
+multiple learning tasks.
+Federated multitask learning (FMTL) considers scenarios in
+which multiple related tasks are learned collaboratively while
+exploiting shared representations or cross-task knowledge.
+Existing studies have investigated multitask learning under
+communication and computation constraints. Ma et al. develop
+dynamic user and task scheduling for FMTL over wireless
+networks [10], while Zhuang et al. propose MAS to efficiently
+coordinate multiple simultaneous federated learning tasks [11].
+These approaches primarily coordinate multitask training
+according to training dynamics or system resource constraints.
+In contrast, our work considers a different source of task
+heterogeneity: time-varying inference demand. We use online
+task-specific inference demand to determine when each task
+should receive greater training emphasis. Consequently, a task
+experiencing high inference demand can receive more training
+attention in earlier rounds, advancing its learning progress and
+improving model accuracy when the task is actively requested,
+without necessarily changing the final converged accuracy.
+B. Joint Training and Inference on Edge Devices
+Training and inference increasingly coexist on resourceconstrained edge platforms. Unlike the conventional trainthen-deploy paradigm, continuously learning systems must
+update their models while simultaneously serving online inference requests. Since the two workloads compete for the same
+computation resources, increasing training activity may reduce
+inference service capacity, whereas prioritizing inference can
+slow model improvement.
+Recent studies have investigated this training-inference
+coupling. For example, EdgeOL develops an in-situ online
+learning framework for continuously adapting models on
+resource-constrained edge devices while maintaining inference
+performance [1]. Han et al. study federated learning while
+providing model-as-a-service and jointly optimize learning
+participation, inference service, and computation and communication resource allocation [2]. These studies demonstrate
+the importance of coordinating model learning with online
+inference services.
+
+Our work differs from prior approaches in two important aspects. First, we consider a multitask model in which
+inference requests are associated with different tasks and
+may exhibit distinct, time-varying demand patterns. Second,
+inference demand affects not only the computation allocation
+between inference and training, but also how the remaining training capacity is distributed across tasks. Specifically,
+the aggregate inference backlog determines the SLO-aware
+inference-training resource split, while task-specific queue
+states determine the relative training emphasis among tasks.
+This two-level scheduling mechanism establishes a direct
+connection between online inference demand and the temporal
+progression of multitask federated training.
+C. Queue-Aware Online Resource and Task Scheduling
+Queue-aware scheduling has been extensively studied for
+online resource allocation in communication and computing
+systems. Lyapunov optimization [6] provides a general framework for making online decisions under stochastic arrivals
+without requiring prior knowledge of future workloads. In
+particular, Drift-Plus-Penalty (DPP) methods balance queue
+stability against application-specific performance objectives
+and have been widely used for dynamic resource allocation [6].
+These principles are particularly relevant to bursty workloads because queue states provide an online measure of accumulated demand. A growing queue indicates that the current
+service or resource allocation is insufficient relative to recent
+arrivals, allowing an online scheduler to adapt without predicting future requests. Existing queue-aware approaches [12],
+[13], [14], however, generally use queue information to control
+resources that directly serve the corresponding workload, such
+as computation, communication, or service capacity.
+Our framework uses queue information in two complementary roles. First, the aggregate pre-service inference backlog
+is used to determine the minimum inference resource ratio
+required to meet the target SLO. Second, the task-specific preservice queues serve as demand signals for a DPP-inspired
+training scheduler. Rather than directly allocating training
+resources to serve these queues, the scheduler uses them to
+determine the optimal distribution of the available training
+capacity across tasks, which is subsequently mapped to dynamic multitask training weights. Hence, inference demand
+influences both how much computation remains available for
+training and which tasks receive greater training emphasis.
+D. Summary and Distinction
+Existing FMTL studies primarily schedule training based on
+learning dynamics or system resource conditions, while joint
+training-inference systems primarily determine how resources
+should be divided between learning and serving workloads. In
+contrast, our framework connects these two decisions through
+online, task-specific inference demand. Specifically, bursty inference demand first adjusts the SLO-aware inference-training
+resource split and then determines the relative training priority
+of individual tasks. This allows the learning progress of a highdemand task to be advanced to earlier communication rounds,
+
+enabling the model to provide higher accuracy during periods
+when that task is frequently requested, while preserving the
+long-term performance of the multitask model.
+III. SLO-AWARE J OINT I NFERENCE AND T RAINING
+F RAMEWORK
+We consider a federated multitask learning system in which
+online inference and local model training coexist on resourceconstrained edge clients. Since these workloads share the
+same computation resources, increasing the resources allocated
+to inference reduces those available for model training, and
+vice versa. To address this coupling, we develop an SLOaware, demand-driven multitask federated learning framework
+(DART-FL). Figure 1 illustrates the overall architecture of
+DART-FL, which consists of four main stages: bursty multitask inference demand, SLO-aware inference-training resource
+allocation, queue-aware training scheduling, and federated
+multitask learning.
+Specifically, at each scheduling interval, newly arrived inference requests are first incorporated into task-specific preservice queues. A shared scheduler then determines the minimum inference resource ratio required to satisfy a predefined
+SLO and assigns the remaining computation capacity to local training. The available training capacity is subsequently
+distributed among learning tasks according to their current
+inference demand. The resulting task allocations are mapped
+to dynamic task weights, which determine the relative contribution of each task to the local multitask training objective.
+A. System Model and Queue Dynamics
+Consider one parameter server and a set of edge clients
+C = {1, . . . , C}. Each client c ∈ C maintains a private local
+dataset Dc and participates in training a common set of tasks
+T = {1, . . . , T }. Raw training samples remain on the clients,
+while model parameters are exchanged with the server during
+federated aggregation.
+Each client maintains the same multitask model architecture Θ = {Θb , Θ1 , . . . , ΘT }, where Θb denotes the shared
+feature extractor and Θτ denotes the task-specific prediction
+head for task τ . For an input x, task τ produces fτ (x) =
+hτ (g(x; Θb ), Θτ ).
+Shared inference workload. We model inference demand
+at the system level because the scheduler makes one shared
+resource-allocation decision for each scheduling interval t. Let
+Aτ (t) denote the number of newly arrived inference requests
+for task τ during interval t, and let Qτ (t) denote the backlog
+carried from the previous interval.
+Since the current arrivals should immediately influence the
+scheduling decision, we define the pre-service queue as
+e τ (t) = Qτ (t) + Aτ (t).
+Q
+e
+Then,
+the aggregate pre-service backlog is Q(t)
+P
+e
+τ ∈T Qτ (t).
+
+(1)
+=
+
+Fig. 1: Overview of DART-FL for federated multitask learning. Bursty task-specific inference arrivals are incorporated into
+pre-service queues. The SLO-aware resource allocator first determines the inference resource ratio and assigns the remaining
+computation capacity to training. The shared queue-aware scheduler then distributes the available training capacity across tasks
+according to their current inference demand, and the resulting allocation determines the dynamic task weights used by selected
+clients for local multitask training. Finally, full-model FedAvg aggregates the shared backbone and all task-specific heads.
+
+Let Sτ (t) denote the number of inference requests of task
+τ served during interval t. After service, the queue evolves
+according to
+h
+i+
+e τ (t) − Sτ (t) ,
+Qτ (t + 1) = Q
+(2)
+
+B. SLO-Aware Inference–Training Resource Allocation
+We next determine the shared computation ratio assigned
+to inference and training. Motivated by Little’s Law [15], the
+time required to clear the current pre-service backlog under
+the allocated inference capacity as
+
+where [x]+ ≜ max{x, 0}.
+This arrival-first queue convention allows both the SLOaware resource allocator and the training scheduler to react to
+inference bursts within the same scheduling interval.
+Computation resources. Let ϕe denote the maximum instantaneous computation capacity available to the shared
+inference-training scheduler, and let γ(t) ∈ [0, 1] denote the
+fraction assigned to inference. Accordingly, ϕinf (t) = γ(t)ϕe
+e where ϕinf and ϕtr are the
+and ϕtr (t) = (1 − γ(t))ϕ,
+computation resources allocated to inference and training,
+respectively.
+Let µmax denote the maximum inference throughput under
+full inference allocation, obtained through offline hardware
+profiling in requests per second. Assuming that the effective
+service capability approximately scales with the allocated
+computation ratio, the inference service rate is
+
+e
+e
+Q(t)
+Q(t)
+=
+.
+(4)
+inf
+µ (t)
+γ(t)µmax
+Let DSLO denote the maximum acceptable inference delay.
+The condition D(t) ≤ DSLO requires
+
+µinf (t) = γ(t)µmax .
+
+(3)
+
+D(t) =
+
+e
+Q(t)
+.
+(5)
+DSLO µmax
+We therefore define the workload-dependent required inference ratio as
+e
+Q(t)
+γ req (t) =
+.
+(6)
+DSLO µmax
+The scheduler assigns only the inference resources required
+by the current workload while preserving the remaining computation for local training.
+"
+#γmax
+e
+Q(t)
+γ ∗ (t) =
+,
+(7)
+DSLO µmax
+γ(t) ≥
+
+γmin
+
+where [x]ba ≜ min{b, max{a, x}}.
+Equivalently, using the maximum full-resource service capacity M max = Ts µmax during a scheduling interval of
+duration Ts , we have:
+γ req (t) =
+
+e
+Q(t)T
+s
+.
+DSLO M max
+
+(8)
+
+The two forms are identical; µmax is measured in requests per
+second, whereas M max is measured in requests per scheduling
+interval.
+If γ req (t) > γmax , the workload exceeds the maximum
+inference allocation permitted by the resource constraint. The
+scheduler therefore saturates at γmax , and the target SLO is
+temporarily infeasible.
+The remaining training ratio is γ tr (t) = 1 − γ ∗ (t). Let
+tr,max
+µ
+denote the maximum effective training capacity when
+all available computation is assigned to training. The training
+capacity available after the inference decision is therefore
+
+µtr (t) = 1 − γ ∗ (t) µtr,max .
+(9)
+Thus, the first-stage decision determines the total amount
+of computation available for training, while the second-stage
+scheduler determines how this capacity is distributed among
+tasks.
+C. Queue-Aware Training Scheduling
+Now, we determine how the available training capacity
+µtr (t) is distributed among the tasks.
+Let ατ (t) denote the fraction of the P
+available training
+capacity assigned to task τ , subject to
+τ ∈T ατ (t) = 1
+and αmin ≤ ατ (t) ≤ αmax . The effective task-level training
+allocation is therefore
+tr
+µtr
+τ (t) = µ (t)ατ (t).
+
+α(t)
+
+τ ∈T
+
+−
+
+X
+
+e τ (t) log µtr (t)ατ (t) + ϵ0
+Q
+
+
+
+τ ∈T
+
+s.t.
+
+X
+
+ατ (t) = 1,
+
+τ ∈T
+
+αmin ≤ ατ (t) ≤ αmax ,
+
+∀τ.
+
+(13)
+
+The queue-dependent term makes the scheduler responsive
+to the current inference workload. In particular, increasing
+e τ (t) strengthens the incentive to allocate training capacity
+Q
+to task τ . In contrast, the switching term discourages large
+changes from the previous allocation. Therefore, the scheduler
+changes the training distribution only when the workloaddependent utility gain is sufficient to compensate for the
+temporal regularization cost.
+The parameters V and ζ have distinct roles. The coefficient
+ζ sets the numerical scale of the switching cost, whereas
+V > 0 controls the responsiveness–smoothness tradeoff. A
+smaller V allows the allocation to respond more aggressively
+to current inference demand, while a larger V favors smoother
+allocations across consecutive intervals.
+We emphasize that the inference queues are not directly
+served by ατ (t). Instead, they provide workload-state information for the training scheduler. Hence, (13) is a DPP-inspired
+queue-aware training allocation objective rather than the exact
+minimizer of the inference queue’s Lyapunov drift.
+
+(10)
+
+Notice that γ(t) and ατ (t) represent two distinct scheduling
+decisions. The first-stage variable γ(t) divides the shared
+computation capacity between inference and training, whereas
+the second-stage variable ατ (t) distributes only the remaining
+training capacity among tasks.
+Queue-aware training utility. To prioritize tasks experiencing higher inference demand, we define
+X
+
+e τ (t) log µtr (t)ατ (t) + ϵ0 ,
+P (t) =
+Q
+(11)
+τ ∈T
+
+where ϵ0 > 0 avoids the logarithmic singularity. A larger
+e τ (t) increases the scheduling importance of task τ , whereas
+Q
+the logarithmic utility introduces diminishing returns and
+discourages a single task from monopolizing the available
+training capacity.
+Temporal regularization. Responding directly to instantaneous demand can cause large allocation changes across
+consecutive scheduling intervals. We therefore introduce the
+switching cost
+X
+2
+G(t) = ζ
+ατ (t) − ατ (t − 1) ,
+(12)
+τ ∈T
+
+where ζ > 0 controls the intrinsic scale of temporal regularization.
+Inspired by the Drift-Plus-Penalty (DPP) principle [6], we
+balance the workload-dependent training utility against temporal allocation changes. The shared scheduler solves
+X
+2
+α∗ (t) = arg min V ζ
+ατ (t) − ατ (t − 1)
+
+D. Dynamic Multitask Training and Federated Aggregation
+The shared task allocation is incorporated into local multitask training through dynamic task weights. Let w0 > 0 denote
+the base task weight and let β ≥ 0 control the strength of
+demand-aware prioritization. For task τ , we define
+
+wτ (t) = w0 1 + βατ∗ (t) ,
+(14)
+where wτ (t) denotes the dynamic training weight assigned to
+task τ at scheduling interval t, and ατ (t)∗ is the optimal training emphasis determined by the shared queue-aware scheduler.
+A larger wτ (t) increases the contribution of task τ to the local
+multitask training objective, thereby directing more training
+emphasis toward tasks with higher current demand.
+The normalized task weight is defined as:
+wτ (t)
+.
+j∈T wj (t)
+
+ωτ (t) = P
+
+(15)
+
+Here, ωτ (t) represents the normalized training importance
+of task
+P τ relative to all tasks, satisfying ωτ (t) ≥ 0
+and
+τ ∈T ωτ (t) = 1. These normalized training weights
+{ωτ (t)}τ ∈T are then used by all clients selected for the
+
+corresponding federated round. Consequently, inference demand changes the relative training emphasis of the federation
+without requiring independent per-client scheduling states.
+Let Lc,τ (Θ) denote the task-specific training loss at client
+c. The local multitask objective is
+X
+Lc (Θ; t) =
+ωτ (t)Lc,τ (Θ).
+(16)
+τ ∈T
+
+Client c performs local optimization using the schedulerweighted multitask objective. For SGD, a local update can be
+written as
+Θc ← Θc − η∇Lc (Θc ; t),
+(17)
+where η > 0 is the model learning rate and is unrelated to the
+scheduler regularization coefficient ζ.
+After local training, each client uploads its complete multitask model, including the shared backbone and all task-specific
+heads. Let Sr denote the clients selected in communication
+round r. The server performs full-model FedAvg:
+X
+N
+P c
+Θr+1
+,
+(18)
+Θr+1 =
+c
+k∈Sr Nk
+c∈Sr
+
+where Nc denotes the number of local training samples at
+client c. Thus, both the shared backbone and all task-specific
+heads are aggregated into one global multitask model.
+E. Overall Scheduling and Federated Training Algorithm
+Algorithm 1 summarizes the overall workflow of the proposed framework. At each scheduling interval, the shared
+scheduler first incorporates newly arrived inference requests
+into the task-specific pre-service queues. It then computes
+the SLO-aware inference allocation γ ∗ (t) and determines the
+remaining training capacity. Based on the task-specific preservice queues, the scheduler solves the queue-aware training allocation problem to obtain α∗ (t) and converts the
+resulting task allocations into dynamic task weights. The
+same scheduler-generated weights are then used by all clients
+selected in the corresponding federated round. After local
+multitask optimization, the server performs full-model FedAvg
+over the shared backbone and all task-specific heads.
+IV. T HEORETICAL A NALYSIS
+We analyze the proposed framework from four aspects:
+SLO-aware inference allocation, inference-queue stability,
+queue-aware training emphasis, and federated multitask convergence under dynamic task weights.
+A. Minimum SLO-Aware Resource Allocation
+e =P Q
+e τ (t),
+Given the aggregate pre-service backlog Q(t)
+τ
+we define the backlog-clearing delay surrogate as
+e
+Q(t)
+D(t) =
+.
+γ(t)µmax
+
+(19)
+
+This is the time required to serve the current backlog under
+the allocated capacity assuming no new arrivals, rather than a
+per-request latency guarantee.
+
+Algorithm 1: Shared SLO-Aware Multitask FL Scheduler
+Input: Global model Θ0 , task set T , client set C
+Initialize Qτ (0) = 0 and feasible ατ (0);
+for r = 0, . . . , R − 1 do
+Set t ← r;
+Queue update: observe Aτ (t) and compute
+e τ (t) = Qτ (t) + Aτ (t), ∀τ ∈ T ;
+Q
+Resource allocation: compute the SLO-aware
+inference ratio γ ∗ (t) using (7) and obtain µtr (t);
+Serve inference requests and update
+e τ (t) − Sτ (t)]+ ;
+Qτ (t + 1) = [Q
+Training allocation: solve (13) to obtain α∗ (t);
+Compute and normalize the dynamic task weights
+{ωτ (t)}τ ∈T ;
+Select participating clients Sr and broadcast Θr
+and {ωτ (t)};
+foreach c ∈ Sr in parallel do
+Train Θrc using the weighted multitask
+objective in (16);
+Aggregate the complete multitask models using
+full-model FedAvg in (18) to obtain Θr+1 ;
+
+Requiring D(t) ≤ DSLO implies
+e
+Q(t)
+.
+DSLO µmax
+Theorem 1. The SLO-aware allocation
+γ(t) ≥ γ req (t) ≜
+
+γ ∗ (t) = min{γmax , max{γmin , γ req (t)}}
+
+(20)
+
+(21)
+
+uses the minimum feasible inference resource required to meet
+the backlog-clearing delay target whenever feasible, thereby
+maximizing the remaining computation capacity for training.
+Proof. From (20), any feasible allocation satisfies γ(t) ≥
+γ req (t). Since the remaining training ratio is 1−γ(t), selecting
+the smallest feasible γ(t) subject to γmin ≤ γ(t) ≤ γmax
+yields (21). If γ req (t) > γmax , the target is infeasible and the
+scheduler saturates at γmax .
+B. Inference Queue Stability
+P
+P
+Let Q(t) =
+τ Qτ (t) and A(t) =
+τ Aτ (t), such that
+e
+Q(t)
+= Q(t) + A(t). Given inference allocation γ(t) and
+scheduling interval length Ts , the actual service is
+n
+o
+e
+S(t) = min Q(t),
+γ(t)µmax Ts .
+(22)
+Hence,
+Q(t + 1) = [Q(t) + A(t) − S(t)]+ .
+
+(23)
+
+max
+
+Let Smax = γmax µ
+Ts denote the maximum service
+capacity per interval. We assume
+E[A2 (t) | Q(t)] ≤ A2 < ∞,
+
+0 ≤ S(t) ≤ Smax ,
+
+and a supportable workload such that, for some ϵ > 0,
+E[A(t) | Q(t)] ≤ Smax − ϵ.
+
+(24)
+
+Using the quadratic Lyapunov function L(Q(t)) = 12 Q2 (t),
+the standard drift argument [6] gives
+∆(t) ≤ B + Q(t)E[A(t) − S(t) | Q(t)],
+
+(25)
+
+2
+where B = 12 (A2 + Smax
+) < ∞.
+
+Theorem 2. Under the above assumptions, the aggregate
+inference queue under the SLO-aware allocation is strongly
+stable.
+
+e τ therefore strengthens the incentive to inA larger Q
+crease the training emphasis of task τ , while the quadratic
+term suppresses abrupt changes. Hence, V ζ controls the
+responsiveness–smoothness tradeoff.
+Equation (13) is DPP-inspired rather than the exact minimizer of the inference queue’s Lyapunov drift: the queues
+provide demand signals for training, whereas inference service
+is controlled by γ(t).
+D. Federated Multitask Convergence
+
+Proof. Define
+Q0 = max {γmax DSLO µmax , Smax } .
+e
+Since Q(t)
+= Q(t) + A(t) ≥ Q(t), whenever Q(t) ≥ Q0 ,
+we have γ req (t) ≥ γmax and hence γ ∗ (t) = γmax . Moreover,
+e ≥ Smax , so (22) gives S(t) = Smax . Therefore,
+Q(t)
+E[A(t) − S(t) | Q(t)] ≤ −ϵ,
+
+Q(t) ≥ Q0 .
+
+The optimal training emphasis is mapped to a normalized
+task weight as
+X
+1 + βατ∗,r
+,
+ωτr = 1,
+(30)
+ωτr =
+|T | + β
+τ ∈T
+
+where β ≥ 0 controls the strength of demand-aware task
+prioritization. Since ατ∗,r ≥ 0,
+ωτr ≥
+
+Substituting into (25) yields
+∆(t) ≤ B − ϵQ(t)
+outside the bounded region Q(t) < Q0 . The drift within this
+bounded region is finite and can be absorbed into a finite
+constant. By the standard Lyapunov stability criterion [6],
+R−1
+
+lim sup
+R→∞
+
+1 X
+E[Q(t)] < ∞.
+R t=0
+
+(26)
+
+1
+> 0.
+|T | + β
+
+(31)
+
+Thus, every task retains a nonzero contribution to the local
+training objective. When β = 0, all tasks receive equal
+weights, whereas increasing β makes the task weights more
+responsive to the scheduler output ατ∗,r .
+The local and global round-dependent objectives are
+X
+X
+Fcr (Θ) =
+ωτr Fc,τ (Θ),
+F r (Θ) =
+pc Fcr (Θ), (32)
+τ
+
+c
+
+P
+
+Thus, temporary bursts may exceed the backlog-clearing
+delay target, while long-term queue stability is preserved
+whenever the workload is supportable.
+
+where pc = Nc / j Nj .
+We assume standard L-smoothness, bounded stochasticgradient variance σ 2 , and bounded client heterogeneity:
+C
+X
+
+C. Queue-Aware Training Emphasis
+
+τ
+
+Theorem 3. For V > 0, ζ > 0, and ϵ0 > 0, if the simplex
+and box constraints define a nonempty feasible region, the
+training-emphasis problem is strongly convex and admits a
+unique global optimum α∗ (t).
+Proof. The Hessian is diagonal, with
+e τ (µtr )2
+∂2f
+Q
+= 2V ζ + tr
+≥ 2V ζ > 0.
+2
+∂ατ
+(µ ατ + ϵ0 )2
+
+(28)
+
+To capture scheduler-induced objective changes, assume
+R−1
+
+F r+1 (Θr+1 ) − F r (Θr+1 ) ≤ δr ,
+
+δ̄R =
+
+1 X
+δr .
+R r=0
+(34)
+
+Theorem 4. Suppose each participating client performs E
+local SGD steps with a sufficiently small learning rate η,
+followed by FedAvg aggregation. Then
+R−1
+
+1 X
+2(F 0 (Θ0 ) − Finf )
+E∥∇F r (Θr )∥2 ≤
+R r=0
+ηER
++ O(ησ 2 ) + O(η 2 E 2 G2 )
+
+
+δ̄R
++O
+,
+ηE
+
+(35)
+
+where Finf is a common finite lower bound.
+
+Hence, the objective is strongly convex, implying a unique
+global optimum over the convex feasible set.
+Moreover,
+e τ µtr
+∂f
+Q
+= 2V ζ(ατ − ατprev ) − tr
+.
+∂ατ
+µ ατ + ϵ0
+
+(33)
+
+c=1
+
+We next analyze the DPP-inspired queue-aware training emphasis problem (13), where inference queues provide demand
+signals and ατ (t) represents relative training emphasis rather
+than physical GPU allocation.
+Suppressing the time index, the objective is
+X
+X
+e τ log(µtr ατ +ϵ0 ). (27)
+f (α) = V ζ
+(ατ −ατprev )2 −
+Q
+τ
+
+2
+
+pc ∥∇Fcr (Θ) − ∇F r (Θ)∥ ≤ G2 .
+
+(29)
+
+Proof sketch. For a fixed round-r objective, standard LocalSGD/FedAvg analysis [16], [17], [18] gives, for sufficiently
+small η,
+E[F r (Θr+1 )] ≤ E[F r (Θr )] − cηE E∥∇F r (Θr )∥2
++ C1 η 2 Eσ 2 + C2 η 3 E 3 G2 ,
+
+(36)
+
+r+1
+
+(Θ
+
+r
+
+r+1
+
+) ≤ F (Θ
+
+) + δr .
+
+Alibaba Trace-Derived Workload
+Stanford Cars
+Oxford Flowers
+
+Stanford Cars
+Oxford Flowers
+
+800
+
+600
+Requests
+
+F
+
+r+1
+
+Synthetic Workload
+700
+
+Requests
+
+for constants c, C1 , C2 > 0.
+Since the scheduler changes the task weights between
+rounds, (34) implies
+
+500
+400
+
+600
+
+400
+
+300
+
+Combining the two inequalities and summing over rounds
+gives
+
+200
+200
+1
+
+50
+
+100
+
+150
+
+200
+
+Round
+
+cηE
+
+R−1
+X
+
+(a) Synthetic workload
+
+E∥∇F r (Θr )∥2 ≤ F 0 (Θ0 ) − Finf
+
+r=0
+
++ O(Rη 2 Eσ 2 )
+
+(37)
+
+250
+
+0
+1
+
+50
+
+100
+
+150
+
+200
+
+250
+
+Round
+
+(b) Alibaba workload
+
+Fig. 2: Task-specific inference workloads: (a) synthetic and (b)
+real Alibaba cluster trace, used in our experiments.
+
++ O(Rη 3 E 3 G2 ) + Rδ̄R .
+Dividing by cηER and absorbing fixed constants into O(·)
+yields (35).
+The bound contains the standard optimization, stochasticgradient, and client-heterogeneity terms, together with an additional term caused by scheduler-induced objective variation. If
+η = Θ(R−1/2 ), E is fixed, and δ̄R = o(R−1/2 ), this additional
+tracking term vanishes asymptotically. This is a conditional
+result and does not imply that the scheduler itself guarantees
+this decay rate.
+V. E VALUATION R ESULTS
+A. Multitask FL Setup
+We evaluate our framework on a two-task vision workload
+consisting of Stanford Cars [7] and Oxford Flowers 102 [8],
+using a shared ResNet backbone with task-specific classification heads. All experiments are conducted on an NVIDIA
+Tesla V100-SXM2 GPU with 32 GB of memory.
+We use 100 federated clients and randomly select 30%
+of them in each communication round. Each selected client
+performs one local epoch with 200 training steps using a
+learning rate of 10−3 . Full-model FedAvg is used to aggregate
+both the shared backbone and all the task-specific heads.
+B. Inference Workloads
+We consider both synthetic and real-trace-driven inference
+workloads. For the synthetic workload, we generate independent Poisson arrivals for Cars and Flowers with a baseline
+rate of 3 requests/s. To emulate bursty demand, the arrival
+rate of the selected task is increased by a factor of 4 during
+predefined burst intervals. Request timestamps are aggregated
+into fixed-length windows and used as arrival inputs to the
+online scheduler.
+For the real-trace-driven workload, we derive task arrivals
+from the Alibaba Cluster Trace 2018 [19]. The trace contains
+production workloads collected from approximately 4,000 machines over eight days, including colocated online services and
+batch workloads. Instances are divided into two task streams
+according to their normalized CPU and memory demands, with
+high-demand instances assigned to Cars and the remaining
+instances assigned to Flowers. We then normalize the two
+streams to maximum arrival counts of 900 and 200 requests
+per slot, respectively.
+
+Figure 2 shows the two inference workloads used in our
+experiments. As shown in Figure 2, the synthetic workload
+contains a controlled burst in Stanford Cars while Oxford
+Flowers remains relatively stable. In contrast, the Alibaba
+trace-derived workload exhibits multiple irregular demand
+peaks. Together, these workloads allow us to evaluate DARTFL under both controlled and realistic workload dynamics.
+C. Scheduling and Metrics
+We obtain the maximum inference service capacity from
+offline hardware profiling. At each scheduling interval, the
+proposed scheduler first determines the minimum inference
+resource ratio required to satisfy the target SLO and allocates
+the remaining capacity to training. It then uses task-specific
+inference demand to determine the training allocation across
+tasks and the corresponding dynamic loss weights.
+We compare DART-FL with two scheduling baselines.
+Round Robin distributes the available training opportunities
+evenly across tasks, without considering task-specific inference
+demand. Burst-Aware FIFO prioritizes training according to
+the current inference demand, assigning training opportunities
+first to the task with the dominant request workload. It therefore reacts aggressively to workload bursts, but may provide
+limited training opportunities to lower-demand tasks.
+We report per-task accuracy, overall multitask accuracy,
+inference and training resource ratios, and queue backlog. We
+evaluate accuracy during burst periods to determine whether
+demand-aware scheduling advances the learning progress of
+high-demand tasks to earlier rounds while maintaining comparable long-term model accuracy.
+D. Overall Performance
+Figure 3 reports the inference accuracy under the synthetic
+workload. During the Cars burst, DART-FL dynamically
+increases the training priority of Stanford Cars. Averaged
+over the burst period, DART-FL improves the Cars inference
+accuracy by 5.17% over Round Robin, with the instantaneous
+improvement reaching up to 15.9% during the most demanding
+burst rounds. These results demonstrate that demand-aware
+training enables the high-demand task to reach higher accuracy
+earlier, precisely when its inference service demand increases.
+This additional training emphasis on Stanford Cars temporarily
+reduces the training capacity available to Oxford Flowers,
+
+1.0
+
+0.8
+
+0.8
+
+0.8
+
+0.8
+
+0.6
+
+0.4
+DART-FL (Ours)
+Round Robin
+Burst-Aware FIFO
+
+0.2
+
+0.0
+
+50
+
+100
+
+150
+
+Round
+
+(a) Stanford Cars
+
+200
+
+250
+
+0.6
+
+0.4
+DART-FL (Ours)
+Round Robin
+Burst-Aware FIFO
+
+0.2
+
+0.0
+
+50
+
+100
+
+150
+
+200
+
+250
+
+Round
+
+(b) Oxford Flowers
+
+Fig. 3: Inference accuracy under the synthetic workload. The
+dashed lines indicate the burst period in Stanford Cars.
+
+resulting in a moderate decrease in its inference accuracy
+during the same period.
+Burst-Aware FIFO exhibits a more aggressive behavior.
+Since Cars dominates the workload during the burst, it assigns
+nearly all available training opportunities to Cars. Consequently, Stanford Cars achieves the highest inference accuracy,
+but Oxford Flowers receives almost no training and therefore
+maintains very low inference accuracy. This result exposes
+the limitation of directly following the dominant workload:
+aggressively prioritizing the high-demand task can effectively
+starve other tasks. In contrast, DART-FL increases the training
+priority of Stanford Cars while preserving non-zero training
+capacity for Oxford Flowers, providing a more balanced
+response to bursty demand.
+Figure 4 further evaluates the methods using the Alibaba
+trace-derived workload. Unlike the controlled synthetic workload, the Alibaba trace contains multiple irregular Cars demand peaks, highlighted by the dashed regions in Fig. 4(a). We
+compute the average inference accuracy over all rounds within
+each peak interval. Compared with Round Robin, DART-FL
+improves the average Cars inference accuracy from 0.618 to
+0.654, from 0.650 to 0.727, and from 0.641 to 0.712 over the
+three peak periods, corresponding to relative improvements
+of 5.83%, 11.85%, and 11.08%, respectively. These results
+show that DART-FL consistently adapts training priorities
+to changes in task demand, even under the more irregular
+workload dynamics of the real-world trace.
+The increased emphasis on Stanford Cars is accompanied
+by a temporary reduction in Oxford Flowers accuracy because
+less training capacity is allocated to the lower-demand task
+during these burst periods. Nevertheless, DART-FL continues
+to reserve training capacity for Flowers, preventing its learning
+progress from being completely stalled. Burst-Aware FIFO
+again represents a more aggressive alternative: by heavily
+prioritizing the dominant Cars workload, it achieves high Cars
+accuracy at the cost of providing very limited training opportunities to Flowers. As a result, its Flowers inference accuracy
+remains substantially low. DART-FL therefore achieves a
+better balance between responding to high-demand tasks and
+maintaining the learning progress of other tasks.
+
+0.6
+
+0.4
+DART-FL (Ours)
+Round Robin
+Burst-Aware FIFO
+
+0.2
+
+0.0
+
+50
+
+100
+
+150
+
+200
+
+250
+
+Inference Accuracy
+
+1.0
+
+Inference Accuracy
+
+1.0
+
+Inference Accuracy
+
+Inference Accuracy
+
+1.0
+
+0.6
+
+0.4
+DART-FL (Ours)
+Round Robin
+Burst-Aware FIFO
+
+0.2
+
+0.0
+
+Round
+
+(a) Stanford Cars
+
+50
+
+100
+
+150
+
+200
+
+250
+
+Round
+
+(b) Oxford Flowers
+
+Fig. 4: Inference accuracy under the Alibaba trace-derived
+workload. The dashed lines indicate the burst periods in
+Stanford Cars.
+
+E. Runtime Adaptation Behavior
+To understand how these accuracy improvements are
+achieved, Figure 5 illustrates the scheduling behavior of
+DART-FL under the synthetic workload. As shown in Figure 5(a), the inference resource ratio increases from approximately 0.2 to 0.5 during the Cars burst, while the training
+ratio decreases accordingly. The SLO-aware resource allocator
+therefore reacts to the increased inference demand by reserving
+more computation for request processing instead of maintaining a fixed inference-training resource split.
+A similar adaptive behavior is observed under the Alibaba
+workload in Figure 5(c). Since the Alibaba trace contains
+multiple irregular demand peaks, the inference–training resource split varies more frequently over time. During periods of increased inference demand, DART-FL increases
+the inference resource ratio and correspondingly reduces the
+resources assigned to training. When the demand decreases,
+more computation is returned to model training. These results demonstrate that DART-FL can dynamically adapt the
+inference–training resource split under both controlled and
+real-world workload variations.
+At the same time, DART-FL adapts how the remaining
+training capacity is distributed across tasks. As shown in
+Figure 5(b), the normalized training loss weights are approximately balanced before the burst. When the Cars burst occurs,
+the Stanford Cars weight increases from approximately 0.5 to
+0.6, while the Oxford Flowers weight decreases from approximately 0.5 to 0.4. Thus, DART-FL performs adaptation at
+two levels: it first increases the resources allocated to inference
+and then shifts the remaining training effort toward the highdemand Cars task. This coordinated adaptation enables Cars
+to improve its model accuracy during the burst and explains
+the corresponding inference accuracy gains in Figure 3.
+A similar behavior is observed under the Alibaba tracederived workload. As shown in Figure 5(d), the normalized
+task weights dynamically change with the time-varying demand. The Stanford Cars weight remains generally higher
+when Cars demand dominates, while the Oxford Flowers
+weight is reduced accordingly. Compared with the controlled
+synthetic burst, these changes are more irregular because the
+Alibaba trace contains multiple demand fluctuations. Together
+with the adaptive inference-training resource split in Fig-
+
+Resource Ratio
+
+0.8
+
+0.6
+
+Inference
+Training
+
+0.4
+
+0.2
+
+0.0
+
+50
+
+100
+
+150
+
+200
+
+250
+
+Normalized Training Loss Weight
+
+1.0
+
+0.8
+Stanford Cars
+Oxford Flowers
+
+0.7
+0.6
+0.5
+0.4
+0.3
+0.2
+
+R EFERENCES
+50
+
+100
+
+Round
+
+0.6
+
+Inference
+Training
+
+0.4
+
+0.2
+
+100
+
+150
+
+200
+
+250
+
+Normalized Task Training Weight
+
+Resource Ratio
+
+0.8
+
+50
+
+200
+
+250
+
+(b) Synthetic: task weights
+
+1.0
+
+0.0
+
+150
+
+Round
+
+(a) Synthetic: resource ratio
+0.8
+0.7
+0.6
+
+Stanford Cars
+Oxford Flowers
+
+0.5
+0.4
+0.3
+0.2
+
+50
+
+100
+
+150
+
+200
+
+250
+
+Round
+
+Round
+
+(c) Alibaba: resource ratio
+
+Robin and Burst-Aware FIFO, DART-FL achieves a better balance between demand responsiveness and multitask
+learning. Future work will extend the framework to largerscale multitask systems with more heterogeneous clients and
+dynamic workloads.
+
+(d) Alibaba: task weights
+
+Fig. 5: Adaptive scheduling behavior of DART-FL under
+synthetic and Alibaba trace-derived inference workloads.
+
+ure 5(c), these results show that DART-FL can jointly adapt
+resource allocation and task-level training priorities under realworld workload dynamics.
+Importantly, the Oxford Flowers training weight remains
+non-zero throughout the burst. This distinguishes DARTFL from Burst-Aware FIFO, which can devote nearly all
+available training opportunities to the dominant Cars workload
+and effectively stall the Flowers training. Hence, DARTFL responds to bursty demand while continuing to preserve
+training progress for lower-demand tasks.
+Overall, the results demonstrate the trade-off between demand responsiveness and multitask balance. Round Robin
+maintains balanced training but cannot respond to task-specific
+demand changes, whereas Burst-Aware FIFO aggressively
+follows the dominant workload and can starve lower-demand
+tasks. DART-FL avoids these two extremes by jointly adapting the inference-training resource split and the task-level
+training weights. Consequently, it accelerates learning and
+improves model accuracy for high-demand tasks during burst
+periods while preserving appropriate training opportunities for
+lower-demand tasks, achieving a better balance between shortterm demand responsiveness and sustained multitask learning.
+VI. C ONCLUSION
+In this paper, we presented DART-FL, a burst-aware
+scheduling framework for multitask federated learning with
+concurrent inference and training. DART-FL dynamically
+adjusts the inference–training resource split and uses a queueaware DPP-inspired scheduler to adapt task-level training
+weights according to time-varying inference demand.
+Experiments with synthetic and Alibaba trace-derived workloads show that DART-FL improves the inference accuracy
+of high-demand tasks during burst periods while preserving
+training opportunities for other tasks. Compared with Round
+
+[1] S. Li, G. Yuan, Y. Wu, Y. Dai, C. Wu, A. K. Jones, J. Hu, Y. Wang, and
+X. Tang, “EdgeOL: Efficient in-situ online learning on edge devices,”
+arXiv preprint arXiv:2401.16694, 2024.
+[2] P. Han, S. Wang, Y. Jiao, and J. Huang, “Federated learning while
+providing model as a service: Joint training and inference optimization,”
+in IEEE INFOCOM 2024 – IEEE Conference on Computer Communications, 2024, pp. 631–640.
+[3] A. Kendall, Y. Gal, and R. Cipolla, “Multi-task learning using uncertainty to weigh losses for scene geometry and semantics,” in Proceedings
+of the IEEE Conference on Computer Vision and Pattern Recognition
+(CVPR), 2018, pp. 7482–7491.
+[4] O. Sener and V. Koltun, “Multi-task learning as multi-objective optimization,” in Advances in Neural Information Processing Systems,
+vol. 31, 2018.
+[5] Z. Li, L. Zheng, Y. Zhong, V. Liu, Y. Sheng, X. Jin, Y. Huang, Z. Chen,
+H. Zhang, J. E. Gonzalez et al., “{AlpaServe}: Statistical multiplexing
+with model parallelism for deep learning serving,” in 17th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI
+23), 2023, pp. 663–679.
+[6] M. J. Neely, Stochastic Network Optimization with Application to
+Communication and Queueing Systems. Morgan & Claypool Publishers,
+2010.
+[7] J. Krause, M. Stark, J. Deng, and L. Fei-Fei, “3d object representations
+for fine-grained categorization,” in Proceedings of the IEEE International Conference on Computer Vision Workshops, 2013, pp. 554–561.
+[8] M.-E. Nilsback and A. Zisserman, “Automated flower classification over
+a large number of classes,” in Proceedings of the Indian Conference on
+Computer Vision, Graphics and Image Processing, 2008.
+[9] H. B. McMahan, E. Moore, D. Ramage, S. Hampson, and B. Agüera y
+Arcas, “Communication-efficient learning of deep networks from decentralized data,” in Proceedings of the 20th International Conference
+on Artificial Intelligence and Statistics, ser. Proceedings of Machine
+Learning Research, vol. 54. PMLR, 2017, pp. 1273–1282.
+[10] H. Ma, H. Guo, and V. K. N. Lau, “Communication-efficient federated
+multitask learning over wireless networks,” IEEE Internet of Things
+Journal, vol. 10, no. 1, pp. 609–624, 2023.
+[11] W. Zhuang, Y. Wen, L. Lyu, and S. Zhang, “MAS: Towards resourceefficient federated multiple-task learning,” in Proceedings of the
+IEEE/CVF International Conference on Computer Vision, 2023, pp.
+23 414–23 424.
+[12] R. Han, J. Wang, Q. Qi, D. Chen, Z. Zhuang, H. Sun, X. Fu, J. Liao,
+and S. Guo, “Dynamic network slice for bursty edge traffic,” IEEE/ACM
+Transactions on Networking, vol. 32, no. 4, pp. 3142–3157, 2024.
+[13] S. Bi, L. Huang, H. Wang, and Y.-J. A. Zhang, “Lyapunov-guided
+deep reinforcement learning for stable online computation offloading
+in mobile-edge computing networks,” IEEE Transactions on Wireless
+Communications, vol. 20, no. 11, pp. 7519–7537, 2021.
+[14] L. Dai, J. Mei, Z. Yang, Z. Tong, C. Zeng, and K. Li, “Lyapunov-guided
+deep reinforcement learning for delay-aware online task offloading in
+MEC systems,” Journal of Systems Architecture, vol. 153, p. 103194,
+2024.
+[15] J. D. C. Little, “A proof for the queuing formula: L = lambda w,”
+Operations Research, vol. 9, no. 3, pp. 383–387, 1961.
+[16] S. U. Stich, “Local sgd converges fast and communicates little,” in
+International Conference on Learning Representations, 2019.
+[17] S. P. Karimireddy, S. Kale, M. Mohri, S. Reddi, S. U. Stich, and A. T.
+Suresh, “SCAFFOLD: Stochastic controlled averaging for federated
+learning,” in Proceedings of the 37th International Conference on
+Machine Learning, vol. 119, 2020, pp. 5132–5143.
+[18] M. R. Glasgow, H. Yuan, and T. Ma, “Sharp bounds for federated
+averaging (local sgd) and continuous perspective,” in Proceedings of the
+25th International Conference on Artificial Intelligence and Statistics,
+vol. 151, 2022, pp. 9050–9090.
+[19] Alibaba Group, “Alibaba cluster trace program: Cluster trace 2018,”
+https://github.com/alibaba/clusterdata, 2018.
+

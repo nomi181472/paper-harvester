@@ -1,0 +1,1634 @@
+Meshlib: In-Process Policy Enforcement for
+Sidecar-less Service Meshes
+Habib Mostafaei
+
+Tom Van Liempd
+
+Eindhoven University of Technology
+h.mostafaei@tue.nl
+
+Eindhoven University of Technology
+tom@berlehof.nl
+
+arXiv:2608.13107v2 [cs.DC] 24 Aug 2026
+
+Abstract
+
+To mitigate these risks, modern orchestration frameworks,
+such as Kubernetes [3, 11] and service meshes such as Istio [4] and Cilium [1], provide fine-grained access control
+mechanisms between services. These mechanisms allow operators to define and enforce policies that restrict which services can communicate and under what conditions, forming
+a critical component of the security posture in microservicebased systems [23, 26, 28, 41].
+Enforcing such policies, however, exposes a fundamental trade-off in current service mesh designs. Applicationlayer (Layer 7) enforcement enables expressive policies, such
+as endpoint-level access control based on HTTP paths and
+methods, but requires intercepting and parsing every request [18, 23]. Existing service meshes intercept all interservice traffic through a dedicated sidecar or proxy, which
+must fully parse each request to evaluate policies before forwarding it. This redundant parsing by the application layer
+(the request is parsed again by the receiving application)
+increases end-to-end latency by approximately 3× in Cilium [44]. At scale, these per-request costs accumulate along
+every hop of a multi-service call path and translate directly
+into infrastructure cost and degraded user experience [12, 30].
+In contrast, transport-layer (Layer 4) enforcement avoids
+most of this overhead, but can express only coarse-grained
+policies at the level of entire services, which is insufficient
+for many security requirements. As a result, developers face
+a difficult choice between precise, application-aware policy
+enforcement and low-latency communication. This tension
+raises a key question: Can Layer 7 policy enforcement be
+decoupled from proxy-based traffic interception without sacrificing security guarantees, deployability, or compatibility with
+unmodified services?
+We present Meshlib, a sidecar-less service mesh extension for Cilium that enforces Layer 7 policies in-process
+within an optional application-bound library, while retaining full compatibility with services that do not adopt the
+library. Meshlib coordinates enforcement state with the service mesh control plane to ensure that security guarantees
+are preserved during policy updates and incremental deployment. Meshlib reuses protocol structures already parsed
+by the application framework, eliminating the redundant
+marshal–inspect–unmarshal cycle that dominates sidecar latency. Services without the library fall back transparently to
+Cilium’s existing Layer 7 Envoy proxy, enabling incremental
+adoption without disrupting existing deployments. Meshlib
+
+Service meshes facilitate service-to-service communication
+and enforce security policies in microservice architectures.
+However, they often depend on per-pod sidecar proxies,
+which introduce significant latency and resource overhead
+due to redundant application-layer parsing on every request.
+Eliminating sidecars without compromising security guarantees remains a central challenge. To address this, we introduce Meshlib, a sidecar-less service mesh extension built
+on Cilium as a control-plane extension. Meshlib incorporates a non-intrusive application-bound library that enforces
+Layer-7 policies within the application process, while delegating transport-level identity and routing to Cilium’s eBPFbased data plane. This separation of responsibilities removes
+sidecar-induced latency and maintains the security semantics of the service mesh. The architecture remains fully interoperable with unmodified services, enabling incremental
+adoption within existing deployments. We evaluate Meshlib against Istio, Linkerd, and unmodified Cilium on the
+TrainTicket benchmark, enforcing 126 security policies across
+37 services and show that it achieves the lowest end-to-end
+latency of all evaluated configurations with comparable resource overhead.
+
+1
+
+Introduction
+
+Modern cloud-native applications are increasingly built as
+collections of loosely coupled microservices, each independently deployed and communicating over a network [3, 11,
+13]. As deployments grow, managing service-to-service communication, including security policy enforcement [17, 21,
+30], access control [20, 23, 24, 38], and traffic routing [25, 37,
+39, 42], becomes a significant operational challenge, which
+has driven the widespread adoption of service meshes [25, 30,
+31]. Service meshes enforce these policies by deploying a dedicated proxy, a sidecar, alongside each service instance, intercepting all inbound and outbound traffic transparently [44].
+They enable developers to focus on implementing business
+logic rather than managing infrastructure complexities [25].
+In such microservice deployments, all inter-service communication is performed over the network, inherently expanding the attack surface. In particular, a compromised microservice can act as a pivot point, issuing malicious requests
+to other services and enabling lateral movement across the
+application [23, 38]. The implicit trust exacerbates this threat,
+often assumed within cluster-internal communication.
+1
+
+is built on standard Kubernetes infrastructure and requires
+no changes to unmodified services.
+Contributions. This paper makes the following contributions:
+• Sidecar-less Layer 7 enforcement. Meshlib performs HTTP policy enforcement in-process via an
+optional library while relying on Cilium’s eBPF data
+plane for transport identity and routing.
+• Consistent policy coordination. We design a lightweight bidirectional gRPC protocol that activates inprocess enforcement only after policy acknowledgment, eliminating update gaps and supporting transparent fallback for unmodified services.
+• Evaluation. We evaluate Meshlib against Istio, Linkerd, and unmodified Cilium on the TrainTicket benchmark [43], enforcing 126 policies across 37 services;
+Meshlib achieves the lowest end-to-end latency with
+comparable resource overhead.
+• Open-source artifact. We release the full implementation, gRPC protocol definition, policy-generation
+tooling, and evaluation scripts as open-source software.
+
+2
+
+Background and Motivation
+
+2.1
+
+Background
+
+Login service
+
+User management service
+
+POST /users/login
+
+✗
+
+POST /users/verify2factor
+
+POST /users/create-user
+
+✓
+
+POST /users/userby-username
+
+Figure 1. A microservice interaction scenario illustrating
+endpoint-level access within a single service-to-service communication channel. The login service legitimately calls
+POST /users/user-by-username (✓), but a compromised
+instance could invoke POST /users/create-user to create
+a backdoor account (✗). Transport-layer controls cannot distinguish these endpoints; Layer 7 enforcement is required.
+
+the kernel via eBPF, requiring no per-pod proxy. A single
+Cilium agent runs on each node, managing networking and
+policy enforcement for all pods on that node by attaching
+eBPF programs to the kernel’s networking stack. For Layer 7
+enforcement, however, eBPF’s verifier constraints limit the
+complexity of programs it can execute [32, 36], so Cilium
+falls back to a shared Envoy proxy per node, redirecting
+traffic through user space with the same parsing overhead
+described above. This hybrid architecture, eBPF for transportlayer enforcement, Envoy as a fallback for Layer 7, makes
+Cilium a natural foundation for Meshlib, as discussed in
+Section 3.
+
+Service meshes. A service mesh addresses the complexity
+of inter-service communication by abstracting it into a dedicated infrastructure layer. It comprises a data plane, which
+is a set of proxies that intercept and forward traffic between
+services, and a control plane that distributes configuration
+and policies to these proxies [31, 40]. In the prevalent sidecar
+model, a dedicated proxy container, typically Envoy, is deployed alongside each service instance. All inbound and outbound traffic is routed through this sidecar, which enforces
+policies configured by the control plane before forwarding
+requests to the application [15, 22].
+eBPF. The Extended Berkeley Packet Filter (eBPF) is a Linux
+kernel subsystem that enables verified, sandboxed programs
+to run in kernel space without requiring kernel modification [29]. eBPF programs attach to kernel events, such as
+network packet processing or system calls, and execute directly within the kernel. This approach eliminates the overhead associated with user-kernel context switches that are
+prevalent in proxy-based architectures. Prior to execution,
+the kernel verifier guarantees that each program is safe, ensuring completion within a bounded time, and preventing
+system crashes or instability.
+Cilium. Cilium is a production service mesh and container
+networking plugin built on eBPF [1], and has become the
+dominant CNI in production Kubernetes deployments, used
+in over 60% of surveyed clusters and adopted by all major
+public cloud providers [9, 10]. Unlike sidecar-based meshes,
+Cilium enforces Layer 3 and Layer 4 policies entirely within
+
+2.2
+
+The Need for Fine-Grained Policy Enforcement
+
+Microservice applications consist of services that communicate over networked APIs, often exposing multiple logically
+distinct operations through a single service interface [6, 14].
+Consequently, the microservice architectural style increases
+the attack surface and requires careful control over serviceto-service interactions [5, 8, 16, 19]. Figure 1 illustrates a
+simplified login workflow in such a system.
+The login service is responsible for authenticating users.
+To fulfill this role, it invokes two endpoints POST /users/login
+from the login service and POST /users/user-by-username on
+the user management service. This microservice call verifies
+credentials and retrieves the corresponding account record.
+However, the same service also exposes an additional endpoint, such as POST /users/create-user, which are unrelated
+to the login functionality.
+If the login service is compromised, an adversary can exploit its existing network connectivity to invoke these additional endpoints. For example, issuing a request to /users/createuser enables the creation of a persistent backdoor account.
+This represents a form of lateral movement, where a compromised service abuses legitimate communication channels
+to perform unintended actions [5, 27].
+2
+
+Listing 1. CiliumNetworkPolicy enforcing least-privilege
+access from the login service to the user management service.
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+
+Sender service
+
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+name: policy-user-mgmt-service
+spec:
+endpointSelector:
+matchLabels:
+app: user-management-service
+ingress:
+- fromEndpoints:
+- matchLabels:
+app: login-service
+toPorts:
+- ports:
+- port: "8080"
+protocol: TCP
+rules:
+http:
+- method: POST
+path: /api/v1/users/user-by-username
+
+(a) Layer 4 (eBPF)
+
+(b) Layer 7 (proxy)
+
+Read from TCP stream
+
+Read from TCP stream
+
+IP/port policy check (eBPF)
+
+Parse request (proxy)
+
+allow / deny
+Application
+
+Envoy
+proxy
+
+Inspect + policy check
+
+3 steps — no parsing
+Serialize to TCP stream
+
+redundant
+
+Parse request (app)
+
+Application logic
+6 steps — 2× parse,
+IPC overhead
+
+Enforcing the principle of least privilege would prevent
+such attacks by restricting the login service to only the endpoints required for its operation. In practice, modern service meshes support such fine-grained authorization policies [8, 19]. However, transport-layer (Layer 4) policies operate at the granularity of IP addresses and ports, and thus cannot distinguish between different API operations multiplexed
+over the same connection [44]. In this example, requests to
+/users/login, /users/user-by-username, and /users/create-user
+are indistinguishable at Layer 4, as they share the same destination port.
+Supporting least-privilege enforcement in microservice
+environments, therefore, requires application-layer (Layer 7)
+visibility, where policies can match on request semantics
+such as HTTP method and path. This motivates the need for
+fine-grained policy enforcement mechanisms that operate
+beyond the transport layer.
+Listing 1 shows what this policy looks like as a CiliumNetworkPolicy. The endpointSelector targets the user management service; the http rule admits only the path the login
+service legitimately needs. Any other request from the login
+service, including POST /users/create-user, is denied by the
+implicit default-deny behavior of the policy.
+To evaluate this policy, Cilium must redirect traffic from
+the login service through a per-node Envoy proxy, which
+fully parses the HTTP request, matches the path against the
+rules, and forwards or drops the request before the application receives it. As the number of services and endpoints
+grows, this proxy-based evaluation applies to every interservice request on every hop of every call path.
+2.3
+
+Figure 2. Comparison of Layer 4 and Layer 7 policy enforcement for a single inter-service request. (a) Layer 4 enforcement via eBPF and (b) Layer 7 enforcement via a sidecar
+proxy.
+
+practice remains a challenge. Existing service meshes implement such policies by intercepting all inter-service traffic
+through a dedicated proxy, which parses each request at
+the application layer to evaluate applicable policies before
+forwarding. Figure 2 illustrates the contrast with transportlayer enforcement: a Layer 4 eBPF check requires no parsing
+and forwards the request directly to the application, whereas
+a Layer 7 proxy must unmarshal, inspect, re-marshal, and
+forward the request, resulting in the application parsing
+the same request a second time. This interception model is
+architecture-agnostic and does not require modifications to
+individual services, which supports broad deployment. However, it introduces per-request overhead that accumulates
+along every hop of a multi-service request path, which are
+typically the most latency-sensitive in production deployments [12, 40].
+To quantify this overhead, we measure the end-to-end
+latency of Cilium under two configurations: (i) transportlayer enforcement implemented entirely in the eBPF data
+path, and (ii) Layer 7 enforcement achieved by redirecting
+traffic through the Envoy proxy.
+Table 1 shows that transport-layer-only enforcement incurs negligible overhead. Enabling Layer 7 inspection, however, increases end-to-end latency by approximately 3× and
+
+Performance Implications of Layer 7 Inspection
+
+Although the necessity for fine-grained Layer 7 policy enforcement is well established, achieving this efficiently in
+3
+
+user workload
+
+TCP proxy
+HTTP proxy
+
+Latency
+overhead
+1×
+3×
+
+CPU
+Parsing share
+overhead
+(latency)
+1×
+3×
+
+<10%
+62–77%
+
+meshlib-enforcer
+Application Library
+
+Parsing share
+(CPU)
+
+eBPF
+
+Mode
+
+Service Mesh
+Data Plane
+
+<10%
+>60%
+cilium-agent
+Control Plane
+meshlib-connector
+
+node
+
+eBPF
+
+User Pod
+
+node
+
+eBPF
+
+Table 1. End-to-end latency overhead of Cilium under the
+transport-layer and Layer 7 enforcement modes, measured
+in our evaluation (Section 4.1).
+
+cilium-envoy
+
+k8s services
+
+Control Flow
+Network traffic
+
+CPU consumption by a comparable factor. A detailed breakdown attributes 62–77% of the latency increase and more
+than 60% of the additional CPU utilization to protocol parsing
+alone.
+These results are consistent with prior analyses of service mesh data planes. In particular, Zhu et al. [44] identify
+proxy-based protocol parsing as the dominant contributor
+to both latency and CPU overhead under Layer 7 enforcement. The consistency between our measurements and prior
+work strengthens the conclusion that protocol parsing is the
+primary source of service-mesh overhead and therefore the
+key target for optimization.
+Adoptability. The performance overhead of proxy-based
+enforcement has prompted several efforts to move policy
+decisions closer to the application. At the library level, ServiceRouter [30] embeds service mesh functionality directly
+into each service, eliminating the need for a proxy and achieving low latency and resource consumption. At the kernel
+level, recent work explores offloading Layer 7 processing
+into eBPF [32] or kernel modules to remove the user-space
+proxy from the data path altogether.
+These approaches fundamentally trade deployability for
+performance. Library-based designs require applications to
+be modified and recompiled against a shared runtime, while
+kernel-level solutions depend on custom kernel extensions
+deployed on every node. In practice, production environments are heterogeneous, often including legacy services,
+third-party containers, and workloads with limited developer
+control. In such settings, imposing invasive changes to either
+application code or the kernel is rarely feasible. As a result,
+operators default to proxy-based service meshes, accepting
+their performance overhead in exchange for deployability.
+This gap motivates an architecture that achieves applicationlevel performance without requiring universal adoption or
+infrastructure changes. Cilium provides a suitable foundation: its eBPF data plane handles transport-layer enforcement, and its existing Layer 7 Envoy proxy serves as a fallback for services that cannot be modified. Meshlib builds
+on this foundation, making application-level enforcement
+opt-in rather than mandatory, so that services adopt it incrementally without disrupting the rest of the deployment.
+
+node
+
+Figure 3. The architecture of Meshlib, integrated within a
+user-specified pod using the Meshlib-enforcer library, and
+the Meshlib-connector within Cilium’s control plane
+
+3
+
+Design
+
+We design Meshlib to bridge the gap between tightly coupled, high-performance service frameworks and broadly deployable but proxy-heavy service meshes. Meshlib targets
+deployments that require service-mesh security guarantees
+while avoiding the latency overhead of per-pod Layer 7 proxies. By shifting Layer-7 policy enforcement into an optional
+application-bound library, Meshlib eliminates redundant
+parsing and removes the proxy from the critical data path
+whenever possible. At the same time, by integrating with
+Cilium, Meshlib maintains compatibility with existing Kubernetes deployments and supports a graceful fallback to
+proxy-based enforcement for services that cannot be modified.
+In doing so, Meshlib provides a practical, deployable architecture that significantly reduces latency overhead while
+maintaining the security guarantees and operational assumptions expected from a service mesh. This combination of
+performance, deployability, and compatibility with existing
+service-mesh assumptions motivates a new design point that
+departs from traditional sidecar-based architectures.
+3.1
+
+Architecture
+
+Figure 3 illustrates the architecture of Meshlib and highlights the minimal changes required to remove Layer 7 proxies from the critical data path. Rather than replacing the
+service mesh, Meshlib introduces an application-bound enforcement component while reusing Cilium’s existing control and data planes.
+Meshlib is composed of two main components: (i) an
+application-bound library that performs policy enforcement
+at the application layer, and (ii) an extension to Cilium’s
+control plane that coordinates configuration and integration
+4
+
+3.2
+
+with the existing Cilium data plane. Together, these components extend Cilium’s service mesh architecture without
+modifying its core data-path behavior.
+3.1.1 Application Library. The application library (Meshlibenforcer) is embedded directly into microservices that opt
+in to low-latency, application-layer policy enforcement. It
+operates at the application layer (e.g., HTTP) and reuses the
+protocol parsing that is already performed by the application framework. By doing so, it avoids the redundant parsing
+and inter-process communication overhead introduced by
+traditional sidecar proxies.
+The library integrates with the receiving side of the communication, where it is attached to the HTTP server running
+inside the application container. All incoming requests are
+evaluated against the applicable security policies before being passed to the application logic. This ensures that only
+authorized and trusted traffic reaches the service while preserving the same trust assumptions and policy semantics as
+a traditional service mesh.
+To obtain the policies it enforces, the application library
+communicates with the Meshlib connector in Cilium’s control plane over a trusted channel. The received configuration
+includes the relevant application-layer policies and identity
+information required to evaluate incoming requests. Once
+initialized, the library enforces these policies locally within
+the application process.
+The application library is optional and non-intrusive. Services that do not include the Meshlib library remain unchanged and continue to rely on Cilium’s existing service
+mesh behavior.
+
+The Meshlib protocol coordinates policy enforcement state
+between an application-bound library and the local Cilium
+agent. Its design enforces the following invariant: Traffic is
+admitted to in-process enforcement only after the library has
+fully installed and acknowledged the current policy version;
+otherwise, enforcement remains on the proxy path.
+To enforce this invariant, the protocol provides two tightly
+coupled functions: policy distribution, which delivers authoritative Layer-7 access control state, and identity resolution, which maintains a consistent mapping between pod
+IP addresses and Cilium security identities. Both functions
+are multiplexed over a single persistent bidirectional gRPC
+stream, allowing policy updates and identity changes to be
+applied asynchronously without per-request control-plane
+overhead.
+3.2.1 Service Interface. Listing 2 defines the service. The
+library opens a single PolicyStream connection to the local
+Cilium agent on startup. The stream qualifier on both the
+request and response types declares a fully bidirectional
+channel: unlike a unary RPC, either side may send messages
+at any time without waiting for a reply. This allows the agent
+to push policy updates proactively and allows the library
+to send acknowledgments independently, with no coupling
+between the two directions. The stream remains open for
+the pod’s lifetime; all messages are multiplexed over it using
+oneof discriminators, so new message types can be added
+without breaking backwards compatibility.
+Listing 2. The PolicyEnforcer gRPC service. One persistent bidirectional stream carries all library→agent and
+agent→library messages.
+1
+2
+3
+4
+
+3.1.2 Control Plane Extension. Meshlib-connector is
+implemented as an extension to Cilium’s control plane. It retains authority over application-layer policy distribution and
+coordinates enforcement decisions with Meshlib-enabled
+services.
+This component integrates with Cilium’s existing policy
+and identity infrastructure. It determines which services
+are Meshlib-enabled and provides the corresponding policy
+configuration to their application libraries. For these services,
+the connector instructs Cilium to bypass its Layer 7 proxy for
+the relevant traffic flows, allowing requests to be delivered
+directly to the application. In contrast, Layer 3 and Layer 4
+enforcement remains handled by Cilium’s eBPF-based data
+plane.
+For services that do not embed Meshlib’s application library, Cilium continues to enforce policies using its standard
+mechanisms, including the Layer 7 proxy when required.
+This hybrid operation preserves backward compatibility
+while allowing Meshlib to be deployed incrementally, enabling sidecar-less enforcement only for services that explicitly opt in.
+
+The Meshlib Protocol
+
+service PolicyEnforcer {
+rpc PolicyStream(stream PolicyStreamRequest)
+returns (stream PolicyStreamResponse);
+}
+
+3.2.2 Library-to-Agent Messages. Library-to-agent messages signal enforcement readiness and confirm policy installation. They allow the Cilium agent to precisely control
+when traffic transitions away from the proxy path, preventing enforcement gaps during startup, updates, and teardown.
+The library emits three message types (Listing 3). Each
+message includes a port field identifying the application’s
+inbound TCP port (e.g., 8080 or 12340), distinct from the
+gRPC control channel. A single library instance may manage multiple ports by issuing separate messages per port:
+1 EnforceReady, which signals readiness to enforce policies on a port and allows Cilium to divert traffic from the
+Envoy proxy; 2 EnforceTerminate, which relinquishes
+enforcement so that Cilium restores the proxy path during
+graceful shutdown; and 3 EnforceAck, which acknowledges a specific policy version, confirming that it has been
+installed before traffic is admitted.
+5
+
+Listing 3. Library-to-agent request messages. Exactly one
+variant is set per frame.
+
+6
+7
+8
+9
+10
+11
+
+message PolicyStreamRequest {
+oneof request_type {
+InboundEnforceReadyMessage
+inbound_enforce_ready
+= 1;
+InboundEnforceTerminateMessage
+inbound_enforce_terminate = 2;
+InboundEnforceAckMessage
+inbound_enforce_ack
+= 3;
+}
+}
+message InboundEnforceReadyMessage
+{ uint32 port = 1; }
+message InboundEnforceTerminateMessage { uint32 port = 1; }
+message InboundEnforceAckMessage { uint32 port
+= 1;
+uint32 sequence = 2; }
+
+1
+2
+3
+4
+5
+6
+
+message PolicyStreamResponse {
+oneof response_type {
+InboundEnforceStateMessage inbound_enforce_state = 1;
+IPCacheUpdateMessage
+ipcache_update
+= 2;
+}
+}
+
+1
+2
+3
+4
+5
+
+Listing 5. Policy state message. should_enforce=false
+signals that Cilium has reclaimed enforcement.
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+
+Listing 4. Agent-to-library response messages.
+
+message InboundEnforceStateMessage {
+uint32
+port
+= 1;
+uint32
+sequence
+= 2;
+bool
+should_enforce = 3;
+repeated Policy policies
+= 4;
+message Policy {
+enum Type { DENY = 0; ALLOW = 1; }
+Type
+type
+= 1;
+repeated uint32
+endpoint_identities = 2;
+repeated HTTPRule http_rules
+= 3;
+message HTTPRule {
+optional string path
+= 1;
+optional string method = 2;
+optional string host
+= 3;
+repeated string headers = 4;
+}
+}
+}
+
+The endpoint_identities field contains a list of Cilium
+numeric security identities, where each identity is a uint32
+assigned by Cilium to a group of pods with identical Kubernetes labels. These identities remain consistent across
+pod restarts; although a pod’s IP address may change upon
+rescheduling, its identity remains unchanged. The library determines the identity of each incoming connection’s source
+IP by consulting the local IP cache before selecting the appropriate Policy entry.
+http_rules specifies a set of HTTPRule match conditions.
+A rule is satisfied when all specified fields match the request,
+while unspecified fields act as wildcards.
+Each HTTPRule can constrain multiple request attributes:
+path is a regular expression over the URI path, method denotes the HTTP verb (e.g., GET, POST), and host matches the
+Host header, which is useful when a service exposes multiple
+virtual hosts on the same port. The headers field defines a
+set of required headers in "Name: Value" format; all listed
+headers must be present for the rule to match.
+A Policy matches a request if the source identity appears in endpoint_identities and at least one HTTPRule
+in http_rules is satisfied. Thus, matching follows conjunction (AND) across fields within a rule and disjunction (OR)
+across rules within a policy. Listing 5 shows the complete
+message definition.
+Identity resolution (IPCacheUpdateMessage). Policies are
+expressed in terms of Cilium security identities rather than
+IP addresses. As a result, the library must resolve the source
+IP of each incoming connection to its corresponding identity
+before evaluating policies. This mapping is maintained by
+the agent, which streams IPCacheUpdateMessage updates
+to the library.
+The update mechanism supports both full and incremental synchronization. When should_clear is set, the library
+
+3.2.3 Agent-to-Library Messages. Agent-to-library messages carry the authoritative enforcement state. The agent
+emits exactly two message types. The InboundEnforceStateMessage conveys the policy rules, while the IPCacheUpdateMessage provides the IP-to-identity mapping required to determine which policy applies to each incoming connection.
+Decoupling policy state from identity updates avoids unnecessary policy re-evaluation: identity mappings change
+frequently as pods are created and removed, whereas policy rules are relatively stable. Listing 4 shows the response
+envelope.
+Policy state (InboundEnforceStateMessage). This message carries the authoritative policy state for an inbound
+port and is the only mechanism through which the agent
+installs or updates policies in the library.
+The fields of this message are as follows. port identifies
+the inbound port for which this policy state applies, matching
+the port registered by EnforceReady. sequence is a monotonically increasing version counter echoed in EnforceAck.
+should_enforce = false passes all traffic without inspection during policy transitions, without touching eBPF maps.
+Each Policy is scoped to Cilium numeric security identities
+(derived from pod labels, stable across restarts) and a list
+of HTTPRule matchers on path (regex), method, host, and
+headers; absent fields match any value.
+Each Policy entry specifies a type, which can be either
+ALLOW or DENY. An ALLOW entry authorizes matching requests
+to proceed to the application, while a DENY entry explicitly
+rejects matching requests and returns HTTP 403 prior to
+the invocation of application code. Explicit DENY entries are
+employed to define exceptions within broader ALLOW rules.
+6
+
+Listing 6. IPCacheUpdateMessage. should_clear=true
+triggers a full table replacement on initialisation.
+1
+2
+3
+4
+5
+6
+7
+8
+9
+
+Cilium agent
+
+Library
+PolicyStream()
+
+message IPCacheUpdateMessage {
+bool
+should_clear = 1;
+repeated IPUpsertEntry upsert_entries = 2;
+repeated IPDeleteEntry delete_entries = 3;
+}
+message IPUpsertEntry { IPType ip_type=1; bytes ip=2;
+uint32 identity=3; }
+message IPDeleteEntry { IPType ip_type=1; bytes ip=2; }
+enum IPType { IPV4 = 0; IPV6 = 1; }
+
+(1) open stream
+
+EnforceReady(port=8080)
+(2) register port
+
+IPCacheUpdate(clear=true, . . . )
+(3) seed IP cache
+
+EnforceState(seq=1, enforce=true, policies)
+(4) push policies
+
+discards its local cache and replaces it with the entries provided in upsert_entries. This occurs during initialization
+or after disruptive events such as agent restarts or node reconnections. During steady-state operation, should_clear
+is unset, and updates consist only of incremental changes
+conveyed through upsert_entries and delete_entries.
+upsert_entries introduce or update mappings from IP
+addresses to identities. Each IPUpsertEntry encodes the IP address in raw binary form (4 bytes for IPv4, 16 bytes for IPv6),
+avoiding string parsing overhead in this high-frequency path.
+The ip_type field distinguishes between IPV4 and IPV6, enabling support for dual-stack deployments. delete_entries
+remove stale mappings when pods terminate or are rescheduled.
+At enforcement time, the library performs a lookup on the
+source IP of each accepted connection. If a mapping is found,
+the corresponding identity is used for policy evaluation. If
+no mapping exists, for example, during the brief window
+before an update is received, the connection is treated as
+originating from an unknown identity. Such requests match
+no ALLOW policy and are therefore denied by default.
+
+EnforceAck(seq=1)
+(5) acknowledge
+
+← steady state: library enforces in-process →
+EnforceState(seq=2, enforce=true, policies’)
+(6) policy update
+
+EnforceAck(seq=2)
+(7) acknowledge
+
+IPCacheUpdate(upsert: 10.0.1.5→id=42)
+(8) new pod
+
+EnforceTerminate(port=8080)
+(9) teardown
+
+Figure 4. Protocol lifecycle for one inbound port. The library opens a persistent stream (1), registers the port (2),
+and receives the initial IP cache (3) and policy set (4). It acknowledges to activate enforcement (5). Policy changes (6–7)
+and IP cache deltas (8) arrive on the same stream. On teardown (9), Cilium reinstates the Envoy proxy for that port,
+ensuring continuous enforcement.
+
+3.2.4 Protocol Lifecycle. Figure 4 illustrates the protocol
+lifecycle for a single inbound port. Enforcement is enabled
+only after the library acknowledges receipt of the initial
+policy state. Subsequent policy updates and identity changes
+are delivered asynchronously on the same stream, while
+acknowledgements ensure that each update is fully installed
+before it becomes effective.
+
+3.2.6 Design Rationale. The protocol design reflects four
+goals: minimizing control-plane overhead, preserving policy
+correctness during updates, supporting incremental deployment, and aligning with Cilium’s identity model.
+1 Single persistent stream. Each pod establishes one longlived gRPC stream that is opened once and reused throughout
+its lifetime. This design eliminates per-request connection
+setup overhead and enables Cilium to deliver policy updates
+asynchronously, avoiding the need for polling by the library.
+2 Identity-based policy scoping. Policies are expressed
+in terms of Cilium security identities rather than IP addresses.
+Because these identities are derived from stable pod labels,
+they remain unchanged across pod restarts and rescheduling
+events, eliminating the need to regenerate policies whenever
+pod IPs change. At runtime, the IPCacheUpdateMessage
+dynamically resolves the mapping between stable identities
+and ephemeral IP addresses.
+3 Sequence numbers and acknowledgements. Sequence
+numbers, combined with EnforceAck, provide a lightweight
+mechanism for confirmed policy delivery and are the basis
+for enforcing the protocol’s no-gap enforcement invariant.
+
+3.2.5 Concrete Example. Listing 7 shows a concrete InboundEnforceStateMessage for ts-auth-service from TrainTicket
+benchmark [43]. The agent enforces two ALLOW policies
+on port 12340: the gateway service (identity 1234) may call
+five endpoints; the user service (identity 5678) may call only
+the authentication endpoint. All other requests are implicitly
+denied.
+On receipt, the library sends EnforceAck(seq=1). Each
+subsequent request on port 12340 is evaluated in-process:
+the library resolves the source IP to a Cilium identity via
+the local cache, selects the matching Policy, and checks
+the http_rules against the already-parsed HTTP request
+object. Matching ALLOW rules proceed to the application; all
+others return HTTP 403 before application code is invoked.
+7
+
+3.3.1 Control Plane Extension. The Meshlib control
+plane extension is implemented as an add-on to the Cilium
+agent running on each Kubernetes node. Its primary role
+is to retain enforcement authority while coordinating policy distribution and state transitions with Meshlib-enabled
+applications.
+The extension exposes a local control endpoint that application libraries use to receive policy and identity updates.
+Communication is implemented using gRPC, which provides
+a language-neutral interface and supports efficient, longlived bidirectional streams–an important property given the
+need to asynchronously deliver policy updates to heterogeneous applications.
+The control plane uses a push-based model in which policy
+and identity updates are delivered asynchronously to Meshlib-enabled services. This design reuses Cilium’s existing
+policy and identity computation, allowing policy semantics
+and enforcement authority to remain unchanged while shifting only the enforcement location.
+
+Listing 7. Concrete InboundEnforceStateMessage for
+ts-auth-service (port 12340, seq 1). Two ALLOW policies
+are installed; requests from any identity not listed in either
+policy are denied by default.
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+
+InboundEnforceStateMessage {
+port=12340 sequence=1 should_enforce=true
+policies=[
+Policy {
+// ts-gateway-service
+type=ALLOW endpoint_identities=[1234]
+http_rules=[
+HTTPRule{method="GET",
+path="/api/v1/users/hello.*"},
+HTTPRule{method="POST",
+path="/api/v1/users/login.*"},
+HTTPRule{method="DELETE", path="/api/v1/users/.*"},
+HTTPRule{method="GET",
+path="/api/v1/auth/hello.*"},
+HTTPRule{method="POST", path="/api/v1/auth/.*"},
+]
+},
+Policy {
+// ts-user-service
+type=ALLOW endpoint_identities=[5678]
+http_rules=[
+HTTPRule{method="POST", path="/api/v1/auth/.*"},
+]
+}
+]
+}
+
+3.3.2 Application Library. The application library is embedded directly within microservices and is responsible for
+enforcing Layer 7 authorization decisions in process. For the
+prototype, we implement the library in Java and integrate
+it with Spring Boot, which is also used by the benchmark
+applications.
+Within Spring Boot, the library is implemented as an
+HTTP request filter that intercepts incoming requests before application logic is invoked. This placement allows the
+library to reuse protocol parsing performed by the framework, avoiding redundant parsing and data copies. For each
+incoming request, the library evaluates the request against
+the current policy using request metadata and the authenticated source identity. Unauthorized requests are rejected
+with HTTP 403 before application code executes, while authorized requests proceed unchanged.
+From an integration perspective, the interaction between
+the application library and Cilium is minimized. Cilium continues to handle service discovery, routing, and transportlayer enforcement, while the application library performs
+only Layer 7 authorization using already-parsed request context. This separation ensures that Meshlib does not interfere
+with Cilium’s core networking responsibilities, allows services without the library to coexist seamlessly with Meshlib-enabled services and easily implemented with other languages or frameworks.
+Maintaining a control channel between each Meshlibenabled application and the Cilium agent introduces additional control-plane complexity and creates a dependency on
+policy availability. This dependency, however, is explicitly
+non-blocking. If the control channel cannot be established
+or is temporarily unavailable, Cilium continues to enforce
+policies via its existing Layer 7 proxy path. Once the channel
+is established, enforcement can transition to the application
+
+Cilium activates a newly installed policy only after receiving the corresponding acknowledgement from the library,
+ensuring that traffic is never processed under an outdated
+policy version and preventing race conditions during policy
+updates.
+4 should_enforce flag. The should_enforce flag provides
+a clean handoff signal: when set to false, it informs the
+library that Cilium has reclaimed enforcement responsibility
+because the library is shutting down, the agent connection is
+being torn down, or the applicable policies no longer require
+application-level enforcement.
+3.3
+
+Proof of Concept
+
+We implement a prototype of Meshlib to validate the feasibility of sidecar-less, application-bound Layer 7 policy enforcement and to evaluate its practical performance implications.
+Rather than targeting production completeness, the prototype is designed to exercise the core architectural decisions
+of Meshlib and to demonstrate that in-process enforcement
+can be integrated with an existing service mesh without
+weakening security guarantees.
+The prototype consists of two components: (i) an extension to the Cilium control plane, and (ii) an applicationbound library embedded within selected microservices. Together, these components implement a hybrid enforcement
+model in which Cilium retains responsibility for lower-layer
+networking and identity management, while application services perform request-level authorization locally.
+8
+
+library at runtime, after which Cilium reconfigures the data
+plane to bypass the proxy.
+
+4
+
+non-trivial inter-service communication paths, making them
+suitable for evaluating service-mesh overhead under realistic
+application behavior.
+Unless otherwise stated, wrk2 is configured with 4 worker
+threads and 16 concurrent connections. We progressively
+vary the offered load from 20 to 200 requests per second
+(RPS) to evaluate both steady-state and near-saturation behavior, following common methodology in microservice and
+datacenter performance evaluations [14].
+
+Performance Evaluation
+
+We evaluate Meshlib to quantify the cost of in-process
+Layer 7 enforcement and to compare its performance against
+representative service mesh architectures. Our evaluation
+focuses on three questions:
+1. How does Meshlib affect end-to-end request latency?
+2. What overhead does Meshlib introduce relative to
+proxy-based service meshes?
+3. How does eliminating the Layer 7 proxy affect CPU
+and memory consumption?
+Experimental setup. All experiments were conducted on a
+dedicated Kubernetes node equipped with an AMD Ryzen 7 7700
+processor (8 cores), 64 GB RAM, and K3S [34], a lightweight
+Kubernetes distribution fully compatible with upstream Kubernetes.
+To isolate the overhead introduced by service-mesh enforcement, all application components were deployed on a
+single node. This configuration eliminates inter-node network variability, allowing observed performance differences
+to be attributed directly to the service mesh data plane and
+policy-enforcement mechanisms rather than to physical network effects. The workload, hardware configuration, and
+deployment topology remain identical across all evaluated
+systems.
+Benchmark application. We use the TrainTicket benchmark [43], a widely used microservice application representative of cloud-native deployments. TrainTicket consists of
+dozens of interacting services and multiple backing databases
+connected through HTTP-based APIs, creating a environment for evaluating service-mesh behavior under fine-grained
+inter-service communication. The application has been adopted
+extensively in prior systems research as a representative
+benchmark for microservice architectures and cloud-native
+runtime evaluation.
+Most TrainTicket services are implemented in Java using Spring Boot, which enables direct integration with the
+Meshlib library while preserving the application’s original
+communication patterns and deployment structure.
+Service mesh configurations. In total, four different service mesh configurations will be tested: Cilium with Meshlib,
+Cilium unmodified, Istio, and Linkerd. For all four configurations, the same set of security policies will be enforced, with
+equivalent versions created across the various configuration
+structures used by the different service meshes. All service
+meshes are deployed to the K3S node with standard options.
+Workload. We use wrk2 [35] to generate a closed-loop workload against the TrainTicket application. The workload consists of representative user-facing operations, including login, trip availability queries, and ticket reservation requests.
+These operations exercise multiple microservices and trigger
+9
+
+Policies. To ensure a fair comparison, all evaluated service
+mesh configurations enforce semantically equivalent security policies. Although each mesh uses a different policy
+language and runtime representation, all configurations implement the same endpoint-level access-control semantics.
+Policies were derived from the TrainTicket application’s
+observed service dependencies. For each service-to-service
+interaction, we generated a least-privilege policy that permits access only to the HTTP endpoints required for correct
+operation while denying all other requests. This methodology reflects realistic deployment practices in production
+service meshes and directly exercises Layer 7 enforcement
+functionality.
+In total, the evaluation enforces 126 distinct policies across
+37 services, corresponding to an average of 3.4 policies per
+service. Each policy governs a specific source–destination
+service pair and restricts access to a subset of the destination
+service’s HTTP endpoints.
+Metrics. We evaluate the performance of Meshlib in three
+dimensions that directly reflect the cost and effectiveness of
+its execution policy: (i) end-to-end request latency, which
+captures the cumulative effect of enforcement along the critical path of microservices; (ii) request overhead, which isolates the communication and policy enforcement costs introduced by the execution model Meshlib; and (iii) resource
+consumption, which quantifies the steady-state cost of enforcing the policy at scale.
+4.1
+
+End-to-end latency
+
+End-to-end latency directly determines user-perceived performance in microservice applications. It captures not only
+the processing time of the entry-point service, but also the
+cumulative latency of all inter-service communication along
+the request path. Because Meshlib enforces policies on every
+inter-service interaction, any per-hop overhead is amplified
+along the critical path.
+We report mean, 95th-percentile, and 99th-percentile latency, since tail latency dominates perceived response time
+in multi-hop microservice call paths [12]. Measuring tail latency, therefore, allows us to assess how Meshlib affects
+worst-case request behavior under realistic execution conditions.
+Figure 6 shows the mean, 95th-, and 99th-percentile endto-end latency for all four configurations. Meshlib achieves
+
+600
+400
+Cilium Meshlib
+Cilium
+Linkerd
+Istio
+
+200
+0
+
+0
+
+20
+
+40 60 80 100 120 140 160 180 200
+Requests per Second (RPS)
+
+(a) 99%-percentile (ms)
+
+800
+sat.
+
+600
+400
+Cilium Meshlib
+Cilium
+Linkerd
+Istio
+
+200
+0
+
+0
+
+20
+
+40 60 80 100 120 140 160 180 200
+Requests per Second (RPS)
+
+Mean Latency (ms)
+
+800
+sat.
+
+95th Pct. Latency (ms)
+
+99th Pct. Latency (ms)
+
+800
+
+sat.
+
+600
+400
+Cilium Meshlib
+Cilium
+Linkerd
+Istio
+
+200
+0
+
+0
+
+20
+
+40 60 80 100 120 140 160 180 200
+Requests per Second (RPS)
+
+(b) 95%-percentile (ms)
+
+(c) Mean (ms)
+
+Figure 5. End-to-end latency of requests to benchmark application for the tested service meshes. The vertical dashed line
+marks the saturation point at 100 RPS.
+the lowest latency across all three metrics, outperforming
+Istio, Linkerd, and unmodified Cilium. This outcome is consistent with Meshlib’s design goal of eliminating the Layer 7
+proxy from the critical request path. Both Meshlib and unmodified Cilium outperform Istio and Linkerd; Cilium’s eBPF
+data plane handles traffic directly in the kernel, avoiding the
+per-request overhead of a sidecar proxy. The mean latency
+(Figure 6c) shows a smaller gap between Meshlib and unmodified Cilium than the 99th percentile (Figure 6a), suggesting that Meshlib’s benefit is most pronounced under
+tail conditions.
+Both Cilium with Meshlib and unmodified Cilium consistently outperform Istio and Linkerd. This difference reflects their use of eBPF-based packet processing in the kernel,
+which avoids the per-hop overhead introduced by sidecar
+proxies. Across all configurations, the 99th-percentile latency
+rises sharply beyond 100 RPS, consistent with database saturation in the TrainTicket benchmark at high load [43].
+4.2
+
+Despite this, Meshlib does not introduce additional overhead relative to existing service meshes and consistently
+outperforms unmodified Cilium. However, the absence of a
+clear trend across all loads suggests that this metric is less stable than end-to-end latency for distinguishing performance
+differences.
+4.3
+
+Resource consumption
+
+We also analyze CPU and memory consumption to quantify
+the resource cost of enforcing Meshlib’s execution policy.
+While latency reflects user experience, resource consumption determines the system’s efficiency and scalability. Increased CPU or memory usage directly translates into higher
+deployment costs, particularly in large-scale microservice
+deployments.
+We measure per-service CPU and memory consumption
+across different configurations to assess how policy enforcement overhead scales with system load and application complexity. These measurements allow us to evaluate the tradeoff between the security and isolation guarantees provided
+by Meshlib and the operational cost of enforcing them.
+CPU usage. Figure 7a presents the average CPU usage measured during the benchmark runs. Cilium with Meshlib
+and standard Cilium exhibit the lowest CPU usage during
+low-load scenarios, outperforming non-eBPF-based service
+meshes. However, during high-load scenarios, this difference
+becomes much smaller, and Cilium’s CPU usage exceeds that
+of the other service meshes. This could be caused by inefficiencies in the Envoy proxy Cilium uses to parse Layer-7
+traffic.
+Memory usage. Figure 7b shows the average memory consumption for each service mesh. The results indicate that
+memory usage differences between the four service mesh
+configurations are relatively small, with variations on the
+order of a few hundred megabytes out of a total usage of
+approximately 27 GB.
+Cilium with Meshlib has the highest memory consumption among the service meshes tested. This is likely due to
+the specific benchmark application, TrainTicket, where the
+
+Request overhead
+
+To isolate the cost of policy enforcement and control-plane
+communication, we measure request overhead as the difference between the total client-observed round-trip time and
+the server-side processing time recorded at the application
+boundary by the Spring Boot request filter:
+𝑡 overhead = 𝑡 client − 𝑡 server .
+Here, 𝑡 client denotes the elapsed time from issuing the request to receiving the response, while 𝑡 server excludes network traversal, routing, and policy enforcement. Therefore,
+their difference precisely quantifies the overhead that Meshlib introduces to the data path.
+Figure 6 presents the mean, 95th, and 99th percentiles of
+request overhead across configurations. Compared to end-toend latency, overhead measurements exhibit higher variance
+across request rates. This variability arises from runtime
+effects such as JVM scheduling and the subtraction-based
+measurement method, which amplifies noise.
+10
+
+20
+Linkerd
+spike
+
+10
+0
+
+20
+40
+60
+Requests per Second (RPS)
+
+80
+
+(a) 99%-percentile (ms)
+
+3
+
+2
+
+1
+
+0
+
+Cilium Meshlib
+Cilium
+Linkerd
+Istio
+
+20
+40
+60
+Requests per Second (RPS)
+
+80
+
+Mean Overhead (ms)
+
+Cilium Meshlib
+Cilium
+Linkerd
+Istio
+
+95th Pct. Overhead (ms)
+
+99th Pct. Overhead (ms)
+
+30
+
+1.5
+1.0
+Cilium Meshlib
+Cilium
+Linkerd
+Istio
+
+0.5
+0.0
+
+(b) 95%-percentile (ms)
+
+20
+40
+60
+Requests per Second (RPS)
+
+80
+
+(c) Mean (ms)
+
+40
+
+Cilium Meshlib
+Cilium
+Linkerd
+Istio
+
+30
+20
+10
+0
+
+0
+
+20 40 60 80 100 120 140 160 180 200
+Requests per Second (RPS)
+
+(a) CPU usage (%)
+
+Average Memory Usage (GB)
+
+Average CPU Usage (%)
+
+Figure 6. Request overhead for benchmark application running on the tested service meshes
+27.75
+
+latency while remaining compatible with existing service
+mesh infrastructure.
+Third, the experimental results show that these modifications do not degrade the service mesh’s functional guarantees. Meshlib enforces the same set of security policies as
+the other evaluated meshes and remains interoperable with
+services that do not adopt the application library, thereby
+preserving deployment flexibility and incremental adoptability.
+Finally, the resource consumption analysis indicates that
+the proposed approach does not introduce prohibitive operational costs. CPU usage is comparable to or lower than that
+of traditional service meshes under most load conditions,
+and memory overhead remains modest relative to the total
+application footprint. Together, these findings demonstrate
+that Meshlib answers the central research question by reducing service mesh latency overhead while maintaining
+security policy enforcement functionality and acceptable
+resource efficiency.
+
+27.50
+27.25
+27.00
+Cilium Meshlib
+Cilium
+Linkerd
+Istio
+
+26.75
+26.50
+0
+
+20 40 60 80 100 120 140 160 180 200
+Requests per Second (RPS)
+
+(b) Memory usage in GB
+
+Figure 7. Resource consumption of the benchmark application for the tested service meshes
+
+application library for Meshlib had to be implemented in
+Java, a memory-intensive programming language.
+Given the scale of the overall memory footprint, these differences are unlikely to be significant in practice. Observed
+differences are small relative to the overall application footprint and are unlikely to materially affect deployment decisions.
+4.4
+
+5
+
+Evaluation Summary
+
+The performance evaluation presented in this section provides empirical evidence to answer the research question.
+First, the results confirm that the primary source of latency
+overhead in traditional service meshes originates from Layer
+7 proxy-based processing. As shown by end-to-end latency
+measurements, configurations that rely on sidecar proxies,
+such as Istio and Linkerd, consistently exhibit higher latency
+than proxy-less approaches. This validates the earlier analysis that redundant parsing, inter-process communication,
+and additional network hops introduced by proxies significantly contribute to overall latency.
+Second, the evaluation shows that architectural modifications to remove the Layer 7 proxy from the critical request path are effective at reducing this overhead. By shifting
+application-layer policy enforcement into the application itself and relying on Cilium’s eBPF-based data plane for lowerlayer enforcement, Meshlib achieves the lowest end-to-end
+latency among the evaluated configurations. This confirms
+that the proposed hybrid architecture successfully reduces
+
+Related Work
+
+Prior work on service mesh design clusters into four architectural families that differ in where Layer 7 processing
+executes; Table 2 summarizes their trade-offs.
+Sidecar-based meshes. Istio and Linkerd deploy a proxy
+alongside each application instance, intercepting all traffic
+without requiring code changes [2, 4]. This provides strong
+isolation and high configurability, but each request traverses
+an additional user-space proxy, incurring context switches,
+data copies, and redundant protocol parsing [44]. These costs
+scale with deployment size, as every service instance requires
+a dedicated sidecar, and are amplified in high-fan-out call
+graphs where requests traverse multiple proxies on a single
+path.
+Node- and kernel-level approaches. Cilium moves transportand network-layer enforcement into the kernel via eBPF,
+eliminating per-pod proxies for L3/L4 policies [1]. For Layer 7
+enforcement, however, it falls back to a node-level Envoy
+proxy, reintroducing parsing overhead. More aggressive approaches offload L7 logic entirely into the kernel [32], but
+11
+
+Table 2. Comparison of representative service mesh architectures. L7 denotes the Layer 7 processing location. Code
+indicates whether applications require source-code modifications. Plat. denotes tight platform or kernel integration.
+Latency (Lat.), resource usage (Res.), and flexibility (Flex.)
+are qualitative relative to a no-mesh baseline. L/M/H denote
+low, moderate, and high overhead; M-H denotes moderateto-high overhead.
+System
+
+L7
+
+Code Plat. Lat. Res. Flex.
+
+Istio
+Side.
+Linkerd
+Side.
+Cilium
+–
+Cilium+Envoy
+Node
+ServiceRouter [30] App
+mRPC [7]
+Shared
+CanalMesh [33]
+Cent.
+KernelOffload [32] Kernel
+
+✓
+✓
+✓
+✓
+×
+×
+✓
+✓
+
+×
+×
+×
+×
+×
+✓
+×
+✓
+
+H
+H
+H
+M-H M-H M
+L
+L
+L
+M
+L
+H
+L
+L
+H
+L
+L
+L
+M-H L M-H
+L
+L
+M
+
+Meshlib
+
+✓
+
+×
+
+L
+
+App
+
+than inherent to the design, as the gRPC control protocol
+and enforcement architecture are language-agnostic. Developing libraries for Go and Python, which are the two most
+prevalent runtimes in production Kubernetes deployments,
+represents a concrete near-term extension.
+Trust model. In-process enforcement places policy evaluation inside the application process. A compromised application could, in principle, bypass the library’s checks. This
+is a weaker isolation boundary than a sidecar, which enforces policies in a separate process. We note, however, that
+Cilium’s eBPF data plane continues to enforce transportlayer identity independently of the library: a compromised
+application cannot forge its Cilium security identity or communicate with services it is not permitted to reach at Layer 4.
+The library adds endpoint-level granularity on top of this
+baseline; it does not replace it.
+HTTP evaluation only. Meshlib supports both HTTP and
+gRPC enforcement, but our evaluation covers HTTP workloads only. gRPC uses protobuf encoding, which has different
+parsing characteristics from JSON-over-HTTP, and the latency benefit of eliminating redundant parsing may differ.
+Benchmarking gRPC workloads is left for future work.
+The current evaluation utilizes the TrainTicket benchmark [43], which is the standard workload for service mesh
+research, but it saturates at approximately 100 RPS due to
+database contention. Future evaluations should include workloads with higher throughput ceilings and varied service callgraph structures. Policy evaluation is also limited to path
+and method matching; the performance of header-based and
+regex-heavy policies has not been characterized.
+
+L
+
+H
+
+are constrained by eBPF’s verifier restrictions and have not
+demonstrated the full range of service mesh functionality.
+Application-integrated designs. ServiceRouter [30] and
+mRPC [7] avoid redundant parsing by operating directly
+on application data structures, achieving low latency and
+resource consumption. However, they require every service
+to be modified or recompiled against a proprietary runtime,
+which limits deployability in heterogeneous clusters and
+precludes incremental adoption.
+Centralized proxies. Canal Mesh [33] amortizes proxy
+costs across services by centralizing enforcement into a
+shared layer, reducing per-instance resource overhead at
+the cost of additional network hops and weaker per-service
+isolation guarantees.
+
+6
+
+7
+
+Conclusion
+
+This work demonstrates that service mesh latency can be significantly reduced by relocating layer-7 policy enforcement
+from external proxies to applications. We showed that redundant parsing and user-kernel space transitions in traditional
+proxies are the primary contributors to latency. Meshlib, our
+hybrid architecture, combines application-integrated policy
+enforcement with an eBPF-based data plane. By leveraging
+existing application-level parsing, it eliminates redundant
+protocol interpretation. Results show lower 99th-percentile
+latency compared to Istio, Linkerd, and proxy-based Cilium, with particularly significant improvements in multimicroservice deployments. The resource consumption of
+Meshlib remains competitive, with comparable CPU usage and negligible memory overhead. We showed that finegrained security enforcement can be application-integrated
+rather than proxy-centralized, achieving better performance
+without sacrificing deployability or requiring invasive infrastructure changes.
+
+Limitations and Future Work
+
+Single-node evaluation. The evaluation is conducted on a
+single node to isolate enforcement overhead from inter-node
+network variability. In production environments, deployments typically span multiple nodes, where factors such as
+cross-rack latency, control-plane scaling under pod churn,
+and identity-cache update frequency may influence absolute
+latency values. Nevertheless, Meshlib’s overhead represents
+a per-request enforcement cost that remains independent of
+network topology. Inter-node latency would be added across
+all configurations and would not alter the relative ordering
+of results. Extending the evaluation to a multi-node cluster
+constitutes a primary direction for future research.
+Java/Spring Boot library only. The current Meshlib library is implemented exclusively for Java/Spring Boot. Services developed in Go, Python, Rust, or other runtimes are
+unable to utilize the library and instead default to Cilium’s
+Envoy proxy. This limitation is engineering-related rather
+
+References
+[1] 2026. Cilium - Cloud Native, eBPF-based Networking, Observability,
+and Security. https://cilium.io/get-started/
+12
+
+[2] 2026. Enterprise power without enterprise complexity. https://linkerd.
+io/
+[3] 2026. Production-Grade Container Orchestration. https://kubernetes.
+io/docs/reference/glossary/
+[4] 2026. Service Mesh. Simplified. Easily build cloud native workloads
+securely and reliably with Istio, with or without sidecars. https:
+//istio.io/
+[5] Priyanka Billawa, Anusha Bambhore Tukaram, Nicolás E. Díaz Ferreyra, Jan-Philipp Steghöfer, Riccardo Scandariato, and Georg
+Simhandl. 2022. SoK: Security of Microservice Applications: A Practitioners’ Perspective on Challenges and Best Practices. In Proceedings of the 17th International Conference on Availability, Reliability and Security (Vienna, Austria) (ARES ’22). Article 9, 10 pages.
+doi:10.1145/3538969.3538986
+[6] Jingrong Chen, Yongji Wu, Shihan Lin, Yechen Xu, Xinhao Kong,
+Thomas Anderson, Matthew Lentz, Xiaowei Yang, and Danyang Zhuo.
+2023. Remote Procedure Call as a Managed System Service. In 20th
+USENIX Symposium on Networked Systems Design and Implementation
+(NSDI 23). 141–159.
+[7] Jingrong Chen, Yongji Wu, Shihan Lin, Yechen Xu, Xinhao Kong,
+Thomas Anderson, Matthew Lentz, Xiaowei Yang, and Danyang Zhuo.
+2023. Remote Procedure Call as a Managed System Service. (April
+2023), 141–159.
+[8] Cilium Authors. 2026. Cilium Security and Policy Enforcement. https:
+//docs.cilium.io/en/stable/security/.
+[9] Cilium Contributors. 2025. Cilium Annual Report 2025. Technical
+Report. Cloud Native Computing Foundation. https://www.cncf.io/wpcontent/uploads/2025/12/cilium-annual-report-2025-final.pdf
+[10] Cloud Native Computing Foundation. 2024. Cilium Project Journey
+Report. Technical Report. Cloud Native Computing Foundation. https:
+//www.cncf.io/reports/cilium-project-journey-report/
+[11] Cloud Service Mesh. Accessed, April 2026. Evolution of Microservices
+- Craft Conference. https://docs.cloud.google.com/service-mesh/docs/
+security/anthos-service-mesh-security-best-practices.
+[12] Jeffrey Dean and Luiz André Barroso. 2013. The tail at scale. Commun.
+ACM 56, 2 (Feb. 2013), 74–80. doi:10.1145/2408776.2408794
+[13] Yu Gan, Yanqi Zhang, Dailun Cheng, Ankitha Shetty, Priyal Rathi,
+Nayan Katarki, Ariana Bruno, Justin Hu, Brian Ritchken, Brendon
+Jackson, Kelvin Hu, Meghna Pancholi, Yuan He, Brett Clancy, Chris
+Colen, Fukang Wen, Catherine Leung, Siyuan Wang, Leon Zaruvinsky,
+Mateo Espinosa, Rick Lin, Zhongling Liu, Jake Padilla, and Christina
+Delimitrou. 2019. An Open-Source Benchmark Suite for Microservices
+and Their Hardware-Software Implications for Cloud & Edge Systems.
+In Proceedings of the Twenty-Fourth International Conference on Architectural Support for Programming Languages and Operating Systems.
+ACM, Providence RI USA, 3–18. doi:10.1145/3297858.3304013
+[14] Yu Gan, Yanqi Zhang, Dailun Cheng, Ankitha Shetty, Priyal Rathi,
+Nayan Katarki, Ariana Bruno, Justin Hu, Brian Ritchken, Brendon
+Jackson, Kelvin Hu, Meghna Pancholi, Yuan He, Brett Clancy, Chris
+Colen, Fukang Wen, Catherine Leung, Siyuan Wang, Leon Zaruvinsky,
+Mateo Espinosa, Rick Lin, Zhongling Liu, Jake Padilla, and Christina
+Delimitrou. 2019. An Open-Source Benchmark Suite for Microservices
+and Their Hardware-Software Implications for Cloud & Edge Systems.
+In Proceedings of the Twenty-Fourth International Conference on Architectural Support for Programming Languages and Operating Systems
+(Providence, RI, USA) (ASPLOS ’19). 3–18. doi:10.1145/3297858.3304013
+[15] Mrittika Ganguli, Sunku Ranganath, Subhiksha Ravisundar, Abhirupa
+Layek, Dakshina Ilangovan, and Edwin Verplanke. 2021. Challenges
+and Opportunities in Performance Benchmarking of Service Mesh for
+the Edge. In 2021 IEEE International Conference on Edge Computing
+(EDGE). 78–85. doi:10.1109/EDGE53862.2021.00020
+[16] Google Cloud. 2025. Cloud Service Mesh Security Best Practices. https://docs.cloud.google.com/service-mesh/docs/security/
+anthos-service-mesh-security-best-practices. Accessed: 2026-05-01.
+
+[17] Karuna Grewal, Brighten Godfrey, and Justin Hsu. 2025. SafeTree:
+Expressive Tree Policies for Microservices. Proc. ACM Program. Lang.
+9, OOPSLA2, Article 349 (Oct. 2025), 27 pages. doi:10.1145/3763127
+[18] Karuna Grewal, P. Brighten Godfrey, and Justin Hsu. 2023. Expressive
+Policies For Microservice Networks. In Proceedings of the 22nd ACM
+Workshop on Hot Topics in Networks (HotNets ’23). 280–286. doi:10.
+1145/3626111.3628181
+[19] Istio Authors. 2024. Istio Security Architecture. https://istio.io/latest/
+docs/concepts/security/.
+[20] Kubernetes. Accessed, April 2026. Using RBAC Authorization. https:
+//kubernetes.io/docs/reference/access-authn-authz/rbac/.
+[21] Neeraj Kumar, Pol Mauri Ruiz, Vijay Menon, Igor Kabiljo, Mayank
+Pundir, Andrew Newell, Daniel Lee, Liyuan Wang, and Chunqiang
+Tang. 2024. Optimizing Resource Allocation in Hyperscale Datacenters:
+Scalability, Usability, and Experiences. In 18th USENIX Symposium on
+Operating Systems Design and Implementation (OSDI 24). Santa Clara,
+CA, 507–528.
+[22] Wubin Li, Yves Lemieux, Jing Gao, Zhuofeng Zhao, and Yanbo Han.
+2019. Service Mesh: Challenges, State of the Art, and Future Research Opportunities. In 2019 IEEE International Conference on ServiceOriented System Engineering (SOSE). 122–1225. doi:10.1109/SOSE.2019.
+00026
+[23] Xing Li, Yan Chen, Zhiqiang Lin, Xiao Wang, and Jim Hao Chen. 2021.
+Automatic policy generation for {Inter-Service} access control of
+microservices. In 30th USENIX Security Symposium (USENIX Security
+21). 3971–3988.
+[24] Fengyu Liu, Yuan Zhang, Tian Chen, Youkun Shi, Guangliang Yang,
+Zihan Lin, Min Yang, Junyao He, and Qi Li. 2025. Detecting Taint-Style
+Vulnerabilities in Microservice-Structured Web Applications. In 2025
+IEEE Symposium on Security and Privacy (SP). 972–990. doi:10.1109/
+SP61157.2025.00137
+[25] Olivier Michaelis, Stefan Schmid, and Habib Mostafaei. 2024. L3:
+Latency-aware Load Balancing in Multi-Cluster Service Mesh. In Proceedings of the 25th International Middleware Conference (Hong Kong,
+Hong Kong) (Middleware ’24). 49–61. doi:10.1145/3652892.3654793
+[26] Francesco Minna, Agathe Blaise, Filippo Rebecchi, Balakrishnan Chandrasekaran, and Fabio Massacci. 2021. Understanding the security
+implications of kubernetes networking. IEEE Security & Privacy 19, 5
+(2021), 46–56.
+[27] National Cyber Security Centre. 2025. Preventing Lateral Movement.
+https://www.npsa.gov.uk/security-best-practices/build-itsecure/network-connected-security-technologies-ncst-guidance.
+[28] Aashutosh Poudel, Pankaj Niroula, Collin MacDonald, Lily Gloudemans, and Stephen Herwig. 2025. Mazu: A Zero Trust Architecture
+for Service Mesh Control Planes. In Proceedings of the 18th European
+Workshop on Systems Security (EuroSec’25). 49–55. doi:10.1145/3722041.
+3723100
+[29] Liz Rice. 2023. Learning eBPF: programming the linux kernel for
+enhanced observability, networking, and security (first edition ed.).
+O’Reilly, Beijing Boston Farnham Sebastopol Tokyo.
+[30] Harshit Saokar, Soteris Demetriou, Nick Magerko, Max Kontorovich,
+Josh Kirstein, Margot Leibold, Dimitrios Skarlatos, Hitesh Khandelwal,
+and Chunqiang Tang. 2023. ServiceRouter: Hyperscale and Minimal
+Cost Service Mesh at Meta. In 17th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI 23). Boston, MA, 969–985.
+[31] Divyanshu Saxena, William Zhang, Madhav Tummala, Saksham Goel,
+and Aditya Akella. 2023. Invited Paper: Towards Efficient Microservice Communication. In Proceedings of the 5th workshop on Advanced
+tools, programming languages, and PLatforms for Implementing and
+Evaluating algorithms for Distributed systems. ACM, Orlando FL USA,
+1–5. doi:10.1145/3584684.3597267
+[32] Giulio Sidoretti, Sebastiano Miano, Stefano Salsano, Gianni Antichi,
+and Aurojit Panda. 2023. Application layer processing offload in
+the kernel. https://2023.eurosys.org/docs/posters/eurosys23postersfinal39.pdf.
+13
+
+[33] Enge Song, Yang Song, Chengyun Lu, Tian Pan, Shaokai Zhang,
+Jianyuan Lu, Jiangu Zhao, Xining Wang, Xiaomin Wu, Minglan Gao,
+Zongquan Li, Ziyang Fang, Biao Lyu, Pengyu Zhang, Rong Wen, Li Yi,
+Zhigang Zong, and Shunmin Zhu. 2024. Canal Mesh: A Cloud-Scale
+Sidecar-Free Multi-Tenant Service Mesh Architecture. In Proceedings of
+the ACM SIGCOMM 2024 Conference. Sydney NSW Australia, 860–875.
+doi:10.1145/3651890.3672221
+[34] Sergii Telenyk, Oleksii Sopov, Eduard Zharikov, and Grzegorz
+Nowakowski. 2021. A Comparison of Kubernetes and KubernetesCompatible Platforms. In 2021 11th IEEE International Conference on Intelligent Data Acquisition and Advanced Computing Systems: Technology
+and Applications (IDAACS), Vol. 1. 313–317. doi:10.1109/IDAACS53288.
+2021.9660392 ISSN: 2770-4254.
+[35] Gil Tene. 2019. wrk2 - a HTTP benchmarking tool based mostly on wrk.
+https://github.com/giltene/wrk2 original-date: 2014-11-08T14:24:11Z.
+[36] Marcos A. M. Vieira, Matheus S. Castanho, Racyus D. G. Pacífico,
+Elerson R. S. Santos, Eduardo P. M. Câmara Júnior, and Luiz F. M.
+Vieira. 2021. Fast Packet Processing with eBPF and XDP: Concepts,
+Code, Challenges, and Applications. Comput. Surveys 53, 1 (Jan. 2021),
+1–36. doi:10.1145/3371038
+[37] Jiali Xing, Akis Giannoukos, Paul Loh, Shuyue Wang, Justin Qiu,
+Henri Maxime Demoulin, Konstantinos Kallas, and Benjamin C. Lee.
+2025. Rajomon: Decentralized and Coordinated Overload Control
+for Latency-Sensitive Microservices. In 22nd USENIX Symposium on
+Networked Systems Design and Implementation (NSDI 25). 21–36.
+[38] Nanzi Yang, Xingyu Liu, Wenbo Shen, Jinku Li, and Kangjie Lu. 2025.
+Dangers Behind Access Control: Understanding and Exploiting Implicit Permissions in Kubernetes. In Proceedings of the 2025 ACM
+SIGSAC Conference on Computer and Communications Security (CCS
+’25). 3401–3415. doi:10.1145/3719027.3765106
+
+[39] Myoungsung You, Jaehyun Nam, Minjae Seo, Taejune Park, and Seungwon Shin. 2025. HardMesh: Enabling High-performance Service Mesh Ingress Processing with SmartNICs. In Proceedings of
+the ACM SIGCOMM 2025 Conference (SIGCOMM ’25). 1235–1237.
+doi:10.1145/3718958.3750471
+[40] Myoungsung You, Jaehyun Nam, Minjae Seo, Taejune Park, and Seungwon Shin. 2026. HybridMesh: A Hardware-software Hybrid Approach
+for Accelerating Service Mesh Ingress. In 23rd USENIX Symposium
+on Networked Systems Design and Implementation (NSDI 26). 359–375.
+https://www.usenix.org/conference/nsdi26/presentation/you
+[41] Zirak Zaheer, Hyunseok Chang, Sarit Mukherjee, and Jacobus Van der
+Merwe. 2019. eZTrust: Network-Independent Zero-Trust Perimeterization for Microservices. In Proceedings of the 2019 ACM Symposium
+on SDN Research (SOSR ’19). 49–61. doi:10.1145/3314148.3314349
+[42] Naiqian Zheng, Tianshuo Qiao, Xuanzhe Liu, and Xin Jin. 2025. MeshTest: End-to-End Testing for Service Mesh Traffic Management. In 22nd
+USENIX Symposium on Networked Systems Design and Implementation
+(NSDI 25). 301–316.
+[43] Xiang Zhou, Xin Peng, Tao Xie, Jun Sun, Chenjie Xu, Chao Ji, and
+Wenyun Zhao. 2018. Benchmarking microservice systems for software engineering research. In Proceedings of the 40th International
+Conference on Software Engineering: Companion Proceeedings. ACM,
+Gothenburg Sweden, 323–324. doi:10.1145/3183440.3194991
+[44] Xiangfeng Zhu, Guozhen She, Bowen Xue, Yu Zhang, Yongsu Zhang,
+Xuan Kelvin Zou, XiongChun Duan, Peng He, Arvind Krishnamurthy,
+Matthew Lentz, Danyang Zhuo, and Ratul Mahajan. 2023. Dissecting
+Overheads of Service Mesh Sidecars. In Proceedings of the 2023 ACM
+Symposium on Cloud Computing. Santa Cruz CA USA, 142–157. doi:10.
+1145/3620678.3624652
+
+14
+

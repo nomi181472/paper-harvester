@@ -1,0 +1,841 @@
+arXiv:2604.11989v1 [cs.DC] 13 Apr 2026
+
+Predictive Bayesian Arbitration: A Scalable
+Noisy-OR Model with Service Criticality Awareness
+Anil Jangam
+
+Ganesh Karthick Rajendran
+
+Roy Kantharajah
+
+Cisco Systems, Inc.
+Milpitas, CA USA
+anjangam@cisco.com
+
+Cisco Systems, Inc.
+Milpitas, CA USA
+ganeraje@cisco.com
+
+Cisco Systems, Inc.
+Appleton, WI USA
+rkantha@cisco.com
+
+Abstract—Geographically High-Available (Geo-HA) cluster
+systems are essential for service continuity in distributed cloudnative environments. However, traditional arbitration mechanisms, which are often predicated on deterministic node-level
+heartbeats, are resource-intensive and inherently reactive. This
+necessitates a dedicated arbiter per deployment and leads to
+reactive switchovers that incur unavoidable downtime, occurring
+only after a failure has already compromised the system. This
+paper presents a novel predictive arbitration framework that
+utilizes a shared, microservice-based architecture to consolidate
+arbitration logic across multiple Geo-HA domains, signiﬁcantly
+reducing the aggregate infrastructure footprint. Central to our
+approach is an adaptive online learning mechanism grounded in
+a Bayesian Noisy-OR model that autonomously discovers and
+learns temporal cascade dependencies from emergent failure
+patterns. To overcome the ”cold start” challenge, the system
+utilizes expert-informed priors that are dynamically reﬁned
+at runtime without manual conﬁguration. Experimental results
+demonstrate that this framework achieves a 60% reduction in
+Mean Time to Failure Detection (MTTFD) and improves total
+switchover efﬁciency by up to 77.8% compared to traditional
+reactive standards. By enabling a signiﬁcant predictive lead time,
+the system allows switchovers to initiate proactively before hard
+failures occur, while maintaining a linear O(n) computational
+complexity. This approach provides a scalable, context-aware alternative that bridges the performance-durability gap in modern
+microservice architectures.
+Index Terms—Geographically High-Availability (Geo-HA),
+Bayesian Networks, Noisy-OR, Adaptive Learning, Cascade Failure Detection, Cloud-Native Arbitration, Predictive Maintenance.
+
+I. I NTRODUCTION
+The resilience of cloud-native infrastructure is paramount
+for mission-critical services.. Geographically High-Available
+(Geo-HA) cluster systems serve as the bedrock of this resilience, ensuring that mission-critical services remain operational despite localized hardware failures or regional disasters.
+These systems typically utilize an active cluster paired with
+a geographically separated standby replica, governed by an
+arbitration mechanism that facilitates consistent switchover
+decisions and prevents ”split-brain” scenarios.
+Despite their necessity, current Geo-HA arbitration solutions
+face scalability challenges. Firstly, traditional models suffer
+from a lack of architectural scalability, necessitating a dedicated arbiter for every deployment, which leads to signiﬁcant
+aggregate resource overhead. Secondly, the ”reactive” nature
+of existing arbitration creates a dangerous trade-off between
+
+data durability and system performance. As noted in current
+replication research [1], live database replication forces a
+choice: asynchronous replication offers superior throughput
+but risks data loss (RP O > 0) due to replication lag;
+conversely, synchronous replication guarantees zero data loss
+(RP O = 0) but imposes a severe latency penalty. Because
+traditional arbiters only trigger switchovers after a failure is
+detected, they often force operators into this ”durability gap.”
+A predictive framework, however, can initiate transitions based
+on degradation trends, allowing the system to ﬂush buffers or
+sync states before a hard failure occurs.
+To achieve this proactivity, the industry has explored Deep
+Learning (DL), yet DL faces signiﬁcant hurdles in data networks [2]. These include the requirement for vast quantities
+of labeled failure data, which is rare in stable production environments, substantial computational overhead, and an inherent
+”black box” nature that impedes the interpretability required
+for high-stakes failover decisions.
+This paper proposes a novel approach grounded in Bayesian
+Networks (BNs) that addresses these limitations through two
+core innovations: a resource-efﬁcient shared architecture and
+an Adaptive Learning mechanism for Cascade Failures. While
+traditional static BNs require manual speciﬁcation of conditional probability tables (CPTs), our framework automatically
+detects emergent interdependencies at runtime. By identifying
+temporal cascade patterns (e.g., Service A → Service B), the
+system dynamically updates its probabilistic model without
+manual intervention. This ensures the arbiter adapts to evolving system architectures and identiﬁes hidden causal relationships that expert-deﬁned rules might miss, while maintaining
+the linear O(n) computational complexity required for realtime scalability.
+The remainder of this paper is structured as follows: Section
+II reviews existing solutions; Section III details the shared
+arbitration architecture; Section IV elaborates on the predictive framework; Section V discusses the adaptive Bayesian
+methodology; Section VI provides a performance analysis;
+and Section VII summarizes the ﬁndings and suggests future
+research directions.
+II. R ELATED W ORK AND P RIOR A RT
+Geo-HA cluster systems have long relied on various arbitration strategies to maintain quorum and prevent split-
+
+brain scenarios. This section reviews prominent prior art and
+positions our proposed solution against them.
+
+III. M ULTI -D OMAIN , M ULTI -C LUSTER A RBITRATION
+A RCHITECTURE
+Our approach introduces a paradigm shift in Geo-HA
+arbitration by transforming the traditional ”one-arbiter-perdeployment” model into a resource-optimized, multi-domain,
+multi-cluster architecture. This is achieved through a cloudnative microservices design.
+
+A. Deterministic and Traditional Arbitration
+Traditional Geo-HA arbitration has historically relied on
+deterministic, site-speciﬁc mechanisms. Implementations such
+as the SUSE ”booth” daemon [3] or decentralized FPGAbased designs [4] focus on maintaining quorum within singledomain deployments. While robust, these architectures lack
+multi-tenancy, requiring dedicated resources per cluster that
+scale linearly with deployment count. Furthermore, storagecentric solutions like Red Hat Gluster’s arbiter bricks [5]
+ensure metadata consistency but remain agnostic to broader
+application-tier health or cascading service failures. While centralized orchestration for containerized functions [6] addresses
+modern cloud-native footprints, it remains reactive, triggering
+recovery only after hard failure thresholds are breached.
+Modern distributed systems leverage consensus protocols
+like Raft [7] or Paxos [8] via tools such as etcd for state
+consistency and leader election. However, these protocols are
+designed for consistency in the face of network partitions
+rather than predictive failure avoidance. Standard consensus
+engines are often indifferent to application-level degradation
+(e.g., replication lag or service latency) as long as a network quorum exists. This creates a ”durability gap” where
+switchovers are delayed until a heartbeat timeout occurs, often
+resulting in data loss (RP O > 0) in asynchronous replication
+environments [1].
+
+A. Core Components and Distributed Arbitration
+The Geo-HA system adopts a 1 + 1 redundancy model
+comprising an Active Cluster, a Standby Cluster, and a Shared
+Arbitration Service (SAS). These three entities form a distributed consensus via raft-based consensus quorum to elect a
+Decision Leader, which serves as the authoritative entity for
+executing ML-driven adaptive switchover (SO) decisions.
+To ensure continuous availability, the leadership role is
+fault-resilient; if the current leader fails, a new leader is
+automatically elected from the remaining two healthy clusters.
+This ensures that the capacity to make SO decisions is never
+lost. Any failed entity (whether a local cluster or the arbiter
+persona) is designed to automatically recover and rejoin the
+quorum as a follower, synchronizing its state to maintain the
+system’s three-node integrity.
+B. Architecture of the Shared Arbitration Service (SAS)
+The SAS (Fig. 1) optimizes scalability by decoupling logical
+arbitration from physical hardware through a cloud-native microservices architecture. It hosts multiple “Arbiter Personas,”
+each acting as a state-machine replica for independent GeoHA domains. To provide high resiliency, the SAS is deployed
+across a three-node quorum to ensure full node-level redundancy. Additionally, the arbiter personas can be deployed as
+two pod replicas to maintain availability in the event of a
+pod failure. This dual-layered architecture protects the system
+against both infrastructure and application-level outages.
+The service is built upon the following architectural pillars:
+• High-Density Multiplexing: Using an event-driven I/O
+model, the SAS can support hundreds of isolated personas on shared infrastructure. This eliminates the linear
+resource growth of dedicated hardware while enforcing
+resource quotas to prevent “noisy neighbor” interference.
+• Data and Logic Isolation: To preserve privacy, telemetry
+processing and Bayesian inference logic remain siloed
+within the local quorum. This ensures that sensitive
+cluster-health data never crosses Geo-HA domain boundaries within the shared platform.
+• Multi-Level Fault Recovery: To mitigate the SAS as a
+single point of failure (SPOF), the orchestration layer
+monitors health at both the host and container levels.
+Whether a physical node failure impacts the entire SAS
+instance or a speciﬁc software fault affects a subset of
+personas, the system triggers automated re-instantiation
+on healthy infrastructure to restore the 2 + 1 redundancy.
+• Operational Decoupling: The architecture separates the
+management plane from the arbitration logic, allowing
+independent conﬁguration and lifecycle management for
+
+B. Modern Consensus and ML-Driven Recovery
+Modern distributed systems often leverage consensus protocols like Raft [7] or Paxos [8] via tools such as etcd or
+ZooKeeper for leader election. While robust, these tools are
+fundamentally distinct from our proposed predictive arbiter.
+Unlike deterministic consensus stores that rely on reactive
+switchovers that incur unavoidable downtime, our framework
+employs a probabilistic Bayesian approach to enable proactive
+transitions by identifying degradation trends before failure.
+Furthermore, standard consensus engines remain agnostic to
+application health, whereas our model integrates critical service group (CSG) metrics and replication lag directly into its
+logic. This microservice-based architecture also reduces overhead by decoupling consensus from the deployment footprint,
+managing multiple domains more efﬁciently than traditional
+dedicated quorums.
+Beyond classical consensus, research has explored MLbased failure prediction using LSTMs for node-level outages
+[9]. However, as discussed in Section I, these models often
+lack interpretability and function only as external ”observers”
+rather than active participants in the arbitration quorum.
+Consequently, they cannot autonomously resolve the servicelevel cascade dependencies required for coordinated Geo-HA
+switchovers. Our framework bridges this gap by embedding
+an interpretable Bayesian model into the distributed arbitration logic, ensuring that predictive insights drive immediate,
+authoritative recovery actions.
+
+Preprint - not yet peer-reviewed.
+
+2
+
+Standby
+
+Arbiter
+
+RHS-1
+
+ARB-1
+
+RHS-2
+
+ARB-2
+
+LHS-3
+
+RHS-3
+
+ARB-3
+
+..
+.
+Geo-HA Setup-n
+
+..
+.
+
+..
+.
+
+LHS-n
+
+RHS-n
+
+Active
+
+loop that treats the system topology as dynamic and partially
+observable.
+The training process identiﬁes ﬁve distinct patterns: (1)
+Normal Operation, representing baseline stability metrics;
+(2) Failure Scenarios, capturing intervals preceding conﬁrmed malfunctions; (3) False Alarms, identifying instances
+where thresholds were met despite system stability; (4) UserTriggered Switchovers, providing implicit labels for nuanced,
+human-identiﬁed failure modes; and (5) Temporal Cascades,
+which involve the automated detection of A → B sequences
+where service B degrades shortly after service A.
+By correlating these sequences, the model autonomously
+populates the Conditional Probability Tables (CPTs). This
+allows the arbiter to identify latent dependencies, such as
+shared infrastructure bottlenecks or cascading timeouts, that
+are often absent from static deployment manifests or ”Day 0”
+expert maps.
+
+Geo-HA Setup-1
+
+LHS-1
+Geo-HA Setup-2
+
+LHS-2
+Geo-HA Setup-3
+
+B. Personalized Training and Site Adaptation
+To account for variability in trafﬁc patterns and hardware,
+the framework personalizes CPTs using an adaptive learning
+rate αadj . This mechanism allows the model to prioritize
+rapid learning at new deployment sites where data is scarce
+(Nobs < Nreq ), while transitioning to a stable, conservative
+posture as site-speciﬁc history matures. Performance indicators
+are normalized relative to deployment scale, ensuring that
+the learned ”causal weights” remain relevant even as clusters
+scale.
+
+ARB-n
+
+Fig. 1: Multi-domain architecture with persona multiplexing.
+each Geo-HA deployment. This containerized approach
+ensures deployment ﬂexibility across hybrid-cloud environments.
+
+C. Privacy-Preserving Decentralized Arbitration
+
+IV. T HE P REDICTIVE A RBITRATION F RAMEWORK
+
+To satisfy data residency and privacy regulations, the framework employs a decentralized architecture. Arbitration decisions and cascade discoveries are executed locally within individual domains. By maintaining data isolation and avoiding
+the pooling of raw telemetry, the system ensures regulatory
+compliance while remaining responsive to localized failure
+patterns.
+
+Beyond resource optimization, we propose a shift from
+reactive to predictive arbitration. This framework utilizes
+Bayesian networks to anticipate switchover requirements by
+autonomously discovering failure dependencies and analyzing
+multifaceted system telemetry.
+A. Predictive Switchover Arbitration Decision Making
+Traditional arbitration relies on binary heartbeat mechanisms. Our framework expands this by monitoring performance parameters and temporal failure sequences to predict
+switchover necessity.
+1) Multi-Tiered Telemetry and CSG Monitoring: The monitoring architecture integrates telemetry across a four-layer
+hierarchy: node-level health, network path dynamics, and
+application-tier performance (e.g., database replication lag).
+Furthermore, the framework incorporates Critical Service
+Groups (CSGs) orchestrated via CSG_LABEL in Kubernetes.
+These metrics are ingested and archived in a time-series
+database to facilitate both real-time inference and longitudinal
+cascade analysis.
+2) Model Initialization and Automated Cascade Discovery:
+To address the ”cold-start” problem, the Bayesian Network is
+initialized using expert-informed priors. However, deﬁning the
+full dependency graph of a modern microservice architecture
+is notoriously difﬁcult and error-prone. To overcome this, our
+framework implements an Automated Cascade Discovery [10]
+
+Preprint - not yet peer-reviewed.
+
+D. Adaptive Learning from Cascade Failures
+Real-world distributed systems exhibit complex interdependencies that are often unknown at deployment time. Static
+Bayesian models frequently miss emergent causal relationships
+or fail to adapt to evolving system architectures. To address
+this, our framework implements an adaptive mechanism [11]
+that autonomously detects failure sequences [12] and reﬁnes
+the model’s decision-making logic.
+1) Causal Sequence Identiﬁcation: The system treats every
+service failure as a potential lead indicator for downstream
+outages. This relationship is formalized through Algorithm 1,
+which implements a temporal correlation loop.
+When a failure event occurs for a service (sid),
+the algorithm scans a sliding window of recent outages
+(recent f ailures). If a prior failure (sA ) occurred within the
+deﬁned ∆tcascade threshold, a potential causal link sA → sid
+is recorded. By logging these sequences, the framework builds
+a longitudinal database of cascade patterns, allowing it to
+
+3
+
+maintain learned dependencies across system restarts and
+infrastructure updates.
+Cascade(A → B) =
+
+Algorithm 1 Online Cascade Detection
+1: Input: failure event(serviceId, timestamp)
+
+if tB − tA ≤ ∆tcascade
+otherwise
+
+True
+False
+
+(1)
+
+Where tA and tB are the failure timestamps of services A
+and B, respectively, and ∆tcascade is the predeﬁned observation window. When a cascade is detected, it suggests a causal
+dependency A → B, prompting an update to the underlying
+probabilistic model.
+
+2: Output: detected cascades[ ]
+3: record f ailure time[serviceId] ← timestamp
+4: for each serviceA in recent f ailures do
+
+delay ← timestamp − f ailure time[serviceA ]
+if ∆t ≤ ∆tcascade then
+7:
+seq ← (serviceA , serviceId, ∆t)
+8:
+cascades.append(seq)
+9:
+end if
+10: end for
+11: return detected cascades
+5:
+6:
+
+B. Online CPT Update with Adaptive Learning
+Once a dependency is identiﬁed, the model updates the
+Conditional Probability Table (CPT) for P (B|A). To balance
+the ”cold start” problem with long-term stability, we utilize
+a weighted Bayesian learning mechanism with an adaptive
+learning rate αadj .
+
+2) Integration with the Prediction Engine: The detection
+of cascades directly enhances the precision of the Noisy-OR
+inference model. Algorithm 2 details how learned Conditional
+Probability Tables (CPTs) are utilized to aggregate risk.
+The engine initializes with a stable base prior (Pef f = 0.05)
+and iteratively updates this risk as services degrade. For each
+degraded service, the engine queries the learned CP T s to retrieve the speciﬁc conditional probability P (target|sA )—the
+likelihood that failure sA necessitates a switchover. These
+probabilities are combined using a Noisy-OR formulation,
+ensuring that the cumulative risk reﬂects the severity of the
+entire failure chain rather than isolated events. This resulting
+posterior probability provides the high-ﬁdelity recommendation required for proactive Geo-HA arbitration.
+
+
+
+Nobs
+(2)
+c = min 0.95,
+Nreq
+
+αadj = αbase (1 − c) + 0.9c,
+
+Here, Nobs represents the number of observations and Nreq
+is the required samples for statistical signiﬁcance. This ensures
+the model learns rapidly from early failures while becoming
+more stable as the data volume grows. The updated probability
+is calculated as:
+Pnew (B|A) = αadj ·Pold (B|A)+(1−αadj )·
+
+Ncascade (A → B)
+Nf ailures (A)
+(3)
+
+C. Inference via Noisy-OR Combination
+
+Algorithm 2 Enhanced Prediction with Adaptive CPTs
+
+The model aggregates these learned dependencies to calculate the effective probability of a system-wide switchover
+requirement (Pef f ). Given a set of degraded metrics or services Ai , the total risk is modeled as:
+
+1: Input: metrics, degraded services, learned CP T s
+2: Output: P (SO = 1)
+3: Pef f ← 0.05 {Initialize with base failure prior}
+4: for each sA ∈ degraded services do
+
+Pef f = 1 −
+
+if learned CP T s[target][sA ] exists then
+6:
+Pcond ← learned CP T s[target][sA ]
+7:
+Pef f ← 1 − ((1 − Pef f ) · (1 − Pcond ))
+8:
+end if
+9: end for
+10: posterior ← BayesianU pdate(Pef f , metrics)
+11: return posterior
+5:
+
+Y
+
+(1 − P (target|Ai ))
+
+(4)
+
+Ai ∈Degraded
+
+This formulation maintains O(n) complexity while incorporating the real-time cascade intelligence gathered by the
+detection algorithm.
+D. Cost-Sensitive Arbitration and Hysteresis
+To mitigate switchover oscillations (ﬂapping), the ﬁnal arbitration decision Dt is governed by a dual-threshold transition
+logic optimized against the costs of False Positives (CF P ) and
+False Negatives (CF N ):
+
+V. A DAPTIVE BAYESIAN A RBITRATION M ODEL
+The proposed arbitration logic transitions from static thresholds to a dynamic Bayesian Network (BN). The model aggregates independent risk factors and learned dependencies using
+an enhanced Noisy-OR formulation.
+
+
+
+1(SWITCHOVER) if Pef f > τactive + δ
+Dt = 0(STANDBY)
+if Pef f < τactive − δ
+
+
+Dt−1
+otherwise
+
+A. Cascade Detection and Dependency Discovery
+To move beyond manual speciﬁcation of dependencies, the
+system monitors failure sequences to identify causal relationships. We deﬁne a cascade failure based on the temporal
+proximity of service outages.
+
+Preprint - not yet peer-reviewed.
+
+(
+
+(5)
+
+where δ is a hysteresis buffer that ensures ”stickiness” in the
+decision-making process, preventing unnecessary disruptions
+during transient network noise.
+
+4
+
+Component Breakdown: Detection/Prediction s Execution Time (E ent 3)
+
+VI. P ERFORMANCE A NALYSIS AND D ISCUSSION
+
+Total: 45s
+
+To evaluate the efﬁcacy of the proposed Multi-Domain
+Shared Arbitration Service (SAS) and its Adaptive Bayesian
+predictive framework, we conducted a series of comparative
+experiments. The evaluation focuses on ”Total Switchover
+Time,” deﬁned as the cumulative duration between the onset of
+system degradation and the successful completion of a failover
+to the standby cluster.
+
+40
+
+De ec ion/Predic ion Time
+Swi chover Execu ion (30s)
+
+Total: 35s
+
+Time (seconds)
+
+30
+
+A. Total Switchover Time Comparison
+
+Total: 25s
+
+Total: 10s
+
+Static
+Bayesian
+
+Adaptive
+Bayesian
+
+20
+10
+0
+
+−10
+
+We compared four distinct arbitration strategies across three
+simulated failure events: (1) Reactive (15s), (2) Reactive (5s),
+(3) Static Bayesian, and (4) Adaptive Bayesian.
+As illustrated in Figure 2, the reactive methods exhibit
+constant delays (45s and 35s) regardless of the event sequence.
+This represents the ”durability gap” where the system is idle
+during the heartbeat timeout period. In contrast, the Adaptive
+Bayesian model demonstrates a signiﬁcant learning curve.
+While it performs identically to the Static model in Event 1, by
+Event 3, it reduces the total switchover time to 15 seconds—a
+66% improvement over the standard reactive baseline.
+
+−20
+
+Reactive
+(15s)
+
+Reactive
+(5s)
+
+Method
+
+Fig. 3: Component Breakdown: Detection/Prediction vs Execution Time (Event 3).
+
+the CPTs. Consequently, in Event 3, the failure probability for
+m11 crosses the decision threshold (0.3) well before the actual
+failure at t = 750s, triggering the predictive switchover.
+
+Event 3
+
+Fail re Probability
+
+Total Switchover Time (seconds)
+
+40
+
+0.8
+
+Event 2
+
+Reactive (15s)
+Reactive (5s)
+Static Bayesian
+Adaptive Bayesian
+
+50
+
+0.6
+
+0.4
+
+30
+
+0.2
+
+20
+
+0.0
+
+10
+
+0
+
+m7
+m5
+m11
+Threshold (0.3)
+
+1.0
+
+Event 1
+
+Probability Evolution Over Time for CSG Services
+
+Total Switchover Time Comparison Across Events
+
+Event 1
+
+Event 2
+
+Event
+
+100
+
+200
+
+300
+
+400
+
+500
+
+Time (seconds)
+
+600
+
+700
+
+800
+
+900
+
+Fig. 4: Probability Evolution Over Time for CSG Services.
+
+Event 3
+
+Fig. 2: Total Switchover Time Comparison Across Events.
+
+D. Timeline and Reliability Discussion
+The temporal advantage provided by the predictive lead time
+is summarized in Figure 5. The Adaptive Bayesian approach
+completes its switchover execution almost simultaneously with
+the actual failure event. This minimizes the period during
+which the application is unavailable and, crucially, allows the
+system to initiate state-syncing and buffer-ﬂushing while the
+primary cluster is still partially functional.
+By transitioning from binary heartbeats to probabilistic
+cascade analysis, the proposed framework effectively mitigates
+the performance-durability trade-off inherent in traditional
+Geo-HA arbitration.
+
+B. Component Breakdown and Predictive Advantage
+To analyze the source of these efﬁciency gains, we examined
+the breakdown between detection/prediction time and execution time for Event 3 (Figure 3).
+Traditional reactive models suffer from positive ”Detection
+Lag,” where execution (ﬁxed at 30s) only begins after a
+failure is conﬁrmed. Our Adaptive Bayesian model achieves
+”predictive lead time” (−20s). By identifying the signature of
+an impending failure, the execution phase begins before the
+service actually drops. This proactive shift allows the total
+system downtime to be reduced to just 10 seconds.
+
+VII. C ONCLUSION
+
+C. Probability Evolution and Cascade Intelligence
+
+This paper presented a novel Geographically HighAvailable (Geo-HA) arbitration framework, shifting the industry paradigm from reactive monitoring to proactive orchestration. By replacing traditional ’one-arbiter-per-deployment’
+models with a cloud-native, shared microservices architecture,
+we demonstrate that high availability does not require high
+resource redundancy. This multi-domain approach decouples
+logical arbitration from the physical footprint, allowing a
+
+The model’s intelligence is driven by its ability to track
+failure probabilities across the Critical Service Group (CSG).
+Figure 4 tracks the evolution of failure probabilities for three
+services (m7, m5, and m11).
+Initially, the model treats failures as isolated. However, as
+the system observes that failures in m7 and m5 often precede
+m11, the Adaptive Learning mechanism (Equation 3) updates
+
+Preprint - not yet peer-reviewed.
+
+0
+
+5
+
+Event Timeline: Switchover Comparison (Event 3, Failure @ t=750s)
+
+algorithms to extract relationships from multivariate timeseries telemetry. This will allow the system to autonomously
+reﬁne its Bayesian topologies as microservice architectures
+evolve without manual intervention. We intend to explore
+federated adaptive learning across multiple Geo-HA deployments, enabling knowledge sharing between disparate clusters while strictly preserving data locality and residency. To
+further optimize decision-making, we plan to supplement
+the Bayesian model with Reinforcement Learning (RL) to
+dynamically tune cost-sensitive thresholds based on real-time
+business impact metrics. Additionally, we will investigate the
+integration of Recurrent Neural Networks (RNN) to enhance
+long-term temporal forecasting and develop Explainable AI
+(XAI) interfaces to provide operators with human-readable
+justiﬁcations for automated switchover decisions. Finally, optimizing the Shared Arbitration Service for resource-constrained
+edge environments remains a priority, ensuring resilience in
+scenarios where network partitions are frequent and latency is
+highly volatile.
+
+Reactive (15s)
+
+Reactive (5s)
+
+Static Bayesian
+
+Actual Failu e
+Reactive (15s)
+Reactive (5s)
+Static Bayesian
+Adaptive Bayesian
+
+Adaptive Bayesian
+
+P ediction
+(befo e failu e) 720
+
+730
+
+740
+
+750
+
+760
+
+Time (seconds)
+
+770
+
+780
+
+790
+
+800
+
+Fig. 5: Event Timeline: Switchover Comparison for Event 3
+(Failure @ t=750s).
+single infrastructure to manage hundreds of isolated domains.
+Consequently, this framework is well-suited for dense microservice architectures or multi-tenant applications where
+traditional dedicated arbitration is cost-prohibitive.
+A key innovation of our framework is the adaptive online
+learning mechanism that automatically discovers and learns
+cascade dependencies from observed failure patterns. Experimental results demonstrate a 60% reduction in Mean Time to
+Failure Detection (MTTFD) compared to reactive methods and
+a 28% improvement over static Bayesian models that cannot
+adapt to unknown dependencies. Central to this optimization
+is the Adaptive Bayesian Noisy-OR engine, which identiﬁes
+leading indicators of failure at the Critical Service Group
+(CSG) level. As demonstrated in our performance analysis, this
+enables a predictive lead time, allowing switchovers to initiate
+before hard failures occur. This proactive posture effectively
+bridges the durability gap, reducing total switchover time
+by up to 77.8% compared to traditional reactive baselines
+while maintaining the O(n) complexity required for real-time
+scalability.
+The system exhibits rapid convergence, showing signiﬁcant
+accuracy improvements after just 1-2 observed cascade events
+with zero manual conﬁguration, as the model self-tunes its
+conditional probability tables. This adaptive capability is particularly valuable in modern production environments where
+system dependencies evolve, new microservices are deployed
+frequently, and infrastructure changes create emergent failure
+patterns. The performance gains of the proposed Adaptive
+Bayesian model are summarized in Table I.
+Method
+Reactive (15s)
+Reactive (5s)
+Static Bayesian
+Adaptive Bayesian
+
+Detection Time (s)
++15
++5
+-5
+-20
+
+Total SO (s)
+45
+35
+25
+10
+
+R EFERENCES
+
+[1] M. A. Georgiou and et al., “Hihooi: A database replication middleware
+for scaling transactional databases consistently,” in 2022 IEEE IEEE
+Transactions on Knowledge and Data Engineering. IEEE, 2022.
+[Online]. Available: https://ieeexplore.ieee.org/document/9068420
+[2] H. V. Pham, S. Qian, J. Wang, T. Lutellier, J. Rosenthal, L. Tan, Y. Yu,
+and N. Nagappan, “Problems and opportunities in training deep learning
+software systems: An analysis of variance,” in 2020 35th IEEE/ACM
+International Conference on Automated Software Engineering (ASE),
+2020, pp. 771–783.
+[3] SUSE. (n.d.) Suse linux enterprise high availability extension
+12 sp5: Geo clustering for suse linux enterprise high availability
+extension. Retrieved on [Insert Retrieval Date Here]. [Online]. Available:
+https://documentation.suse.com/sle-ha/12-SP5/html/SLE-HA-all/cha-ha-geo-concept.ht
+[4] Y. Liu and et al., “A design of decentralized dual mode
+redundant hot standby arbitration switchover logic and architecture,”
+in 2018 IEEE 4th International Conference on Computer and
+Communications (ICCC). IEEE, 2018, pp. 1177–1181. [Online].
+Available: https://ieeexplore.ieee.org/document/8401458
+[5] Red Hat. (n.d.) Red hat gluster storage 3.5 administration
+guide:
+Creating
+arbitrated
+replicated
+volumes.
+Retrieved
+on
+[Insert
+Retrieval
+Date
+Here].
+[Online].
+Available:
+https://docs.redhat.com/en/documentation/red hat gluster storage/3.5/html/administratio
+[6] A. Sharma and et al., “Automated data analytics and resource
+arbitration scheduling for containerized network functions,” in 2023
+IEEE 10th International Conference on Data Science and Advanced
+Analytics (DSAA). IEEE, 2023, pp. 1–10. [Online]. Available:
+https://ieeexplore.ieee.org/document/10056679
+[7] D. Ongaro and J. Ousterhout, “In search of an understandable consensus
+algorithm,” in 2014 USENIX Annual Technical Conference (USENIX
+ATC 14), Philadelphia, PA, 2014, pp. 305–319.
+[8] L. Lamport, “The part-time parliament,” ACM Transactions on Computer
+Systems (TOCS), vol. 16, no. 2, pp. 133–169, 1998.
+[9] T. Das et al., “Predictive failure analysis in cloud systems using machine
+learning,” IEEE Transactions on Reliability, vol. 67, no. 2, pp. 512–524,
+2018.
+[10] X. Zhou and X. Peng, “Detecting cascading failures in microservices,”
+in IEEE International Conference on Web Services, 2021.
+[11] N. Friedman and M. Goldszmidt, “Online learning of bayesian network
+parameters,” Machine Learning, vol. 50, pp. 95–126, 2003.
+[12] W. Lam and F. Bacchus, “Online structure learning for bayesian networks,” Artiﬁcial Intelligence, vol. 282, 2020.
+
+Improv.
+Baseline
+22.2%
+44.4%
+77.8%
+
+TABLE I: Comparative Performance of Arbitration Strategies
+A. Future Research and Enhancements
+Future work will focus on the automated synthesis of
+CSG dependency maps using Causal Structure Discovery
+
+Preprint - not yet peer-reviewed.
+
+6
+

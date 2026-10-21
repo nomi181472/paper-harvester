@@ -1,0 +1,2995 @@
+MURPHY - A SCALABLE MULTIRESOLUTION FRAMEWORK FOR SCIENTIFIC COMPUTING ON 3D BLOCK-STRUCTURED
+COLLOCATED GRIDS
+
+arXiv:2112.07537v2 [math.NA] 1 Jul 2022
+
+THOMAS GILLIS ∗ AND WIM M. VAN REES ∗†
+Abstract. We present the derivation, implementation, and analysis of a multiresolution adaptive grid framework for numerical simulations on octree-based
+3D block-structured collocated grids with distributed computational architectures. Our approach provides a consistent handling of non-lifted and lifted interpolating wavelets of arbitrary order demonstrated using second, fourth, and sixth order wavelets, combined with standard finite-difference based discretization
+operators. We first validate that the wavelet family used provides strict and explicit error control when coarsening the grid, and show that lifting wavelets increase
+the grid compression rate while conserving discrete moments across levels. Further, we demonstrate that high-order PDE discretization schemes combined with
+sufficiently high order wavelets retain the expected convergence order even at resolution jumps. We then simulate the advection of a scalar to analyze convergence
+for the temporal evolution of a PDE. The results shows that our wavelet-based refinement criterion is successful at controlling the overall error while the coarsening
+criterion is effective at retaining the relevant information on a compressed grid. Our software exploits a block-structured grid data structure for efficient multilevel operations, combined with a parallelization strategy that relies on a one-sided MPI-RMA communication approach with active PSCW synchronization. Using
+performance tests up to 16, 384 cores, we demonstrate that this leads to a highly scalable performance. The associated code is available under a BSD-3 license at
+https://github.com/vanreeslab/murphy.
+Key word. multiresolution, adaptive mesh refinement, wavelet, finite-difference, MPI-RMA
+AMS subject classifications. 65M04,65M50,65M06
+
+1. Introduction. Solutions to partial differential equations (PDEs) are typically characterized by unsteady spatial scale separations. In incompressible fluid dynamics, for example, flows within a boundary layer include important structures on the smallest
+viscous length scales, whereas the wake is characterized by much larger, inertial structures. Moreover, these flows are intrinsically
+unsteady and often coupled with the motion or deformation of immersed boundaries, making the resolution requirements difficult to predict a priori. Especially in three-dimensional problems, where performance and memory constraints of computing
+resources constrain the range of applications, it is desirable to construct methods that can adapt the local resolution of the grid
+to the physical requirements of the PDE solution evolved on that same grid. To achieve accurate solutions, such methods need
+to be able to discretize and evolve the PDE consistently across different resolutions; detect the need to refine or opportunity to
+coarsen; and perform the actual coarsening or refinement of the field. Further, their (parallel) implementation needs to be sufficiently efficient so that any increase in computational overhead due to the required memory access patterns, load balancing,
+and synchronizations does not cancel the gains from the reduction in computational elements, compared to uniform resolution
+grids. Consequently, the algorithms and implementations of such adaptive grid refinement methods are significantly more complex than uniform grid methods, and have seen significant development over the last three to four decades of research in scientific
+computing.
+An established family of methods is formed by the patch-based adaptive mesh refinement (pAMR) approach, which considers
+nested overlapping grids of increasing resolution [2, 3]. This approach is prevalent across many application domains and has
+mature implementations inside several software frameworks such as Chombo [1], SAMRAI [25], and AMReX [45]. Overlapping grids
+simplifies the use of coarsening and refinement operators, and provide straightforward integration with multigrid-based elliptic
+solvers. Excluding more expensive adjoint approaches [18], grid adaptation decisions in pAMR are typically made on the basis of
+either a heuristic measure of the field values and/or their derivatives, or an estimate of the truncation error through a Richardson
+extrapolation technique [2], or some combination of both [35]. If the chosen measure is larger than a user-defined threshold, the
+grid is refined, and if it is smaller than a second user-defined threshold, the grid is coarsened. Such heuristic measures are easy
+to implement but generally provide no a priori sense of the error made. The Richardson extrapolation method is more rigorous
+but also more challenging to implement [1], and requires the simultaneous evolution of the discrete equations on multiple levels.
+After the decision to adapt a grid has been made, the actual coarsening/refinement approaches and the evaluation of differential
+operators across resolution boundaries are most often based on polynomial interpolation. Most approaches achieve second-order
+accuracy in space throughout these operations, though extensions to fourth order have been demonstrated as well [41, 44].
+Our work falls under a different family of methods which does not consider overlapping grids but instead uses an octree-based
+approach. This was demonstrated first in Gerris [32] and has a more general distributed implementation in p4est [6], which itself
+is successfully used across different application clients such as the finite-volume solver ForestClaw [7]. The dyadic recursive structure associated with these approaches can be combined with a wavelet-based multiresolution analysis of any signal on the grid
+[30, 31]. Combining wavelet-based grid adaptation with node-based collocated PDE solution methods such as finite-difference
+techniques leads to the wavelet-collocation method [8, 24, 36]. Wavelet collocation methods typically rely on interpolating wavelets, which distinguish the information between two levels through the deviation of fine-level values from an interpolating polynomial constructed from coarse-level values [13]. The interpolating wavelets have been cast in a formal basis through the addition of
+∗ Department of Mechanical Engineering, Massachusetts Institute of Technology, 77 Massachusetts Avenue, Cambridge, MA 02139, USA
+† Corresponding author: wvanrees@mit.edu
+
+1
+
+2
+
+THOMAS GILLIS AND WIM M. VAN REES
+
+the biorthogonality [9] and extended to include moment-preservation and reduce aliasing through the lifting scheme [10, 37, 38].
+The lifted interpolating wavelets form the basis of so-called second generation wavelet collocation methods [43]. Existing codes
+using wavelet-based grid adaptation with finite-difference based PDE evolutions are MRAG [34, 42], which uses non-lifted interpolating wavelets for incompressible flow simulations with shared-memory parallelism, and wabbit [15], using non-lifted and lifted
+interpolating wavelets on distributed memory architectures for weakly compressible flow simulations. Overall, despite the potential advantages of high-order grid adaptation, formal multiresolution analysis, explicit error control, and parallel performance,
+there is a significantly smaller body of work on the implementation details and performance analysis of non-lifting and lifting
+wavelets on block-structured grids, as compared to pAMR methods.
+In this work, we describe the derivation, implementation, and analysis of a parallel, scalable implementation of a 3D multiresolution adaptive grid solver for partial differential equations on collocated grids, supported by non-lifted or lifted wavelets for
+scale detection, grid adaptation, and ghost reconstruction. In section 2 we provide a brief background of the wavelet theory and
+show how this translates to block-structured multi-level grids. We emphasize here the consistent treatment of resolution jumps to
+preserve polynomial order and lifting properties in multiple dimensions. Section 3 details our implementation, using one-sided
+MPI-RMA communication strategies to handle parallel communication. In section 4 we validate our approach on static grid adaptation tests by demonstrating error control and convergence of high-order finite-difference schemes for all wavelets, and moment
+conservation for lifted wavelets. Section 5 applies the resulting software to solve partial differential equations, where we provide
+detailed analysis of the error as a function of the wavelet-based thresholding parameters. Here we limit ourselves to linear and
+nonlinear scalar advection equations as examples of challenging problems involving dynamically changing scales, though our
+framework as presented can already handle a wider set of problems including advection-diffusion and reaction-diffusion equations, and will be further extended in future work. In section 6 we demonstrate that our code retains parallel efficiency across more
+than sixteen thousand compute cores and conclude our work with a perspective and future work in section 7.
+2. Wavelet-based multiresolution. Our work relies on a few key contributions that have been made to the field of wavelets
+theory that include the multiresolution analysis, biorthogonal interpolating wavelets, and the lifting scheme. Though a complete
+overview of wavelet theory is beyond the scope of this manuscript, we provide a concise review of the concepts required to detail
+the mathematical framework for our multiresolution grid adaptation below.
+2.1. Interpolating wavelets. Throughout our work we use interpolating wavelets. These were first introduced by [13], and
+generalize the polynomial interpolation procedure on nested dyadic grids presented in [11, 12] using wavelet theory, as detailed in
+[14]. Interpolating wavelets can be constructed through polynomial interpolation, thus avoiding the Fourier transform. Through
+the introduction of the orthogonal multiresolution analysis first, and the biorthogonal multiresolution analysis second, they have
+been formalized within the framework of second-generation wavelets, and through the lifting scheme they can be generalized to
+achieve moment-conservation properties and reduce aliasing. Here we will briefly touch upon these concepts and their mathematical background.
+2.1.1. The orthogonal multiresolution analysis. The multiresolution analysis [9, 29, 37] defines nested orthogonal subspaces decomposition of L 2 (R) indexed by L. Mathematically the nested spaces can be written as V L ⊂ V L+1 for L ∈ Z, where
+the union ∪L∈Z V L is dense and orthogonality implies that the intersection ∩L∈Z V L is empty. The subspaces are further defined
+with dilation and translation characteristics that guarantee
+the existence of a unique function ϕ(x), such that for any L ∈ Z the
+p
+translated and dilated family of functions ϕLk (x) = 2L ϕ(2L x − k) for k ∈ Z is an orthonormal basis of V L [29]. Orthonormality
+­
+®
+­
+® R∞
+here means that ϕLk (x) , ϕLi (x) = δi ,k ∀ {k, i } ∈ Z, where f (x) , g (x) = −∞ f (x)g (x) dx. The difference between two spaces V L
+¡
+¢⊥
+and V L+1 is characterized by a new subspace W L as the orthogonal complement of V L to V L+1 , so that W L = V L ∩ V L+1 , hence
+to V L , a basis for W L is obtained through the dilatation and translation of the wavelet function ψ(x),
+V L ⊕ W L = V L+1 . Similarly
+p
+L
+L
+L
+such that ψm (x) = 2 ψ(2 x − m) with m ∈ Z.
+With these definitions, a given function f (x) ∈ L 2 (R) can be projected onto either basis to define the scaling coefficients λLk
+and detail coefficients γLk
+(2.1)
+
+­
+®
+λLk , f (x) , ϕLk (x)
+
+®
+­
+γLm , f (x) , ψLm (x) .
+
+and
+
+We can then build a hierarchy of projections of f (x) into the wavelet subspaces. We start with the projection of f (x) onto level L
+denoted as
+X
+£ ¤
+(2.2)
+P L f (x) , λLk ϕLk (x) ,
+k
+
+Further, given that V L ⊕ W L = V L+1 , we can relate the projection of f (x) onto level L + 1 to lower levels through the refinement
+relation:
+X
+X
+X L L
+£ ¤
+(2.3)
+P L+1 f (x) , λL+1
+ϕL+1
+(x) = λLk ϕLk (x) +
+γm ψm (x) .
+j
+j
+j
+
+k
+
+m
+
+3
+
+MURPHY
+
+Applied recursively, (2.3) can be used to create a hierarchy of nested decompositions from level L 0 to level L:
+X L L
+X
+£ ¤
+ϕL+1
+(x) = λk 0 ϕk 0 (x) +
+P L+1 f (x) = λL+1
+j
+j
+
+(2.4)
+
+j
+
+k
+
+X X
+
+L 0 ≤l ≤L m
+
+γlm ψlm (x) .
+
+2.1.2. Biorthogonality and linear filters. To generalize the multiresolution analysis to a broader class of wavelet functions
+such as the symmetric or interpolating ones, one can relax the criteria for finding scaling and corresponding wavelet functions
+using the dual multiresolution analysis based on biorthogonality [9, 38]. With biorthogonal wavelets, the basis of V L , ϕLk (x), does
+no longer need to be orthonormal. Instead, one uses another subspace Ṽ L and the associated basis functions ϕ̃Lk (x) such that:
+­
+
+(2.5)
+
+®
+ϕLi (x) , ϕ̃Lk (x) = δi ,k
+
+with
+
+{i , k} ∈ Z .
+
+The spaces V L and Ṽ L have non-orthogonal complements W L and W̃ L , respectively, such that V L ⊥ W̃ L and Ṽ L ⊥ W L . This leads
+to the definition of the primal (dual) scaling functions ϕ (ϕ̃), and the primal (dual) wavelet functions ψ (ψ̃), which form bases of
+their respective subspaces and satisfy
+­
+
+(2.6)
+
+® ­
+®
+ϕ̃Li (x) , ψLk (x) = ψ̃Li (x) , ϕLk (x) = 0
+
+­
+
+and
+
+The definitions of the scaling and detail coefficients become
+­
+®
+λLk , f (x) , ϕ̃Lk (x)
+
+(2.7)
+
+® ­
+®
+ϕ̃Li (x) , ϕLk (x) = ψ̃Li (x) , ψLk (x) = δi ,k .
+
+­
+®
+γLm , f (x) , ψ̃Lm (x) ,
+
+and
+
+and the refinement relation remains unchanged
+
+X
+X
+X L L
+£ ¤
+P L+1 f (x) = λL+1
+ϕL+1
+(x) = λLk ϕLk (x) +
+γm ψm (x) .
+j
+j
+
+(2.8)
+
+j
+
+m
+
+k
+
+Following the nested subspace decomposition a linear filter can be associated to each primal/dual basis function [38], binding
+two levels together
+(2.9)
+
+ϕLk (x) =
+
+X
+j
+
+h k, j ϕL+1
+(x),
+j
+
+ψLm (x) =
+
+X
+n
+
+g m,n ϕL+1
+n (x),
+
+ϕ̃Lk (x) =
+
+X
+j
+
+h̃ k, j ϕ̃L+1
+(x)
+j
+
+and
+
+ψ̃Lm (x) =
+
+X
+n
+
+g̃ m,n ϕ̃L+1
+n (x) .
+
+Combined with the biorthogonal refinement relation, the filters provide the relations for the forward wavelet decomposition (also
+known as the analysis operation):
+(2.10)
+
+λLk =
+
+X
+j
+
+h̃ k, j λL+1
+, H̃k, j λL+1
+j
+j
+
+and
+
+γLm =
+
+X
+j
+
+g̃ m, j λL+1
+, G̃ m, j λL+1
+,
+j
+j
+
+where we used the Einstein summation convention to simply the notation. The inverse wavelet decomposition (also known as
+synthesis operation) is obtained as
+(2.11)
+
+λL+1
+=
+j
+
+X
+k
+
+h j ,k λLk
+
++
+
+X
+m
+
+g j ,m γLm , H j ,k λLk +G j ,m γLm .
+
+Both the forward and inverse transforms have linear computational complexity in the number of degrees-of-freedom and are
+easily represented as a block diagram, as illustrated in Figure 2.1b.
+2.1.3. Interpolating wavelets. Our work relies on the interpolating wavelets first proposed by [13] based on the DeslauriesDubuc interpolation filters [11, 12]. This wavelet family provides a non-orthogonal basis [13] but their construction can be framed
+within the context of a biorthogonal multiresolution analysis as detailed in [37, 38].
+Like the orthogonal wavelets, interpolating wavelets are characterized by the dilatation and translation of a (non-orthonormal)
+scaling function ϕLk = ϕ(2L x − k) [13]. The interpolating property of the scaling function is given by ϕ(i − k) = δi ,k for i , k ∈ Z. It is
+
+convenient at this point to define x L,k , k2−L as the coordinate associated to an index k ∈ Z at level L such that ϕLk (x L,i ) = ϕ(i − k).
+The interpolating nature then implies that the evaluation of the projection of the function at x L,i is equal to the associated scaling
+coefficient at that coordinate, λLi :
+(2.12)
+
+X
+£ ¤
+P L f (x L,i ) = λLk ϕLk (x L,i ) = λLi .
+k
+
+4
+
+THOMAS GILLIS AND WIM M. VAN REES
+
+Interpolating wavelets can be classified by their degree of interpolation N , which corresponds to the number of moments of the
+scaling function,
+Z ∞
+(2.13)
+x p ϕ(x) dx = δp
+0≤p <N .
+−∞
+
+This relation guarantees the ability of the scaling functions to exactly reproduce polynomials of order N − 1.
+
+Interpolating wavelets are well suited to wavelet collocation methods because it is convenient to use function evaluations
+at x L,k interchangeably with scaling coefficients λLk . However, in general this does incur an error associated with the truncation
+L£ ¤
+of detail coefficients at any given level. This error can be captured by comparing the exact function with the function P f (x)
+P
+L£ ¤
+defined as P f (x) , k f (x L,k ) ϕLk (x). This corresponds to a similar projection as (2.12), but replacing λLk with f (x L,k ). A bound
+on the difference can be found as [39]:
+¯ £ ¤
+¯
+¡
+¢
+¯ L
+¯
+(2.14)
+¯P f (x) − f (x)¯ ≤ O 2−L N .
+
+¯
+¯
+¡
+¢
+Specifically at location x L,k we then find ¯ f (x L,k ) − λLk ¯ ≤ O 2−L N . Since 2−L = x L,k+1 − x L,k ∼ h relates to the grid spacing on level
+L, this relation implies that using function values in an N th order interpolating wavelet-based projection incurs a discretization
+error of O (h N ).
+The simplest family of interpolating wavelets are the Donoho interpolating wavelets [13, 37, 38], which are classified here
+with the code N .0, with N the degree of interpolation. For the Donoho interpolating wavelets, the dual scaling function is a Dirac
+impulse located at the origin [37], ϕ̃Lk (x) = δ(x − x L,k ). Hence, it follows that at any level
+­
+®
+λLk = f (x) , ϕ̃Lk (x) = f (x L,k ) ,
+
+(2.15)
+
+which means the scaling coefficients at £level
+¤ L do not£just
+¤ equate the function projection evaluation at level L, as in (2.12), but they
+equate the function evaluation itself: P f (x L,k ) = P f (x L,k ) = f (x L,k ) = λLk . However, these wavelets do not conserve moments
+when compressing information, and are characterized by considerable aliasing in the wavelet transform as reported in [37]. One
+potential avenue to address these issues is by increasing Ñ , the number of zero moments of the wavelet function. This can be done
+through the lifting approach proposed in [37] as discussed in the next section.
+2.1.4. Lifted interpolating wavelets. The lifting scheme has been introduced as a general and convenient way to construct
+biorthogonal and second generation wavelets and their associated linear filters [10, 37, 38, 40]. Although the scheme can be
+generalized to any wavelet family, we restrict ourselves here to the interpolating wavelet. Starting with a set of scaling coefficients
+on level L + 1, the lifting scheme uses the following three different steps to obtain the set of scaling and detail coefficients on level
+L:
+1. The splitting step splits the fine scaling coefficients into temporary coarse scaling (even indices) and detail (odd indices)
+coefficients. This step is also known as the application of the “Lazy wavelet”, and can be captured by the filters H̃k, j = δ2k, j
+and H̃m, j = δ2m+1, j . After this first step, we have a set of coarse scaling and detail coefficients
+λLk = λL+1
+2k
+
+(2.16)
+
+,
+
+L+1
+γLm = λ2m+1
+.
+
+2. The dual lifting applies the filter S̃ to the scaling coefficients and uses the result to update the detail coefficients:
+γLm ← γLm + S̃ m,k λLk .
+
+(2.17)
+
+3. The primal lifting applies the filter S to the detail coefficients and uses the result to update the scaling coefficients:
+λLk ← λLk + S k,m γLm .
+
+(2.18)
+
+The successive application of the three steps is illustrated in Figure 2.1, and can be expressed through composite filters H a and G a
+that combine all stages into single operators. Reversing the sequence of operations and individual steps leads to the corresponding
+inverse transform, captured by the H s and G s filters.
+The Donoho interpolating wavelets discussed in the previous section can be cast in the format of the lifting scheme by setting
+S̃ to the filter coefficients of [11, 12], which ensure exact interpolation for polynomials of degree up to N − 1, and setting all primal
+lifting filter coefficients S̃ = 0.
+To ‘lift’ these wavelets, following [37], one can choose the primal filter S̃ in such a way that the first Ñ moments of the primal
+wavelet function vanish:
+Z ∞
+(2.19)
+x p ψLk (x) dx = 0
+0 ≤ p < Ñ .
+−∞
+
+5
+
+MURPHY
+
+Forward
+
+Inverse
+
+λL+1
+
+split
+
+−
+
+λL
+
++
+S
+
+S̃
+
+Inverse
+
+Ha
+
+S
+
+S̃
+
+γL
+
++
+
+Forward
+
+merge
+
+λL+1
+
+λL
+
+Hs
+
+λL+1
+
+λL+1
+γL
+
+Ga
+
+−
+
+(a) The dual/primal lifting filters
+
+Gs
+
+(b) Biorthogonal filter bank
+
+Figure 2.1: The forward and inverse wavelet transform as the combination of the dual and primal lifting steps, expressed through
+the dual/primal filters (a) and through the full biorthogonal filter bank (b).
+
+If this holds, we ensure the conservation of the first Ñ moments across levels:
+"
+#
+"
+#
+"
+#
+Z ∞
+Z ∞
+Z ∞
+X L L
+X L+1 L+1
+X L L
+X L L
+p
+p
+p
+(2.20)
+x
+λk ϕk (x) dx =
+x
+λk ϕk (x) +
+γm ψm (x) dx =
+x
+λk ϕk (x) dx ,
+−∞
+
+−∞
+
+k
+
+−∞
+
+m
+
+k
+
+k
+
+for 0 ≤ p < Ñ . Using the moment properties on ϕ(x) from the interpolating wavelet, the pth moment on level L can be expressed
+as:
+Z ∞
+X LZ ∞ p L
+X L¡
+£ ¤
+¢p
+x p P L f (x) dx =
+λk
+x ϕk (x) dx = 2−L
+λk x k,L
+(2.21)
+,
+−∞
+
+k
+
+−∞
+
+k
+
+which allows us to rewrite the moment conservation identity of lifted interpolating wavelets (2.20) between two levels L + 1 and L
+as
+X L¡
+X L+1 ¡
+¢p
+¢p
+,
+λk x L,k
+(2.22)
+λj
+x L+1, j = 2
+j
+
+k
+
+for 0 ≤ p < Ñ .
+
+To satisfy (2.19), on a uniform grid and assuming Ñ ≤ N it can be shown that S Ñ = −1/2 S̃ Ñ [37, theorem 12], where S̃ are
+the dyadic interpolation coefficients from [11, 12] and given in Table 2.1. The lifting scheme thus results in an interpolating filter
+bank for interpolating wavelets indexed by the corresponding interpolation and moment properties N .Ñ , which can be used for
+refinement ( H̃ = H a and G̃ = G a ) and coarsening (H = H s and G = G s ) operations. Non-lifted (Donoho) interpolating wavelets
+have Ñ = 0, whereas lifted wavelets have Ñ > 0; numerical values for the filters are given in section SM1. All our results in this work
+are restricted to N ∈ {2, 4, 6} and Ñ ∈ {0, 2}.
+N
+2
+4
+6
+
+S −2
+−3/256
+
+S −1
+1/16
+25/256
+
+S0
+−1/2
+−9/16
+−75/128
+
+S1
+−1/2
+−9/16
+−75/128
+
+S2
+1/16
+25/256
+
+S3
+
+−3/256
+
+Table 2.1: Dual-lifting coefficients, S̃ i [4, Appendix B.3]. For uniform grids the filter is symmetric, i.e. S̃ −i = S̃ i .
+Lastly, we note that lifting the interpolating wavelets leaves the primal scaling function ϕ(x) unaffected, but does change the
+dual scaling function ϕ̃(x) from a delta function to a continuous distribution. This means the identity f (x L,k ) = λLk of the Donoho
+¯
+¯
+¡
+¢
+interpolating wavelets is lost, and instead we fall back on the general error bound ¯λLk − f (x L,k )¯ ≤ O 2−L N provided in (2.14).
+
+2.1.5. Compression. Relying on the multiresolution theory, compression can be achieved by discarding all the detail coefficients whose absolute values are smaller than a tolerance ². This yields a coarser (or compressed) representation of the information,
+X L L
+X
+X l
+£ ¤
+(2.23)
+P L f ² (x) = λk 0 ϕk 0 (x) +
+γm ψlm (x) .
+k
+L 0 ≤l ≤L |γm |>²
+It can be shown [13, 26, 43] that the error committed by this approximation is of the order of ²,
+¯¯ L £ ¤
+¯¯
+£ ¤
+¯¯P f (x) − P L f (x)¯¯ ≤ C 1 ² ,
+(2.24)
+²
+∞
+
+6
+
+THOMAS GILLIS AND WIM M. VAN REES
+
+where C 1 depends on f (x). In practice, with a reasonably smooth function the value of C 1 ≈ 1, which means that ² is an accurate
+estimate of the local error committed.
+2.2. Extension to block-structured grids. In this section we describe how to adapt the multiresolution analysis described
+above to block-structured grids. Throughout this work, we limit the jump of resolution between two adjacent blocks to 1 (denoted
+as the 2:1 constraint), which considerably simplifies the operations and the implementation complexity. Below we discuss three
+fundamental operations that are required in the implementation: coarsening describes the compression of data in 2d blocks into
+a single block at the next lower resolution level, with d the number of spatial dimensions of the grid; refinement describes the
+refinement of data in a single block into 2d new blocks at the next higher resolution level; and ghost point reconstruction relates
+to the construction of ghost points for blocks across a resolution jump, so that finite-difference stencils can be evaluated on each
+block at its own local uniform resolution.
+We describe each of these operations in 1D in more detail below, focusing on the wavelet 2.2 wavelet for simplicity. Subsequently, we will discuss how implementation choices lead to the treatment of grid points near resolution jumps, and how we
+define the criteria for compressing or refining a block. We note beforehand that our sketches use grid ‘blocks’ and associated numbering that do not reflect a practical setting, but rather provide the minimum number of points needed to explain the respective
+operations for ease of interpretation.
+2.2.1. Coarsening. Starting from a uniform resolution one can coarsen a block using the filter H a . The coarsening pattern is
+illustrated in Figure 2.2 for wavelet 2.2 where the ‘left’ (green) and ‘right’ (blue) fine scaling coefficients at level L + 1 = 1 (top row)
+are converted into coarse scaling coefficients at level L = 0 (bottom row) through subsequent application of the dual lifting (S̃) and
+lifting (S) filters. After these steps, only the scaling coefficients at level L are retained while the detail coefficients are discarded.
+Due to the lifting step, ghost points are required for a block to coarsen when using wavelets with Ñ > 0, with the precise number
+specified in the first column of Table 2.2. In the example of Figure 2.2a for wavelet 2.2, the green region needs one ghost point at
+the back (λ14 , needed to compute λ01 ) and the blue region needs two ghost points at the front (λ18 and λ19 , required to compute λ05 ).
+λ11
+
+λ12
+
+λ13
+
+λ14
+
+λ15
+
+λ16
+
+λ17
+
+λ18
+
+λ19
+
+λ110
+
+λ111
+
+λ112
+
+λ113
+
+λ00
+
+γ00
+
+λ01
+
+γ01
+
+λ02
+
+γ02
+
+λ03
+
+γ03
+
+λ04
+
+γ04
+
+λ05
+
+γ05
+
+λ06
+
+γ06
+
+λ05
+
+γ05
+
+L
+
+DL
+
+λ10
+
+(a) coarsening step
+
+λ15
+
+λ16
+
+λ17
+
+λ18
+
+λ19
+
+λ02
+
+γ02
+
+λ03
+
+γ03
+
+λ04
+
+γ04
+
+iL
+
+iDL
+
+λ14
+
+γ01
+
+γ06
+
+(b) update step
+
+Figure 2.2: Sketch of the steps required to coarsen the left (green) and right (blue) grid regions using wavelet 2.2, with the central
+(red) region remaining at fine resolution. First we apply the dual lifting (DL) and lifting (L) steps successively to compute the
+coarse-level scaling coefficients, and discard the neglected detail coefficients (a). When Ñ > 0 the information encoded in the
+discarded detail coefficients must also be removed from the fine-level information on the central (red) region, by using the inverse
+lifting (iL) and inverse dual lifting (iDL) filters during the update step (b).
+
+Discarding the detail coefficients on level L does not affect the scaling coefficients on that level, however when Ñ > 0 discarding these details does affect the scaling coefficients of adjacent blocks whose resolution has not changed. This can be seen and
+accounted for by performing an inverse wavelet transform from level L back to level L +1 after discarding the details, and updating
+
+7
+
+MURPHY
+
+the values of the affected scaling coefficients:
+λL+1
+← λL+1
+−G sj ,n γLn .
+j
+j
+
+(2.25)
+
+where γLn are all the detail coefficients that we have discarded. To perform the update step on a fine block whose neighbor has
+coarsened, the fine block needs to have enough ghosts points to compute the values of γLn that are discarded, which increases
+significantly the ghost point requirements of the update step as shown in Table 2.2. The distance (in index space) to the farthest
+detail to be discarded depends on the wavelet order and Ñ , and is shown in Table 2.2 under the column coarse region extension.
+In the specific example of Figure 2.2, though the middle red region does not change resolution, we must still remove all the
+information associated with the discarded detail coefficients of the coarsened green and blue regions. For wavelet 2.2, this corresponds to discarding the information associated with γ01 on the left and γ05 on the right. To achieve this, starting from the original
+uniform grid on the top line of Figure 2.2a, the red region requires two ghost points in front (λ12 and λ13 , needed to compute γ01 )
+and three ghost points in the back (λ110 , λ111 , and λ112 , needed to compute γ05 ), in order to perform the update step associated with
+the coarsening of both its neighboring grid regions. Lastly, as indicated in Figure 2.2, for wavelet 2.2 we additionally discard the
+detail coefficient γ02 when the left region coarsens, and γ04 when the right region coarsens, which will be explained further in the
+next two sections below.
+2.2.2. Ghost point reconstruction. For any grid configuration with blocks at multiple levels of resolution, we have to be able
+to compute ghost points for each block at their local resolution level. We choose here to rely on the wavelets to do so for all ghosting
+operations, in order to be consistent with the grid adaptation operations.
+Figure 2.3 shows the computation of the ghost points for a fine region (in red) surrounded by neighboring coarse regions
+(in green and blue) for wavelet 2.2 in 1D. Ghost points to be computed are shown with open circles (on the coarse level) and
+open squares (on the fine level), whereas known scaling coefficients are shown in colored symbols with black outlines. A naive
+wavelet transform indicates the immediate problem that the ghost points for the finer region and those for the coarser region
+are interdependent: for instance, to compute λ13 we would need to apply inverse lifting on λ02 , but λ02 is in turn dependent on λ13
+through the dual lifting. This interdependency gets more intricate in higher dimensions and for higher-order wavelets. Though
+these systems can be solved as proposed in [34] for non-lifting wavelets, the associated implementation requires expansive look-up
+tables that significantly increase the memory footprint of the solver, especially in 3D [42]. To avoid this complication, we choose
+to discard the fine-region detail coefficients that cause the interdependency between the wavelet transforms on the two levels,
+which we denote the ‘coarse-extension assumption’. In the case illustrated in Figure 2.3 specifically, this means we discard the
+detail coefficients γ02 and γ04 . On a more abstract level, this choice means that we effectively extend the coarse-level region across
+the resolution jump into the first few grid points on the neighboring fine resolution block. To consistently follow-through with
+this assumption requires additional steps in our implementation that we will discuss more below. For now, with this assumption
+in place the ghost reconstruction across a resolution jump can be done in two steps. First, we can use the wavelet transform to
+compute ghost values for the fine resolution block through what is essentially a local refinement of the coarse grid, which can now
+be done explicitly.
+λ13
+
+λ14
+
+λ15
+
+λ02
+
+γ02
+
+λ16
+
+λ17
+
+λ18
+
+λ19
+
+λ110
+
+γ04
+
+λ05
+
+λ111
+
+λ112
+
+iL
+
+iDL
+
+λ12
+
+λ01
+
+λ06
+
+Figure 2.3: Sketch of the process used to reconstruct ghost points (open symbols) for a 1D fine-resolution grid region (in red) surrounded by coarse grid regions on the front (green) and back (blue), using wavelet 2.2. The arrows denote the flow of information
+from grid values to the unknown ghost points. After the ghost points for the fine region have been computed, the ghost points for
+both coarse regions can be found from a standard coarsening procedure (Figure 2.2a)
+
+In Figure 2.3 we illustrate this approach for the computation of the fine ghost values with the wavelet 2.2. Focusing first on
+the right resolution jump, our assumption of explicitly discarding γ04 formally sets the ghost point λ110 = λ05 and further allows us
+to directly evaluate λ111 as λ111 = 1/2(λ05 + λ06 ). This is essentially a refinement procedure where we take the coarse-level scaling coefficients and refine them under the assumption that all unknown detail coefficients involved in this process are zero, irrespective
+of the side of the interface where they exist.
+
+8
+
+THOMAS GILLIS AND WIM M. VAN REES
+
+For the left resolution jump, the specific grid layout enables us to proceed in one of two ways. The first way is conceptually
+0
+similar to how we describe the right interface, where by assumption
+¡ 0γ2 =0 ¢0 even though this detail resides in the fine resolution
+0
+1
+1
+grid. Under this assumption, λ2 = λ4 and the ghost point λ3 = 1/2 λ1 + λ2 is obtained from the inverse wavelet¡ transform
+¢ of the
+coarse-level data. The second way relies on the inverse of the dual lifting step: we can directly write λ13 = 1/2 λ14 + λ01 without
+explicitly considering γ02 . The two approaches are identical if γ02 = 0. Note that this is only possible on the left interface; on the
+right interface, the value of λ110 is not readily available unless γ04 = 0, since λ110 belongs to the coarse region. In practice, we use the
+first approach and explicitly assume that both γ02 and γ04 are zero. We do so because the implementation of the inverse dual lifting
+in multiple dimension is not trivial (see subsection 2.3), which would complicate the second approach.
+This concludes the computation of the ghost points for the fine level; afterwards, we can treat the region of the fine resolution
+as a local uniform grid that we coarsen in order to obtain the ghost points for the coarse grid levels. This procedure poses no
+further difficulties and is identical to the coarsening described above.
+2.2.3. Refinement. The refinement operation of a block away from resolution boundaries is trivially done through the subsequent application of the lifting and dual lifting filters. Near resolution boundaries, we retain the coarse-extension assumption
+introduced for the computation of ghost points described in the previous subsection, which enables the explicit computation of
+the fine-level scaling coefficients. This process is illustrated in Figure 2.4 for the special case of the wavelet 2.2, in which case only
+the ghost point λ05 is required on the right resolution jump to compute the new scaling coefficient λ19 . The number of ghost points
+needed for a block to refine for any other wavelet considered here is shown in the last column of Table 2.2.
+λ15
+
+λ16
+
+λ17
+
+λ18
+
+λ19
+
+iL
+
+iDL
+
+λ14
+
+λ02
+
+λ03
+
+λ04
+
+λ05
+
+Figure 2.4: Sketch of the refinement procedure of a 1D coarse grid region (in red) using wavelet 2.2. Starting from the coarselevel scaling coefficients (bottom line), we use inverse lifting (iL) and inverse dual lifting (iDL) to compute the fine-level scaling
+coefficients (top line). For this wavelet, only one ghost point on the back of the refined region is required, indicated in blue.
+
+2.2.4. Substitution. In the previous subsections we motivated and detailed the coarse-extension assumption, where we neglect specific fine-level detail coefficients near coarse-fine resolution jumps to facilitate explicit ghost reconstruction and refinement operations. We explained that this is essentially equivalent to an extension of the coarse-level region into a small band of
+the adjacent fine-level block. In practice however, these specific detail coefficients on the fine-level block may not be zero due to
+field operations on the associated fine-level scaling coefficient, such as during the evolution of a PDE. Without addressing this, we
+would inconsistently neglect high-frequency information during the grid adaptation and ghost reconstruction due to our coarseextension assumption.
+To avoid that this spurious information persists and leads to an inconsistent wavelet transform on the two sides of the interface, we perform an additional “substitution” step where we overwrite each fine-level scaling coefficient associated with a neglected detail coefficient locally with wavelet-reconstructed values that will enforce a zero detail coefficient. To achieve this step,
+we use the dual lifting relationship
+(2.26)
+
+γLm = 0
+
+⇒
+
+a
+L+1
+L+1
+a
+L+1
+G m,
+= G m,
+j λj
+j 6=(2m+1) λ j 6=(2m+1) + λ2m+1 = 0
+
+⇒
+
+a
+L+1
+λL+1
+2m+1 ← −G m, j 6=(2m+1) λ j 6=(2m+1) ,
+
+a
+where we used the fact that G m,0
+= 1 for all wavelets considered in this work. We note that in 1D, the proposed approach is
+exactly the inverse of the dual lifting step, as illustrated in Figure 2.5. This substitution step is subtle so we point out that this step
+does not affect the order of accuracy of the wavelet operations, only removes detail coefficient values that are generated during the
+PDE evolution starting from values below the coarsening threshold, and can be rigorously understood as the consistent enforcement of the coarse-extension assumption. In practice, we apply the substitution step as part of the ghost point reconstruction,
+immediately after the computation of the fine ghost points and before computation of the coarser ghost points.
+
+2.2.5. Block adaptation criteria. Subsection 2.1.5 describes how to compress a signal in 1D given its wavelet transformation.
+Here we explain how we transform this condition to compress data on a block-structured grid, detect emerging scales and manage
+the need to refine during a simulation.
+
+9
+
+MURPHY
+
+λ15
+
+λ16
+
+λ17
+
+λ18
+
+λ19
+
+λ110
+
+iL
+
+iDL
+
+λ14
+
+Figure 2.5: Sketch of the substitution process, where spurious information associated with neglected detail coefficients in fineresolution grid regions adjacent to coarse-resolution regions is explicitly discarded. For wavelet 2.2 in 1D, as shown here, substitution is equivalent to the inverse dual lifting.
+
+Compression. Starting with the former, for each block at level L we compute all associated details γL−1 through the forward
+wavelet transform, and take the maximum value for each block b as ||γL−1 ||b∞ . Consistent with our coarse-extension assumption
+above, we consider within this local infinite norm also the set of details that we require to be negligible when computing ghost
+points, the refinement relation, and the coarsening steps, even though these detail coefficients might physically reside in adjacent
+blocks. The number of additional details considered beyond the block boundary is given in the column coarse region extension in
+Table 2.2. Once we have the maximum detail coefficient on each block, we decide on an action to take. Due to the octree nature
+of our grid, we can only coarsen all leaf blocks within a single tree node simultaneously. Therefore, for each set of 2d leaf blocks
+in the grid where d is the spatial dimension, we reduce them to a single coarser level block if each of the leaf blocks b satisfies
+||γL−1 ||b∞ < ²c , with ²c the coarsening threshold. This criterion constitutes a generalization of (2.23) to a block-structured grid. This
+approach implies that the compression rate of a given signal decreases as the block size increases, due to a reduced granularity in
+the grid. We emphasize here that by including the details neglected during the coarse-extension assumption within our definition
+of ||γL−1 ||b∞ , the compression approach remains consistent with (2.23).
+Refinement. The criterion to refine is necessarily more ad-hoc, as it aims to predict where new scales are expected during
+the evolution of the equations based on an instantaneous analysis of the field. Different approaches exist within existing waveletbased adaptive grid methods, such as increasing the resolution of neighboring blocks to take into account the smallest scales
+created by the PDE [26]. Here we follow [34] to rely on a user-specified tolerance ²r > ²c that determines whether refinement is
+necessary. Using this approach, a block b is refined if ||γL−1 ||b∞ > ²r , i.e. if the detail coefficients of the current information exceed
+a user defined threshold. We will analyze this choice in the validation and result sections below.
+Under the above compression policy, we are guaranteed by the wavelet framework to discard only information encoded by
+detail coefficients that do not exceed ²c . With the refinement approach, the maximum detail coefficients during the evolution of
+the equations are guaranteed to never exceed ²r , since we would refine when that happens. Specifically, if we refine a block at level
+L for which ||γL−1 ||b∞ > ²r , we create new blocks at level L + 1, each one of which is characterized by ||γL ||b∞ = 0. This means we
+have to make sure we do not coarsen blocks just after they have been refined, even though technically their detail coefficients are
+smaller than the coarsening threshold. The implementation of this requirement is discussed in section 3.
+Ratio between compression and refinement thresholds. From (2.14) we know that ||γ||b∞ ∝ h N with N the interpolation order
+of the wavelet. This means that coarsening a block will generally increase its detail coefficient by a factor 2N . Consequently, if we
+choose ²r /²c < 2N and a block with ||γ||b∞ only slightly below the coarsening threshold is coarsened, its details will exceed ²r after
+coarsening. In this case, the block will be flagged for refinement again, leading to flip-flops in the grid adaptation. Conversely,
+choosing ²r /²c > 2N can lead to a non unique grid: if we consider a block with ||γ||b∞ slightly above the coarsening threshold and
+therefore admissible on the grid, the same block coarsened by one level would also be admissible on the grid. In this case the
+adaptation is therefore not unique and the obtained grid depends on external factors such as the initial level.
+In practice, we observe ²r to be the threshold that determines the overall accuracy of the simulation, since this is the threshold
+that sets the maximum value of detail coefficient admissible on the grid. Then ²c determines the compression rate, or how much
+information we are willing to discard for a given ²r . This can be controlled by the ratio ²r /²c , which we make sure to set to ²r /²c > 2N
+to prevent the flip-flopping described above. The effect of both ²r and the ratio ²r /²c is discussed through numerical experiments
+below.
+Adaptation frequency. For transient problems we have to choose a frequency of adaptation that balances the need to adjust
+the grid to dynamically evolving scales against the computational cost of changing the grid. In general, lowering the mesh adaptation frequency will lead to wavelet detail coefficients in the grid that fall more and more below the compression threshold in
+some regions, and increase more and more beyond the refinement threshold in others. The former will not increase the errors
+
+10
+
+THOMAS GILLIS AND WIM M. VAN REES
+
+made during the simulation, but the latter could potentially lead to the grid not capturing emerging or transported scales that are
+relevant to the PDE evolution. A counter point to this is that the block-structured grid contains significant ‘inertia’, which grows
+with the block size, due to the fact that we refine even when one single detail in a block exceeds the threshold.
+To put the adaptation frequency into context, we can consider a transport problem with characteristic velocity U . In this case,
+the time it takes for the solution to travel α grid points at level L is 2−L α/U (assuming a unit cube as root domain). If we adapt
+every N a timesteps and follow a CFL-based timestep constraint, the solution has traveled CFL N a grid points between successive
+adaptations. Though in practice likely problem-dependent our results in subsection 5.1 show that for a smooth signal and suitably
+small refinement threshold this number is allowed to be of comparable value as the block size Nb leading to N a ∼ Nb /(CFL).
+coarsening
+wavelet order
+N
+Ñ
+2
+0
+2
+2
+4
+0
+4
+2
+6
+0
+6
+2
+
+# ghost points
+front
+back
+0
+0
+2
+1
+0
+0
+4
+3
+0
+0
+6
+5
+
+update after neighbor has coarsened
+coarse region extension
+front (1D / 3D) back (1D / 3D)
+0/0
+0/1
+1
+2
+0/2
+0/3
+3
+4
+0/4
+0/5
+5
+6
+
+# ghost points
+front (1D / 3D) back (1D / 3D)
+0/0
+0/1
+2
+3
+0/4
+0/5
+6
+7
+0/8
+0/9
+10
+11
+
+refinement
+# ghost points
+front
+back
+0
+1
+0
+1
+1
+2
+1
+2
+2
+3
+2
+3
+
+Table 2.2: Ghost points requirement for a block when coarsening (see Figure 2.2a); for a block at level L + 1 performing the update
+step when a neighbor at level L has coarsened (see Figure 2.2b); and when refining a block (see Figure 2.4). The coarse region extension indicates how many additional scaling and detail coefficients at level L have to be computed outside of the blocks boundaries
+to perform the update step. The associated ghost points are required at the level L + 1 of the block whose neighbor has coarsened.
+The size of these regions can vary between 1D and 3D, as explained in subsection 2.3.
+
+2.3. Extension to multiple dimensions. Here we detail the extension of the above methodology to multiple spatial dimensions, starting with the coarsening operation and subsequently emphasizing some of the implementation details to consider.
+The filter application in 3D relies on the successive application of the corresponding 1D filters in each dimension. To clarify
+the notation we use a superscript on all the filters to denote the direction in which the filter is applied. For coarsening we then
+obtain
+£
+¤
+(2.27)
+λLkx ,k y ,k z = H Xa × HYa × H Za λL+1 ,
+which exclusively relies on the H a filter applied tensorially on the scaling coefficients at level L + 1.
+
+To compute the detail values we alternatively apply the filters H a or G a depending on the scaling or detail behavior in the considered dimension, as dictated by whether the associated index in that dimension is even or odd. This means we can distinguish
+different “degrees” of detail coefficients, given by the number of directions in which the coefficient behaves as a detail information.
+Specifically, the first degree detail coefficients, which we collectively denote as γL1◦ , have an odd index in one direction only and
+are given by
+£
+¤
+£
+¤
+£
+¤
+γLm y = H Xa ×G Ya × H Za λL+1
+γLm z = H Xa × HYa ×G Za λL+1
+.
+(2.28)
+γLm x = G Xa × HYa × H Za λL+1
+Similarly the second degree detail coefficients, which we collectively denote as γL2◦ , have two odd indices and we obtain
+
+(2.29)
+
+£
+¤
+γLm x ,m y = G Xa ×G Ya × H Za λL+1
+
+£
+¤
+γLm x ,m z = G Xa × HYa ×G Za λL+1
+
+£
+¤
+γLm y ,m z = H Xa ×G Ya ×G Za λL+1 .
+
+Finally, the third degree scaling coefficient, which we collectively denote as γL3◦ , are obtained as
+(2.30)
+
+£
+¤
+γLm x ,m y ,m z = G Xa ×G Ya ×G Za λL+1 .
+
+In order to relax further the notation, for all detail coefficients γL = {γL1◦ , γL2◦ , γL3◦ } we will refer to the fine scaling coefficients located
+L+1 L+1
+at the same positions as {λL+1
+1◦ , λ2◦ , λ3◦ }, respectively. We also have the ‘zeroth’ degree scaling coefficients associated with even
+L+1
+L+1 L+1 L+1
+indices in all three directions, which we denote by λL+1
+= {λL+1
+0◦ so that λ
+0◦ , λ1◦ , λ2◦ , λ3◦ }.
+
+Revisiting the coarse-extension assumption we made in 1D, its extension to three dimensions can be formulated as discarding
+any first, second and third degree detail coefficients in a fine block adjacent to a resolution jump that are involved in the multidimensional refinement scheme. This is reflected by the higher 3D values in the column coarse region extension of Table 2.2,
+which represents the index-space distance from the block boundary to the farthest detail coefficient that is discarded. As before,
+
+11
+
+MURPHY
+
+we discard this information through the substitution procedure, which inverts locally the inverse dual lifting step. In 3D, the
+substitution on first degree scaling coefficients is performed as
+£ ¤
+£ a¤
+L+1
+(2.31)
+γL1◦ = G a (i )6=(0) λL+1 + λ1L+1
+⇒ λL+1
+,
+◦
+1◦ ← G (i )6=(0) λ
+
+where we used that [G a ](i )=(0) = 1 for all wavelets considered in this work. For second degree scaling coefficients, this becomes
+£
+¤
+£ a
+¤
+a
+L+1
+(2.32)
+γL2◦ = G a ×G a (i , j )6=(0,0) λL+1 + λ2L+1
+⇒ λL+1
+,
+◦
+2◦ ← G ×G (i , j )6=(0,0) λ
+
+and for third degree, we find
+¤
+£
+(2.33)
+γL3◦ = G a ×G a ×G a (i , j ,k)6=(0,0,0) λL+1 + λL+1
+3◦
+
+⇒
+
+¤
+£ a
+L+1
+a
+a
+.
+λL+1
+3◦ ← G ×G ×G (i , j ,k)6=(0,0,0) λ
+
+At first it seems that each equation is interdependent since the first, second, and third degree scaling coefficients are all included
+L+1
+in λL+1 . However, analyzing the filter G a reveals that the first degree scaling coefficients λL+1
+1◦ only need λ0◦ to be updated, the
+L+1
+L+1
+L+1
+second degree coefficients λ2◦ need λ0◦ and λ1◦ , and so forth. This means we can consistently and explicitly perform the
+substitution step in 3D by first updating the first degree, then the second degree, and finally the third degree scaling coefficients
+according to the values of the respective neglected detail coefficients.
+2.4. Boundary conditions. All theory described above is for infinite signals and grids, and the validation and results cases below rely on fields with compact support, so that boundary conditions are not relevant. In practice, we do need an implementation
+of boundary conditions for finite signals, which we created by relying on interpolation and extrapolation at the domain boundary.
+Our solver currently supports zero value (Dirichlet), zero flux (Neumann), plain zeros filling and extrapolation boundary conditions. They all rely on polynomial interpolation done at the order of the wavelet used, which is compatible with the non-lifted
+wavelet theory but doesn’t conserve the moments when used with lifted wavelets. To improve the numerical properties of the interpolation we use Neville’s algorithm [33]. Wavelets on the interval [13] would provide more consistent implementations of such
+boundary conditions, and the lifting scheme provides avenues for moment conservation [17], but we reserve this for future work.
+3. Implementation and algorithms. In this section we discuss high-level implementation choices of the ghost reconstruction and grid adaptation operations, deferring the details to section SM2 in the Supplementary Materials. Our entire code base
+relies on the external library p4est [6] to handle the meta-data infrastructure of the octree, while all grid adaptation and block operations have been implemented directly in our solver. Within p4est, we define each ‘tree’ as a unit cube domain, which forms the
+root (level L = 0) of an octree data structure that can be refined, and the leaves are uniform resolution blocks of size Nb3 . Following
+p4est, the trees can be tiled to create a ‘forest’ of trees, which enables us to create rectangular domains of arbitrary aspect ratios.
+We currently have implemented wavelets with N ∈ {2, 4, 6} and Ñ ∈ {0, 2}.. Extension to higher N is straightforward if needed; higher
+Ñ on the other hand will potentially deteriorate the efficiency of the solver as we will have to significantly increase the number of
+adjacent detail coefficients that needs to be discarded in accordance with our coarse-extension assumption. Throughout our implementation we apply the 2:1 constraint on levels of adjacent blocks, enforcing it during grid adaptation and exploiting it during
+all multiresolution wavelet operations.
+Ghost reconstruction procedure. The implementation of the ghost reconstruction consists of two parts: the first recovers the
+value from coarser neighbors and same level neighbors (see Algorithm 1 in section SM2), and the second computes the values
+from finer neighbors (see Algorithm 2 in section SM2). The inter-rank communication during both parts is handled using MPIRMA with a Post-Start-Complete-Wait (PSCW) synchronization strategy, chosen to target massively parallel infrastructures [23]. In
+the first step, we copy (or use MPI_Get) the required scaling coefficients from the coarse- and same-level neighbors to the current
+block, where the actual ghost points are computed locally once the required values are gathered. This choice reduces the size of the
+communications and the required memory for the buffers. For similar reasons, to retrieve ghost values from a finer neighbor block,
+we first compute the required ghost values from the perspective of the neighboring block, which then copies (or uses MPI_Put) the
+coarsened values to our block. Throughout these steps, we have implemented the ghost point computation for vector- or tensor
+fields in a “component-by-component” way, so that we can overlap communication and computation by performing waveletbased refinement/coarsening operations on one component while the ghost exchange is performed for the next one.
+Grid adaptation. The implementation of the grid adaptation follows an iterative procedure. During each iteration we start
+by computing the maximum detail criterion for each block as explained in section subsection 2.2.5, which in turn dictates the
+block’s desired actions. Then we enforce global policies that include the 2:1 condition, possible user-defined limits of minimum/maximum level (not used in this manuscript), and the prohibition of coarsening blocks that have been refined at earlier
+iterations; a detailed description is included in section SM2. This finalizes the adaptation decision on each block, after which
+we perform the refinement and/or coarsening on the affected blocks and use the update step to adjust the scaling coefficients of
+blocks whose neighbors have just been coarsened. Finally, we use the p4est grid partitioning algorithm to distribute the blocks
+among ranks and ensure load balancing of the current grid. This ends the current iteration, after which we recompute the ghost
+values. The iterative process ends when, under our policy, no blocks have changed their resolution, which ensures that ||γ||∞ < ²r
+on all blocks.
+
+12
+
+THOMAS GILLIS AND WIM M. VAN REES
+
+4. Validation. We present here the numerical validation of our framework on three different aspects: the grid adaptation and
+the error control, the moment conservation for the lifted wavelets, and the convergence of finite difference operators on multilevel grids. For all cases, we set the linear dimension of each block to Nb = 24, so that each block contains Nb3 = 13 824 unknowns.
+4.1. Grid adaptation and error control. The grid adaptation test, referred to as the “epsilon test”, measures the error between
+a coarsened field and the original, non-compressed information. According to the wavelet theory and (2.24) this error must be
+bounded by C 1 ²c , where we observed in practice C 1 = O (1). For a fixed value of ²c , the epsilon test proceeds as follows:
+1. initialize an analytic field on a fine level L max ,
+2. given ²c , coarsen the grid according to the block adaptation policy described above,
+3. refine the grid back to the L max level and compare the error with the initial condition.
+
+We have chosen the analytical field to be a scalar Gaussian function centered within a cubic computational domain of size 2:
+· 2¸
+¡
+¢2
+r
+r 2 = (x − 1)2 + y − 1 + (z − 1)2 ,
+(4.1)
+f (x, y, z) = exp − 2
+σ
+
+where we set σ = 2/15. The field is initialized at L max = 5. In Figure 4.1a we show the evolution of the infinite norm of the error E ∞
+depending on the value of ²c , for a range of different wavelets, where the error is defined as
+¯¯ L max £ ¤
+¯¯
+L max £ ¤
+E ∞ = ¯¯P
+f (x) − P
+f ²c (x)¯¯∞ .
+
+(4.2)
+
+The results validate that the ²c is an accurate prediction of the compression error, consistent with the 1D wavelet theory described
+above. For high values of ²c , the error plateaus as the block granularity in the grid is too low to allow further coarsening. Looking
+at the number of blocks as a function of the E ∞ in Figure 4.1b, we observe that for a given error the number of blocks required to
+represent the compressed field decreases significantly as the wavelet order N increases. Further, the lifting wavelets characterized
+by Ñ = 2 consistently require a slightly smaller number of blocks than their non-lifting counterpart characterized by Ñ = 0, for the
+same error and interpolation order N .
+100
+104
+
+10−2
+# blocks
+
+E∞
+
+10−4
+10−6
+
+103
+
+102
+10−8
+101
+
+10−10
+10−10
+
+10−8
+
+10−6
+
+10−4
+
+10−2
+
+10−10
+
+100
+
+²
+(a) error on the field
+
+10−8
+
+10−6
+E∞
+
+10−4
+
+10−2
+
+(b) compression of the field
+
+Figure 4.1: Epsilon-test: effect of the compression threshold ²c on error (left) and number of blocks (right) for a static grid adaptation using wavelet 2.0 (
+), 2.2 (
+), 4.0 (
+), 4.2 (
+), 6.0 (
+), 6.2 (
+).
+
+4.2. Moment conservation. The moment-preserving properties of lifting wavelets described above can be validated by comparing the moments on a given uniform level L max , both before and after discarding the detail coefficients according to ²c . Using
+L max £ ¤
+L max £ ¤
+f (x) and P
+f ²c (x) and define their difference
+the same setup as for the epsilon-test, we compare moments between P
+as
+Z
+Z
+L max £ ¤
+L max £ ¤
+(4.3)
+Mp,q,r =
+P
+f (x) x p y q z r dx −
+P
+f ²c (x) x p y q z r dx ,
+R3
+
+R3
+
+where 0 ≤ p, q, r < Ñ . Each moment can be evaluated from the scaling coefficients using (2.21). The results of this test are shown
+for the different wavelets in Figure 4.2a and Figure 4.2b respectively for the zeroth moment p = q = r = 0 and the norm of the three
+
+13
+
+MURPHY
+
+first moments. This validates that the lifted interpolating wavelets conserve both the zeroth and the first moment of the scaling
+coefficients throughout the adaptation process. When considering the non-lifted wavelet family, we notice that the error in the
+moments is negligible for the higher ²c values, then suddenly increases at a certain ²c and gradually decrease when ²c is reduced. At
+the largest values for ²c , the adaptation process coarsens the grid uniformly, and by virtue of the dual scaling functions with Ñ = 0
+we retain the original function values on the remaining grid points. Refinement does not affect the moments of the field for any
+interpolating wavelet (see (2.13)) and so in this case our test will compare moments between function values on two uniform grids
+at different resolutions. On a uniform grid the moment integration rule is equivalent to a spectrally accurate trapezoid quadrature
+due to the compactness and smoothness of the Gaussian function, and it turns out that even for the relatively high values of ²c
+considered the coarsening does not affect the error of this approximation, leading to zero values in the moment error. For each of
+the three wavelets with Ñ = 0, there exist a “critical” value of ²c for which the coarse grid first contains multiple levels, thus breaking
+the favorable convergence properties associated with a uniform grid quadrature and showing the real effect of grid adaptation on
+the lack of moment conservation for these wavelets.
+
+10−8
+
+10−8
+
+10−11
+
+10−11
+M1
+
+M0
+
+10−5
+
+10−14
+
+10−14
+
+10−17
+
+10−17
+
+10−20
+
+10−20
+10−10
+
+10−8
+
+10−6
+
+10−4
+
+10−2
+
+100
+
+10−10
+
+10−8
+
+²
+(a) M0 = M0,0,0
+
+10−6
+
+10−4
+
+10−2
+
+100
+
+²
+(b) M1 =
+
+q
+
+2
+2
+2
+M1,0,0
++ M0,1,0
++ M0,0,1
+
+Figure 4.2: Moment test: effect of the compression threshold ²c on the conservation of zero (left) and first (right) moments before
+and after static grid adaptation, for the wavelet 2.0 (
+), 2.2 (
+), 4.0 (
+), 4.2 (
+), 6.0 (
+), 6.2 (
+).
+
+4.3. Wavelets and spatial discretization. As a third measure of a static validation of our 3D wavelet-based multiresolution
+grid framework, we consider convergence of various finite-difference operators across a resolution jump as a function of the wavelet order and refinement level. We consider an advection term discretized using conservative upwind finite difference schemes of
+third order (CONS-3) and fifth order (CONS-5), as well as central laplacian operators of second order (DIFF-2) and fourth order
+(DIFF-4). More details about the finite-difference schemes used can be found in section SM4.
+The analytical field is the same Gaussian blob as in the previous two subsections, and is initialized on a uniform fine level
+characterized by grid spacing h f . To simplify the measure of convergence, we do not consider the automatic mesh adaptation in
+this subsection and instead focus on a grid with two levels of resolution that are fixed in space. Starting from the initial condition
+at level h f , we coarsen one eighth of the grid by one level, making sure we cover all possible resolution jumps between blocks
+(jumps across faces, edges, and corners). We then compute the ghost points as described above and evaluate the finite-difference
+stencil on the entire grid. To compute the error, we compare the discrete values to the analytic solution of applying the continuous
+differential operators to the analytic field.
+The convergence of the infinite norm (E ∞ ) of the error is shown in Figure 4.3 as a function of h f , for different wavelet orders
+N and Ñ . The results show that if the wavelet order is sufficiently high, the expected convergence order is reached for all finitedifference operators even in the infinity norm, indicating a correct treatment of the resolution jump. For lower-order wavelets, the
+error instead is bound by the polynomial order of the wavelet used to interpolate the fine-level ghost points. Specifically, in this
+case the error is bound by N − n, where N is the wavelet order and n is the order of the derivative operator, consistent with the
+accuracy order of numerically differentiating an N th degree polynomial n times. Across all cases, the convergence of the error can
+thus be given as h p with p = min(k, N − n), where k is order of the finite-difference stencil.
+
+In practice we should therefore only consider wavelets with N ≥ 4 to obtain a scheme that is at least second-order accurate on
+first- and second-order PDEs.
+
+14
+
+THOMAS GILLIS AND WIM M. VAN REES
+
+100
+
+100
+
+10−1
+
+0
+p = 1.0
+
+10−1
+
+p = 1.00
+
+10−2
+p=
+
+E∞
+
+E∞
+
+10−3
+
+10−2
+
+10−4
+
+.00
+
+3
+p=
+
+0
+
+p=
+
+10−5
+
+10−3
+
+3.00
+
+5.0
+
+10−6
+10−2.6
+
+10−2.4
+
+10−2.2
+hf
+
+10−2
+
+10−1.8
+
+10−1.6
+
+10−2.6
+
+(a) CONS-3
+
+10−2.4
+
+10−2.2
+hf
+
+10−2
+
+10−1.8
+
+10−1.6
+
+10−2
+
+10−1.8
+
+10−1.6
+
+(b) CONS-5
+
+103
+102
+
+102
+
+101
+
+E∞
+
+E∞
+
+101
+.00
+
+p =2
+
+100
+
+10−1
+
+100
+
+0
+2.0
+p=
+
+p=
+
+10−2
+
+10−1
+
+0
+
+4.0
+
+10−3
+10−2.6
+
+10−2.4
+
+10−2.2
+hf
+
+10−2
+
+10−1.8
+
+10−1.6
+
+(c) DIFF-2
+
+10−2.6
+
+10−2.4
+
+10−2.2
+hf
+
+(d) DIFF-4
+
+Figure 4.3: Convergence order of spatial derivatives for third and fifth order conservative advection (top row) and a second and
+fourth order laplacian (bottom row) on a two-level grid with finest level h f , obtained using ghost points reconstructed with wavelet 2.0 (
+), 2.2 (
+), 4.0 (
+), 4.2 (
+), 6.0 (
+), 6.2 (
+).
+
+5. Convergence analysis for a linear advection equation. Having validated the correct implementation of the grid adaptation for non-lifted and lifted wavelets, as well as the ghost point reconstruction and finite-difference operators, we focus here on
+the behavior of grid adaptation during the evolution of a partial differential equation. We consider the transport of a scalar field in
+a divergence-free flow field ∇ · u = 0 as a simple case of a hyperbolic conservation law:
+(5.1)
+
+¡ ¢
+∂φ
++ ∇ · uφ = 0 .
+∂t
+
+Through this section, we compute the right-hand side using the third-order finite-difference scheme CONS-3, perform time
+integration using a third-order RK3-TVD scheme [21, 22] (detailed in section SM3), and fix the block size to 243 .
+We note that this problem poses a sufficiently challenging test case to allow us to analyze our methodology and differentiate
+between the wavelets. Nevertheless, as shown above, the presented software framework in its current form is also able to handle
+time-dependent problems involving diffusion and reaction terms, as well as vector-based quantities.
+5.1. Translation of a Gaussian blob. To assess the convergence behavior of our algorithm and implementation, we consider
+a simple case of the advection of a Gaussian blob in a uniform velocity field. The computational domain is chosen as a rectangular
+
+15
+
+MURPHY
+
+box of size 3 × 3 × 6 with each unit cube represented by a separate tree, leading to 54 trees in the domain. We set the velocity as
+[0 ; 0 ; 1], and advect a Gaussian blob (σ = 1/5) initially centered at (3/2, 3/2, 3/2) over a distance of 3, so that we can evaluate the
+exact solution as a mirror of the initial condition. The time-step is controlled by setting the CFL = 1/4 (based on the finest-level grid
+spacing), which is small enough so that the spatial discretization errors dominate the time integration errors. We adapt the grid
+every 6 time steps, so that the information travels at most 1/16th of the finest-level block between adaptation steps. Within this
+setting we vary ²r and ²c to control the grid adaptation during the evolution of the PDE, focusing on wavelet 4.0 and wavelet 4.2
+only. For context of the discussion, in Figure 5.1 we illustrate the obtained grid for the case of wavelet 4.2, with ²r = 10−6 and
+²c = 10−8 . In this case the maximum level during the simulation is 4, leading to an effective grid spacing of h f = 2.6 × 10−3 or, if
+the grid was uniformly refined to this level, a domain with about 3 trillion grid points. The 2D projections highlight the front/back
+asymmetry in the grid refinement which is due to the difference between the refinement and coarsening threshold in combination
+with the moving field: the mesh coarsening will be triggered at larger distances behind the blob than the refinement in front of the
+blob.
+
+(a) t = 0
+
+(b) t = 0.78
+
+(c) t = 1.5
+
+(d) t = 2.27
+
+(e) t = 3
+
+−6
+Figure 5.1: 2D Projection in the£ X Z -plane of the gaussian blob for
+¤ wavelet 4.2 and ²r = 10 with ²r /²c = 100. The 2D projections
+−6
+−5
+−4
+−3
+−2
+−1
+are illustrated with isolevels at 10 , 10 , 10 , 10 , 10 , 10 .
+
+Effect of refinement threshold. We first consider the effect of varying the refinement threshold ²r , keeping the ratio ²r /²c = 100
+fixed.
+The time evolution of the error during the advection is presented at Figure 5.2a for wavelet 4.0 (in blue) and wavelet 4.2
+(in orange) across a range of ²r values, showing that the error decreases with ²r without significant differences between the two
+wavelets. The evolution of the maximum detail coefficient on the grid (||γ||∞ ) is shown in Figure 5.2b, which confirms that the
+maximum detail is always bound by ²r . Further, the time evolution shows that the maximum detail varies over time in a nonsmooth manner, which is explained by noting that the location at which ||γ||∞ is computed can jump in space as individual blocks
+refine or coarsen.
+Studying the convergence behavior of a simulation on a multi-level grid is not trivial. On a uniform grid, one would show
+convergence evaluating the maximum error E ∞ as a function of the grid spacing h. On adaptive grids, however, the grid spacing h
+varies in space and time, we have no direct control on the minimum grid spacing h, and there is no guarantee that the maximum
+error E ∞ is measured at a single physical location when adapting the grid. Alternatively, one can use a parameter like the effective
+number of degrees-of-freedom in the simulation to measure convergence. We show associated results briefly at the end of this
+subsection. However, we consider this convergence metric less relevant to the point of this work, because the effective number of
+degrees-of-freedom is an outcome of the simulation and will likely vary in time. Instead, we control the error primarily by varying
+²r , and so a more suitable convergence analysis relates the maximum error at the end time of the simulation as a function of
+the input parameter ²r (Figure 5.3a). The result demonstrates that ²r is successful at controlling the error and moreover its value
+provides an estimate of the error made in a simulation, albeit with a problem-specific prefactor of O (10) in this case.
+We can decompose this convergence behavior into different components. First, through our adaptation policy we guarantee
+that ²r bounds the maximum detail coefficient ||γ||∞ . In Figure 5.3b we show the relation between the error and the maximum
+detail coefficient, where we included a uniform resolution line (in gray) obtained by varying the constant grid spacing h, and
+
+16
+
+THOMAS GILLIS AND WIM M. VAN REES
+
+10−2
+
+²r = 1e − 03
+
+10−3
+
+²r = 1e − 04
+
+10−4
+²r = 1e − 04
+
+E∞
+
+²r = 1e − 07
+
+10−6
+10−7
+−8
+
+0
+
+0.5
+
+1
+
+1.5
+t
+
+(a) E ∞ over time
+
+2
+
+2.5
+
+3
+
+10−5
+
+²r = 1e − 05
+
+10−6
+
+²r = 1e − 06
+
+10−7
+
+²r = 1e − 07
+
+||γ||∞
+
+²r = 1e − 06
+
+10−5
+
+10−9
+
+²r = 1e − 03
+
+²r = 1e − 05
+
+10−4
+
+10
+
+10−3
+
+10−8
+0
+
+0.5
+
+1
+
+1.5
+t
+
+2
+
+2.5
+
+3
+
+(b) ||γ||∞ over time
+
+Figure 5.2: Effect of ²r (using ²r /²c = 100) on the time evolution of the maximum error (left) and max detail coefficient (right) for a
+linear advection testcase with CONS-3, using wavelet 4.0 (
+) and wavelet 4.2 (
+).
+
+computing for each h the maximum error E ∞ as well as the maximum detail coefficient evaluated by a single-level wavelet 4.0
+transform. Both uniform and multiresolution results show a clear 3/4 slope, where the wavelet results vary as the locations of the
+maximum scaling coefficient and the maximum error jump independently across different locations in the grid between individual
+simulations. The 3/4 slope can be explained by two observations. First, we know that the order of the CONS-3 spatial discretization
+is third, so that E ∞ ∝ h 3 . This is confirmed in Figure 5.3c, showing the error as a function of the finest-level grid spacing h f ; both
+the uniform and the wavelet 4.2 lines follow a third-order slope (wavelet 4.0 will be discussed below). Second, according to (2.14),
+the detail coefficients associated with a projection of a given smooth function onto a level with spacing h scale as ||γ||∞ ∝ h N ,
+where here N = 4 is the polynomial interpolation order of the wavelet. For our data this convergence is confirmed in Figure 5.3d,
+where we plot the maximum detail coefficient as a function of the finest grid spacing h f . Combining these relations we find that
+E ∞ ∝ ||γ||3/4
+∞ .
+
+Looking more closely at Figure 5.3c and Figure 5.3d indicates that though the overall behavior in Figure 5.3a is consistent
+between wavelet 4.0 and wavelet 4.2, the associated grid adaptation strategies are different. Figure 5.3c shows that wavelet 4.2
+behaves similarly to the uniform resolution grid, which is impressive as the uniform grid result represents the smallest possible
+error for any given h f ; the wavelet 4.2 does not compromise that error despite the continuous grid adaptation during the simulation. The behavior of wavelet 4.0 instead demonstrates that this wavelet transform generates detail coefficients that do not predict
+the error committed by the PDE and therefore cause a spurious coarsening and belated refinement. This is emphasized by the last
+two points on the left (associated with ²r = 10−6 and ²r = 10−7 ) where the error goes down even though the finest grid spacing
+stays the same. This means that at ²r = 10−6 the error was associated with a coarser level than the maximum, and refining that
+level without affecting the finest level successfully reduced the error. Similarly, in Figure 5.3d the gaps between the uniform grid
+and the adapted grids are associated with coarsening, which increases the maximum detail coefficients. We see again that the behavior between wavelet 4.0 and wavelet 4.2 is different: the reduced aliasing of the lifted wavelet 4.2 leads to a better correlation
+of the maximum detail coefficients, the finest grid spacing, and the maximum error, compared with the non-lifted wavelet 4.0. We
+emphasize however, that despite the different strategies both wavelets successfully control the error during the evolution of this
+PDE as a function of ²r , as evidenced by the overlapping lines in Figure 5.3a.
+The different strategies of wavelet 4.0 and wavelet 4.2 are further reflected by the number of blocks required throughout the
+simulation, as a function of ²r . The evolution of the number of blocks over time is shown in Figure 5.4a. For early times, as the
+Gaussian blob translates through the grid the trailing side of the blob gets coarsened since the small details there fall below ²c . The
+leading side does not get refined yet as the small details do not yet exceed ²r , so the number of blocks decreases, leading to the
+front/back asymmetric grid structure as shown in Figure 5.1. Once the leading side of the blob gets picked up by ²r the number
+of blocks increases again , though the asymmetry persists.. At later times, the number of blocks plateaus for wavelet 4.2 across
+all values of ²r , indicating that the grid structure is largely constant. For wavelet 4.0, on the other hand, the number of blocks
+increases throughout the simulation. This is consistent with the convergence analysis above, where we observed that wavelet 4.0
+produces detail coefficients that do not accurately reflect the PDE error, and thus refines the grid in locations without strongly
+reducing the error.
+
+17
+
+MURPHY
+
+10−2
+
+10−2
+
+10−3
+
+10−3
+
+5
+
+E∞
+
+E∞
+
+p=
+
+10−4
+
+10−4
+
+10−5
+
+10−5
+10−7
+
+10−6
+
+10−5
+²r
+
+10−4
+
+10−7
+
+10−3
+
+(a) Convergence of E ∞ as a function of ²r
+
+10−6
+
+0.7
+
+10−5
+||γ||∞
+
+10−4
+
+(b) Convergence of E ∞ as a function of ||γ||∞
+
+10−3
+10
+
+−2
+
+10−4
+10−3
+
+00
+
+||γ||∞
+
+10−6
+
+10−5
+
+10−7
+10−3
+
+10−2
+hf
+
+(c) Convergence of E ∞ as a function of the finest grid spacing h f , showing third-order due to the use of CONS-3
+
+p
+
+10−4
+
+=
+
+4.
+
+p
+
+=
+
+3.
+
+00
+
+E∞
+
+10−5
+
+10−3
+
+10−2
+hf
+
+(d) Variation of h f as a function of ||γ||∞ , showing fourth-order due to
+the use of wavelet 4.X
+
+), wavelet 4.2 (
+), and a uniform
+Figure 5.3: Convergence characteristics for linear advection with CONS-3 for wavelet 4.0 (
+grid (
+), as a function of ²r (using ²r /²c = 100), with the error evaluated at end time t = 3. In each plot, the subsequent data
+points for multiresolution simulations are obtained by systematically varying ²r , whereas the uniform resolution data points are
+obtained by systematically varying the grid spacing h f . Each marker symbol is associated with a unique value of h f to facilitate
+the comparison across subgraphs.
+
+Plotting the error made in the simulation as a function of the number of blocks (Figure 5.4b) shows a slope of 1 with respect
+to the effective number of degrees-of-freedom for both uniform and multiresolution simulations. Since the number of blocks
+is inversely proportional to an ‘effective’ linear grid spacing to the power of 3, this thus recovers the third-order convergence of
+the discretization scheme. Comparing the two wavelets, we find that wavelet 4.0 requires up to twice more blocks compared to
+wavelet 4.2 at the lowest error values. Both wavelets provide significant gains over the uniform resolution simulation (fewer blocks
+by a factor of ≈ 30 − 40 for wavelet 4.0 and ≈ 70 for wavelet 4.2), though this metric is heavily dependent on the scale separation
+of the simulation. A rough estimate implies that the ratio of the volume occupied by a sphere of radius 3σ and the volume of the
+rectangular domain is ≈ 70, similar to the compression rate of wavelet 4.2.
+Effect of coarsening threshold. In the previous section we varied ²r while keeping the ratio ²r /²c fixed. Repeating the analysis
+for a range of values for ²r /²c does not significantly change the results, as shown in Figure 5.4b. Here the dotted, dashed, and solid
+lines correspond to ²r /²c = 16, ²r /²c = 100, and ²r /²c = 104 respectively, and each data point for each simulation is associated with
+
+18
+
+THOMAS GILLIS AND WIM M. VAN REES
+
+2
+
+·104
+10−2
+
+10−3
+
+²r = 1e − 07
+
+p
+
+E∞
+
+# blocks
+
+1.5
+
+1
+
+=
+
+1.0
+
+0
+
+10−4
+0.5
+²r = 1e − 06
+
+10−5
+
+²r = 1e − 05
+²²r =
+1e − 04
+r = 1e − 03
+
+0
+0
+
+0.5
+
+1
+
+1.5
+t
+
+2
+
+2.5
+
+3
+
+(a) evolution of the number of blocks over time for various values of ²r ,
+for ²r /²c = 100
+
+102
+
+103
+
+104
+# blocks
+
+105
+
+(b) wavelet-based convergence: E ∞ vs the number of blocks (at t =
+3.0), with ²r /²c = 16 ( ), ²r /²c = 100 ( ), and ²r /²c = 104 ( ).
+
+Figure 5.4: Evolution of the number of blocks in the grid over time (left), and maximum error against number of blocks (right) for
+the linear advection testcase with CONS-3 using wavelet 4.0 (
+), wavelet 4.2 (
+), and a uniform grid (
+), for various values
+of ²r ’s. In (b), we also show the effect of varying ²r /²c using different line styles.
+
+a given value of ²r . For both wavelets, the number of blocks associated with a given error decreases slightly when ²r /²c decreases,
+reflecting the more aggressive coarsening of the grid when ²c increases. At all points, except the finest ²r for wavelet 4.0, increasing ²c for a given ²r decreases the number of blocks without significantly changing the error. This emphasizes the capability of
+wavelets to detect where to compress information without degrading the overall accuracy of the solution, and shows that generally
+a simulation should take ²r /²c close to the lower bound of 2N (explained in subsection 2.2.5), with N the wavelet order.
+Effect of adaptation frequency. For a fixed ²r = 10−5 , ²r /²c = 100, and wavelet 4.2 we vary the adaptation frequencies ranging from every 6 (as in the cases above) to every 768 time steps. With constant value of CFL = 1/4 this corresponds to the signal
+traveling from 1/16th of a block to 8 blocks at the finest scale between adaptations. As mentioned in subsection 2.2.5, there are
+two expected effects that occur when increasing the adaptation frequency: a delayed coarsening of blocks where the detail coefficient falls below the coarsening threshold, and a delayed refinement of blocks where the detail coefficient exceeds the refinement
+threshold. Compared to a more frequently adapted grid, the former will reduce the compression rate of the adapted grid whereas
+the latter will increase the error of the PDE solution.
+The results of our numerical experiment are shown in Figure 5.5 with the error and maximum detail evolution for all cases
+over time (left) and the evolution of the number of blocks (right). Increasing the adaptation frequency up to and including every
+192 time steps increases the number of blocks as grid compression is delayed, but does not strongly affect the error. When the
+adaptation frequency is every 384 time steps or lower, we observe that there are prolonged periods of time where the maximum
+detail coefficient exceeds the refinement threshold 10−5 , and the error starts to increase significantly compared to the other cases.
+For the lowest frequency (adaptation every 768 time steps), the maximum level in the grid drops to 2 compared to 3 for all other
+cases, as details of the signal are progressively lost and the grid is compressed accordingly. For this particular testcase, we thus find
+some robustness in the results to the adaptation frequency between values of 6 and 192, partly due to the smooth nature of the
+function and partly due to our 2:1 constraint in adaptation approach. Both features ensure that the grid adapted at a single time is
+able to capture and evolve the solution well when the signal travels up to 2 fine-level blocks afterwards.
+5.2. Deformation of a Gaussian blob. Here we present the results of our framework on a more challenging scale separation
+problem, and showcase the ability of the wavelet-based adaptation to track the need for computational resources. Specifically, we
+use the advection equation to transport a Gaussian blob in a non-linear periodic incompressible flow field defined as
+(5.2)
+
+u(x) = sin2 (π x) sin(2π y) sin(2π z)
+v(x) = sin(2π x) sin2 (π y) sin(2π z) ,
+w(x) = sin(2π x) sin(2π y) sin2 (π z)
+
+which was proposed originally in [27] and has been used extensively since in the level-set community since [16]. Following the
+latter we multiply the velocity components by cos(πt /3), and here evaluate only the ‘forward’ evolution up to t = 1.5. As initial
+
+19
+
+MURPHY
+
+10−2
+10−3
+
+103
+
+# blocks
+
+E ∞ , ||γ||∞
+
+10−4
+10−5
+
+102.8
+
+10−6
+10−7
+0
+
+0.5
+
+(a) E ∞ (
+
+1
+
+1.5
+t
+
+) and ||γ||∞ (
+
+2
+
+2.5
+
+3
+
+0
+
+) over time
+
+0.5
+
+1
+
+1.5
+t
+
+2
+
+2.5
+
+3
+
+(b) # blocks over time
+
+Figure 5.5: Effect of adaptation frequency for the linear advection testcase with CONS-3 using wavelet 4.2. The number of timesteps
+between successive adaptations shown is 6 ( ), 96 ( ), 192 ( ), 384 ( ), and 768 ( ). With CFL = 1/4, this corresponds to the
+information traveling 1/16th of a block, 1 block, 2 blocks, 4 blocks, and 8 blocks respectively.
+
+condition we choose a compact spherically symmetric Gaussian blob defined in terms of the radial coordinate r as
+
+(5.3)
+
+·
+¸
+r 2 /σ2
+φ0 (r ) = exp −
+,
+1 − r 2 /β2
+
+for r < β and with σ = 0.1 and β = 2σ, centered at [0.35 , 0.35 , 0.35] within a unit cube. We apply grid adaptation tolerances of
+²r = 10−2 and ²r /²c = 100, use CFL = 0.5, and adapt the grid every 12 time steps.
+
+At t = 0, the grid contains only 92 blocks on levels 2 and 3, as the Gaussian is smooth and can be captured by the fourth-order
+wavelets at relatively coarse resolution. As the blob deforms, it thins rapidly near the center of the domain, as shown through
+visualization of an isosurface in Figure 5.7. This process triggers refinement throughout the evolution leading eventually to approximately 11, 500 blocks, and levels between 2 all the way to 8. The refinement pattern at the final time is interesting, as the grid
+reflects the subtleties in the wavelet analysis: the maximum levels are localized concentrated exactly where we expect a fourthorder polynomial interpolation to show the largest errors, near the center of the domain. The ‘tips’ of the deformed shape are still
+smooth and, despite relatively large gradients, still captured well on much coarser resolutions. From a user perspective, we note
+that we do not need to bound the maximum level; instead, the consistency of the refinement criterion with the wavelet-based grid
+adaptation ensures that setting a suitable ²r is sufficient to keep the levels in the grid within reasonable bounds.
+
+Finally, we study the ability of the ²r criterion as an input to control the solution error in this non-linear problem. As the
+equations have no analytical solutions, we perform a self-convergence study where the result of a uniform-grid simulation at level
+5 (or 7683 grid points) at time t = 0.5 is used
+For the multiresolution cases, we use wavelet 4.2 and consider
+© as reference solution.
+ª
+four different refinement thresholds ²r ∈ 1 ; 10−1 ; 10−2 ; 10−3 . We set the time step as ∆t = 1/2 h f /U , with h f the instantaneous
+finest spacing in the grid, and U fixed to be U = 1 at all times. None of these multiresolution simulations reaches level 5 within this
+time window. Once the multiresolution simulations has reached t = 0.5, we refine their multi-level grids uniformly to level 5 using
+the chosen wavelet, and then compute the maximum error between the refined uniform grid and the reference uniform resolution
+simulation result.
+The evolution of the error with the refinement criterion is shown in Figure 5.6a where we observe that the slope matches the
+theoretical convergence rate of 3/4 for both the refinement criterion ²r and the measured maximum detail in the domain ||γ||∞
+reasonably well. In Figure 5.6b we show the error as a function of the number of blocks at the final time. This metric is more
+sensitive as the number of blocks varies in time; in this particular case, the second-last point at ²r = 10−2 just refined the grid prior
+to t = 0.5 which has moved the data point to the right compared to the expected slope. Nevertheless, this convergence analysis
+demonstrates that the main results of the linear transport problem described in subsection 5.1 can still be reproduced for this
+more challenging, non-linear transport problem as well.
+
+20
+
+THOMAS GILLIS AND WIM M. VAN REES
+
+100
+
+10−1
+
+E∞
+
+E∞
+
+10−1
+5
+
+p
+
+=
+
+0.7
+
+p
+
+10
+
+−2
+
+10−2
+
+10−3
+(a) E ∞ vs ²r (
+
+10−2
+10−1
+²r , ||γ||∞
+), and vs ||γ||∞ (
+
+100
+
+101
+
+=
+
+1.0
+0
+
+102
+#blocks
+
+103
+
+(b) E ∞ vs # blocks.
+
+) with ²r /²c = 100.
+
+Figure 5.6: Advection of a compact gaussian scalar field using a deformation velocity field: wavelet-based convergence analysis.
+
+(a) 3D view
+
+(b) plane YZ
+
+(c) plane XY
+
+Figure 5.7: Advection of a compact gaussian scalar field using a deformation velocity field: 3D and perspective views of the grid
+together with an isosurface of the field at value φ = 0.25, for t = 1.5. We have visualized the outlines of individual blocks to highlight
+the structure of the grid.
+
+6. Weak scalability and performance analysis. In this section we present the results of the weak scalability campaign we
+have done on Cori, a Cray XC40 supercomputer whose CPU partition contains 2388 nodes of 32 cores each1 . The testcase is
+the execution of 50 times steps for the advection of a Gaussian tube aligned with the z-direction in a rectangular domain. The
+size of the domain, and therefore the size of the simulation S, is adapted to maintain the number of blocks per core constant:
+S (Nc ) = [1 × 1 × Nc /32], with Nc the number of cores. To get a significant sample of each operation, we perform the adaptation
+every time step, although in practice we would adapt less frequently. The domain is initialized with 75.5 blocks per rank and one
+rank per core, which with a block size of 243 leads to about 1 million unknowns per core. We used the wavelet 4.0 and CFL = 0.25.
+
+We study the performance of our framework from 1 nodes to 512 nodes, with the latter corresponding to 16, 384 cores and
+about 17 billion unknowns. In Figure 6.1a we show the evolution of the time spent per timestep for the grid adaptation (orange) and the stencil computation (blue). We also show separately the time spent in ghost computations (green), which is the
+communication-heavy part of the stencil computation. Though highly problem-dependent, for this particular problem the grid
+adaptation takes roughly half the time of the stencil computation within an RK3 timestep, which is very reasonable given that we
+1 The MPI implementation used is OpenMPI/4.1.2
+
+21
+
+MURPHY
+
+typically would need to adapt the grid only every 10 to 100 timesteps. Further, the ghosting takes up about a third of the time of a
+stencil computation, even on very large partitions.
+Based on this timing data, we show in Figure 6.1b the weak efficiency η w defined as
+(6.1)
+
+η w (Nc ) =
+
+T (Nref , S (Nref ))
+,
+T (Nc , S (Nc ))
+
+where T (N , S (N )) is the time taken by the simulation to run a problem of size S on N cores and where we used Nref = 64, i.e. 2
+nodes.
+Based on Figure 6.1a and Figure 6.1b, the Post-Start-Complete-Wait (PSCW) strategy allows us to reach a perfect scalability in
+the case of the ghost and the stencil operation. This observation is confirmed by analyzing the break-down of the different operations illustrated in Figure SM5.1. This result is only possible because both operations are scalable and done on group of ranks with
+the PSCW calls, instead of using the entire communicator.We do pay a price to achieve this scalability in the ghost computation,
+because we have to re-initialize the ghost meta-data structure every time we modify the grid. As observed in Figure 6.1b, this adaptation process has a lower parallel efficiency. Analyzing the timing of different operations within the adaptation step (Figure SM5.3)
+shows that the less scalable operations are the synchronization step, which contains a non-blocking MPI_Allreduce and various
+RMA synchronizations, and the reset operation of the meta-data for the ghosting, which involves the creation and deletion of the
+window on MPI_COMM_WORLD. For the latter we currently use non-dynamic windows as we do not expect the adaptation to be called
+often compared to the use of the ghosting and the stencils, and so its computation cost will not dominate in practice. However, in
+the future we could still improve the implementation by considering a dynamic window allocation, which might be better suited
+for a policy that requires very frequent adaptations. Overall, the observed behavior of this weak scalability test is consistent with
+the implementation choices, as all the global operations are less scalable by definition, while the local operations demonstrate
+excellent scalability.
+1
+
+2.5
+
+0.9
+
+2
+0.8
+
+1.75
+ηw
+
+[sec/time-step]
+
+2.25
+
+1.5
+
+0.7
+
+1.25
+1
+
+0.6
+
+0.75
+0.5
+1
+
+128
+
+256
+nodes
+
+(a) time per time-step
+
+384
+
+512
+
+2
+
+128
+
+256
+nodes
+
+384
+
+512
+
+(b) weak scaling efficiency
+
+Figure 6.1: Weak scaling for the three main operations involved in adaptive grid simulations: the grid adaptation (
+, performed
+every time step here), the stencil operations (
+), and the time spent in the ghost computations (
+) during the stencil
+evaluation. The times are given in seconds per time-step, from 1 node to 512 nodes (32 cores to 16, 384 cores).
+
+7. Conclusion. This work provides a detailed explanation of the mathematical foundation and distributed computational implementation of a 3D block-structured adaptive grid method based on a multiresolution analysis using wavelets, named murphy. In
+our approach we apply significant emphasis on the handling of resolution jumps in block-structured grids to provide consistency
+with non-lifted and lifted interpolating wavelets of second, fourth, and sixth polynomial order. We validate the implementation
+through rigorous tests of error control and moment conservation on static grids.
+Compared with most existing adaptive mesh refinement approaches, the wavelet-based approach provides explicit grid adaptation metrics that are intrinsically linked to the point-wise error made in the field compared with a polynomial interpolation. The
+wavelet framework provides a consistent multiresolution perspective for adaptation metric, adaptation procedure, and ghost reconstruction across resolution jumps, with a formal separation of scales in all operations. When combined with finite-difference
+schemes we demonstrate the ability of our approach to reach point-wise high order convergence on multi-level grids. Further,
+the nature of the non-overlapping octree-based grids with constant-size blocks provides excellent opportunities for scalability. We
+
+22
+
+THOMAS GILLIS AND WIM M. VAN REES
+
+exploit this in our implementation using state-of-the-art one-sided communication strategies that show excellent scalability of
+the grid adaptation, ghost reconstruction, and stencil computation processes at least up to 16, 384 cores.
+We tested our multiresolution adaptive grid algorithm on the convergence of simple linear hyperbolic conservation laws in
+the form of scalar advection using divergence-free velocity fields. The results demonstrate that the refinement threshold, which
+provides user control over the error permitted as detected by the wavelet analysis, is an excellent indicator for the global field error
+even during the evolution of this partial differential equation. As such, reducing the refinement threshold leads to convergence
+of the error, along a slope that can be captured by the ratio of the convergence order of the finite-difference scheme, and the
+polynomial order of accuracy of the wavelet used. For lifted wavelets we observe that the global maximum error on any multi-level
+grid is very close to the error on a uniform-resolution grid of the same maximum resolution. Compared to non-lifted wavelets,
+the reduced aliasing properties of lifted wavelets enable them to detect the need for refinement and opportunity for compression
+more efficiently, leading ultimately to a smaller number of blocks in the grid by about a factor of two for the same maximum error.
+The implementation and performance benefits of our octree-based block-structured grid implementation does lead to constraints in terms of the adaptation patterns that can be achieved, for instance compared to patch-based adaptive mesh refinement
+techniques. The use of ‘forest-of-trees’ as offered by p4est enables us to create arbitrary aspect ratio rectangular domains, rather
+than remain restricted to cubic domains as in previous codes [34]. However, our current implementation is still limited to cubic blocks with isotropic grids. To gain more flexibility, one can build on domain mapping techniques [5] or consider extending
+work in computer graphics that generalizes wavelets to work on arbitrary compact surfaces [28]. Closer to our approach, it should
+also be relatively straightforward to use a larger set of blocks that enable separate refinement or compression in each of the three
+cartesian directions. We reserve this extension for future work.
+With the fundamentals and implementation of our framework presented, future work will focus on investigating the performance of the wavelet-based refinement criterion to accurately capture refinement requirements for non-linear PDEs. Previous
+work on wavelet-adapted grids is promising in this regard (e.g. [34]) but systematic investigations are lacking. At the same time,
+we note that this level of rigor is also often absent from other adaptive mesh refinement methodologies, which typically rely on
+heuristic or post-hoc criteria for refinement and compression that make it difficult to compare their ability to capture emerging scales, or discard information that does not affect the overall error. In our case, however, the formal wavelet multiresolution
+theory provides a useful perspective to frame this discussion and analyze convergence with respect to the refinement threshold,
+compared with other possible policies. Further, we wish to explore the benefits of moment conservation offered by lifted wavelets
+as demonstrated in our solver, for the solution of conservative PDEs such as the hyperbolic conservation law considered in this
+work. Finally, we intend to combine our multiresolution framework with an elliptic solver to handle problems such as the freespace incompressible Navier-Stokes equations, as well as an immersed interface method [19, 20] which will enable us to perform
+high-order simulations with embedded interfaces for multiphysics problems.
+Acknowledgments. We would like to acknowledge the insightful discussions with James Gabbard, Matthieu Duponcheel,
+Pierre Balty, and Philipe Chatelain, as well as the help received from Howard Pritchard and Greg Hernandez to run the PSCW
+MPI-RMA on different infrastructures. Further we wish to acknowledge the financial support from an Early Career Award from
+the Department of Energy, Program Manager Dr. Steven Lee, award number DE-SC0020998 (TG, WVR), the Belgian American
+Educational Fundation (B.A.E.F.) (TG) and from Wallonie-Bruxelles International (WBI) excellence fellowship (TG). Computational resources have been provided by the Consortium des Équipements de Calcul Intensif (CÉCI) funded by the Fonds de la
+Recherche Scientifique de Belgique (F.R.S.-FNRS) under Grant No. 2.5020.11 and by the Walloon Region. Additional resources
+include the Tier-1 supercomputer of the Fédération Wallonie-Bruxelles, infrastructure funded by the Walloon Region under the
+grant agreement n°1117545, the Tier-0 LUMI accessed throught the pilot-phase and in collaboration with the CÉCI, and MELUXINA an infrastructure accessed through EuroHPC under the grant EHPC-DEV-2022D05-149. Finally this research used resources
+of the National Energy Research Scientific Computing Center (NERSC), a U.S. Department of Energy Office of Science User Facility located at Lawrence Berkeley National Laboratory, operated under Contract No. DE-AC02-05CH11231 using NERSC award
+ASCR-ERCAP20232.
+References.
+[1] M. A DAMS , P. C OLELLA , D. T. G RAVES , J. J OHNSON , N. K EEN , T. J. L IGOCKI , D. F. M ARTIN , P. M C C ORQUODALE , D. M ODIANO, P. S CHWARTZ , T. S TERNBERG ,
+AND B. V. S TRAALEN , Chombo software package for amr applications design document, tech. report, Lawrence Berkeley National Laboratory, 2019.
+[2] M. B ERGER AND P. C OLELLA, Local adaptive mesh refinement for shock hydrodynamics, Journal of Computational Physics, 82 (1989), pp. 64–84, https://doi.
+org/10.1016/0021-9991(89)90035-1, https://doi.org/10.1016/0021-9991(89)90035-1.
+[3] M. J. B ERGER AND J. O LIGER, Adaptive mesh refinement for hyperbolic partial differential equations, Journal of Computational Physics, 53 (1984), pp. 484–512,
+https://doi.org/10.1016/0021-9991(84)90073-1, http://www.sciencedirect.com/science/article/pii/0021999184900731.
+[4] C. B ERNARD, Wavelets and ill posed problems: optic flow and scattered data interpolation, PhD thesis, Centre de Mathematiques Appliquees, 1999.
+[5] E. B ROWN -DYMKOSKI AND O. V. VASILYEV, Adaptive-anisotropic wavelet collocation method on general curvilinear coordinate systems, Journal of Computational Physics, 333 (2017), pp. 414–426, https://doi.org/https://doi.org/10.1016/j.jcp.2016.12.040, https://www.sciencedirect.com/science/article/pii/
+S0021999116307021.
+[6] C. B URSTEDDE , L. W ILCOX , AND O. G HATTAS, p4est: Scalable algorithms for parallel adaptive mesh refinement on forests of octrees, SIAM Journal on Scientific
+Computing, 33 (2011), pp. 1103–1133, https://doi.org/10.1137/100791634, https://doi.org/10.1137/100791634.
+[7] D. C ALHOUN AND C. B URSTEDDE, Forestclaw: A parallel algorithm for patch-based adaptive mesh refinement on a forest of quadtrees. arXiv:1703.03116, 2017.
+[8] A. C OHEN, Adaptive methods for pde’s wavelets or mesh refinement?, arXiv: Numerical Analysis, (2002).
+
+MURPHY
+
+23
+
+[9] A. C OHEN , I. D AUBECHIES , AND J.-C. F EAUVEAU, Biorthogonal bases of compactly supported wavelets, Communications on Pure and Applied Mathematics,
+45 (1992), pp. 485–560, https://doi.org/10.1002/cpa.3160450502, http://dx.doi.org/10.1002/cpa.3160450502.
+[10] I. D AUBECHIES AND W. S WELDENS, Factoring wavelet transforms into lifting steps, Journal of Fourier Analysis and Applications, 4 (1998), pp. 247–269, https:
+//doi.org/10.1007/BF02476026, https://doi.org/10.1007/BF02476026.
+[11] G. D ESLAURIERS AND S. D UBUC, Interpolation dyadique. Fractals, Dimensions non-entieres et applications, 1987.
+[12] G. D ESLAURIERS AND S. D UBUC, Symmetric iterative interpolation processes, Constructive Approximation, 5 (1989), pp. 49–68, https://doi.org/10.1007/
+BF01889598, https://doi.org/10.1007/BF01889598.
+[13] D. D ONOHO, Interpolating wavelet transforms, Tech. Report EFS NSF 408, Standford, Nov 1992.
+[14] D. D ONOHO AND T. Y U, Deslauriers dubuc ten years after, tech. report, Stanford University, 1996.
+[15] T. E NGELS , K. S CHNEIDER , J. R EISS , AND M. FARGE, A wavelet-adaptive method for multiscale simulation of turbulent flows in flying insects, Commun. Comput. Phys., 30 (2021), pp. 1118–1149.
+[16] D. E NRIGHT, R. F EDKIW, J. F ERZIGER , AND I. M ITCHELL, A hybrid particle level set method for improved interface capturing, Journal of Computational Physics,
+183 (2002), pp. 83–116, https://doi.org/https://doi.org/10.1006/jcph.2002.7166, https://www.sciencedirect.com/science/article/pii/S0021999102971664.
+[17] G. F ERNANDEZ , S. P ERIASWAMY, AND W. S WELDENS, Liftpack: a software package for wavelet transforms using lifting, in Proc.SPIE, vol. 2825, 10 1996, https:
+//doi.org/10.1117/12.255250, https://doi.org/10.1117/12.255250.
+[18] K. J. F IDKOWSKI AND D. L. D ARMOFAL, Review of output-based error estimation and mesh adaptation in computational fluid dynamics, AIAA Journal, 49
+(2011), pp. 673–694, https://doi.org/10.2514/1.J050073, https://doi.org/10.2514/1.J050073.
+[19] J. G ABBARD, T. G ILLIS , P. C HATELAIN , AND W. M. VAN R EES, An immersed interface method for the 2d vorticity-velocity navier-stokes equations with multiple
+bodies, Journal of Computational Physics, 464 (2022), p. 111339, https://doi.org/https://doi.org/10.1016/j.jcp.2022.111339, https://www.sciencedirect.com/
+science/article/pii/S0021999122004016.
+[20] T. G ILLIS , Y. M ARICHAL , G. W INCKELMANS , AND P. C HATELAIN, A 2d immersed interface vortex particle-mesh method, Journal of Computational Physics, 394
+(2019), pp. 700–718, https://doi.org/10.1016/j.jcp.2019.05.033, http://www.sciencedirect.com/science/article/pii/S0021999119303717.
+[21] S. G OTTLIEB AND C.-W. S HU, Total variation diminishing Runge-Kutta schemes, Mathematics of Computation, 67 (1998), pp. 73–85, https://doi.org/10.1090/
+S0025-5718-98-00913-2.
+[22] S. G OTTLIEB , C.-W. S HU , AND E. TADMOR, Strong stability-preserving high-order time discretization methods, SIAM Review, 43 (2001), pp. 89–112, https:
+//doi.org/10.1137/S003614450036757X, https://doi.org/10.1137/S003614450036757X.
+[23] W. G ROPP, T. H OEFLER , R. T HAKUR , AND E. L USK, Using Advanced MPI: Modern Features of the Message-Passing Interface, MIT Press, 2014.
+[24] A. H ARTEN, Multiresolution algorithms for the numerical solution of hyperbolic conservation laws, Communications on Pure and Applied Mathematics, 48
+(1995), pp. 1305–1342, https://doi.org/10.1002/cpa.3160481201, https://doi.org/10.1002/cpa.3160481201.
+[25] R. D. H ORNUNG AND S. R. KOHN, Managing application complexity in the SAMRAI object-oriented framework, Concurrency and Computation: Practice and
+Experience, 14 (2002), pp. 347–368, https://doi.org/10.1002/cpe.652, https://doi.org/10.1002/cpe.652.
+[26] N. K. R. K EVLAHAN AND O. V. VASILYEV, An adaptive wavelet collocation method for fluid-structure interaction at high reynolds numbers, SIAM Journal on
+Scientific Computing, 26 (2005), pp. 1894–1915, https://doi.org/10.1137/S1064827503428503, https://doi.org/10.1137/S1064827503428503.
+[27] R. J. L E V EQUE, High-resolution conservative algorithms for advection in incompressible flow, SIAM Journal on Numerical Analysis, 33 (1996), pp. 627–665,
+https://doi.org/10.1137/0733033, https://doi.org/10.1137/0733033.
+[28] M. L OUNSBERY, T. D. D E R OSE , AND J. WARREN, Multiresolution analysis for surfaces of arbitrary topological type, ACM Trans. Graph., 16 (1997), pp. 34–73,
+https://doi.org/10.1145/237748.237750, https://doi.org/10.1145/237748.237750.
+[29] S. G. M ALLAT, Multiresolution approximations and wavelet orthonormal bases of l2 (r), Transactions of the American Mathematical Society, 315 (1989), pp. 69–
+87, https://doi.org/10.2307/2001373, http://www.jstor.org/stable/2001373.
+[30] S. G. M ALLAT, A theory for multiresolution signal decomposition: the wavelet representation, IEEE Transactions on Pattern Analysis and Machine Intelligence,
+11 (1989), pp. 674–693, https://doi.org/10.1109/34.192463.
+[31] Y. M EYER, Wavelets and Operators, vol. 1, Cambridge University Press, Cambridge, 1993, https://doi.org/DOI:10.1017/CBO9780511623820, https://www.
+cambridge.org/core/books/wavelets-and-operators/1E2A0A9CE47CB41603C9B6080E5FFFEA.
+[32] S. P OPINET, Gerris: a tree-based adaptive solver for the incompressible euler equations in complex geometries, Journal of Computational Physics, 190 (2003),
+pp. 572–600, https://doi.org/https://doi.org/10.1016/S0021-9991(03)00298-5, https://www.sciencedirect.com/science/article/pii/S0021999103002985.
+[33] W. H. P RESS , S. A. T EUKOLSKY, W. T. V ETTERLING , AND B. P. F LANNERY, Numerical Recipes in C, CAMBRIDGE UNIVERSITY PRESS, third edition ed., 2007.
+[34] D. R OSSINELLI , B. H EJAZIALHOSSEINI , W. VAN R EES , M. G AZZOLA , M. B ERGDORF, AND P. KOUMOUTSAKOS, MRag-I2d: Multi-resolution adapted grids for
+remeshed vortex methods on multicore architectures, Journal of Computational Physics, 288 (2015), pp. 1–18, https://doi.org/http://dx.doi.org/10.1016/j.jcp.
+2015.01.035.
+[35] C. R OY, Strategies for Driving Mesh Adaptation in CFD (Invited), no. 0 in Aerospace Sciences Meetings, American Institute of Aeronautics and Astronautics,
+2021/12/10 2009, https://doi.org/doi:10.2514/6.2009-1302, https://doi.org/10.2514/6.2009-1302.
+[36] K. S CHNEIDER AND O. V. VASILYEV, Wavelet methods in computational fluid dynamics, Annual Review of Fluid Mechanics, 42 (2009), pp. 473–503, https:
+//doi.org/10.1146/annurev-fluid-121108-145637, https://doi.org/10.1146/annurev-fluid-121108-145637.
+[37] W. S WELDENS, The lifting scheme: a custom-design construction of biorthogonal wavelets, Applied and Computational Harmonic Analysis, 3 (1996), pp. 186–
+200.
+[38] W. S WELDENS, The Lifting Scheme: A construction of Second Generation Wavelets, SIAM Journal on Mathematical Analysis, 29 (1998), pp. 511–546, https:
+//doi.org/10.1137/S0036141095289051, https://arxiv.org/abs/http://dx.doi.org/10.1137/S0036141095289051.
+[39] W. S WELDENS AND R. P IESSENS, Quadrature formulae and asymptotic error expansions for wavelet approximations of smooth functions, SIAM Journal on
+Numerical Analysis, 31 (1994), pp. 1240–1264, https://doi.org/10.1137/0731065, https://doi.org/10.1137/0731065, https://arxiv.org/abs/https://doi.org/10.
+1137/0731065.
+[40] W. S WELDENS AND P. S CHRODER, Building your own wavelets at home, in ACM Conference on Computer Graphics and Interactive Techniques, 1996.
+[41] J. A. VAN H OOFT AND S. P OPINET, A fourth-order accurate adaptive solver for incompressible flow problems, Journal of Computational Physics, 462 (2022),
+p. 111251, https://doi.org/https://doi.org/10.1016/j.jcp.2022.111251, https://www.sciencedirect.com/science/article/pii/S0021999122003138.
+[42] W. VAN R EES, 3D simulations of vortex dynamics and biolocomotion, PhD thesis, ETH Zurich, 2014.
+[43] O. V. VASILYEV AND C. B OWMAN, Second-Generation Wavelet Collocation Method for the Solution of Partial Differential Equations, Journal of Computational
+Physics, 165 (2000), pp. 660 – 693, https://doi.org/http://dx.doi.org/10.1006/jcph.2000.6638.
+[44] Q. Z HANG , H. J OHANSEN , AND P. C OLELLA, A fourth-order accurate finite-volume method with structured adaptive mesh refinement for solving the advectiondiffusion equation, SIAM Journal on Scientific Computing, 34 (2012), pp. B179–B201, https://doi.org/10.1137/110820105, https://doi.org/10.1137/110820105.
+[45] W. Z HANG , A. A LMGREN , V. B ECKNER , J. B ELL , J. B LASCHKE , C. C HAN , M. D AY, B. F RIESEN , K. G OTT, D. G RAVES , M. P. K ATZ , A. M YERS , T. N GUYEN , A. N ON AKA , M. R OSSO, S. W ILLIAMS , AND M. Z INGALE , Amrex: a framework for block-structured adaptive mesh refinement, The Journal of Open Source Software,
+(2019).
+
+SUPPLEMENTARY MATERIALS: MURPHY - A SCALABLE MULTIRESOLUTION FRAMEWORK FOR SCIENTIFIC COMPUTING
+ON 3D BLOCK-STRUCTURED COLLOCATED GRIDS
+THOMAS GILLIS ∗ AND WIM M. VAN REES ∗†
+
+arXiv:2112.07537v2 [math.NA] 1 Jul 2022
+
+SM1. Implementation details - filters bank. In this section we detail the exact construction of the filter banks, as used in
+the software. From an implementation perspective, two approaches have been considered in the literature: the step-by-step
+implementation of the lifting scheme, as in [4], or the filter-based approach as in [7]. Although the operation count is smaller in
+the first approach and a factor 2 has been reported in the complexity [2], we follow the second approach which provides significant
+simplifications especially in multiple dimensions. Further, the memory layout in the implementation is achieved more naturally
+when interlacing the scaling and detail coefficients:
+£
+¤
+u L = . . . λLk−1 , γLk−1 , λLk , γLk , λLk+1 , γLk+1 , . . . .
+
+(SM1.1)
+
+This does not affect the G a and H a filters used in the analysis, but requires the definition of two new filters J s and K s to replace
+H s and G s during the synthesis operation, such that
+s L
+λL+1
+2k = J u
+
+(SM1.2)
+
+s L
+λL+1
+2k+1 = K u ,
+
+where the array u L in the left equation is implicitly assumed to be centered on λLk , and in the right equation on γLk . This change of
+perspective is strictly equivalent to the classical H s /G s filters and has been done to simplify the implementation. Considering this
+new approach, the filter coefficients for wavelet 2.0, wavelet 4.0, and wavelet 6.0 are given in Table SM1.1, and the coefficients for
+wavelet 2.2, wavelet 4.2, and wavelet 6.2 are given in Table SM1.2.
+Ha
+G
+
+a
+
+Js
+K
+
+s
+
+Ha
+
+1
+− 21
+
+1
+
+− 12
+
+G
+
+1
+
+0
+
+9
+− 16
+
+0
+
+9
+16
+
+Js
+
+1
+1
+2
+
+1
+1
+16
+
+a
+
+1
+2
+
+K
+
+1
+
+9
+− 16
+
+0
+
+1
+16
+
+9
+16
+
+0
+
+1
+− 16
+
+1
+1
+− 16
+
+s
+
+(a) wavelet 2.0
+
+1
+
+(b) wavelet 4.0
+
+Ha
+G
+
+a
+
+Js
+K
+
+s
+
+1
+3
+− 256
+
+0
+
+25
+256
+
+0
+
+25
+− 256
+
+0
+
+75
+− 128
+
+0
+
+75
+128
+
+1
+
+75
+− 128
+
+0
+
+25
+256
+
+0
+
+3
+− 256
+
+75
+128
+
+0
+
+25
+− 256
+
+0
+
+3
+256
+
+1
+3
+256
+
+1
+
+(c) wavelet 6.0
+
+Table SM1.1: Non-lifted interpolating wavelet filter coefficients as operated on interleaved scaling and detail coefficients. The
+filters H a and J s are centered on (even) scaling coefficients, and the filters G a and K s are centered on odd scaling coefficients and
+detail coefficients, respectively.
+
+SM2. Algorithms and implementation. In this section we describe in detail the different algorithms as implemented in our
+presented software framework. We refer to section 3 for additional explanations and context regarding the different steps. In
+Algorithm 1 and Algorithm 2 we detail the implementation of the ghosting procedure, while in Algorithm 3 we expose the implementation of the adaptation of the grid.
+SM2.1. Ghost computation. We describe here the technicalities of the ghost computation implementation. To facilitate the
+discussion, we introduce some notation inspired by the p4est naming convention. Any block b is part of the total set of blocks B
+within the grid, which are distributed among multiple MPI ranks. In this section we understand b to contain the cartesian grid
+data of size Nb3 , as well as a ghost region on the same level as b extending N g points in each dimension on each side of the block,
+∗ Department of Mechanical Engineering, Massachusetts Institute of Technology, 77 Massachusetts Avenue, Cambridge, MA 02139, USA
+† Corresponding author: wvanrees@mit.edu
+
+SM1
+
+SM2
+
+THOMAS GILLIS AND WIM M. VAN REES
+
+Ha
+Ga
+
+− 18
+
+3
+4
+
+1
+4
+
+− 12
+
+1
+
+− 21
+
+− 14
+
+Js
+Ks
+
+1
+4
+
+1
+2
+
+− 18
+
+1
+3
+4
+
+− 41
+1
+2
+
+− 18
+
+Ha
+
+1
+64
+
+− 81
+
+0
+1
+16
+
+Ga
+
+0
+
+Js
+− 18
+
+Ks
+
+1
+− 16
+
+1
+64
+
+− 81
+
+(a) wavelet 2.2
+
+Ha
+Ga
+
+3
+− 1024
+
+Js
+Ks
+
+3
+− 1024
+
+1
+4
+
+23
+32
+
+1
+4
+
+9
+− 16
+
+1
+
+9
+− 16
+
+− 14
+9
+16
+
+1
+23
+32
+
+− 41
+9
+16
+
+− 81
+
+0
+
+0
+
+1
+16
+
+− 81
+
+1
+− 16
+
+1
+64
+
+1
+64
+
+(b) wavelet 4.2
+
+0
+
+11
+512
+
+0
+
+3
+− 256
+
+0
+
+25
+256
+
+3
+256
+
+11
+512
+
+25
+− 256
+
+125
+− 1024
+
+0
+
+125
+− 1024
+
+1
+4
+
+181
+256
+
+1
+4
+
+75
+− 128
+
+1
+
+75
+− 128
+
+− 14
+
+75
+128
+
+1
+181
+256
+
+− 41
+
+75
+128
+
+125
+− 1024
+
+0
+
+11
+512
+
+0
+
+0
+
+25
+256
+
+0
+
+3
+− 256
+
+125
+− 1024
+
+25
+− 256
+
+11
+512
+
+3
+256
+
+3
+− 1024
+
+3
+− 1024
+
+(c) wavelet 6.2
+
+Table SM1.2: Lifted interpolating wavelet filter coefficients as operated on interleaved scaling and detail coefficients. The filters
+H a and J s are centered on (even) scaling coefficients, and the filters G a and K s are centered on odd scaling coefficients and detail
+coefficients, respectively.
+
+where N g is determined from the PDE requirements or wavelet support, depending on the operation. A subset of B is the mirror
+group M, defined as the set of blocks that are the neighbor of at least one other block on another rank, and thus have to be accessed
+through MPI communications. For each block b, we further define 6 different neighbor sets. All neighbors that exist on the same
+level as b fall in the group G0 , all neighbors that are coarser than b fall in the group G− , and all neighbors that are finer than b fall
+in the group G+ . Each of these group can either exist on the same rank as b, in which case they are denoted as ‘local’ G0/−/+
+, or
+L
+0/−/+
+on another rank in which case they are denoted as ‘global’ GG
+. The ghost point computation is divided into two parts. For a
+−
+0
+block b, the first step combines the values of coarser neighbors GG/L
+and same level neighbors GG/L
+with a coarse perspective of
+the data in b to be able to compute a local refinement of the ghost region and retrieve the required ghost points (see Algorithm 1).
+This step implements the process outlined in the main section in subsection 2.2.2. In the second step, block b uses the refined
+region of step 1 (including ghosts) to coarsen again, leading to coarse ghost points that block b then communicates to neighbors
+−
+GG/L
+(see Algorithm 2).
+Part 1: Coarser and same-level neighbors . First, due to the continuity in memory needed by the RMA window (our current
+memory allocation does not guarantee continuity for a given field across blocks), we start by a copy of all the b ∈ M into the buffer
+reserved for the communication, bufRMA . The ghost values from same-level neighbors are trivially obtained by accessing the values
+0
+.
+needed by the ghost region through a memory copy for G0L and using MPI_Get() for GG
+To obtain ghost values from coarser and same-level neighbors of our current block b, we have to use the refinement operation
+as described in subsection 2.2. This operation relies on the grid values of G− and the even values of our current block b and G0 .
+We proceed by gathering all the required values for the computation of the ghost into a temporary buffer b̃ (whose size is 1/8th of
+the block-size, extended with a coarsened representation of the ghost region). The contribution of the coarser neighbors are first
+obtained through a copy or MPI_Get() of the required values into b̃, and we gather the even values of the same-level neighbors,
+together with the even data of the current block. The data inside b̃ associated with fine-level neighbors is left blank and ignored
+throughout this process. Once all the needed data are gathered into b̃, we apply any domain boundary conditions at the coarse
+level. Finally, we perform the refinement operation locally on the rank associated with b and read out the computed ghost values
+within the regions overlapping with G0 and G− from the refined buffer.
+Part 2: Fine-level neighbors . In the second part of the algorithm, we use the data in b and its ghost points computed in
+part 1 to compute coarse-level ghost points for G− , with the individual steps described in Algorithm 2. We first apply any specified
+domain boundary conditions on b if required, and then perform the substitution step as detailed in subsection 2.2.4. We then
+coarsen b along the lines described in subsection 2.2 and store the coarsened data into b̃. Once the coarsening is completed, block
+−
+b copies the required coarse-level ghost points to G−
+L or issues a MPI_Put() for GG to write into the coarser neighbor’s memory.
+When completed, we are left with the application of the boundary conditions as all the ghost informations are now complete.
+With these two steps, all block interfaces in the domain can be handled. In the way explained above, the ghost reconstruction
+would correspond to a tree traversal from the coarsest to the finest levels in part 1, and back up to the coarsest level in part 2. However, choosing Nb larger than the support of the wavelet filters together with the 2:1 constraint in resolution jumps guarantees that
+our algorithm for ghost reconstruction parallelizes efficiently across the different levels, with only independent synchronizations
+

@@ -1,0 +1,1119 @@
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+1
+
+K8S Power Irrigation: Deep Reinforcement
+Learning for Performance-Aware Power
+Efficiency of Kubernetes Cloud-Native
+arXiv:2605.25218v1 [cs.NI] 24 May 2026
+
+Microservices
+Zouhir Bellal, Laaziz Lahlou, Nadjia Kara, Timothy Murphy, Tan Phat Nguyen
+
+Abstract
+Modern cloud platforms are facing a sharp increase in power demand driven by the rapid adoption
+of AI-powered applications, making power optimization urgent under net-zero commitments and sustainability goals. Yet, reducing power in production remains challenging for latency-sensitive microservices (e.g., backend pipelines for autonomous driving, real-time AI inference, and AI/IoT workloads),
+where performance violations directly impact user experience and operational risk. These microservices
+exhibit heterogeneous workload characteristics (CPU-bound, memory-bound, and mixed) and diverse
+load patterns. In multi-tenant environments, especially for memory-intensive workloads, contention on
+shared uncore resources (e.g., last-level cache and memory bandwidth) can degrade performance and
+trigger violations of performance requirements. As a conservative safeguard, providers often pin servers
+to performance mode (maximum core and uncore frequencies). This occurs because existing power
+governors largely disregard application-level performance requirements and ignore uncore interference
+under contention, maintaining reliability by sacrificing energy efficiency and causing systematic power
+This work has been submitted to the IEEE for possible publication. Copyright may be transferred without notice, after which
+this version may no longer be accessible.
+This work is supported by NSERC and Ericsson Canada, Grant # 561771
+Z. Bellal is with École de technologie supérieure (ÉTS), Montréal, Canada (zouhir.bellal.1@ens.etsmtl.ca)
+L. Lahlou is with École de technologie supérieure (ÉTS), Montréal, Canada (laaziz.lahlou@etsmtl.ca)
+N. Kara is with École de technologie supérieure (ÉTS), Montréal, Canada (nadjia.kara@etsmtl.ca)
+T. Murphy is with Ericsson, Canada (timothy.murphy@ericsson.com)
+T. Phat Nguyen is with Ericsson, Canada (Tan.Phat.Nguyen@ericsson.com)
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+2
+
+over-provisioning. To address this, we introduce K8SPI (Kubernetes Power Irrigation), a hierarchical
+reinforcement learning (HRL) controller that jointly optimizes CPU core and uncore frequencies for
+cloud-native deployments. K8SPI uses a two-stage control architecture: a coarse-grained agent rapidly
+mitigates performance violations, while a fine-grained agent iteratively minimizes power consumption
+once performance requirements are met. Guided by multi-level telemetry spanning hardware, Kubernetes,
+and application performance signals, K8SPI adapts to workload heterogeneity and cross-microservice
+interference to meet performance requirements with minimal node power. We evaluate K8SPI on a
+Kubernetes testbed across multiple scenarios. Experimental results show that K8SPI reduces node-level
+power consumption by 23–30% relative to the Linux performance governor while keeping performance
+requirement violations below 2–3%, even under severe uncore contention and dynamic load fluctuations.
+
+Index Terms
+Power monitoring, Cloud power observability, Container-level power monitoring, Power accuracy
+validation framework, Kepler accuracy validation,
+
+I. I NTRODUCTION
+By 2030, the electricity demand of the IT sector is projected to reach approximately 3,200
+TWh [1]. These projections likely underestimate future consumption due to the rapid proliferation
+of energy-intensive Artificial Intelligence (AI) workloads, particularly generative AI. Reports
+indicate that a single ChatGPT query may consume significantly more energy than a conventional
+web search [2], [3], with the additional global power capacity required for AI projected to reach
+327 GW by 2030 [4]. Even with innovations such as DeepSeek that reduce the cost of developing
+large language models (LLMs), overall energy demand is unlikely to slow down due to largescale deployment and workload growth [5].
+This surge, combined with regulatory pressures such as carbon pricing schemes [6], prompts
+energy efficiency to be a primary operational objective for cloud providers. However, achieving
+efficiency in cloud-native environments, characterized by multi-tenancy, heterogeneous microservices, and dynamic load, remains a complex control problem.
+Dynamic Voltage and Frequency Scaling (DVFS) is the standard mechanism for managing
+processor power. Modern architectures support scaling for both processing cores and the “uncore”
+(interconnects and Last Level Cache). While core frequency dictates computational throughput,
+uncore frequency governs memory subsystem performance, including L3 cache latency and
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+3
+
+bandwidth availability. Existing power governors (e.g., intel_pstate, lunix schedutil) rely on
+hardware-derived utilization metrics (CPU usage, instruction by cycle) to adjust these frequencies.
+However, these governors optimize system-level utilization rather than enforcing microservicelevel performance requirements (e.g., latency constraints). Consequently, they may over-provision
+resources—leading to unnecessary power waste—or under-provision them, resulting in Performance requirement violations. This limitation becomes particularly critical in performancesensitive microservices deployed in cloud environments.
+The problem is exacerbated in multi-tenant nodes where microservices exhibit diverse power–
+performance sensitivities. CPU-bound services rely on core frequency, while memory-bound
+services depend heavily on uncore frequency. Furthermore, strictly enforcing CPU core isolation
+(e.g., via Kubernetes QoS classes) does not isolate shared uncore resources. Consequently,
+uncore interference—where co-located workloads contend for memory bandwidth—can degrade
+performance unpredictably. In practice, to mitigate this risk, providers often default to maximum
+frequency (performance mode), sacrificing energy efficiency for reliability.
+Several solutions have been proposed in the literature to address power–performance tradeoffs, where Reinforcement Learning (RL) has emerged as a promising approach for adaptive
+power control. Existing solutions often lack the granularity required for modern cloud environments. Most state-of-the-art RL approaches either control frequencies in isolation, optimize for
+utilization rather than Performance requirements, or neglect the impact of uncore interference.
+To bridge this gap, we propose K8SPI (Kubernetes Power Irrigation), a Hierarchical Reinforcement Learning (HRL) controller that jointly optimizes core and uncore frequencies. K8SPI
+employs a two-stage control architecture to balance rapid performance requirement enforcement
+with energy minimization:
+•
+
+Coarse-grained Restoration: An agent that reacts to performance requirement violations
+by performing significant frequency adjustments to rapidly restore performance.
+
+•
+
+Fine-grained Refinement: Once performance constraints are met, a second agent iteratively
+refines the configuration to minimize power consumption without triggering new violations.
+
+To support this decision-making, K8SPI utilizes a multi-level telemetry stack:
+•
+
+Low-level: Per-microservice hardware performance counters capturing instruction execution
+and stall cycles.
+
+•
+
+Application-level: Real-time microservice performance metrics (e.g., request latency).
+
+•
+
+Global-level: Socket-wide counters reflecting memory controller and interconnect activity.
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+4
+
+By synthesizing these signals, K8SPI effectively manages workload heterogeneity, dynamic
+load variations, and uncore interference.
+We implement and evaluate K8SPI on a dedicated Kubernetes-based testbed that emulates
+cloud deployment conditions using benchmark-driven microservices. The evaluation covers three
+scenarios with increasing co-location and contention: (i) a single performance-sensitive microservice, (ii) a single performance-sensitive microservice co-located with best-effort workloads, and
+(iii) multiple performance-sensitive microservices sharing the same node under high contention.
+Across all scenarios, K8SPI achieves a 23%–30% reduction in node-level power compared to
+the Linux performance governor operating at maximum frequency, while keeping latency violations below 2%–3%, even under dynamic load fluctuations and uncore interference. These results
+indicate that K8SPI can reduce power waste without compromising performance requirements
+in multi-tenant, cloud-native deployments.
+In summary, the main contributions of this paper are as follows:
+•
+
+We propose K8SPI (Kubernetes Power Irrigation), a novel Hierarchical Reinforcement
+Learning (HRL) controller that jointly optimizes CPU core and uncore frequencies to
+reduce power consumption in cloud-native environments without violating microservice
+performance requirements.
+
+•
+
+We develop an end-to-end framework for the rapid prototyping of RL-based power optimization policies, specifically tailored for latency-sensitive microservices.
+
+•
+
+We implement K8SPI within a Kubernetes testbed, evaluating its robustness across increasingly complex scenarios, including isolated execution, best-effort co-location, and highcontention multi-instance deployments of latency-sensitive microservices.
+
+•
+
+We demonstrate that K8SPI achieves a 23%–30% reduction in node-level power consumption compared to the default Linux performance governor operating at maximum frequency,
+while strictly maintaining performance requirement violations below 2%–3% under severe
+uncore interference and dynamic load fluctuations.
+
+A. Background & Motivation
+1) Latency-Sensitive Microservices: Latency-sensitive microservices (e.g., real-time IoT analytics and interactive online services) operate under strict response-time Service Level Agreements (SLAs). In this work, latency is defined as the time elapsed between request arrival at
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+5
+
+the service and generation of the corresponding response. These constraints are strictly enforced
+because they directly impact user experience and contractual compliance.
+Cloud services consume compute/memory resources (CPU, cache, memory bandwidth) in
+addition to storage/network; this work focuses on compute/memory only.
+Microservices exhibit heterogeneous workload characteristics, which we categorize into three
+classes:
+•
+
+CPU-intensive (compute-dominated and sensitive to core frequency),
+
+•
+
+memory-intensive (memory/bandwidth-dominated and typically more sensitive to uncore
+frequency), and
+
+•
+
+mixed (joint compute and memory demands, sensitive to both core and uncore frequencies).
+
+2) Understanding Uncore Resource Contention: Uncore resources, including the shared lastlevel cache (LLC) and memory bandwidth, are shared across CPU cores within a socket. This
+shared design introduces contention and can degrade performance when multiple memoryintensive microservices are co-located on the same node.
+Uncore frequency plays a central role in this interference because it influences the operating
+point of the memory subsystem and, consequently, the achievable memory bandwidth at both
+per-core and socket-wide levels. Since the uncore is shared, bandwidth utilization is inherently
+interdependent: a core may achieve a high bandwidth in isolation at a given uncore frequency,
+but its effective throughput is bounded by the socket’s aggregate capacity and the concurrent
+demand from other cores.
+For illustration, consider a 16-core server at a baseline uncore frequency with an aggregate
+socket bandwidth limit of 120 GB/s and an achievable single-core bandwidth of 15 GB/s. A
+single memory-intensive microservice pinned to one core can reach close to 15 GB/s. Under
+full co-location, if all 16 cores execute memory-bound workloads simultaneously, the aggregate
+demand exceeds 120 GB/s, and the effective bandwidth per core is reduced (e.g., to approximately
+7.5 GB/s). This reduction increases memory stall time and can cause noticeable latency degradation for memory bandwidth-intensive microservices. Fig. 1 shows a 21% per-core bandwidth
+drop under co-location.
+An efficient uncore frequency scaling policy that can scale up frequency under contention to
+improve bandwidth, and scale down when demand is low to avoid over-provisioning and reduce
+power.
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+6
+
+Fig. 1: Per-core memory bandwidth of a memory-intensive microservice running on a single
+CPU core in isolation versus co-located with 13 memory-intensive co-runners on a 14-core
+socket (core/uncore fixed at 2.6/2.4 GHz). Co-runners reduce per-core bandwidth by 21%.
+
+3) Frequency Management in Cloud Servers: Cloud servers manage the performance–power
+trade-off using DVFS policies, commonly exposed as CPU frequency governors. These policies
+are typically categorized as static or dynamic.
+Static governors (e.g., performance and powersave) operate at fixed operating points. The performance governor keeps frequencies at (or near) their maximum to prioritize performance, which
+helps performance-sensitive services satisfy latency requirements but often causes power waste
+through over-provisioning. In contrast, powersave prioritizes low frequencies to reduce power,
+which can degrade performance and increase the risk of performance requirement violations.
+Dynamic governors (e.g., Intel P-state and Linux ondemand/schedutil) adapt frequencies online
+using utilization-driven heuristics derived from runtime signals. In general, core frequency is
+increased under higher compute demand and reduced when demand subsides.
+4) Core/Uncore Adjustment Policies:
+a) Core frequency control: Core DVFS policies typically adjust frequency using systemlevel indicators of compute demand, such as: CPU load or IPC (or related hardware indicators),
+where higher instruction throughput can indicate compute-intensive execution and motivate
+higher frequency.
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+7
+
+b) Uncore frequency governor: While our solution targets Intel processors, the proposed
+methodology is architecture-agnostic and adaptable to other multi-core systems possessing,
+such as the AMD Zen architecture. The uncore is a substantial resource consumer, occupying
+roughly 30% of the die area and driving approximately 20% of total power consumption. Uncore
+frequency policies can be grouped into:
+1) CPU load-based governors: On some architectures (e.g., Intel Skylake and early Sapphire
+Rapids generations), uncore frequency is pushed to its maximum whenever any core reaches
+its base frequency. This approach ignores actual memory or cache demand. Such a strategy
+can lead to significant energy waste for CPU-bound applications where the application
+performance is insensitive to the memory latency.
+2) Memory operation-based governors: More recent architectures (e.g., Intel Sierra Forest)
+introduce activity-driven uncore scaling, adjusting uncore frequency based on memory
+bandwidth usage and cache access patterns.
+c) Limitation: lack of application awareness: Despite these advances, core and uncore
+governors are primarily driven by system-level signals and do not explicitly incorporate microservice performance requirements (e.g., latency). Consequently, they cannot reliably distinguish
+between (i) conservative scaling that preserves latency targets while reducing over-provisioning
+and (ii) aggressive downscaling that saves power but induces performance requirement violations,
+especially under heterogeneous workloads and multi-tenant interference.
+B. Reinforcement Learning
+Our work employs RL to develop a dynamic, performance-aware power optimization scheme.
+RL works by obtaining strategy improvements through continuous interactions with the changing
+environment in discrete time steps. At each step, an agent receives the current state and a reward
+(e.g., a function of the measured energy consumption and application-layer performance). It then
+chooses an action from the set of available actions (e.g., core and uncore configuration) and uses
+the action to configure the environment (e.g., the hardware). The environment will then move
+to a new state, and the reward associated with the transition is determined. The goal of the RL
+agent is to learn a policy that maximizes the expected cumulative reward, i.e., the overall power
+saving with guaranteed application performance. In this work, we choose to use a policy network
+optimized via Proximal Policy Optimization (PPO). Given the discrete nature of the action space
+and the need for fast online adaptation, PPO directly optimizes the policy and gracefully handles
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+8
+
+noisy environments. Unlike Q-learning-based methods, PPO utilizes incremental, continuous
+policy updates that ensure smooth adaptation to the evolving workloads and resource contention
+typical in dynamic cloud environments. This property makes the controller highly robust against
+runtime anomalies and short-term data drifts. Furthermore, PPO is generally less sensitive to
+hyperparameter tuning, providing the additional stability required for reliable online deployment.
+C. Related Work
+Prior work manages the power/energy–performance trade-off using DVFS and UFS. Early
+controllers are profile- or rule-based. RL has recently become a promising runtime alternative
+because it can adapt online under a dynamic environment.
+1) Non-RL Runtime Control: A large body of prior work manages the power/energy–performance
+trade-off using DVFS and uncore frequency scaling (UFS) via profiling and rule-based runtime
+control. These methods are effective in structured settings (often HPC) where objectives are
+typically expressed as energy reduction under a bounded slowdown budget.
+Cuttlefish [7] profiles MSRs to compute TIPI (memory requests per retired instruction),
+classifies workloads as compute- vs memory-bound, and triggers an exploration-based linear
+search to select core/uncore frequencies (CF/UF) minimizing joules per instruction (JPI). On a
+20-core Intel Xeon Haswell E5-2650 with ten HPC benchmarks, it reports 19.4% geometricmean energy savings with 3.6% slowdown versus the performance governor, but its deterministic
+classification policy can be brittle under phase changes and co-runner interference. DUFP [8]
+combines package power capping with UFS using runtime FLOPS/s and bandwidth signals to
+detect phases and adjust RAPL caps within a tolerated slowdown (0–20%), while tuning uncore
+using the same indicators; on NAS, HPL, and LAMMPS it reports improved energy efficiency,
+with strong results near a 10% slowdown budget.
+Complementary UFS-focused runtimes further validate uncore as a first-order control knob.
+DUF [9] adapts uncore frequency online to reduce socket power/energy under bounded slowdown, and UPSCavenger [10] selects uncore frequency in a phase-aware manner for HPC
+workloads. Collectively, these efforts show that coordinated core–uncore tuning expands the
+energy–performance trade-off, but the objective is typically slowdown-centric rather than latencySLO-centric.
+For latency-critical services, non-RL controllers shift the objective from slowdown to explicit
+QoS preservation. PEGASUS [11] uses feedback control for energy proportionality under service-
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+9
+
+level constraints; SleepScale [12] jointly selects DVFS and sleep states under QoS constraints;
+TimeTrader [13] leverages tail-latency slack by slowing non-critical requests; and Gemini [14]
+uses learning-based prediction for per-query power/frequency decisions under tight latency targets.
+2) RL-Based DVFS/UFS Control Under QoS Constraints: RL has emerged as a promising
+alternative for DVFS/UFS control under workload non-stationarity and co-location dynamics,
+because it can learn adaptive policies from telemetry rather than relying on fixed heuristics.
+In latency-sensitive, multi-workload environments, Twig [15] applies deep RL with hardware
+counters to model QoS behavior and drive energy-efficient control under co-location. Hipster [16]
+combines RL with heuristic structure to manage latency-critical workloads alongside batch corunners, using DVFS and runtime resource control to reduce energy while preserving QoS and
+improving throughput. Greeniac [17] extends QoS-aware control to fog/edge clusters, framing
+frequency selection as a bandit problem under response-time constraints.
+In service-centric networking, RL is also applied under explicit performance constraints.
+RL-ADR [18] selects frequency for a 5G user-plane function to minimize power under nearhard packet-drop constraints, using a policy library and conservative fallback to handle traffic
+distribution shifts; the authors report zero packet drops on long unseen traces while reducing
+power versus static baselines. GreenNFV [19] uses actor–critic learning (DDPG) for NFV
+scheduling and tuning, including CPU frequency among multiple actuators to satisfy performance
+requirement/throughput targets while improving energy efficiency.
+A second cluster shows the benefit of joint core–uncore control. Juan and Marculescu [20]
+study reinforcement-based policies over core and uncore DVFS under power constraints, showing
+coordinated policies outperform core-only or uncore-only scaling under iso-power conditions.
+PManager [21] co-optimizes power caps and UFS across phases using RL, and Gocht et al. [22]
+explore the core×uncore space using Q-learning-style exploration with region awareness and
+direct energy feedback. A hierarchical RL design is also proposed in patent literature [23], but
+it lacks peer-reviewed evaluation. Finally, embedded platforms study RL-based DVFS under
+deadline/performance constraints (e.g., Q-learning in [24] and DDQN with Linux CPUFreq
+in [25]). Despite this progress, many studies still assume isolation or whole-socket occupancy.
+This abstraction does not match cloud nodes where multiple services share a socket and compete
+for uncore resources. Our objective is to satisfy per-service latency SLAs while minimizing power
+by dynamically scaling core and uncore frequencies under co-location, heterogeneous workload
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+10
+
+Fig. 2: K8SPI architecture overview.
+
+types, and time-varying load.
+II. K8SPI A RCHITECTURE
+A. System Overview
+In this paper, we propose K8SPI, an online, hierarchical reinforcement learning (HRL) based
+power governor tailored for multi-tenant cloud environments. Specifically, K8SPI targets heterogeneous microservices deployed via Kubernetes (K8s) under the Guaranteed Quality of Service
+(QoS) class, a configuration that allocates dedicated CPU cores to individual microservices. The
+primary objective of the K8SPI framework is to minimize the CPU socket power consumption
+without incurring performance degradation that violates the performance requirements of the
+hosted microservices.
+As illustrated in Fig. 2, the K8SPI control loop consists of two primary modules: a multilayered Metrics Monitoring module and an HRL-based Power Governor.
+B. Multi-Layered Telemetry and Monitoring
+To accurately capture the dynamic behavior of the system, the continuous monitoring module
+aggregates telemetry data across three distinct abstraction layers, providing both a global system
+view (i.e., socket-level view) and per-microservice visibility using:
+•
+
+Application Layer: Captures high-level performance metrics (e.g., target latency) and
+dynamic microservice loads, measured in requests per second (RPS) for each microservice.
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+•
+
+11
+
+Orchestration (K8s) Layer: Gathers container- and pod-level metrics from the Kubernetes
+control plane to monitor deployment constraints and accurately map CPU cores to their
+respective microservices.
+
+•
+
+Hardware (Socket) Layer: Collects lightweight, low-level hardware performance counter
+measurements (e.g., instructions per cycle, cache miss rates, and memory bandwidth utilization) at both the socket and core levels.
+
+C. Event-Triggered Hierarchical Power Governor
+K8SPI employs an event-driven control loop that reacts dynamically to the evaluated system
+state. The control loop actively evaluates the aggregated telemetry against current performance
+thresholds. As depicted by the decision logic in Fig. X, the RL-based Power Governor is invoked exclusively when the monitoring subsystem detects an imminent performance requirement
+violation or a state of significant resource overprovisioning.
+Upon identifying such conditions, the HRL-based Power Governor intervenes to concurrently
+modulate the dedicated CPU core frequency of the target microservice and the shared uncore
+frequency of the processor socket.
+To efficiently navigate this expansive, multi-dimensional configuration space, the K8SPI governor relies on a two-stage hierarchical RL architecture:
+•
+
+Stage 1 - Coarse Agent: This agent makes large, rapid adjustments to the frequency
+settings. Its primary goal is to quickly mitigate performance violations or eliminate massive
+overprovisioning, bringing the system into a safe operational region. In doing so, it creates
+an optimal starting point for the subsequent tuning phase.
+
+•
+
+Stage 2 - Fine Agent: Once the system is stabilized near the safe threshold, the fine
+agent takes over. It performs smaller, granular frequency refinements to minimize power
+consumption while ensuring that the performance requirement remains strictly satisfied.
+III. S YSTEM M ODEL AND P ROBLEM F ORMULATION
+
+A. Socket-Level Orchestration Architecture
+We consider a multi-tenant cloud compute node comprising multiple physical processor sockets; K8SPI acts at the socket level. The socket encompasses a set of physical CPU cores, denoted
+by C, and hosts a set of heterogeneous, latency-critical microservices, M. To guarantee strict
+compute isolation and satisfy Kubernetes Guaranteed Quality of Service (QoS) requirements,
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+12
+
+we assume an exclusive deployment mapping where each microservice mi ∈ M is pinned to a
+dedicated core ci ∈ C.
+The hardware exposes two primary control domains for dynamic voltage and frequency scaling
+(DVFS), and uncore frequency scaling (UFS). First, each core ci operates at an independent core
+min
+max
+frequency, fcore,i , bounded by [fcore
+, fcore
+]. Second, all cores within the socket share a common
+
+uncore subsystem, which includes the Last Level Cache (LLC) and memory controllers. This
+min
+max
+shared domain operates at a global uncore frequency, funcore , bounded by [funcore
+, funcore
+].
+
+B. Workload and Performance Model
+The system operates under an event-triggered control paradigm. Let tk denote the timestamp
+of the k-th control invocation epoch, triggered by either an imminent performance violation or
+a state of massive resource overprovisioning.
+Each microservice mi is characterized by an architectural workload profile, ωi (e.g., computebound or memory-bound), and experiences a dynamic incoming request load, λi (tk ) ∈ [0, 1].
+The performance of mi is strictly governed by a target latency constraint, Ltarget,i .
+The measured tail latency at epoch tk , denoted as Lcurrent,i (tk ), is modeled as the sum of its
+isolated execution latency and a contention time penalty:
+
+Lcurrent,i (tk ) = Φ (fcore,i (tk ), funcore (tk ), λi (tk ), ωi ) + ∆Linterf,i (tk )
+
+(1)
+
+where Φ(·) represents the baseline latency function of the microservice executed without
+noisy neighbors. The term ∆Linterf,i (tk ) ≥ 0 encapsulates the latency time penalty induced by
+uncore interference. Because latency measures execution delay, interference strictly adds to this
+delay. This degradation occurs because co-located microservices aggressively compete for the
+shared memory bandwidth. While increasing funcore expands the aggregate socket bandwidth, the
+effective throughput available to mi decreases as co-runner demand increases, causing memory
+stall cycles that strictly inflate Lcurrent,i .
+Crucially, because Φ(·) and ∆Linterf,i depend on highly dynamic runtime behaviors, opaque
+microarchitectural state interactions (e.g., core pipeline stalls and cache hierarchy thrashing), and
+complex, non-linear resource contention across the entire socket, deriving an exact analytical
+model is computationally intractable. Instead, these highly dynamic and coupled interactions
+must be approximated and learned iteratively at runtime.
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+13
+
+C. Power Model
+The total power consumption of the socket, Psocket (tk ), is decomposed into the dynamic power
+of the active cores, the dynamic power of the shared uncore domain, and the baseline static
+leakage power (Pstatic ):
+
+Psocket (tk ) =
+
+X
+
+uncore
+core
+(funcore (tk ), ⃗λ(tk )) + Pstatic
+(fcore,i (tk ), λi (tk )) + Pdyn
+Pdyn
+
+(2)
+
+i∈C
+
+Because dynamic power scales proportionally with the switching frequency and the square of
+the supply voltage (P ∝ V 2 f ), aggressive scaling of both core and uncore frequencies provides
+the primary lever for power minimization. Crucially, in modern high-density processors, the
+uncore
+uncore subsystem represents a massive physical domain. Consequently, Pdyn
+consumes a
+
+disproportionately dominant fraction of the total socket power compared to any individual core’s
+core
+dynamic power (Pdyn
+). Therefore, the K8SPI controller treats the uncore frequency not just as
+
+a performance knob, but as the most critical variable for achieving node-wide energy efficiency,
+albeit one highly coupled to the aggregate memory transaction rate ⃗λ(tk ) generated by all cores
+on the socket.
+Similar to the latency model, explicitly formalizing the complex, non-linear coupling between
+highly dynamic multi-core workloads, joint frequency scaling, and holistic socket power consumption across diverse hardware is practically infeasible at runtime. Therefore, the exact powerperformance manifold is treated as a highly dynamic, black-box environment whose underlying
+transition dynamics will be implicitly learned via the Deep Reinforcement Learning policy.
+D. Problem Definition
+The objective of the proposed K8SPI framework is to determine the optimal frequency scaling
+actions at each event epoch tk to minimize the total socket power consumption, while strictly
+guaranteeing that no microservice violates its performance requirement. The constrained optimization problem is formulated as:
+
+min
+
+f⃗core ,funcore
+
+subject to
+
+K
+X
+
+Psocket (tk )
+
+(3)
+
+k=0
+
+Lcurrent,i (tk ) ≤ Ltarget,i
+
+∀mi ∈ M, ∀k
+
+(4)
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+14
+
+min
+max
+fcore
+≤ fcore,i (tk ) ≤ fcore
+,
+
+(5)
+
+min
+max
+funcore
+≤ funcore (tk ) ≤ funcore
+
+This formulation highlights the core control challenge: minimizing Equation 2 by lowering
+frequencies directly penalizes the latency function in Equation 1, thereby risking violations of
+the strict constraint in Equation 4 amid unpredictable uncore interference.
+Because the functions governing power (Eq. 2) and latency (Eq. 1) exhibit complex, non-linear,
+and highly dynamic behaviors at runtime across both core and uncore domains, traditional convex
+optimization and static heuristic control are inadequate. Consequently, we frame this optimization
+as a Markov Decision Process (MDP). K8SPI leverages a Deep Reinforcement Learning agent to
+map real-time telemetry states to optimal frequency actions, inherently learning a robust control
+policy capable of navigating the complex trade-offs between strict performance requirement
+enforcement and maximum energy efficiency.
+IV. H IERARCHICAL R EINFORCEMENT L EARNING C ONTROLLER
+To navigate the high-dimensional joint frequency space efficiently, we propose a Hierarchical
+Reinforcement Learning (HRL) architecture. The hierarchical approach decomposes the DVFS
+adjustment into two sequential decisions.
+By splitting the action into coarse and fine stages, the hierarchical controller reduces the search
+space and explicitly separates the objectives of rapid SLA stabilization and fine-grained energy
+minimization. Triggered whenever a performance requirement violation or massive resource
+overprovisioning crosses a defined threshold, the control loop operates over a fixed two-step
+episode: Agent A1 (coarse) selects a large frequency delta to immediately exit the performance
+requirement violation or reduce gross overprovisioning, providing a safe and feasible starting
+point. Agent A2 (fine) then refines A1’s action by taking smaller delta steps to safely maximize
+energy savings before the episode terminates.
+A. State Representation and Observations
+At each decision step, the active agent receives a structured observation representing the
+system’s telemetry. The state space is composed of three primary components:
+•
+
+Service-level vector (xs ): Contains microservice-specific performance counters at the hardware level (e.g., IPC, bandwidth per core) and at the application level (e.g., current latency).
+This vector is primarily used to guide the core frequency scaling decisions.
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+•
+
+15
+
+Socket-level vector (xu ): Contains aggregated socket-wide counters, reflecting the "outsidethe-core" view and the resource pressure exerted by concurrent, co-located microservices.
+This vector is primarily used to guide uncore frequency scaling.
+
+•
+
+Action Mask (m): A mask that marks infeasible actions as invalid to prevent the agent
+from choosing frequencies outside the allowable hardware ranges.
+
+The specific metrics tracked in the observation space are detailed in Table I. These metrics
+are highly curated as they are the primary factors determining the hardware-level performance
+of the microservice. Crucially, they allow the RL agent to identify the architectural bottleneck
+(e.g., compute-bound vs. memory-bound) at runtime.
+1) Frequency-Conditioned State Normalization: Standard global normalization fails to capture
+how physical hardware boundaries shift under Dynamic and Frequency Scaling. To ensure stable
+convergence and explicitly embed domain knowledge, we introduce a frequency-conditioned
+online normalization strategy. The environment maintains independent running statistics (mean
+µ, standard deviation σ) for each unique core and uncore frequency pair (fcore , funcore ). The
+telemetry vector x is normalized via an online z-score strictly within its active frequency bucket:
+x(norm) =
+
+x − µ(fcore ,funcore )
+σ(fcore ,funcore ) + ξ
+
+(6)
+
+This bucketed approach enables the RL agent to intelligently isolate architectural bottlenecks.
+If compute-related metrics (e.g., KIPS) yield high positive z-scores during an performance
+requirement violation, the agent infers core saturation and scales up fcore . Conversely, saturating
+memory metrics (e.g., bandwidth) prompts the agent to scale funcore . While this accurately
+captures regime-specific hardware limits, it introduces a minor cold-start phase where newly
+visited frequency pairs require a brief initialization window to stabilize their statistics.
+B. Hierarchical Action Space
+Rather than exploring a massive flat joint action space (e.g., 289 actions), the two-agent design
+drastically reduces the dimensionality.
+•
+
+Coarse Stage (Agent A1): Selects broad adjustments with ∆f ∈ {−0.8, 0, +0.8} GHz for
+both the core and uncore knobs, yielding a highly focused space of 3 × 3 = 9 actions.
+
+•
+
+Fine Stage (Agent A2): Refines the coarse adjustment by selecting smaller deltas with
+∆f ∈ {−0.4, −0.2, 0, +0.2, +0.4} GHz, yielding 25 possible actions.
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+16
+
+TABLE I: RL Agent Observation Space Metrics
+Metric Name
+
+Description
+Service-Level Metrics (Used to guide core)
+
+Core_L3_Misses
+
+L3 cache misses on the service core
+
+Core_L3_Hits
+
+L3 cache hits on the service core
+
+Core_Mem_Bandwidth
+
+Local memory bandwidth used by the service
+
+Service_Avg_Latency
+
+Average latency of service requests
+
+Service_Target_Latency
+
+Target latency of service requests
+
+Core_MPKC
+
+Misses per thousand instructions
+
+Core_IPC
+
+Instructions per cycle
+
+Core_KIPS
+
+Kilo Instructions per Second
+
+CPU_Time_System
+
+Time spent in system/kernel mode
+
+CPU_Time_User
+
+Time spent in user mode
+
+CPU_Utilization
+
+Container’s total CPU usage (%)
+
+Core_Frequency
+
+Core frequency assigned to the service
+
+Core_L3_Occupancy
+
+L3 cache usage by the service core
+
+Socket-Level Metrics (Used to guide uncore)
+Socket_L3_Misses
+
+Aggregate L3 cache misses on the socket
+
+Socket_L3_Hits
+
+Aggregate L3 cache hits on the socket
+
+Socket_Mem_Bandwidth
+
+Total memory bandwidth on the socket
+
+Socket_L3_Occupancy
+
+Overall L3 cache occupancy
+
+Socket_Power_CPU
+
+Package-level CPU power consumption (W)
+
+Socket_Power_DRAM
+
+DRAM power consumption (W)
+
+Socket_Uncore_Frequency
+
+Current uncore frequency on the socket
+
+For both domains, the selected action is a discrete frequency delta applied to the current
+operating state:
+(new)
+fcore
+= fcore + ∆fcore ,
+
+(new)
+funcore
+= funcore + ∆funcore
+
+(7)
+
+To strictly prevent the agent from selecting out-of-bound frequencies, the environment applies
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+17
+
+a dynamic binary mask M that filters infeasible deltas prior to action selection:
+
+
+1, if f min ≤ fcore + ∆fcore ≤ f max and f min ≤ funcore + ∆funcore ≤ f max
+core
+core
+uncore
+uncore
+M(∆fcore , ∆funcore ) =
+
+0, otherwise
+(8)
+C. performance Gap Quantization
+To stabilize the learning process and prevent control jitter, the performance state of each
+microservice is evaluated via a quantized latency gap. First, the raw relative latency gap for a
+given microservice is defined as:
+graw =
+
+L − L∗
+L∗
+
+(9)
+
+where L is the current measured average latency and L∗ is the strict target latency constraint.
+Under this formulation, a positive value indicates an performance requirement violation, whereas
+a negative value indicates resource overprovisioning.
+Crucially, the magnitude of this raw gap serves as the primary trigger for corrective action.
+The control loop is only invoked when the performance deviates beyond an acceptable boundary—for instance, an acceptable latency degradation threshold (e.g., graw > +15%) or a severe
+overprovisioning threshold (e.g., graw < −15%).
+Rather than feeding the continuous, noisy graw directly to the RL agent, the environment maps
+it to a discrete, bucketed gap g(L, fc , fu ) using a three-tiered logic:
+
+
+
+0,
+if hardware-saturated
+
+
+
+g(L, fc , fu ) = 0,
+if |graw | < ϵ
+
+
+
+
+sgn(g )δ⌈|g |/δ⌉, otherwise
+raw
+raw
+
+(10)
+
+This quantization strictly enforces three operational rules to ensure predictable power transitions:
+1) Deadzone (ϵ): A tight tolerance band (e.g., τ = 5%) masks small, transient latency
+fluctuations. This prevents jitter and unnecessary frequency toggling when the system is
+operating near the target.
+2) Step-Based Scaling (δ): The gap is discretized into fixed intervals (e.g., δ = 10%) to group
+state observations into distinct buckets, rendering the optimization landscape more stable
+for the agent.
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+18
+
+3) Hardware-Aware Safety Cap: The gap is forced to zero if the system is hardware-saturated.
+Specifically, this occurs if the performance requirement is satisfied but frequencies are
+already at their lowest supported bounds (L ≤ L∗ ∧ fc = fc,min ∧ fu = fu,min ), or if the
+performance requirement is violated but frequencies are already maxed out (L ≥ L∗ ∧
+fc = fc,max ∧ fu = fu,max ). This hardware awareness stops the controller from attempting
+physically impossible adjustments.
+D. Hierarchical Reward and Credit Assignment
+The reward signals are engineered to encode both strict performance requirement constraint
+satisfaction and power efficiency. The hierarchical controller operates over a fixed two-step
+episode:
+A1 (coarse)
+
+A2 (fine)
+
+s0 −−−−−−−→ s1 −−−−−−−→ s2
+(1)
+
+(1)
+
+∆fc ,∆fu
+
+(2)
+
+(11)
+
+(2)
+
+∆fc ,∆fu
+
+where Agent A1 performs a coarse move transitioning the system to intermediate state s1 , and
+Agent A2 refines it to reach the terminal state s2 . Let g0 , g1 , and g2 represent the quantized
+performance gaps at the pre-A1, post-A1, and terminal stages, respectively.
+a) Universal Performance Potential: To evaluate performance requirement compliance consistently across both hierarchical stages, we define a universal performance potential function
+Φ(g) based on the quantized gap:
+
+Φ(g) =
+
+
+
+
+−(2 + g),
+
+g>ϵ
+
+
+
+1 − |g|,
+
+g≤ϵ
+
+(violation)
+(12)
+(safe)
+
+where ϵ represents the SLA safety threshold (e.g., ϵ = 0.05). This piecewise function heavily penalizes performance requirement relatively to variation magnitude (g) while rewarding proximity
+to the target latency when operating in the safe zone.
+b) Etiquette Penalty: To embed domain knowledge and prevent unsafe throttling, an etiquette penalty applies at both steps t ∈ {1, 2}. It strictly penalizes the active agent for decreasing
+both frequencies if the system is already in a state of performance requirement violation:
+
+
+ψt = ηboth · I gt−1 > 0 ∧ ∆fc(t) < 0 ∧ ∆fu(t) < 0
+
+(with ηboth = 0.5)
+
+(13)
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+19
+
+E. Agent A2 (Fine) Reward Function
+The goal of the fine agent is to refine the frequencies to minimize power once the system is
+near or within the safe region. Its total reward, RA2 , evaluates the terminal performance state g2
+and adds an efficiency bonus R∗ if the SLA is satisfied, minus its step-specific etiquette penalty:
+RA2 = Φ(g2 ) + I[g2 ≤ ϵ] · R∗ − ψ2
+
+(14)
+
+To explicitly favor low-power operating points, each discrete hardware frequency is mapped
+to a normalized index ax ∈ [0, 2], where 0 is the minimum supported frequency and 2 is the
+maximum. The efficiency bonus is defined as:
+R∗ = wc (1 − ac,2 ) + wu (1 − au,2 )
+
+(15)
+
+When the performance requirement is met (g2 ≤ ϵ), the agent balances two competing
+objectives. The performance term Φ(g2 ) = 1 − |g2 | encourages the agent to operate closely to
+the target latency, minimizing unnecessary performance slack and overproviding. Concurrently,
+the efficiency bonus R∗ drives power reduction. Because dynamic power scales directly with
+operating frequency, core and uncore frequencies serve as reliable proxies for power consumption. The normalization mapping to ax ∈ [0, 2] ensures that selecting the minimum supported
+frequency yields a maximum positive reward (e.g., 1−0 = 1), whereas operating at the maximum
+frequency introduces a penalty (e.g., 1 − 2 = −1). Furthermore, we configure the weights such
+that wc < wu ; consequently, raising the core frequency is less penalized than raising the uncore
+frequency, accurately reflecting the higher power cost of the socket-wide uncore domain.
+F. Agent A1 (Coarse) Reward Function
+The primary goal of the coarse agent is to rapidly reduce the latency gap and create an optimal,
+safe starting point for A2’s fine-tuning. Because A1 transitions the system to the intermediate
+state s1 , its immediate performance reward is Φ(g1 ).
+To ensure cohesive teamwork and prevent A1 from acting greedily, A1’s total reward directly
+incorporates A2’s terminal outcome, while subtracting its own step-specific etiquette penalty
+(ψ1 ):
+RA1 = Φ(g1 ) − ψ1 + RA2
+
+(16)
+
+This elegantly coupled design forces A1 to select coarse actions that not only immediately improve the SLA state (Φ(g1 )) but also position the intermediate state such that A2 can successfully
+minimize energy without triggering a terminal violation (RA2 ).
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+20
+
+G. Runtime Orchestration and Action Aggregation
+In a live production environment, K8SPI operates as an event-triggered control loop monitoring
+the performance gaps of all co-located microservices on a shared socket. When a specific
+microservice mi ∈ M actively violates its performance requirement/severely over-provisioned
+(gi > +/ − 20%), the RL controller proposes a corrective joint frequency action (fcore,i , funcore,i )
+per microservice. However, the physical hardware imposes distinct granularity constraints for
+applying these independent per-service actions.
+When come to the proposed core frequency is applied directly and independently to the specific
+core hosting mi (as microservices are pinned to a single cpu core):
+fcore (ci ) = fcore,i
+
+(17)
+
+Conversely, the uncore subsystem is a shared, socket-wide resource. To resolve conflicting
+uncore frequency proposals among co-located services while ensuring the performance require∗
+ments of all microservices are met, the final uncore frequency funcore
+applied to the socket is the
+
+maximum of all individual proposals:
+∗
+funcore
+= max {funcore,i }
+mi ∈M
+
+(18)
+
+This pessimistic aggregation guarantees that the most memory-constrained service is strictly
+protected against uncore throttling, while node-wide power savings are successfully captured
+only when all co-located services mutually tolerate a scaled-down uncore frequency.
+V. S CALABLE I MPLEMENTATION AND T RAINING M ETHODOLOGY
+Hardware-in-the-loop RL is slowed by multi-second feedback: each frequency action must
+be applied and then observed through the monitoring stack (e.g., Prometheus) before the next
+
+Fig. 3: Fast RL Prototyping Framework Architecture Overview.
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+21
+
+Fig. 4: Testbed Architecture Overview.
+
+step. Since RL needs thousands of trials, this makes training and iterative tuning (reward design,
+hyperparameters) prohibitively slow on a live Kubernetes node.
+A. Distributed Training and Snapshot Caching
+To accelerate learning, K8SPI uses Ray RLlib to enable distributed training with a centralized
+learner coordinating multiple concurrent environment runners. However, running many environments is costly because each environment ultimately requires execution on the physical node
+(frequency actions are hardware operations and cannot be virtualized). K8SPI resolves this by
+inserting an offline Config–Action–Observation Snapshot Cache. Fig. 3 shows the architecture of
+the fast RL prototyping framework. When an RL agent instance encounters a new ⟨state, action⟩
+pair, the framework performs a one-time hardware profiling run: it deploys the state (the specific
+microservice executing its corresponding benchmark under a defined uncore stress level), applies
+the selected frequency configuration on the testbed, and collects telemetry over a sustained 5minute window to average out transient effects. The resulting high-fidelity observation vector
+is stored in a Parquet-backed datastore. Future visits to the same ⟨state, action⟩ pair are served
+instantly from the cache, enabling safe parallel RLlib training without live-hardware latency.
+VI. E XPERIMENTAL M ETHODOLOGY
+A. Testbed Infrastructure and Software Stack
+To ensure stable, reproducible, and noise-free Reinforcement Learning observations and power
+measurements, we constructed a strictly controlled, dual-socket Kubernetes testbed wchich it
+congration illustrated in Table II and in Fig 4.
+To prevent background OS noise from corrupting the RL agent’s telemetry or power measurements, we enforced strict hardware-level isolation. Socket 1 was dedicated to executing
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+22
+
+TABLE II: Testbed Hardware and Software Configuration
+Attribute
+
+Specification
+
+CPU Model
+
+Intel Xeon Gold 6132 Threads/Core
+
+1 (HT Disabled)
+
+Cores/Socket
+
+14
+
+Sockets
+
+2
+
+NUMA Nodes
+
+2
+
+Core Freq (GHz)
+
+1.0 – 2.6
+
+L3 Cache
+
+38.5 MB/socket
+
+Uncore Freq (GHz) 1.2 – 2.4
+
+OS
+
+Ubuntu 22.04.5
+
+Kubernetes QoS
+
+Guaranteed
+
+Turbo & C-States Disabled
+
+Memory Swap
+
+Disabled
+
+Core Governor
+
+Uncore Governor
+
+userspace
+
+userspace
+
+Attribute
+
+Specification
+
+the experimental microservices and the telemetry stack. Socket 2 was reserved entirely for the
+Kubernetes control plane and operating system background processes. Moreover, to eliminate
+unpredictable power fluctuations, several BIOS and kernel-level features were explicitly disabled
+(see Table II). The telemetry stack utilized Intel PCM for hardware performance counters, Intel
+PowerStat (i.e., Intel RAPL) for socket-level ground-truth power measurements, and cAdvisor
+alongside Kubelet metrics for per-microservice resource usage and core-pinning resolution.
+Finally, we employed custom scripts to measure the end-to-end latency per HTTP request for
+each hosted service, establishing the application-level performance of each microservice. Data
+was scraped and aggregated using a telemetry stack comprising Telegraf and Prometheus. To
+prevent load-generation overhead from interfering with the testbed, the traffic generators were
+hosted remotely and triggered the microservices via HTTP. To control the core and uncore
+frequencies during the experiments, we utilized the open-source Intel pepc library, which
+provides a sophisticated power control toolkit.
+B. Benchmarks and Workloads
+We construct a benchmark-driven microservice corpus using two micro-benchmark suites:
+Stress-NG (primarily CPU-bound and mixed behaviors) and Parallel Memory Bandwidth (PMBW)
+(memory-bound behaviors with strong sensitivity to the shared memory subsystem and uncore
+frequency). Each selected benchmark is containerized and deployed as a stateless HTTP microservice with fixed resource allocations (1 CPU and 2 GB memory). Each request triggers a
+bounded unit of benchmark work executed at a controlled load level. For each benchmark, we
+define 4–5 discrete load settings (e.g., a fixed number of memory-copy operations) to expose
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+23
+
+Fig. 5: Micro-benchmark Dataset Split for Model Development and Evaluation.
+
+different demand workload levels. To separate learning and evaluation from final testing, we
+create two disjoint datasets. Dataset 1 contains 20 services, split into 16 for training and 4
+held out for RL model evaluation. Dataset 2 contains 8 additional services reserved exclusively
+for final testing and validation. Fig. 5 illustrates the dataset partitioning across the training,
+evaluation, and test phases.
+Crucially, each dataset incorporates a diverse mix of CPU-bound, memory-bound, and mixedworkload microservices. Each workload class exhibits a unique power and performance profile in response to independent core and uncore frequency scaling. We illustrate the impact
+of core and uncore frequency scaling on performance (microservice latency) and power consumption (package and DRAM power) across three representative benchmarks: a CPU-bound
+(BG_CPUAckermann) in Fig. 6, a memory-bound (BG_MemrateFlush) in Fig. 7, and a
+mixed (BG_Memthrash) microservice in Fig. 8. To isolate the specific impact of core frequency
+scaling, we fix the uncore frequency to its minimum. Similarly, we lock the core frequency at
+its minimum when varying the uncore frequency.
+To establish a performance reference for each service, we sweep joint core/uncore frequency
+configurations and execute the service in isolation on the socket across the defined load levels.
+We record end-to-end response times and define the target latency for each microservice at each
+configuration as the 70th percentile of the measured samples.
+1) Uncore Interference Generation: To evaluate the controller’s robustness against noisy
+neighbors, we generate controlled uncore interference using the PMBW benchmark. We employ two distinct memory-bandwidth stressor profiles: ScanRead (memory read pressure) and
+ScanWrite (memory write pressure).
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+(a) Latency vs. Core Freq. (b) Latency vs. Uncore
+
+(c) Power vs. Core Freq.
+
+24
+
+(d) Power vs. Uncore Freq.
+
+Freq.
+
+Fig. 6: Impact of core and uncore frequency scaling on the CPU-bound BG_CPUAckermann
+microservice.
+
+(a) Latency vs. Core Freq. (b) Latency vs. Uncore
+
+(c) Power vs. Core Freq.
+
+(d) Power vs. Uncore Freq.
+
+Freq.
+
+Fig. 7: Impact of core and uncore frequency scaling on the memory-bound BG_MemrateFlush
+microservice.
+
+As illustrated in Fig. 9, on the 14-core test socket, one physical core is strictly dedicated
+to the target latency-sensitive microservice deployed within the Kubernetes environment. The
+remaining 13 cores are utilized to host uncore stressor instances (USI) to generate varying
+levels of interference. These uncore stressors are deployed outside the Kubernetes boundary as
+standalone, non-containerized processes. To ensure precise and consistent interference scaling,
+each stressor instance is pinned to a distinct physical core via taskset, allocated 2 GB of
+memory, and its core frequency is statically locked at the maximum 2.6 GHz. By dynamically
+scaling the number of active stressor instances from 1 to 13, we accurately emulate escalating
+levels of background uncore contention. This process generates a detailed dataset for every
+benchmark across our training, evaluation, and test dataset splits. Specifically, for every core
+and uncore frequency combination, the dataset records both the microservice’s performance and
+the resulting socket-level metrics under varying levels of uncore stress.
+
+THIS WORK HAS BEEN SUBMITTED TO THE IEEE FOR POSSIBLE PUBLICATION
+
+(a) Latency vs. Core Freq. (b) Latency vs. Uncore
+
+(c) Power vs. Core Freq.
+
+25
+
+(d) Power vs. Uncore Freq.
+
+Freq.
+
+Fig. 8: Impact of core and uncore frequency scaling on the mixed-workload BG_Memthrash
+microservice.
+
+Fig. 10a, Fig. 10b, and Fig. 10c show the impact of escalating uncore stress levels (0, 6, 9,
+and 13 instances) on CPU-bound, memory-bound, and mixed workloads, respectively. For these
+experiments, we fix the core frequency at 1.8 GHz and the offered load at its maximum. The
+data reveals that CPU-bound workloads are largely immune to background uncore contention, as
+their latency is strictly compute-dominated. Conversely, memory-bound workloads suffer severe,
+yet approximately linear, performance degradation as the interference scales. Mixed workloads
+exhibit a moderate, hybrid impact that depends heavily on their active memory bandwidth
+reliance. Crucially, the latency degradation footprint is dictated not only by the intensity of
+the interference (i.e., the uncore stress level) but also by the specific workload nature of the
+uncore stressor (e.g., ScanRead vs. ScanWrite) and the target microservice workload. This
+demonstrates the complex landscape of real-world cloud environments, where diverse workloads
+
+Fig. 9: Uncore Pressure Generation and Its Real-World Impact: Trace Collection Setup
+

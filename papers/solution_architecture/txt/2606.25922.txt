@@ -1,0 +1,1318 @@
+arXiv:2606.25922v1 [cs.DC] 24 Jun 2026
+
+Interference-Aware Cross-Application Placement: A
+Multi-Objective Optimization Approach for
+Microservice Clusters
+1st Iqra Zafar
+
+2nd Christian Medeiros Adriano
+
+3rd Holger Giese
+
+Hasso Plattner Institute
+Potsdam, Germany
+iqra.zafar@hpi.de
+
+Hasso Plattner Institute
+Potsdam, Germany
+christian.adriano@hpi.de
+
+Hasso Plattner Institute
+Potsdam, Germany
+holger.giese@hpi.de
+
+Abstract—In modern cloud architectures, multiple applications
+often run within the same clustered environment, sharing underlying resources. This resource sharing can cause interference
+among applications, leading to degraded latency and reduced
+system stability. As containerized microservices become increasingly central to cloud-native applications, their performance can
+suffer from complex interference scenarios related to resource
+competition. Meanwhile, most existing microservice approaches
+address interference either by detecting and localizing performance issues or by optimizing latency alone, without explaining
+why specific co-locations cause cross-application interference, and
+how this can inform service placement optimization. This work
+closes that gap by building a spatio-temporal data structure
+that captures the causal effects of cross-application interference.
+These causal effects are mathematically formalized as necessary
+and sufficient conditional probabilities that inform a multiobjective optimizer (Optuna). Cross-application profiling is used
+to simulate traces and estimate interference probabilities, while
+per-service latency baselines are provided by performance data,
+such as 95th-percentile response times (p95). Our approach supports network penalties, application isolation requirements, and
+adjustable weighting of necessary and sufficient causal metrics.
+Experimental results on real multi-application workloads show
+that interference-aware placements significantly reduce crossapplication interference and improve response performance.
+Ultimately, the causality-driven multi-objective formulation gives
+cloud operators explicit control over interference, latency, and
+communication overhead when configuring service placements.
+Index Terms—Microservices, Multi-Node Cluster, Service
+Placement, Self-Adaptation, Optimization, Causality
+
+I. I NTRODUCTION
+Microservices have become the foundation of scalable
+cloud-native systems (e.g., in Kubernetes and serverless environments) [1]. A monolithic program may be divided into
+smaller, independently deployable, and scalable services, i.e.,
+microservices. Despite its adaptability, this architecture exhibits unpredictable performance due to co-location interference (Definition 1.1) over shared resources. Inadequate
+service placement can cause latency to rise, response times to
+deteriorate, or even breach of SLAs and SLOs targets. Service
+interference is a common cause of performance degradation
+in current cloud-native environments, often leading to latency
+spikes, dropped requests, or reduced throughput [2], [3]. Co-
+
+located microservices competing for constrained CPU, memory, or I/O bandwidth on shared nodes are usually the source
+of this interference.
+Definition 1.1: Interference happens when two services
+that have no logical dependency (caller-callee relation) but
+compete for the same resource (compute, memory, I/O) to
+the extent that they affect each other’s performance (e.g.,
+throughput, latency) [4].
+Traditional placement techniques lack the foresight to proactively prevent such interference, as they often rely on reactive [5]–[7] or static/periodic optimization [8]. The reliance
+on purely correlational information and static rules hinders
+current approaches’ ability to identify the origin of crossapplication interference and the direction of its effects, given
+the complex propagation of performance anomalies. To move
+beyond reacting to performance breaches after they occur
+and searching for elusive sources across multiple applications,
+we propose capturing causal-effect associations and pathways
+that are not typically visible in microservice call graphs (i.e.,
+service meshes).
+Research Questions:
+RQ.1 (Severity of phenomenon): What is the magnitude
+of the cross-application interference? - Magnitude consists of the number of nodes and the level of performance
+degradation, which determines the phenomenon severity
+and consequently, the specific needs for mitigation, e.g.,
+which nodes and the extent of interference reduction.
+• RQ.2 (Effectiveness): Is our service placement approach
+able to reduce interference across scenarios of increasing
+complexity (number of nodes affected)? - This question
+evaluates the effectiveness of the approach in recovering
+the microservice systems from degradation, while also
+providing insights into the scope of adaptations, i.e.,
+the number of impacted nodes and residual interference
+(unmitigated). For instance, are there trade-offs between
+the residual interference and impacted nodes?
+• RQ.3 (Component contribution): What is the impact of
+each component of the approach on the effectiveness of
+placement? - The components of the approach consist of
+•
+
+two elements of causal knowledge that will be introduced
+later.
+Our contribution: This paper presents a novel approach
+to microservice placement optimization by integrating formal
+causal reasoning with continuous adaptation within an offline feedback loop extension of the MAPE-K architectural
+pattern [9]. The main contributions are as follows: (1) A
+causality-aware microservice placement framework – We
+propose an adaptive placement approach based on SpatioTemporal Interference Graphs (STIGs) from our prior work
+[10]. The framework uses Probability of Sufficiency (PS),
+Probability of Necessity and Sufficiency (PNS), and Probability of Necessity (PN) to identify, explain, and mitigate
+interference among co-located services. By grounding these
+metrics in formal notions of necessity and sufficiency, the
+approach improves both the precision and interpretability of
+placement decisions. (2) Runtime-aware adaptation within
+an offline MAPE-K loop – We integrate Prometheus and
+Istio to continuously collect traces, service- and system-level
+metrics, including response time, CPU/memory usage, latency,
+and error rates. These observations feed the Monitor and
+Analyze phases of the MAPE-K loop, enabling the system to
+detect SLO violations and performance anomalies, re-evaluate
+current placements through the STIG model, and respond to
+changing workload conditions. (3) A multi-objective adaptive
+planner for scalable placement optimization – We develop
+an Optuna-based planner that jointly optimizes service responsiveness and interference reduction. To keep the search
+efficient and focused, the planner prioritizes services using PNand PS-based rankings, progressively expands the placement
+search space, and incorporates SLO-aware service importance
+during optimization. (4) A comprehensive evaluation on
+representative microservice benchmarks – We evaluate the
+proposed approach on Tea-Store, BookInfo, and Sock-Shop
+across diverse runtime scenarios, including failure conditions,
+traffic surges, and geo-distributed deployments. The results
+show that the approach consistently reduces interference, improves response performance, and adapts placement strategies
+in response to observed system dynamics. Finally, all data and
+scripts are publicly available1 .
+Tour - Section II details the preliminaries, Section III the
+state-of-the-art, Section IV the service placement approach,
+Section V the evaluation, while implications and threats to
+validity are in Section VI and we conclude with Section VII.
+
+II. P RELIMINARIES
+A. Contention and Interference
+Contention refers to the pressure a service exerts on a
+shared resource (e.g., CPU, memory, I/O bandwidth) when
+multiple services attempt to access it simultaneously [11].
+High contention arises when demand for a resource approaches
+or exceeds its available capacity. This leads to performance
+1 Reproducibility package: https://doi.org/10.5281/zenodo.18900711
+
+degradation, e.g., increased latency or response time. In microservice systems, contention is a key driver of interference,
+as two services without logical dependencies (no caller–callee
+relation) may still negatively impact their performance when
+they contend for the same underlying resource [2].
+Interference arises when resource competition and degrade
+microservice performance [5]. We capture cross-application
+interference using a dynamic data structure (Definition 2.1),
+where dependencies between microservices are measured as
+correlations observed during concurrent executions. For more
+details about how STIGs are being generated from the system’s
+knowledge graph, refer to our prior work [10].
+Definition 2.1: Spatio-Temporal Interference Graph
+(STIG) is denoted as G = (V, E, Xv(t) , Xe(t) ), where V are
+nodes representing services, E are directed edges representing
+interference between services across applications, Xv(t) are
+the time-varying node features (e.g., resource per service), and
+Xe(t) the edge features (e.g., interference probability).
+B. Causality in STIG
+Microservice interference is inherently a causal phenomenon, where the resource consumption of one service affects the performance of other services. However, correlations
+in execution traces do not imply causation. To remediate that,
+we rely on causal reasoning about interference represented in
+STIGs and we adopt the counterfactual notions2 of sufficiency
+and necessity from Pearl [13] and Halpern & Hitchcock [14].
+Definition 2.2: Causal Sufficiency in STIGs A cause is
+sufficient for an effect if its occurrence alone guarantees the
+effect. Within a STIG, this corresponds to an interference
+edge e ∈ E, where the source service’s consumption always
+induces a performance degradation in the target service. A
+high-probability edge weight (close to 1.0) in an STIG can be
+interpreted as approaching sufficiency, meaning that whenever
+the source service experiences contention, the target service is
+consistently affected by interference. An example is when a
+service A interferes with service B with probability 1.0. This
+reflects a condition of near-sufficiency, because the simultaneous execution of service A causally induces a slowdown in
+service B. Probability of sufficiency is defined in Equation (1).
+
+ PNS(X → Y ) , P (Y | ¬X) < 1,
+(1)
+PS(X → Y ) = 1 − P (Y | ¬X)
+
+0,
+otherwise,
+Definition 2.3: Causal Necessity in STIGs A cause is necessary for an effect if the effect cannot occur in its absence. In
+STIG terms, this implies that interference observed at a target
+service node cannot be explained without a particular source
+node being active in the graph. Necessity can be assessed by
+analyzing minimal cut-sets or exclusive dependency paths in
+the STIG [15], [16]. If removing a given source node (or its
+edges) eliminates all interference paths leading to a target, that
+source is necessary. The obvious case is when Service A is
+2 For a formal analysis of 12 definitions of sufficiency and necessity, their
+use cases, and implications, please refer to Becker [12].
+
+the only origin of interference paths leading to Service B,
+then A’s contention is necessary for B’s slowdown. Pearl’s
+probability of necessity is defined in Equation (2).
+
+ PNS(X → Y ) , P (Y | X) > 0,
+P (Y | X)
+PN(X → Y ) =
+(2)
+
+0,
+otherwise
+Interplay of Sufficiency and Necessity – Because of the
+large number of interdependencies in multi-tenant systems,
+we expect few interference relations are both necessary and
+sufficient. Sufficiency as a probability, it strongly increases the
+likelihood of interference, even though it does not guarantee it
+in every case. Necessity is distributed, because it is part of a set
+of causes connected by conjunctions, i.e., all must be present to
+cause an interference. In our formulation, we map sufficiency
+to edge weights and necessity to graph connectivity properties.
+This way the STIG can provide a causal lens for inferring
+direction in the correlations computed from execution traces
+and enable the identification of the interference propagation
+path across the microservice deployment. The probability of
+necessity and sufficiency is then computed as in Equation (3).
+
+PNS(X → Y ) = max 0, P (Y | X) − P (Y | ¬X)
+(3)
+C. MAPE-K as the Control Framework
+Our system is designed around the MAPE-K (Monitor–Analyze–Plan–Execute over Knowledge) loop, a popular
+autonomic control architecture to allow self-adaptive behavior
+in microservice-based cloud settings [9]. This loop is offline,
+meaning it is not embedded or running continuously at runtime
+within the cloud system. The goal of MAPE-K is to systematically close the feedback loop between dynamic decisionmaking and system observation. For practical examples of
+how the MAPE-K can be applied to causal-based analysis and
+planning, please refer to our previous work [3], [17].
+III. S TATE - OF - THE -A RT
+In software architecture, many approaches apply multioptimization models to improve system performance [18],
+inclusive distributed architectures. Concerning adaption of
+microservices, most state-of-the-art focus on detectioncentric [19] and correlation-driven [20] to surface latency
+symptoms (p95/p99) and localize ”likely” culprits along a
+trace graph. However, these approaches often overlook why a
+configuration produces interference and how to adjust placement under competing objectives, such as increasing response
+time or mitigating interference.
+Interference-aware placement has been addressed by
+iPlace [2], [5], which clusters microservices to minimize interference and reduce the number of servers while still meeting
+performance targets. IRENE [6] targets edge environments and
+uses a genetic algorithm to jointly optimize high availability
+and contention-induced performance interference for microservice applications. Community- and priority-based microservice placement [8] models dependencies as a graph and incorporates long-term interference awareness into the placement
+optimization problem. At production scale, C-Koordinator [7]
+
+extends Kubernetes/Koordinator with CPI-based prediction
+models to detect and mitigate interference in co-located microservice clusters, improving response-time metrics across.
+Optimal placement of microservices has been investigated in various methods. Particle Swarm Optimization-based
+microservice placement [21] allocates microservices in
+cloud-native infrastructures, including a Sock Shop case study
+that demonstrates improved resource utilization and SLA compliance. Multi-objective reconfiguration of real-time microservices [22] applies an energy-based nuclear reaction optimization meta-heuristic to adapt microservice deployments to multiple objectives, including timing and resource constraints. An
+Optuna-based [23] multi-objective optimization was adopted
+to fine-tune edge service placement and related parameters to
+minimize both latency and deployment cost for location-based
+services in mobile edge computing environments [24].
+Causal latency modeling for microservices employs causal
+discovery and domain knowledge methods to build latency
+graphs that explain SLO violations and support prediction and
+diagnosis [25]. CAR-PT and related causal performance testing approaches employ causal reasoning to generate workloads
+that are more likely to expose performance issues, linking
+causal graphs with performance-critical test inputs [26]. Detecting causal structure on cloud applications with Granger
+causality infers dependency graphs among microservices from
+logs and traces, providing causal structures that can complement or motivate representations such as STIGs [27]. A recent survey of causal-inference-based RCA for microservices
+evaluates multiple causal discovery and reasoning techniques
+on benchmark datasets, and positions causal graphs as a
+foundation for moving from root-cause localization toward
+broader decision problems such as placement [28].
+Methodological challenges – (i) Causality vs. correlation:
+since counterfactuals (for example, “what if these two services
+were not co-located?”) are typically missing [19], [25], [29],
+[30], necessity and sufficiency remain indistinct, and methods
+overfit observed traces. (ii) Actuation granularity: although
+placement is a key trigger for interference, placement-aware
+actions (affinity/anti-affinity, node isolation) are seldom explored; remediation usually relies on auto-scaling, restarting,
+or circuit breaking [31]. (iii) Single-objective bias: many
+approaches optimize tail delay only and do not quantify
+the trade-off surface or weight interference reduction against
+response time or throughput [32]. (iv) Blind spots in evaluation: studies often under-stress behavioral complexity (spikes,
+node failures, location changes) and rarely separate it from
+structural complexity (graph size or density), while favoring
+steady-state traffic and small homogeneous topologies [33]. (v)
+Observability limitations: sensitivity to incomplete knowledge
+is rarely assessed; trace sampling, head/tail bias, and partial
+coverage are common, and few systems maintain a persistent knowledge base for design-time evaluation or reuse of
+placements [34], [35]; finally, misreported overheads of online
+inference and continuous tracing reduce external validity and
+repeatability [36]. Our contribution is to bridge the detectionto-placement decision that is informed by causal knowledge
+
+and, hence, more robust to hidden changes in the architecture.
+IV. A PPROACH
+A. System Architecture & Methodology
+Figure 1 shows the proposed self-adaptive loop, which
+follows the offline MAPE-K pattern. The managed element
+is a multi-tenant microservice application on Kubernetes. The
+controller detects interference between co-located services and
+proactively reconfigures their placement to improve performance and fault tolerance without human intervention.
+In the Monitor phase, the system continuously collects
+runtime data: request traces, response-time statistics (for example p95 latency per service), resource usage (CPU, memory,
+I/O), deployment state (service replica to node mapping), and
+cross-application interactions. These metrics and traces are
+normalised and stored in the knowledge base as time-stamped
+events and call graphs.
+In the Analyze phase, the STIG simulator derives interference knowledge from these observations. It builds STIG
+graphs that capture which services interfere when co-located in
+a same cluster sharing same host/server, and estimates causal
+measures (PN, PS, PNS) for each service pair. Combining
+these with STIG edge weights yields an expected interference
+score per pair. The analyzer then correlates these scores
+with response-time degradation to identify interference-prone
+services, producing STIGs, causal estimates, and per-service
+interference sensitivity indicators.
+In the Plan phase, the controller computes a placement
+strategy. It aggregates pairwise interference scores into a perservice priority ranking, then defines a search space of alternative placements for the most interference-sensitive services.
+An Optuna-based multi-objective optimizer used, evaluating
+each candidate placement by total expected interference and
+response-time cost (p95 latency plus penalties for cross-node
+communication on critical edges). From the resulting Pareto
+front, the planner selects a configuration that matches current
+operator preferences and forwards it to Execute.
+In the Execute phase, the system enacts the selected placement by updating Kubernetes scheduling constraints (i.e. node
+selectors) and allowing the orchestrator to migrate pods. It
+may move only high-priority services or rebalance all services.
+Monitoring then continues under live workload, allowing
+direct observation of the impact on latency, throughput, and
+interference indicators.
+The shared Knowledge base stores deployment graphs,
+STIGs, causal interference estimates, service rankings, and
+outcomes of past reconfigurations (for example, “separating A
+from B reduced interference by X but increased latency by Y
+ms”). This history enables continuous refinement. The Analyze
+phase updates interference models. The Plan phase favours
+successful patterns, while the Execute collects further traces
+for future analysis. Over time, the MAPE-K loop evolves
+from purely reactive control to experience-driven, interferenceaware placement in a multi-node cluster.
+
+Fig. 1. STIG-based MAPE-K loop with interference-aware service placement.
+
+B. Algorithm
+Our research utilizes two algorithms, Algorithm 1 is used
+to compute causal probabilities values (PN,PS,PNS) from
+collected traces across multi-node cluster.The algorithm starts
+by loading the cleaned trace dataset D from CSV (line 1). For
+each span, it parses the start time into a timestamp ts (line -2),
+converts the duration into seconds, and computes the end time
+te = ts + duration (line 3). For each service s, it computes the
+mean µs and standard deviation σs of span durations (line 4),
+and defines a service-specific anomaly threshold (line 5). A
+span is marked anomalous if it reports an error or if its duration
+exceeds τs (line 6), forming the anomalous set Da (line 7).
+The algorithm then counts anomalous spans per service and
+retains only services with at least M anomalies to reduce
+noise (line 8). For each remaining service, anomalous spans
+are sorted by start time and stored as aligned arrays {txs } and
+{txe } (line 9). The output table T is initialized next (line 10).
+The function TemporalHits (lines 11-17) iterates over all
+events of service X (line 13), constructs a temporal window
+[txs , txe +∆t] for each event (line 14), and increments a counter
+whenever a Y -event start time falls inside this window (lines
+15-16), returning the hit count h.
+The function IndependentFrac (lines 18-27) returns 0
+if service Y has no anomalous events (line 19). Otherwise,
+it iterates over all Y -events (line 21), checks whether each
+event is covered by any X-window (lines 22-25), and counts
+uncovered events (line 26). It returns the uncovered fraction
+u/|{tys }| (line 27), i.e., an empirical estimate of P (Y | ¬X).
+The main loop iterates over all ordered service pairs (X, Y )
+with X ̸= Y (line 28). Pairs belonging to the same application
+are skipped using AppOf(X) = AppOf(Y ) (lines 29–31).
+The anomalous time arrays {txs , txe , tys , tye } are extracted from
+Da (line 32). If either service has no anomalous events, the
+pair is skipped (lines 33–35). The total number of anomalous
+events of X, NX , is then computed (line 36), followed by the
+hit count h using TemporalHits (line 37). The conditional
+probabilities(line 38-43) are estimated based on formulation
+explained in section Finally, the algorithm appends as a row
+
+in table T (line 44). After all service pairs are processed, the
+completed table T is returned (line 46).
+The allocation of microservices across worker nodes under
+a multi-objective optimization approach is formalized in Algorithm 2. It starts by importing all input data collected during
+load test, probability values generated by the method explained
+inAlgorithm 1, Interference graphs(STIGs) generated by STIG
+simulator. It parses response time logs and computes a robust
+latency for each service using the median of p95 values
+(line 1). It then processes the PNS table, mapping each (X,
+Y) relation to canonical service keys for consistency across
+all artifacts (line 2). All STIG graphs are loaded and their
+interference weights aggregated, yielding one STIG based
+contention value per service pair (line 3). The global service
+set is built as the union of services appearing in logs, the PNS
+table, and the STIG (line 4). For each service pair present in
+both the causal table and STIG graphs, the algorithm computes
+a causal strength α(s, t) from PN, PS, and PNS (lines 5-7).
+Expected interference E(s,t) is then defined as α(s, t) times
+the STIG weight, capturing causal-topological co-location cost
+(line 8). In parallel, a communication edge set is built for
+all service pairs that exchange requests, to account for crossnode penalties (Line 9). Each service receives a priority score
+obtained by summing all incoming and outgoing E(s,t), identifying the most placement-critical services (lines 10-12). A
+multi-objective Optuna study is created, and each trial samples
+a candidate node placement for all services (lines 13-27). For
+each trial, total interference is computed by summing E(s,t)
+over co-located pairs, while latency is adjusted with penalties
+for cross-node communication. After all trials, Pareto-optimal
+placements are extracted, one is selected (preferring lower
+interference), and the algorithm returns the chosen placement,
+its objectives, and the priority scores (lines 28-30).
+V. E VALUATION
+A. Experimental Setup
+Testbed Infrastructure – In our in-house developed
+testbed, all experiments ran on a single Ubuntu VM (can add
+more VMs as per complexity of architecture), provisioned with
+32 vCPUs, 50 GiB RAM, and 200 GiB SSD storage. We
+deployed a Kind Kubernetes cluster with one control plane
+node and two worker nodes. We deploy three microservice
+applications (Sock-Shop3 , TeaStore4 , and Bookinfo5 ) across
+various Kubernetes namespaces. Three HTTPRoutes (/sock,
+/tea, /book) received traffic that was entered over an Istio
+Gateway (Gateway API). Every application namespace had
+sidecar injection enabled. There was no inter-VM traffic since
+the cluster was using the default type CNI. Prometheus (scrape
+interval: 15s) gathered metrics and surfaced them in Kiali.
+Jaeger (all-in-one) collected distributed traces using an Istio
+Telemetry resource that allowed tracing. Logs were recorded
+using the stdout/stderr container. A detailed knowledge graph
+3 SockShop: https://microservices-demo.github.io/
+
+(Figure 2) shows three deployed shop applications on a cluster.
+
+Fig. 2. knowledge graph
+
+Reproducibility – To create the type cluster, deploy Istio,
+and execute all experiments, we offer k6 scripts, Kubernetes
+manifests (Namespaces, Gateway/HTTPRoutes, DestinationRules), and a run script6 . Each run used a different set of
+random seeds and scenario ordering.
+To demonstrate the resilience of our proposed method and
+its benefits over several state-of-the-art approaches, we carry
+out intensive experiments. Our collected datasets consist of
+specific of incidents mentioned below, collected from multi
+node Kubernetes cluster. We created scenario-based tests
+that represent actual operational difficulties in a multi-node
+cluster where interference happened. The selected scenario
+describes adaptation goals commonly found in microservices
+applications. We quantify changes in system-level parameters,
+including error rate (service failure, ”req failed”), interference
+score, and reaction time, before and after adaptation in order
+to assess adaptation performance across all circumstances.
+Test Scenario – We simulated a surge in resource demand
+to mimic an abrupt jump in resource demand, similar to a
+flash sale or unanticipated traffic spike. As the load rises, we
+monitor how interference levels and response rates vary. This
+maps to our three research questions (RQ.1, RQ.2, RQ.3) and
+a set of specified metrics (Table I) computed (sampled) by the
+monitoring stack. Next we detail the directives we followed
+to simulate the surge scenario.
+• Generate traffic spike using k6, increasing CPU, memory,
+and request load across services.
+• Check whether the system can stop co-location when
+under stress.
+• Monitor response degradation and re-optimization frequency.
+• Analyze Optimizer stability and MAPE-K loop responsiveness as system pressure rises.
+Metrics to Collect per Scenario – We collect metrics (Table I) that characterize system behavior during
+each test. The optimizer logs planning-side signals (placement, interference score, response score, iteration, migration
+count, convergence time), while Prometheus/Istio provide runtime measures including end-to-end response time (RT), tail
+latency(Lp95 /Lp99 latency), error rate εt and node resource
+utilization. Response time is considered primary metric at
+macro level as it encompasses full end-to-end experience in
+
+4 Tea-Store: https://github.com/DaGeRe/TeaStore
+5 Bookinfo: https://istio.io/latest/docs/examples/bookinfo/
+
+6 See cluster script at https://doi.org/10.5281/zenodo.18900711
+
+TABLE I
+M ONITORING M ETRICS AND L OGS
+Metric
+Tool
+Purpose
+Response time
+Prometheus, Istio SLO violations, user experience
+request duration
+Prometheus
+Latency degradation
+(P95)
+Placement logs (.json)
+Test script
+Service-to-node mapping
+SLO violations
+Prometheus, Istio, Responsiveness
+Jaeger
+Node utilization
+kubectl top Affected nodes
+node, metricsserver
+
+test scenario. We monitor, compare, and display response
+times across time, services, or nodes since they are continuous
+and timestamped. When assessing service placement under
+interference, it is a more accurate statistic since it directly
+correlates to user-perceived delay. Span duration is a secondary metric at micro level which is a time required for
+a particular microservice or function to complete a trace. It
+is also important when we want to analyze service performance bottlenecks, also calculate the internal delay for each
+microservice (payment service vs. cart service in SockShop ,
+for example) and examine breakdown of total time per component. We can measure any interference and its mitigation
+after re-deployment (RQ.1, RQ.2) and sensitivity to missing
+knowledge (RQ.3), by correlating these streams (SLO breach
+events → re-optimization latency → new placement → change
+in interference and latency). We can also demonstrate that the
+causal, STIG-guided planner maintains interference magnitude
+reduction across applications (RQ.1).
+B. Scenario Based Analysis
+Surge in resource demand – To examine how the multinode cluster responds to sudden increases in resource demand,
+we use a load generator to send traffic through the Istio
+ingress and monitor the cluster’s behavior during spikes. We
+perform load tests at regular intervals. In each test run, we
+first establish a baseline using Kubernetes’ default placement
+for all microservices, then run a k6 workload while collecting
+distributed traces and performance metrics. These defaultcluster multiple test run measure the extent of cross-service
+interference before any adaptive placement strategy is applied.
+Table II shows a clear performance imbalance among the
+services across the four test runs.
+TABLE II
+D EFAULT C LUSTER ( WITHOUT OPTIMIZATION ) ACROSS MULTIPLE TEST
+RUNS , P 95 IN MILLISECONDS MS
+Run
+1
+2
+3
+4
+Mean
+Std
+
+p95 (book)
+10250
+10340
+10300
+10290
+10295.00
+32.02
+
+p95 (sock)
+47.77
+47.71
+47.98
+47.93
+47.85
+0.11
+
+p95 (tea)
+202.24
+177.11
+143.41
+143.96
+166.68
+24.65
+
+req failed (%)
+24.62
+24.75
+24.59
+24.57
+24.63
+0.07
+
+We collect traces after load test and analysis each trace,
+its start time, duration, latency and failure status. During the
+
+TABLE III
+T OP SERVICES BY LATENCY (P50, 95, 99, M AX IN MILLISECONDS MS )
+Service
+productpage.bookinfo
+details.bookinfo
+front-end.sock-shop
+reviews.bookinfo
+webui.teastore
+ratings.bookinfo
+
+Fail rate (%)
+0.00
+0.00
+0.00
+0.00
+50.00
+0.00
+
+P50
+21.63
+2.00
+1.75
+4.61
+2.37
+0.86
+
+P95
+64.95
+42.60
+42.33
+6.03
+3.49
+1.07
+
+P99
+67.61
+43.63
+42.81
+7.25
+4.16
+1.18
+
+Max
+82.52
+46.90
+43.13
+7.67
+9.63
+1.26
+
+test window, we collected 24000 spans. For example, in Test1 (Table II), 5,940 spans were recorded, 414 of which were
+identified as error spans. Table III contains the latency results
+obtained on the collected trace.
+This workload produced an overall failure rate of 7%.
+Tail latency was analyzed using the 95th percentile (p95) to
+highlight services that struggle under peak load. The main
+hotspot is productpage.bookinfo. Details.bookinfo and frontend.sock-shop also show elevated p95 values. In contrast,
+reviews.bookinfo and ratings.bookinfo remain fast and stable
+(p95 = 6 ms and 1 ms). webui.teastore service is unusual,
+it has a very high error rate (approx. 50%) but low p95
+latency (approx. 3–4 ms), indicating many quick failures
+(e.g., misrouting, unavailable backends, or quota issues) rather
+than slow responses. Overall, the data match the architecture.
+productpage service acts as a gateway and accumulates tail
+latency. Sock-Shop’s front-end shows milder stress, TeaStore
+appears misconfigured or under-provisioned. This span-level
+view identifies where to focus optimization such as scaling,
+timeout tuning, and resilience improvements. The broader goal
+is to detect interference anomalies when multiple shops run
+concurrently on the same cluster. Figure 3 shows the minutelevel distribution of anomalies during Load Spike scenario
+across shops. The red dashed line marks the onset of the spike.
+Bookshop and TeaStore exhibit far more anomalies than SockShop just after concurrent start-up. TeaStore is dominated by
+error-based anomalies (instability/failures under load), while
+Bookshop shows many duration-based anomalies (queuing and
+slowdown from resource contention). Anomalies gradually
+decline over time, consistent with cluster adaptation (e.g.,
+throttling or queue stabilization). SockShop remains largely
+unaffected, suggesting lower resource demand or indirect
+isolation. These patterns support the hypothesis that co-located
+services under concurrent traffic experience interference, producing distinct anomaly profiles and revealing imbalanced
+resource contention on the shared infrastructure.
+Next, we process these traces to compute the causal interference measures PN, PS, and PNS for all observed pairs of
+services (see Algorithm 1).
+Cluster Reconfiguration Plan – In the reconfiguration
+plan, the services are ranked according to their likelihood of
+causing the interference anomaly. Since interference occurs in
+both directions, the strategy may identify abnormal services on
+each side of an interference relationship as the source and the
+target. When an anomalous service interferes with services
+from other applications, our method ranks services by the
+
+Fig. 3. Interference Anomaly (Service Failure/Error) vs Request Duration
+TABLE IV
+C AUSAL INTERFERENCE PROBABILITIES BETWEEN SERVICES .
+X (source)
+Y (target)
+PNS PN
+PS
+webui.teastore
+reviews.bookinfo
+99.79 100.00 99.79
+webui.teastore
+ratings.bookinfo
+96.03 100.00 96.03
+webui.teastore
+productpage.bookinfo 42.68 100.00 42.68
+productpage.bookinfo webui.teastore
+92.68 92.68 100.00
+ratings.bookinfo
+webui.teastore
+81.12 81.12 100.00
+reviews.bookinfo
+webui.teastore
+81.12 81.12 100.00
+TABLE V
+O PTUNA SUGGESTED CONFIGURATION (B EST P OSSIBLE )
+Service
+productpage.bookinfo
+ratings.bookinfo
+reviews.bookinfo
+front-end.sock-shop
+webui.teastore
+
+Default placement
+kind-cluster-worker2
+kind-cluster-worker1
+kind-cluster-worker1
+kind-cluster-worker1
+kind-cluster-worker1
+
+Optimized placement
+kind-cluster-worker1
+kind-cluster-worker2
+kind-cluster-worker2
+kind-cluster-worker2
+kind-cluster-worker1
+
+likelihood that they are necessary and sufficient, explained
+in Section II-B. We derived the probabilities displayed in
+Table IV after applying these formulas to the interference
+anomaly data.
+Service Placement – The placement strategy, explained in
+Section IV-B, jointly considers cross-application service interference and deployment-induced latency. Based on STIG
+interference weights and causal PN/PS/PNS estimates, the
+optimiser explores placements that minimise expected interference while constraining communication overhead. The
+resulting configurations indicate which services should be colocated and which should be separated across nodes to reduce contention, thereby guiding reconfiguration decisions that
+enhance performance stability in multi-tenant deployments.
+Table V shows a comparison between default and best possible
+placement setting suggested by Optuna.
+For instance, under certain workload, the Optuna-based optimizer identifies webui.teastore and productpage.bookinfo as
+the most interference-sensitive services, followed by the frontend and two additional Bookinfo backend services. Using
+these priorities together with the learned interference matrix,
+it places Teastore’s web UI alongside a small group of low-
+
+Fig. 4. Trade-off between total expected interference and total latency
+
+priority services on kind-cluster-worker1, while placing most
+Bookinfo and Sock-shop services on kind-cluster-worker2.
+This placement cleanly separates all highly interfering service
+pairs, achieving a total interference score of 45.67 and keeping
+the overall end-to-end latency around 2.3 × 106 ms.
+The Fig. 4 shows the trade-off between total expected interference and total latency for all service placements evaluated
+by Optuna. Each blue dot is a candidate placement, scored on
+two objectives: (1) total interference (i.e., the sum of expected
+interference over all service pairs derived from STIG weights
+and PN/PS/PNS metrics) and (2) total latency (i.e., the overall response-time cost including cross-node communication
+penalties). Reducing interference generally spreads services
+across nodes (raising latency), while reducing latency tends
+to co-locate them (raising interference), so the optimization
+produces a trade-off between them.
+The solid blue line is the Pareto front configurations where
+any further reduction in interference would increase latency
+and vice versa. The orange point marks the selected placement,
+with the adjacent values giving its interference–latency pair. It
+lies on or near the Pareto front, indicating an efficient compromise. Latency values are plotted with a constant vertical offset
+(2.256×106 subtracted) so that the axis focuses on meaningful
+variation rather than absolute magnitudes. Overall, we show
+that Optuna explores a wide range of placements and that the
+chosen configuration is a trade-off between performance and
+interference mitigation in the multi-tenant cluster.
+Re-Deployment Results – In this section, we explain the
+service placement results for the optimized cluster suggested
+by our Optuna placement method. Table VI reports the raw
+p95 latency and error statistics for the optimized placement
+across four test runs for the suggested placement. Book-info
+and Sock-shop remain in the same general latency regime as in
+the baseline – book stays around 10.1 s p95 and sock around
+47 ms, both with very small variance, which indicates that
+the optimization does not change their worst-case behaviour.
+Conversely, TeaStore shows a lower p95 latency of about 8.8
+ms, suggesting an improvement over the default cluster results
+
+TABLE VI
+O PTIMIZED CLUSTER - PLACEMENT- LOAD TEST RUN
+Run p95 (book, ms) p95 (sock, ms) p95 (tea, ms) req failed (%)
+1
+10 100.00
+47.24
+8.80
+32.58
+2
+10 090.00
+47.25
+8.74
+32.63
+3
+10 190.00
+47.36
+8.76
+32.71
+4
+10 210.00
+47.45
+8.83
+32.83
+Mean
+10 147.50
+47.32
+8.78
+32.69
+Std
+61.31
+0.10
+0.04
+0.11
+TABLE VII
+D EFAULT VS OPTIMIZED CLUSTER . P 95 IN MS ; FAILURE IN %.
+Metric
+Default (µ±σ) Optimized (µ±σ)
+∆ abs
+∆%
+p95 (book, ms) 10 295.00 ± 32.02 10 147.50 ± 61.31 −147.50 −1.43
+p95 (sock, ms)
+47.85 ± 0.11
+47.32 ± 0.10 −0.53 −1.11
+p95 (tea, ms)
+166.68 ± 24.65
+8.78 ± 0.04 −157.90 −94.73
+req failed (%)
+24.63 ± 0.07
+32.69 ± 0.11 +8.06 +32.72
+
+TABLE VIII
+C OMPARISON OF OPTIMIZATION STRATEGIES .
+Method
+Interference Latency (ms)
+Optuna (full causal)
+997.30 7 474 879.01
+Optuna (no causal, lat-only)
+1 763.49 7 409 925.13
+GA baseline
+1 763.49 7 409 925.13
+RL baseline
+1 763.49 7 409 925.13
+
+in the previous Table II. The HTTP failure rate (req failed)
+under the optimized placement is consistently around 32.7 %
+(slightly higher than in the default configuration).
+Table VII now combines default and optimized cluster
+statistics (mean ± standard deviation) with the absolute and
+relative ∆. Book-info and Sock-shop present modest p95 latency reductions of about 1–1.5%, showing that the optimized
+placement preserves their performance while giving small
+gains. TeaStore improves dramatically: its p95 latency drops
+from 166.68 ± 24.65 ms to 8.78 ± 0.04 ms, corresponding to
+∆abs = −157.90 ms and ∆% = −94.73, which indicates that
+a major bottleneck or interference source has been removed.
+At the same time, the mean HTTP failure rate increases from
+24.63 ± 0.07% to 32.69 ± 0.11% (∆abs = +8.06 percentage
+points, ∆% = +32.72). Overall, the optimized placement
+achieves strong latency reductions, especially for TeaStore, but
+at the cost of an increase in request failures.
+C. Comparison with Baseline:
+We selected few baselines intentionally to compare with
+selected Optuna optimizer for service placement problem in
+our study. They reflect standard practice for placement without
+access to causal information, and all are evaluated under the
+same search budget as Optuna. The Optuna (no causal, latencyonly) configuration is an ablation of our proposed method. It
+adopts the same optimizer and search space as the full causal
+Optuna variant, but we remove PN/PS/PNS and STIG from
+the objective function. This design isolates the contribution of
+causal information by holding all other components fixed. The
+Genetic Algorithms (GA) [37] and Reinforcement Learning
+(RL) [38] baselines are widely used “state-of-the-art” metaheuristics for placement and scheduling problems. In our setup
+(Table VIII), both optimize exactly the same latency-only
+objective as Optuna (i.e., non-causal).
+
+This allows us to distinguish whether any observed improvements are due to the optimization algorithm (Optuna
+vs GA/RL) or due to the objective formulation (causal vs
+non-causal). All four strategies are evaluated using the same
+objective, full-causal interference (PN/PS/PNS, weighted by
+STIG) combined with placement-sensitive latency. We observe
+that all latency-only strategies (Optuna no-causal, GA, RL)
+converge to the same placement. They achieve essentially
+identical interference and latency. This is consistent with the
+fact that they optimize the same latency-only objective, and
+it also indicates that Optuna is competitive with GA and RL
+as a generic black-box optimizer. In contrast, the full-causal
+Optuna configuration converges to a different placement, the
+interference decreases from approximately 1763 to 997 (about
+a 43% reduction), at the cost of a small increase in latency
+(around +0.9%). This baseline design supports the following interpretation, relative to realistic “black-box” heuristics
+(GA/RL) that only observe latency, augmenting the objective
+with PN/PS/PNS and STIG systematically steers Optuna toward placements with substantially lower causal interference.
+Since GA and RL reproduce the latency-only Optuna solution,
+the observed improvements cannot be attributed merely to
+Optuna being a stronger optimizer, they arise specifically from
+incorporating causal knowledge into the placement objective.
+D. Answers to Research Questions
+RQ.1 Answer: Yes, interference is high both in terms
+of density (many contending services per node) and impact
+(large latency inflation). Under the default cluster placement,
+interference appears in how far it spreads across nodes and
+how much it worsens latency. Services from BookInfo, Sockshop, and TeaStore are densely co-located on the same Kubernetes worker node, so they compete for CPU, memory, and
+network queues. This amplifies even moderate cross-traffic and
+produces clear contention in the traces (Figure 3). The PN, PS,
+and PNS estimates (Table IV) capture this effect, for example,
+webui.teastore → reviews.bookinfo and webui.teastore → ratings.bookinfo both have PN = 100 with PNS/PS above 96,
+while productpage.bookinfo → webui.teastore reaches PNS
+= 92.68 and PS = 100 (inclusive the reverse edge also has
+PN = 92.68), all indicating strong causal interference when
+these services share a node. Because high-traffic services are
+concentrated on a small subset of nodes, the interference is
+localized but intense, driving p95 latencies from hundreds up
+to tens of thousands of milliseconds for some services that
+failed to serve the request. For instance, webui.teastore service
+has failure rate 50% larger than other services (Table III).
+Therefore, the higher density (contending services per node)
+and impact (latency) motivate a causal-aware placement as a
+means to mitigate interference and recover performance.
+RQ.2 Answer: Yes. Across all test runs, the causal Optuna
+model best recovers from performance degradation, shown
+in Table VII. Even as the number of services and communication patterns grows, the optimizer consistently finds
+placements with much lower interference than all non-causal
+baselines. The results also expose a key trade-off: reducing
+
+TABLE IX
+A BLATION SUMMARY ( BEST POSSIBLE VALUES ). A LL LATENCY VALUES
+IN MILLISECONDS , I NTERFERENCE IS A SCORE .
+Configuration
+Causal (PN/PS/PNS × STIG)
+No PN/PS/PNS (STIG only)
+No STIG (PN/PS/PNS only)
+Latency-only (non-causal baseline)
+
+Interference
+0.000
+2.400
+300.000
+undetectable
+
+Latency (ms)
+1781622.249
+2256455.232
+2256505.232
+2256405.232
+
+peak). More broadly, the results suggest that interference
+can inform service placement alongside CPU and memory
+usage. While we showed that in a reactive feedback control
+loop (MAPE-K), our causal approach could also inform selfstabilizing orchestration [39] and, eventually, be integrated
+with Kubernetes schedulers and autoscalers [40]–[42].
+B. Threats to validity
+
+interference usually means spreading services across nodes,
+but spreading them increases cross-node latency. The causal
+model learns placements that balance these forces, while noncausal methods either (a) over-concentrate services and cause
+interference, or (b) overspread them and inflate latency. Overall, the approach remains effective, minimizing both residual
+interference and the number of impacted nodes as connectivity
+complexity increases.
+RQ.3 Answer: Yes, causal knowledge (PNS and STIGs) has
+a discernible impact on placement effectiveness. The ablation
+experiments show that removing causal components degrades
+performance, as follows: (a) Without PN/PS/PNS, the optimizer loses direction and strength of interference, leading to
+near-random co-locations and much higher total interference;
+(b) Without STIG (temporal–topological severity), it cannot
+distinguish mild from severe interference patterns, leading to
+suboptimal placements even when PN/PS/PNS are present;
+and (c) Removing both reduces the system to a latency-only
+optimizer, which consistently underperforms the causal model.
+Table IX shows an ablation study that covers a full causal
+model (PN/PS/PNS × STIGs knowledge) achieves zero interference with slightly less latency comparable to all ablations.
+With STIG only, interference rises slightly (2.4) with virtually
+no latency benefit. With PN/PS/PNS only, interference jumps
+sharply (300) despite similar latency. The latency-only baseline also finds an undetectable interference placement in this
+small case. However, without modeling interference structure,
+it is unlikely that its identification will be reliable under tighter
+constraints or higher contention. Each causal component adds
+distinct, non-redundant information, and their combination for
+near-optimal interference-aware placement.
+VI. D ISCUSSION
+A. Implications
+This work shows that treating service placement as a crossapplication interference-aware, multi-objective optimization
+problem yields measurable gains in tail latency and stability for multi-application clusters. It indicates that topologyagnostic scheduling leaves performance on the table, even
+without changing code or resource limits. Placements guided
+by empirical interference profiles can significantly reduce p95
+latency, especially for highly contended services like TeaStore.
+The framework exposes explicit trade-offs among latency,
+interference, and cross-node communication, making it useful
+as a decision-support tool for operators choosing Paretooptimal placements that reflect current priorities (for example,
+isolation for critical services versus lower network cost at
+
+Internal Validity – The interference model is learned from
+offline profiling with Optuna rather than being deployed in a
+live scheduler. As a result, it may not adapt to short-term workload shifts or concept drift in real deployments. Moreover, the
+estimation of “causal interference” relies on correlations that
+may be biased by unobserved confounding factors, potentially
+affecting the accuracy of the inferred relationships.
+External Validity – The evaluation relies on a fixed set
+of multi-application workloads and microservice topologies
+(Book, Sock, and Tea e-commerce stacks). These testbeds
+may not capture the diversity of interference patterns present
+in larger, heterogeneous clusters, or under conditions such
+as bursty traffic, GPU-intensive, or batch workloads. Consequently, the generalizability of the results to broader production contexts remains limited.
+Construct Validity – The analysis focuses on p95 response time and HTTP failure rate as primary quality-ofservice (QoS) metrics. Other important dimensions, such as
+p99 latency, jitter, throughput, energy efficiency, or cost, are
+not optimized, and these may exhibit different behaviors. Our
+metric selection could restrict how comprehensively the study
+captures system performance.
+VII. C ONCLUSION & F UTURE W ORK
+We introduced an interference-aware, cross-application
+placement method for containerized microservices in shared
+clusters. Our approach is driven by causal knowledge
+of counterfactual probabilities of sufficiency and necessity
+computed through a Spatio-Temporal representation model
+(STIG) of the interference phenomenon. By combining crossapplication profiling, per-service latency baselines, and the
+STIG-based estimates of probabilities of sufficiency and necessity (PN/PS/PNS), we formulated service placement as
+a multi-objective optimization problem that minimizes interference and improves response times under network and
+isolation constraints. Using Optuna’s multi-objective engine,
+our study explored trade-offs between latency, interference,
+and communication cost to derive the Pareto-optimal placements that reflect operator preferences. The results indicate
+that a causality-driven multi-objective formulation provides
+operators with explicit control over interference, latency, and
+communication overhead. In future work we plan to integrate
+the optimizer with an online scheduler, extend the interference
+model with additional QoS and reliability metrics, and scale
+the experiments to larger and more heterogeneous clusters.
+
+Algorithm 1 Compute cross-application causal probabilities
+Require: Cleaned
+trace
+D
+with
+spans
+(spanID, traceID, service name, startTime, duration, error tag),
+application map AppOf(·), time window ∆t, duration
+anomaly threshold z, minimum events per service M .
+Algorithm 2 Service Placement by Optimizer (SPO)
+Ensure: PN/PS/PNS table T over cross-application service Require: Probability table (PS,PN,PNS) P (columns
+pairs.
+X, Y, App(X), App(Y ), P N, P S, P N S), response-time
+1: Load D from CSV.
+log R, STIG graphs directory G, set of nodes N , number
+2: For each span, parse startTime into timestamp ts .
+of optimization trials T .
+3: Convert duration to seconds and compute end time te ←
+Ensure: Best placement π ⋆ : S → N , total interference
+ts + duration.
+I(π ⋆ ), total latency L(π ⋆ ), service priorities Priority(s).
+4: For each service s, compute mean µs and standard devi1: Parse R and compute median p95 latency L(s) for each
+ation σs of span durations.
+service s.
+5: Set per-service duration threshold τs ← µs + z · σs .
+2: Parse P and map (X, Y, App(X), App(Y )) to canonical
+6: Mark span i as anomalous if error tagi = True or
+service keys (s, t) using the service-name map.
+durationi > τservice namei .
+3: Parse all STIG graphs in G and aggregate interference
+7: Let Da be the subset of anomalous spans.
+weights wSTIG (s, t) for each service pair (s, t).
+8: For each service s, count anomalous spans ns in Da and
+4: Let S be the union of all services that appear in R, P or
+keep only services with ns ≥ M .
+G.
+9: For each remaining service s, sort spans by ts and store
+5: For every pair (s, t) that appears in both P and G:
+arrays tss and tse .
+6:
+read P N (s, t), P S(s, t), P N S(s, t) from P;
+10: Initialize empty result table T .
+7:
+compute causal factor α(s, t) ← P N (s, t) +
+X Y
+11: function TemporalHits(tX
+s , te , ts , ∆t)
+P S(s, t) − P N S(s, t);
+12:
+h←0
+8:
+compute expected interference E(s, t) ← α(s, t) ·
+13:
+for each event i of X do
+wSTIG (s, t).
+X
+14:
+window ← [tX
+s,i , te,i + ∆t]
+9: Build communication edge set C as undirected pairs {s, t}
+Y
+15:
+if any ts falls in window then h ← h + 1
+whenever (s, t) or (t, s) exists in P.
+16:
+return h
+10: for all services {s} ∈ S do
+P
+17: end function
+11:
+Priority(s) ← t E(s, t)
+X X Y
+18: function IndependentFrac(ts , te , ts , ∆t)
+12: end for
+19:
+if |tYs | = 0 then return 0.0
+13: for k = 1 to T do
+20:
+u←0
+14:
+Optimizer proposes a placement πk : S → N by
+21:
+for each t ∈ tYs do
+sampling a node index for
+Peach service.
+22:
+covered ← False
+15:
+I(πk ) ← 0; L(πk ) ← s∈S L(s).
+23:
+for each event i of X do
+16:
+for all ordered pairs (s, t) with defined E(s, t) do
+X
+24:
+window ← [tX
+17:
+if πk (s) = πk (t) then
+s,i , te,i + ∆t]
+25:
+if t in window then covered ← True
+18:
+I(πk ) ← I(πk ) + E(s, t).
+26:
+if not covered then u ← u + 1
+19:
+end if
+27:
+return u/|tYs |
+20:
+end for
+28: end function
+21:
+for all edges {s, t} ∈ C do
+29: for all ordered pairs of services (X, Y ) with X ̸= Y do
+22:
+if πk (s) ̸= πk (t) then
+30:
+if AppOf(X) = AppOf(Y ) then
+23:
+L(πk ) ← L(πk ) + NET PENALTY MS.
+31:
+continue {skip same-application pairs}
+24:
+end if
+32:
+end if
+25:
+end for
+X Y
+33:
+Extract tX
+s , te , ts from Da .
+26:
+Report objective vector (I(πk ), L(πk )) to Optimizer.
+Y
+34:
+if |tX
+s | = 0 or |ts | = 0 then
+27: end for
+35:
+continue
+28: Retrieve the Pareto-optimal trials from the Optimizer
+36:
+end if
+study.
+37:
+NX ← |tX
+s |
+29: Select π ⋆ from the Pareto front using a tie-breaking rule
+X Y
+38:
+h ← TemporalHits(tX
+s , te , ts , ∆t)
+(e.g., minimum I(π), then minimum L(π)).
+39:
+P (Y |X) ← h/NX
+30: return π ⋆ , I(π ⋆ ), L(π ⋆ ), and Priority(s) for all s.
+X Y
+40:
+P (Y |¬X) ← IndependentFrac(tX
+s , te , ts , ∆t)
+41:
+P N S ←(max(0, P (Y |X) − P (Y |¬X))
+P N S/P (Y |X) if P (Y |X) > 0
+42:
+PN ←
+0
+otherwise
+(
+
+P N S/ 1 − P (Y |¬X) if 1 − P (Y |¬X) > 0
+43:
+PS ←
+0
+otherwise
+44:
+Append row (X, Y, AppOf(X), AppOf(Y ), ]
+P (Y |X), P (Y |¬X), P N S, P N, P S, NX , |tYs |) to T .
+45: end for
+46: return T .
+
+R EFERENCES
+[1] S. Newman, Building microservices: designing fine-grained systems.
+O’Reilly, 2021.
+[2] M. Adeppady, C. Chiasserini, H. Karl, and P. Giaccone, “iplace: An
+interference-aware clustering algorithm for microservice placement,” in
+Proc. of the IEEE Int. Conf. on Communications (ICC), 2022.
+[3] I. Zafar, “Towards interference-resilient multi-tenant microservices via
+spatio-temporal models of self-configuration,” in 2024 IEEE International Conference on Autonomic Computing and Self-Organizing Systems Companion (ACSOS-C). IEEE, 2024, pp. 173–175.
+[4] X. Pu, L. Liu, Y. Mei, S. Sivathanu, Y. Koh, and C. Pu, “Understanding
+performance interference of i/o workload in virtualized cloud environments,” in IEEE 3rd Int. Conf. on Cloud Computing. Miami, FL, USA:
+IEEE, 2010, pp. 51–58.
+[5] M. Adeppady, P. Giaccone, H. Karl, and C. F. Chiasserini, “Reducing
+microservices interference and deployment time in resource-constrained
+cloud systems,” IEEE Trans. on Network and Service Management,
+vol. 20, no. 3, pp. 3135–3147, 2023.
+[6] P. Souza, J. Nascimento, C. Boeira, Â. Vieira, F. Rubin, R. Reis,
+F. Rossi, and T. Ferreto, “IRENE: Interference and high availability
+aware microservice-based applications placement for edge computing,”
+in Proc. of the 10th Int. Conf. on Cloud Computing and Services Science
+(CLOSER). SCITEPRESS, 2020.
+[7] S. Song, M. Xu, Z. Zhang, C. Gao, F. Zeng, Y. Ding, K. Ye, and C. Xu,
+“C-koordinator: Interference-aware management for large-scale and colocated microservice clusters,” arXiv preprint, 2025.
+[8] Z. Qu et al., “Community and priority-based microservice placement in
+dynamic microservice systems,” Journal of Systems Architecture, 2024,
+interference-aware community- and priority-based placement.
+[9] C. Krupitzer, F. M. Roth, S. VanSyckel, G. Schiele, and C. Becker, “A
+survey on engineering approaches for self-adaptive systems,” Pervasive
+and Mobile Computing, vol. 17, pp. 184–206, 2015.
+[10] I. Zafar, C. M. Adriano, and H. Giese, “Stigs: Spatio-temporal interference graph simulator for self-configurable multi-tenant cloud systems,”
+in Companion of the 15th ACM/SPEC International Conference on
+Performance Engineering, 2024, pp. 52–56.
+[11] S. Zhuravlev, S. Blagodurov, and A. Fedorova, “Addressing shared resource contention in multicore processors via scheduling,” ACM Sigplan
+Notices, vol. 45, no. 3, pp. 129–142, 2010.
+[12] S. Beckers, “Causal sufficiency and actual causation,” Journal of Philosophical Logic, vol. 50, no. 6, pp. 1341–1374, 2021.
+[13] J. Pearl, Causality. Cambridge university press, 2009.
+[14] J. Y. Halpern and C. Hitchcock, “Actual causation and the art of
+modeling,” Metaphysica, vol. 11, no. 1, pp. 25–61, 2010.
+[15] T. Eiter and T. Lukasiewicz, “Causes and explanations in the structuralmodel approach: Tractable cases,” Artificial Intelligence, vol. 116, no.
+1–2, pp. 23–74, 2002.
+[16] J. Y. Halpern and J. Pearl, “Causes and explanations: A structural-model
+approach. part i: Causes,” British Journal for the Philosophy of Science,
+vol. 56, no. 4, pp. 843–887, 2005.
+[17] C. M. Adriano, S. Ghahremani, F. Kaiser, and H. Giese, “Neurosymbolic causal reasoning for cautious self-adaptation under distribution
+shifts,” in 2025 IEEE International Conference on Autonomic Computing
+and Self-Organizing Systems (ACSOS). IEEE, 2025, pp. 88–99.
+[18] A. Aleti, B. Buhnova, L. Grunske, A. Koziolek, and I. Meedeniya,
+“Software architecture optimization methods: A systematic literature
+review,” IEEE Trans. on Software Engineering, vol. 39, no. 5, pp. 658–
+683, 2012.
+[19] J. Soldani and A. Brogi, “Anomaly detection and failure root cause
+analysis in (micro) service-based cloud applications: A survey,” ACM
+Computing Surveys (CSUR), vol. 55, no. 3, pp. 1–39, 2022.
+[20] Y. Gan, G. Liu, X. Zhang, Q. Zhou, J. Wu, and J. Jiang, “Sleuth: A
+trace-based root cause analysis system for large-scale microservices
+with graph neural networks,” in Proc. of the 28th ACM Int. Conf.
+on Architectural Support for Programming Languages and Operating
+Systems, Volume 4, 2023, pp. 324–337.
+[21] I. Benamor, M. Zarour, and A. Tari, “Towards a framework for optimized
+microservices placement in cloud native environments,” Int. Journal of
+Advanced Computer Science and Applications, vol. 15, no. 7, 2024.
+[22] M. N. Abadeh, “Multi-objective reconfiguration of evolving realtime microservices-based environments using energy-based nuclear
+reaction optimization,” Systems, 2025, multi-objective nuclear-reaction-
+
+based meta-heuristic for real-time microservices. [Online]. Available:
+https://scimet.iau.ir/University.php?id=157
+[23] T. Akiba, S. Sano, T. Yanase, T. Ohta, and M. Koyama, “Optuna: A
+next-generation hyperparameter optimization framework,” in Proc. of
+the 25th ACM SIGKDD Int. Conf. on Knowledge Discovery & Data
+Mining. ACM, 2019.
+[24] K. Kittikamron, N. Manop, A. Chanakitkarnchok, and K. Rojviboonchai,
+“Edge service placement optimization for location-based service,” in
+20th Int. Joint Conf. on Computer Science and Software Engineering
+(JCSSE). IEEE, 2023, pp. 488–493.
+[25] C. Lohse, D. Tsutsumi, A. Ba, P. Harsha, C. Subramanian, M. Straesser,
+and M. Ruffini, “Causal latency modelling for cloud microservices,” in
+IEEE 18th Int. Conf. on Cloud Computing. IEEE, 2025, pp. 143–151.
+[26] C. Mascia, R. Pietrantuono, A. Guerriero, L. Giamattei, and S. Russo,
+“Microservices performance testing with causality-enhanced large language models,” in Proc. of the 2nd ACM Int. Conf. on AI Foundation
+Models and Software Engineering (FORGE), 2025.
+[27] Q. Wang, L. Shwartz et al., “Detecting causal structure on cloud
+application microservices using granger causality models,” in Proc. of
+the IEEE Int. Conf. on Cloud Computing (CLOUD), 2021.
+[28] L. Pham et al., “Root cause analysis for microservices based on causal
+inference: How far are we?” in Proc. of the 39th IEEE/ACM Int. Conf.
+on Automated Software Engineering (ASE), 2024.
+[29] T. Wang and G. Qi, “A comprehensive survey on root cause analysis in
+(micro) services: methodologies, challenges, and trends,” arXiv preprint
+arXiv:2408.00803, 2024.
+[30] M. Panahandeh, A. Hamou-Lhadj, M. Hamdaqa, and J. Miller, “Serviceanomaly: An anomaly detection approach in microservices using
+distributed traces and profiling metrics,” Journal of Systems and Software, vol. 209, p. 111917, 2024.
+[31] S. Rajagopalan and H. Jamjoom, “{App–bisect}: Autonomous healing
+for {microservice-based} apps,” in Proc. of the 7th USENIX Workshop
+on Hot Topics in Cloud Computing (HotCloud 15), 2015.
+[32] L. Wu, J. Tordsson, E. Elmroth, and O. Kao, “Microrca: Root cause
+localization of performance issues in microservices,” in Proc. of the
+IEEE/IFIP Network Operations and Management Symp. (NOMS), 2020.
+[33] Z. Yao, C. Pei, W. Chen, H. Wang, L. Su, H. Jiang, Z. Xie, X. Nie, and
+D. Pei, “Chain-of-event: Interpretable root cause analysis for microservices through automatically learning weighted event causal graph,” in
+Companion Proc. of the 32nd ACM Int. Conf. on the Foundations of
+Software Engineering, 2024, pp. 50–61.
+[34] Z. Yao, H. Ye, C. Pei, G. Cheng, G. Wang, Z. Liu, H. Chen, H. Cui,
+Z. Li, J. Li et al., “Sparserca: Unsupervised root cause analysis in sparse
+microservice testing traces,” in Proc. of the IEEE 35th Int. Symp. on
+Software Reliability Engineering (ISSRE). IEEE, 2024, pp. 391–402.
+[35] Z. Zhang, M. K. Ramanathan, P. Raj, A. Parwal, T. Sherwood, and
+M. Chabbi, “{CRISP}: Critical path analysis of {Large-Scale} microservice architectures,” in Proc. of the USENIX Annual Technical Conf.
+(USENIX ATC 22), 2022, pp. 655–672.
+[36] M. Allam, N. Boujnah, N. E. O’Connor, and M. Liu, “Synthetic time
+series for anomaly detection in cloud microservices,” in Int. Conf. on
+Machine Learning, Optimization, and Data Science. Springer, 2024,
+pp. 419–433.
+[37] R. Saravanan, P. Asokan, and M. Sachidanandam, “A multi-objective
+genetic algorithm (ga) approach for optimization of surface grinding
+operations,” Int. journal of machine tools and manufacture, vol. 42,
+no. 12, pp. 1327–1334, 2002.
+[38] A. K. Shakya, G. Pillai, and S. Chakrabarty, “Reinforcement learning
+algorithms: A brief survey,” Expert Systems with Applications, vol. 231,
+p. 120495, 2023.
+[39] B. Cai, X. Wang, B. Wang, M. Yang, Y. Guo, and Q. Guo, “A
+self-stabilizing and auto-provisioning orchestration for microservices in
+edge-cloud continuum,” Computer Networks, vol. 242, p. 110279, 2024.
+[40] E. Incerto, R. Pizziol, and M. Tribastone, “µopt: An efficient optimal
+autoscaler for microservice applications,” in 2023 IEEE Int. Conf. on
+Autonomic Computing and Self-Organizing Systems (ACSOS). IEEE,
+2023, pp. 67–76.
+[41] G. Quattrocchi, E. Incerto, R. Pinciroli, C. Trubiani, and L. Baresi,
+“Autoscaling solutions for cloud applications under dynamic workloads,”
+IEEE Trans. on Services Computing, vol. 17, no. 3, pp. 804–820, 2024.
+[42] P. Liang, Y. Xun, J. Cai, and H. Yang, “Autoscaling of microservice
+resources based on dense connectivity spatio-temporal gnn and qlearning,” Future Generation Computer Systems, vol. 174, p. 107909,
+2026.
+

@@ -1,0 +1,1384 @@
+Containing the Autonomous Operator:
+A Defense-in-Depth Framework and Reference Architecture
+for Securing AI Agents on Kubernetes
+
+arXiv:2610.02861v1 [cs.CR] 2 Oct 2026
+
+Simhadri Podala Narasimha
+Independent Researcher
+Littleton, Colorado, USA
+podalas@gmail.com
+October 2026
+
+Abstract
+Large language model (LLM) agents are moving from chat interfaces into infrastructure operations, where
+they read telemetry, call tools, generate and execute code, and change the state of production Kubernetes
+clusters. This collapses a boundary that conventional cloud-native security assumes: the boundary
+between data and control. Content that an agent merely reads—a log line, a ticket, a tool description—can
+redirect what it does. This paper argues that the model must not be treated as a security boundary and
+that agent safety on Kubernetes is therefore an infrastructure problem: every guarantee must continue to
+hold under the assumption that the agent is fully compromised by prompt injection. We contribute (i) a
+threat model and ten-class threat taxonomy for agents operating on and within Kubernetes, aligned with
+emerging OWASP guidance for agentic applications; (ii) nine design principles, centered on complete
+mediation at the tool boundary and on breaking the combination of untrusted input, sensitive access, and
+external egress; (iii) a seven-layer defense-in-depth framework that maps each principle to native or widely
+adopted Kubernetes mechanisms—workload identity, RBAC and ValidatingAdmissionPolicy, gVisor/Kata
+sandboxing via the SIG Apps Agent Sandbox project, FQDN-aware egress policy, an agent/MCP gateway
+with policy-as-code over tool arguments, and eBPF runtime enforcement; (iv) a reference architecture with
+concrete policy artifacts and per-layer bindings for Amazon EKS, Azure Kubernetes Service, and Google
+Kubernetes Engine; and (v) a qualitative evaluation comprising a threat–control coverage matrix and four
+attack walkthroughs, with a proposed empirical methodology. We report no measured attack-success
+or overhead figures; instead we identify residual risks and the measurements needed to validate the
+framework.
+Keywords: AI agents, agentic AI, Kubernetes, cloud-native security, prompt injection, Model Context
+Protocol, sandboxing, policy as code, eBPF, zero trust, least privilege, Amazon EKS, Azure AKS, Google
+GKE
+The views expressed are the author’s own and do not represent those of any employer.
+
+1
+
+Introduction
+
+Operations teams are beginning to delegate real work to LLM-based agents: triaging alerts, reading logs
+and metrics, proposing and applying remediations, opening pull requests against GitOps repositories, and
+1
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+generating ad hoc scripts to diagnose problems. Kubernetes is a natural home for these agents. It is where
+the workloads they manage already run, its declarative API is well suited to automated reasoning, and
+an ecosystem of agent frameworks, protocols, and gateways has grown around it, including the Model
+Context Protocol (MCP) [1], the Agent2Agent (A2A) protocol, the CNCF kagent project [2], and the Linux
+Foundation agentgateway project [3].
+An agent that can act on a cluster is, from a security standpoint, a new kind of principal. Unlike a controller,
+its behavior is not fixed by code that can be reviewed: it is a function of a model, a prompt, and every
+piece of content that enters its context window during a task. Unlike a human operator, it does not reliably
+distinguish instructions from data. Indirect prompt injection—adversarial instructions embedded in content
+the agent retrieves rather than in the user’s request—has been demonstrated against deployed LLM-integrated
+applications [4], and benchmark studies show that tool-using agents remain susceptible even with model-level
+defenses [5]. In the MCP ecosystem specifically, tool poisoning—hidden instructions in tool descriptions,
+schemas, or return values—has been demonstrated against widely used clients [6, 7].
+For a Kubernetes operator this has a sharp consequence. Content that an agent merely reads—a container log
+line written by an attacker-controlled workload, an annotation on a resource, a field in an incident ticket, a
+tool description served by a third-party MCP server—can become a command that the agent then executes
+with its own credentials. The classical separation between the data plane and the control plane, on which
+much of cloud-native security rests, does not survive contact with an agent unless the platform reconstructs it.
+This paper takes the position that the model is not a security boundary. Model alignment, system prompts,
+and input classifiers reduce the probability of misbehavior, but they offer no guarantee, and their failure modes
+are adversarially discoverable. Agent security on Kubernetes must therefore be built the way multi-tenant
+platform security is built: by assuming the workload is hostile and constraining what it can reach, do, and
+exfiltrate, regardless of what it “intends.” This framing aligns with the classical principles of least privilege
+and complete mediation [8] and with the confused-deputy problem [9], both of which return with new force
+when the deputy is an LLM.
+
+1.1
+
+Contributions
+
+1. A threat model for LLM agents that operate on a Kubernetes cluster (as operators) and within it (as
+workloads), with a ten-class taxonomy aligned with OWASP guidance for agentic applications [10, 11]
+(Section 3).
+2. Nine design principles that make agent safety independent of model behavior (Section 4).
+3. A seven-layer defense-in-depth framework that realizes the principles with Kubernetes-native and
+widely adopted open-source mechanisms, with concrete policy artifacts (Section 5).
+4. A reference architecture with graduated autonomy tiers and a per-layer mapping onto the three
+major managed Kubernetes services—Amazon EKS, Azure Kubernetes Service (AKS), and Google
+Kubernetes Engine (GKE)—including where each provides native controls and where the gaps must be
+filled with open-source components (Section 6).
+5. A qualitative evaluation: a threat–control coverage matrix, four attack walkthroughs, an analysis of
+residual risk, and a proposed methodology for empirical validation (Section 7).
+
+2
+
+P REPRINT
+
+1.2
+
+Securing AI Agents on Kubernetes
+
+Scope and Non-Goals
+
+We focus on agents used for infrastructure and platform operations—the setting in which agent actions have
+the largest blast radius. We do not address model training-time attacks (data or weight poisoning), the safety
+of model outputs presented to humans, or hardening of the inference service itself. We treat the model
+provider as reachable over the network and outside the trust boundary of the cluster. The policy artifacts in
+this paper are illustrative; API versions of fast-moving projects should be checked against current releases.
+
+2
+
+Background
+
+2.1
+
+LLM Agents
+
+An LLM agent iterates a loop: it receives a goal, reasons over its context, selects a tool and arguments,
+observes the result, and repeats until it decides the goal is met [12]. Three properties matter for security. First,
+tool results re-enter the context, so data returned by any tool can influence subsequent tool choices. Second,
+tool selection is open-ended: the agent chooses which capability to invoke and with what arguments at run
+time. Third, agents increasingly carry memory across sessions—vector stores, scratchpads, or summaries—so
+a single injection can persist.
+
+2.2
+
+Agent Protocols
+
+MCP standardizes how an agent (client) discovers and invokes tools, resources, and prompts exposed by
+servers [1]. Tool descriptions and schemas are natural-language metadata that the model reads to decide
+when and how to call a tool. Because this metadata is consumed by the model rather than by deterministic
+code, it is an injection surface in its own right [6, 13, 14]. A2A standardizes agent-to-agent messaging and
+capability discovery. Both protocols are now commonly fronted by gateways that terminate transport security,
+authenticate callers, and apply per-tool authorization [3].
+
+2.3
+
+Kubernetes Security Primitives
+
+Kubernetes provides a rich but fragmented set of controls: ServiceAccounts and projected, audience-bound
+tokens for workload identity; RBAC for coarse authorization by verb and resource; admission control,
+including the in-process, CEL-based ValidatingAdmissionPolicy (VAP) [15], for fine-grained validation
+of object content; Pod Security Standards; RuntimeClass for selecting alternative container runtimes
+such as gVisor [16] or Kata Containers [17]; NetworkPolicy and CNI-specific extensions such as Cilium’s
+FQDN-aware policies [18]; and API-server audit logging [19]. eBPF-based tools such as Tetragon [20]
+and Falco [21] add kernel-level observation and enforcement. Managed Kubernetes services add workloadidentity federation that maps ServiceAccounts to short-lived cloud credentials: EKS Pod Identity and IAM
+Roles for Service Accounts (IRSA) on AWS [22], Microsoft Entra Workload ID on AKS [23], and Workload
+Identity Federation for GKE [24]. They also increasingly offer managed sandbox runtimes and FQDN-aware
+egress policy, which we compare in Section 6.
+None of these mechanisms was designed with agents in mind, and none, alone, addresses the data/control
+collapse described above. The contribution of this paper is to compose them, together with agent-specific
+components, into a coherent posture.
+
+3
+
+P REPRINT
+
+3
+
+Threat Model
+
+3.1
+
+System Model
+
+Securing AI Agents on Kubernetes
+
+We consider an operations agent deployed as a workload in a Kubernetes cluster (or in a management cluster
+that administers workload clusters). The agent receives tasks from humans (chat, tickets) or from automation
+(alerts). It reasons using a hosted or self-hosted model, calls tools exposed over MCP (Kubernetes API reads,
+log and metrics queries, GitOps operations, cloud-provider APIs), and may request code-execution sandboxes
+in which it runs generated scripts. It may store memory in a vector database, and it may delegate sub-tasks to
+other agents over A2A.
+
+3.2
+
+Assets
+
+The assets at risk are: (a) the integrity and availability of cluster workloads and configuration; (b) credentials
+reachable from the agent or its tools (ServiceAccount tokens, cloud credentials, API keys); (c) confidential
+data visible through tools (logs, configuration, customer data in telemetry); (d) the integrity of the agent’s
+memory; and (e) the audit trail that attributes actions to principals.
+
+3.3
+
+Adversary Capabilities
+
+We consider five adversary capabilities, which may combine:
+A1 Content injection. The adversary controls some content the agent will read: a log line emitted by
+a workload they control, an annotation or label, a ticket body, a web page, a document in a retrieval
+corpus.
+A2 Malicious or compromised tool server. The adversary operates an MCP server the agent connects to,
+or compromises an existing one, and can change its tool metadata or responses at any time.
+A3 Malicious generated code. As a consequence of A1 or A2, code the agent writes and executes is
+attacker-influenced.
+A4 Low-privilege insider. A user permitted to make requests of the agent attempts to use it to exceed
+their own authority.
+A5 Benign failure. No adversary is present, but model error, hallucination, or a feedback loop produces
+harmful actions.
+We assume the adversary can fully control the agent’s subsequent tool choices and arguments once injection
+succeeds. This is the central modeling choice: we grant the attacker the agent.
+
+3.4
+
+Trust Assumptions
+
+We trust the Kubernetes control plane, the node kernel and container runtime (subject to the isolation strength
+of the selected RuntimeClass), the policy engines, the gateway, and the identity provider. We do not trust
+the model, the agent process, its context, retrieved content, tool metadata from servers outside an approved
+registry, or generated code.
+
+4
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+Table 1: Threat taxonomy for agents on Kubernetes
+ID
+
+Threat
+
+Kubernetes manifestation
+
+T1
+
+Goal hijack via indirect prompt injection
+Tool misuse / excessive agency
+
+A crafted log line or annotation instructs the agent to delete, scale, or
+reconfigure a workload.
+The agent invokes a legitimate tool with harmful arguments (e.g.,
+replicas: 0 in production).
+The agent acts with its own broad ServiceAccount instead of the requesting user’s authority.
+Tool poisoning, rug-pull redefinition, tool shadowing, or a typosquatted
+MCP server image.
+Generated code exploits a kernel vulnerability or reads a mounted token
+from a shared-kernel container.
+The agent is induced to send secrets or logs to an attacker-controlled
+endpoint.
+Injected content is written to long-term memory and influences future
+sessions.
+A remediation loop restarts or rescales repeatedly; fan-out exhausts quotas
+or budget.
+A rogue agent impersonates a trusted peer over A2A, or relays injected
+instructions.
+Actions cannot be attributed to a requester, prompt, and approval.
+
+T2
+T3
+
+Privilege compromise / confused
+deputy
+Tool and MCP supply chain
+
+T4
+T5
+T6
+
+Untrusted code execution and escape
+Data and credential exfiltration
+
+T7
+
+Memory and context poisoning
+
+T8
+
+Cascading or runaway action
+
+T9
+
+Inter-agent spoofing
+
+T10
+
+Repudiation and untraceability
+
+3.5
+
+Threat Taxonomy
+
+Table 1 lists ten threat classes. The taxonomy is aligned in spirit with the OWASP Agentic AI threats-andmitigations work and the OWASP Top 10 for Agentic Applications [10, 11], specialized here to Kubernetes.
+
+3.6
+
+The Lethal Combination
+
+A useful lens is the observation, popularized by Willison [30] and formalized as the “Agents Rule of Two” by
+Meta [31], that serious harm typically requires an agent session to combine three properties at once: exposure
+to untrusted input, access to sensitive data or privileged actions, and the ability to communicate externally or
+change state. Removing any one of the three for a given session sharply bounds the damage of a successful
+injection. Kubernetes is unusually well suited to enforcing this structurally, because each property maps
+onto a controllable resource: content sources onto tool authorization, sensitive access onto RBAC and secret
+placement, and external communication onto egress policy.
+
+4
+
+Design Principles
+
+P1 – The model is not a security boundary. Every control must hold if the agent is fully adversary-controlled.
+Prompt-level defenses are hygiene, not guarantees.
+P2 – Complete mediation at the tool boundary. Every action the agent takes leaves the agent process
+through a mediated channel—the gateway or the Kubernetes API server—where it is authenticated, authorized
+against its arguments, and logged. There is no unmediated path.
+P3 – Least agency. Grant the minimum set of tools, verbs, resources, and namespaces needed for the task
+class, and prefer read-only capabilities. Agency should be scoped per task, not per agent product.
+
+5
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+Tetragon / Falco, audit-log analytics, kill switch
+
+L6 Data & secrets
+
+server-side secrets, redaction, memory provenance
+
+L5 Tool mediation
+
+agent/MCP gateway, policy over tool + args, signed tool registry
+
+L4 Network
+
+default-deny, FQDN egress allowlist, mTLS
+
+L3 Execution isolation
+L2 Authorization
+L1 Identity
+
+Agent Sandbox, gVisor / Kata RuntimeClass, ephemeral pods
+
+scoped RBAC, ValidatingAdmissionPolicy, Pod Security
+
+G: approval, autonomy tiers, budgets
+
+L7 Runtime detection & response
+
+per-agent SA, workload identity, delegated user tokens
+
+Figure 1: Seven technical layers (L1–L7) and a cross-cutting governance layer (G).
+
+P4 – Delegated, attributable identity. Each agent has its own workload identity; actions on behalf of a user
+carry that user’s delegated authority, so the agent cannot exceed the requester’s permissions.
+P5 – Isolate untrusted execution. Generated code runs in ephemeral, kernel-isolated sandboxes with no
+ambient credentials.
+P6 – Break the lethal combination. Deny egress by default, and arrange sessions so that untrusted input,
+sensitive access, and external communication do not coexist without human approval.
+P7 – Prefer reversible, reviewable actions. Route state changes through GitOps pull requests where possible,
+so they gain review, history, and rollback.
+P8 – Observable and attributable by construction. Correlate each request, model call, tool call, API-server
+action, and approval in a single trace.
+P9 – Bounded autonomy. Rate-limit actions, cap budgets, and trip circuit breakers; autonomy is graduated
+by environment and by action risk.
+
+5
+
+A Seven-Layer Defense-in-Depth Framework
+
+Fig. 1 summarizes the framework. Layers L1–L7 are technical controls; a cross-cutting governance layer (G)
+covers approval, autonomy tiers, and budgets.
+
+5.1
+
+L1: Identity
+
+Per-agent workload identity. Every agent, and every class of tool server, runs under its own ServiceAccount.
+The default ServiceAccount is never used, and automountServiceAccountToken is disabled on any
+pod that does not call the Kubernetes API, notably on code-execution sandboxes. Where tokens are needed,
+projected tokens should be audience-bound and short-lived. Cloud access uses workload identity—EKS Pod
+Identity or IRSA [22], Microsoft Entra Workload ID [23], or Workload Identity Federation for GKE [24]—
+rather than static keys, so credentials are scoped, rotated, and attributable in the provider’s audit trail (AWS
+CloudTrail, Azure Monitor and Entra sign-in logs, or Cloud Audit Logs). For mesh-wide identity across
+clusters and non-Kubernetes services, SPIFFE/SPIRE [32] provides attestable workload identities usable for
+mutual TLS.
+Delegated user authority. To address the confused-deputy threat (T3), an agent acting on behalf of a user
+6
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+should present the user’s delegated authority, not only its own. OAuth 2.0 Token Exchange [33] allows the
+gateway to exchange the user’s token for a down-scoped token that carries both the user (sub) and the agent
+(act) as actors. Tool servers then authorize against the intersection of the two. On the Kubernetes API itself,
+the agent can use user impersonation headers, permitted by a tightly scoped impersonate RBAC rule
+that restricts which users or groups may be impersonated, so that RBAC is evaluated against the human’s
+permissions and the audit log records both identities.
+
+5.2
+
+L2: Authorization and Admission
+
+RBAC. RBAC answers which verbs on which resources in which namespaces. Agents receive namespaced Roles, never ClusterRoles with write verbs. Read-only roles (get, list, watch) are the default;
+pods/exec, secrets, serviceaccounts/token, and RBAC objects are excluded, since each allows a direct path to privilege escalation.
+Admission as an agent guardrail. RBAC cannot express constraints on object content: it cannot forbid
+scaling to zero while permitting scaling, or forbid an agent from editing objects in control-plane namespaces
+while permitting edits elsewhere. ValidatingAdmissionPolicy [15] fills this gap with in-process CEL expressions that can be scoped to requests from agent identities via matchConditions. Listing 1 shows a policy
+that applies only to ServiceAccounts in the agents namespace. Because it is enforced by the API server, it
+holds even if the agent bypasses the gateway and calls the API directly with a stolen token—a property that
+tool-layer controls alone cannot provide. Kyverno or OPA Gatekeeper can express equivalent rules where
+richer policy libraries are needed.
+Pod Security. Namespaces that host agents and sandboxes enforce the restricted Pod Security Standard,
+which prevents privileged pods, host namespaces, and hostPath mounts—the most direct paths from a
+compromised pod to the node.
+
+5.3
+
+L3: Execution Isolation
+
+Agents that execute generated code (T5) need stronger isolation than a standard container, because containers
+share the host kernel and a single kernel vulnerability is sufficient for escape. Two mature options are available
+through RuntimeClass: gVisor [16], which interposes a user-space kernel that services system calls on
+behalf of the container and thereby shrinks the host-kernel surface, at a cost in syscall-heavy workloads [34];
+and Kata Containers [17], which runs each pod in a lightweight virtual machine with its own guest kernel.
+The Kubernetes SIG Apps Agent Sandbox project [35] provides a Sandbox custom resource and controller
+for exactly this use case: isolated, stateful, singleton workloads with a stable identity, intended among other
+things for running untrusted, LLM-generated code. Its extensions add templates, claims, and pre-warmed
+pools to reduce start-up latency, which matters because per-session sandboxes are only practical if they
+are fast to obtain. Listing 2 shows a hardened sandbox: kernel-isolated runtime, no ServiceAccount token,
+non-root, read-only root filesystem, all capabilities dropped, a digest-pinned image, and resource limits.
+Sandboxes should be ephemeral and per session; a sandbox that persists across users becomes a channel for
+cross-session contamination (T7). They are placed in a dedicated namespace with no RBAC bindings, and
+their network access is governed by L4.
+
+7
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+name: agent-guardrails
+spec:
+failurePolicy: Fail
+matchConstraints:
+resourceRules:
+- apiGroups: ["apps"]
+apiVersions: ["v1"]
+operations: ["CREATE", "UPDATE", "DELETE"]
+resources: ["deployments", "deployments/scale", "statefulsets", "statefulsets/
+scale"]
+matchConditions:
+- name: only-agent-identities
+expression: "request.userInfo.username.startsWith(’system:serviceaccount:agents
+:’)"
+validations:
+- expression: "!request.namespace.startsWith(’kube-’) && request.namespace != ’
+agents’"
+message: "agents may not modify control-plane or agent namespaces"
+- expression: "request.operation != ’DELETE’"
+message: "agents may not delete workloads; open a GitOps PR instead"
+- expression: "request.operation == ’DELETE’ || !has(object.spec.replicas) ||
+object.spec.replicas > 0"
+message: "agents may not scale workloads to zero"
+--apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+name: agent-guardrails-binding
+spec:
+policyName: agent-guardrails
+validationActions: ["Deny", "Audit"]
+
+Listing 1: ValidatingAdmissionPolicy restricting agent-originated changes.
+
+5.4
+
+L4: Network
+
+Network policy is the most direct way to break the exfiltration leg of the lethal combination (T6). Agent and
+sandbox namespaces start from default-deny for both ingress and egress. Egress is then allowed only to cluster
+DNS, to the agent gateway, and to an explicit allowlist of external hostnames—typically the model endpoint.
+Because external services are addressed by name and their IP addresses change, IP-based NetworkPolicy is
+insufficient; FQDN-aware policies, as provided by Cilium [18], are required. Listing 3 permits an agent to
+reach only DNS, the gateway, and a single model endpoint. Sandboxes typically receive no external egress at
+all; when a task genuinely needs internet access, egress should be through an inspecting proxy and should
+trigger the approval path (Section 5.8).
+The same intent is expressed with provider-native resources on AKS and GKE (Section 6.2, Listing 6). Note
+that the agent pod has no route to the Kubernetes API server in this policy. All cluster actions go through tool
+servers behind the gateway, which hold the necessary credentials. This realizes P2: the agent’s only path to
+state change is mediated. East–west traffic between gateway, tool servers, and agents should use mutual TLS,
+either from a service mesh or from SPIFFE-issued certificates.
+
+8
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: Sandbox
+metadata:
+name: session-7f3a
+namespace: agent-sandboxes
+labels: {app.kubernetes.io/component: agent-sandbox}
+spec:
+podTemplate:
+spec:
+runtimeClassName: gvisor
+# GKE Sandbox; kata-vm-isolation on AKS
+automountServiceAccountToken: false
+securityContext:
+runAsNonRoot: true
+seccompProfile: {type: RuntimeDefault}
+containers:
+- name: runtime
+image: registry.internal/sandbox/python@sha256:<digest>
+securityContext:
+allowPrivilegeEscalation: false
+readOnlyRootFilesystem: true
+capabilities: {drop: ["ALL"]}
+resources:
+limits: {cpu: "1", memory: 1Gi, ephemeral-storage: 512Mi}
+volumeMounts:
+- {name: scratch, mountPath: /workspace}
+volumes:
+- name: scratch
+emptyDir: {sizeLimit: 512Mi}
+
+Listing 2: Hardened code-execution sandbox (API group/version per project release).
+
+5.5
+
+L5: Tool Mediation
+
+The tool boundary is where agent intent becomes action, and it is the most important point of control. We
+place an agent gateway between agents and all tool servers (MCP), peer agents (A2A), and, optionally, model
+endpoints. agentgateway [3], now a Linux Foundation project, is one open-source realization; it supports
+MCP and A2A, includes MCP- and A2A-aware authorization, and integrates with Kubernetes through the
+Gateway API via kgateway. The gateway performs five functions.
+(1) Authentication. It authenticates the calling agent by workload identity and the originating user by token,
+and performs the token exchange described in Section 5.1.
+(2) Authorization over tool and arguments. Per-tool allow lists are necessary but insufficient (T2): the
+harm in scale(deployment, 0) lies in the argument, not the tool name. The gateway therefore sends
+a structured decision request—agent, user, tool, arguments, session attributes—to a policy engine such as
+OPA [36] or Cedar. Listing 4 shows a Rego policy that permits read tools within an agent’s namespaces,
+permits GitOps pull requests only to approved repositories, requires human approval for disruptive actions in
+production, and denies scale-to-zero outright. Admission policy (L2) enforces overlapping constraints at the
+API server; the duplication is intentional, since L5 can block earlier with richer context while L2 cannot be
+bypassed.
+(3) Supply-chain control for tools (T4). Tool servers are admitted only from an internal registry, with images
+signed and verified at admission (e.g., Sigstore/cosign [37] with a Kyverno or policy-controller rule). Tool
+descriptions and schemas are pinned: the gateway records a hash of each tool’s metadata at approval time and
+9
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+name: agent-egress
+namespace: agents
+spec:
+endpointSelector:
+matchLabels: {app.kubernetes.io/component: agent}
+egress:
+- toEndpoints:
+- matchLabels:
+k8s:io.kubernetes.pod.namespace: kube-system
+k8s-app: kube-dns
+toPorts:
+- ports: [{port: "53", protocol: ANY}]
+rules:
+dns: [{matchPattern: "*"}]
+- toEndpoints:
+- matchLabels:
+k8s:io.kubernetes.pod.namespace: agentgateway-system
+toPorts:
+- ports: [{port: "8080", protocol: TCP}]
+- toFQDNs:
+- matchName: bedrock-runtime.us-west-2.amazonaws.com
+toPorts:
+- ports: [{port: "443", protocol: TCP}]
+
+Listing 3: FQDN-restricted egress for agent pods (Cilium).
+
+rejects or quarantines a server whose metadata changes—the “rug-pull” pattern identified in OWASP’s MCP
+guidance [7]. Tools with colliding or confusable names across servers (shadowing) are rejected at registration.
+(4) Response handling. Tool responses are untrusted input. The gateway can strip markup commonly used
+to smuggle instructions, enforce size limits, and tag provenance so the agent framework can render tool
+output as quoted data. These measures reduce but do not eliminate injection; they are hygiene under P1, not a
+boundary.
+(5) Logging and rate limiting. Every call is logged with its decision and correlated trace ID (L7, G), and
+rate limits per agent, tool, and session bound runaway behavior (T8).
+Risk-tiered tools. We classify tools into three tiers: observe (reads; auto-execute), propose (open a PR, create
+a dry-run plan; auto-execute, since a human reviews the result), and act (direct mutation; approval-gated in
+production). Exposing a “propose” alternative for every “act” tool lets most remediation flow through GitOps
+(P7), where Argo CD or Flux applies changes with history and rollback.
+
+5.6
+
+L6: Data and Secrets
+
+Secrets never enter the context. Credentials are held by tool servers, fetched server-side from a secret
+manager (e.g., via the External Secrets Operator or Vault), and never returned in tool output. An agent that
+never sees a secret cannot be induced to leak it, which removes an entire class of exfiltration regardless of
+egress policy.
+Redaction at the source. Log and event tools redact tokens, keys, and personal data before returning results,
+both to protect confidentiality and to avoid feeding sensitive material to an external model.
+10
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+package agent.tools
+import rego.v1
+read_only := {"k8s_get", "k8s_list", "k8s_logs", "prom_query"}
+disruptive := {"k8s_scale", "k8s_rollout_restart", "k8s_cordon"}
+default decision := {"allow": false, "approval": false}
+agent := data.agents[input.agent]
+in_scope if input.args.namespace in agent.namespaces
+deny contains "scale-to-zero is forbidden" if {
+input.tool == "k8s_scale"
+input.args.replicas == 0
+}
+deny contains "cross-namespace access" if {
+input.args.namespace
+not in_scope
+}
+decision := {"allow": true, "approval": false} if {
+count(deny) == 0
+input.tool in read_only
+in_scope
+}
+decision := {"allow": true, "approval": false} if {
+count(deny) == 0
+input.tool == "gitops_open_pr"
+input.args.repo in agent.repos
+}
+decision := {"allow": true, "approval": true} if {
+count(deny) == 0
+input.tool in disruptive
+in_scope
+startswith(input.args.namespace, "prod-")
+}
+
+Listing 4: Policy over tool calls and their arguments (OPA/Rego v1).
+
+Memory provenance (T7). Writes to long-term memory record their source (user, tool, session) and trust
+level. Content derived from untrusted tool output is not promoted to memory without review, memory is
+partitioned per tenant and per agent, and memory stores support point-in-time rollback so a poisoning incident
+can be reversed.
+Information-flow separation. The strongest available defense against T1 is architectural: separate the
+component that reads untrusted data from the component that plans privileged actions, so that untrusted
+content can influence data values but not control flow. The CaMeL design [38] demonstrates this pattern with
+a privileged planner and a quarantined reader, enforced by capability tracking in an interpreter. On Kubernetes,
+the pattern maps naturally onto separate pods with separate identities and tool grants: a quarantined “reader”
+agent with read-only tools and no egress, and a “planner” agent that never ingests raw untrusted content and
+11
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+name: sandbox-token-guard
+spec:
+podSelector:
+matchLabels: {app.kubernetes.io/component: agent-sandbox}
+kprobes:
+- call: "security_file_open"
+syscall: false
+args:
+- {index: 0, type: "file"}
+selectors:
+- matchArgs:
+- index: 0
+operator: "Prefix"
+values: ["/var/run/secrets/kubernetes.io", "/var/run/secrets/eks.amazonaws.
+com"]
+matchActions:
+- action: Sigkill
+
+Listing 5: Tetragon policy terminating token access in sandboxes.
+
+whose actions pass through L5.
+
+5.7
+
+L7: Runtime Detection and Response
+
+Preventive layers will be misconfigured or bypassed; detection bounds the dwell time.
+Kernel-level enforcement. eBPF tools observe agent and sandbox pods at the system-call level. Tetragon [20]
+can both detect and enforce, for example terminating a process that attempts to open a ServiceAccount token
+path inside a sandbox that should have none (Listing 5). Falco [21] offers a broad rule set for unexpected
+shells, network connections, and file writes.
+Control-plane analytics. API-server audit logs [19], filtered to agent identities, are baselined: new verbs,
+new namespaces, or abnormal call rates raise alerts. Gateway decision logs supply denied-call spikes, which
+are a strong signal of an injection attempt in progress.
+Kill switch. A single, rehearsed action must disable an agent: revoke or rotate its ServiceAccount and
+workload-identity bindings, scale it to zero, apply a quarantine network policy, and invalidate its gateway
+sessions. Because the agent’s only paths are mediated (P2), revoking identity at L1 and L5 is sufficient to
+stop it even if its pod persists.
+
+5.8
+
+G: Governance—Approval, Autonomy, and Budgets
+
+Human approval. Approval-gated calls are suspended at the gateway and surfaced to a human with the full
+context: requester, rationale, exact arguments, and a dry-run diff. Approval is bound to the specific call (by
+hash of tool and arguments) and expires, so it cannot be replayed for a different action.
+Autonomy tiers. Autonomy is graduated by environment (Table 2). An agent may be fully autonomous for
+reads in production and for most actions in development, while production mutations require approval or
+GitOps review.
+
+12
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+Table 2: Graduated autonomy tiers
+Tool tier
+
+Dev
+
+Staging Production
+
+Observe (read)
+auto
+auto
+auto
+Propose (PR, dry-run)
+auto
+auto
+auto†
+Act (mutate)
+auto
+notify
+approval
+Destructive (delete)
+approval approval denied (L2)
+† A human reviews and merges the pull request.
+
+Model endpoint
+(FQDN allowlist)
+ns: agents (default-deny egress)
+
+Planner agent
+SA: agent-ops
+User / Alert
+(OIDC token)
+
+task, quoted data
+
+Reader agent
+read-only, no egress
+
+Agent / MCP gateway
+authn, token exchange,
+OPA policy, approval,
+rate limit, OTel
+approve / deny
+
+ns: agent-tools
+
+K8s MCP server
+(scoped RBAC)
+
+kube-apiserver
+RBAC + VAP
+
+Logs / metrics MCP
+(redaction)
+
+Tetragon / Falco
+audit analytics
+
+GitOps MCP
+(PR only)
+
+Git → Argo CD
+
+Sandbox MCP
+→ Agent Sandbox
+
+Sandbox pod
+gVisor/Kata, no token
+
+Human approver
+
+Figure 2: Provider-neutral reference architecture (provider bindings in Table 3). Agent pods have no route to the API
+server or the internet except the model endpoint; every action is mediated by the gateway, and mutations are re-validated
+by admission control.
+
+Budgets and circuit breakers. Each agent and session has budgets for tool calls, mutations per time window,
+model tokens, and spend. A circuit breaker opens after repeated failed remediations of the same object, after
+repeated policy denials, or when a mutation does not improve the triggering signal, and hands the incident to
+a human. This directly targets runaway loops (T8), which are the most likely harm in practice because they
+require no adversary (A5).
+
+6
+
+Reference Architecture on Managed Kubernetes: EKS, AKS, and GKE
+
+Fig. 2 shows a reference deployment. Its core—namespaces, RBAC, admission policy, the agent gateway
+and its policy engine, GitOps, and eBPF runtime enforcement—is provider-neutral and runs unchanged on
+Amazon EKS, Azure Kubernetes Service (AKS), and Google Kubernetes Engine (GKE). Five concerns
+bind to the provider: cloud workload identity, the kernel-isolated sandbox runtime, FQDN-aware egress
+enforcement, the managed model endpoint, and managed detection and audit services. Section 6.2 maps each
+layer onto the three services.
+
+6.1
+
+Components
+• Agent namespace. A planner agent and a quarantined reader agent (Section 5.6), each with its own
+ServiceAccount federated, through the provider’s workload identity, to a narrowly scoped cloud role
+that can invoke only the model endpoint. Default-deny egress with an FQDN allowlist. No Kubernetes
+API access.
+13
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+• Gateway. An MCP/A2A gateway that authenticates agents and users, performs token exchange, calls
+OPA for per-call decisions, holds approval-gated calls, enforces rate limits and budgets, and emits
+OpenTelemetry spans.
+• Tool namespace. Signed, digest-pinned MCP servers, each with its own ServiceAccount and minimal
+RBAC: a Kubernetes server with read and narrowly scoped write roles, an observability server that
+redacts, a GitOps server that can only open pull requests, and a sandbox server that requests per-session
+Sandbox objects.
+• Sandbox namespace. Agent Sandbox controller with gVisor or Kata RuntimeClass, warm pools,
+no RBAC bindings, no egress.
+• Control plane guardrails. VAP bindings matched to agent and tool identities; Pod Security
+restricted on all three namespaces; image-signature verification at admission.
+• Detection. Tetragon policies on agent and sandbox pods; audit-log pipeline with per-identity baselines;
+gateway decision logs; a scripted kill switch.
+
+6.2
+
+Provider Bindings
+
+Table 3 maps each framework layer onto the native services of EKS, AKS, and GKE. Three differences
+matter most for agent workloads.
+Sandboxing is the largest gap. GKE offers the most complete managed path: GKE Agent Sandbox
+is a managed add-on built on the open-source Agent Sandbox controller, uses gVisor for kernel-level
+isolation, and adds pre-warmed pools for sub-second provisioning, a claim-based request model, and
+default-deny networking for sandboxes [25]. AKS provides managed Kata-based Pod Sandboxing, in
+which each pod runs in a lightweight VM with its own guest kernel, selected with runtimeClassName:
+kata-vm-isolation; it requires Azure Linux node pools [26], and the open-source Agent Sandbox
+project documents its use on AKS [27]. On EKS there is no managed sandbox runtime at the time of writing,
+so operators install gVisor or Kata themselves on dedicated node groups and run the open-source controller.
+That is feasible but places the isolation runtime, and its patching, inside the operator’s responsibility.
+FQDN egress is native on AKS and GKE, not on EKS. On AKS, FQDN filtering is part of Advanced
+Container Networking Services (ACNS) and requires Azure CNI powered by Cilium; it is a paid add-on,
+and Microsoft notes possible degradation above roughly 1,000 requests per second per pod [28]. On GKE,
+the FQDNNetworkPolicy resource requires GKE Dataplane V2 and caps each FQDN at 50 resolved
+addresses [29]; Listing 6 expresses the intent of Listing 3. On EKS, the VPC CNI’s network-policy support is
+not FQDN-aware, so the egress allowlist of Section 5.4 requires Cilium (in chaining or replacement mode) or
+a forced egress proxy. On all three, private connectivity to the model endpoint (PrivateLink, Private Endpoint,
+or Private Service Connect) lets the allowlist name a private address rather than a public one, and on GKE,
+VPC Service Controls adds a perimeter around Vertex AI and other Google APIs that limits where data can
+flow even with valid credentials.
+Identity semantics differ in detail. All three federate a Kubernetes ServiceAccount to a cloud principal
+without static keys, which satisfies L1. They differ in where the binding is declared—an EKS Pod Identity
+association or IRSA role trust policy, an Entra federated identity credential, or a Google IAM policy binding
+on the Kubernetes principal—and therefore in which team controls it. In every case the binding should
+be owned by the platform team and managed declaratively (for example with Crossplane or Terraform),
+so that an agent with write access to its own namespace cannot widen its cloud permissions by editing
+ServiceAccount annotations.
+
+14
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+Table 3: Mapping of framework layers onto managed Kubernetes services. Entries reflect provider documentation as of
+late 2026; availability varies by region and cluster version.
+Layer
+
+Amazon EKS
+
+Azure AKS
+
+Google GKE
+
+L1 Workload
+identity
+L2 Admission
+
+EKS Pod Identity or IRSA →
+IAM role
+VAP; Kyverno or Gatekeeper
+
+Workload Identity Federation for
+GKE → IAM
+VAP; Policy Controller
+
+L2 Image trust
+
+Image signing with AWS
+Signer/Notation, verified at
+admission
+No managed option; self-installed
+gVisor or Kata RuntimeClass
+on suitable nodes
+
+Microsoft Entra Workload ID
+(federated credentials)
+VAP; Azure Policy for AKS
+(Gatekeeper-based)
+Notation signatures on ACR,
+verified with Ratify
+Pod Sandboxing: Kata VM
+isolation
+(kata-vm-isolation) on
+Azure Linux node pools
+Open-source Agent Sandbox
+(Kata on AKS example)
+ACNS FQDN filtering with Azure
+CNI powered by Cilium
+
+GKE Sandbox (gVisor)
+
+Managed GKE Agent Sandbox
+add-on (warm pools, claims)
+FQDNNetworkPolicy with
+GKE Dataplane V2
+
+Secrets Manager via Secrets Store
+CSI or External Secrets
+Amazon Bedrock
+
+Key Vault provider for Secrets
+Store CSI
+Azure OpenAI
+
+Secret Manager add-on or
+External Secrets
+Vertex AI
+
+GuardDuty EKS Runtime
+Monitoring
+EKS control-plane logs;
+CloudTrail
+
+Microsoft Defender for
+Containers
+AKS diagnostic logs to Azure
+Monitor
+
+Security Command Center
+Container Threat Detection
+Cloud Audit Logs
+
+L3 Sandbox
+runtime
+
+L3 Sandbox
+orchestration
+L4 FQDN
+egress
+L4 Private
+model access
+L5 Gateway
+and policy
+L6 Secrets
+L6 Model
+endpoint
+L7 Managed
+detection
+L7 Audit
+
+Open-source Agent Sandbox
+
+Binary Authorization
+
+Not supported by VPC CNI
+network policy; Cilium or an
+egress proxy required
+Private Endpoint to Azure OpenAI Private Service Connect; VPC
+PrivateLink (VPC endpoints) to
+Service Controls
+Bedrock
+Provider-neutral: agentgateway (or equivalent) with OPA/Cedar; identical on all three
+
+Portability. Because the gateway, policy engine, admission policies, and Tetragon policies are providerneutral, an organization running agents across clouds can keep a single policy repository and vary only
+the provider overlay—the RuntimeClass name, the egress-policy resource, the identity binding, and the
+model endpoint. We regard this split as a design goal: the controls that encode what an agent may do should
+not depend on the cloud, while the controls that encode how isolation is achieved may.
+
+6.3
+
+Request Walkthrough
+
+An alert reports elevated error rates for checkout in prod-payments. (1) The alert carries a service
+identity; the planner receives the task. (2) The planner asks the reader to summarize recent logs and
+metrics; the reader calls the observability tools through the gateway, which authorizes read-only access to
+prod-payments, and returns a structured summary to the planner as quoted data. (3) The planner proposes
+a rollout restart. The gateway’s policy classifies k8s_rollout_restart in a prod- namespace as
+approval-gated and suspends the call. (4) An on-call engineer approves the exact call; the gateway forwards it
+with an exchanged token. (5) The Kubernetes tool server applies the change; the API server evaluates RBAC
+and the VAP against the request. (6) Every step is a span in one trace, from alert to API-server audit event.
+
+15
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+apiVersion: networking.gke.io/v1alpha1
+kind: FQDNNetworkPolicy
+metadata:
+name: agent-model-egress
+namespace: agents
+spec:
+podSelector:
+matchLabels: {app.kubernetes.io/component: agent}
+egress:
+- matches:
+- name: "us-central1-aiplatform.googleapis.com"
+ports:
+- {protocol: "TCP", port: 443}
+
+Listing 6: GKE equivalent of Listing 3: egress limited to the model endpoint (GKE Dataplane V2). A standard
+NetworkPolicy additionally permits DNS and the gateway.
+
+Table 4: Threat–control coverage (• primary, ◦ supporting)
+
+7
+
+Threat
+
+L1 L2 L3 L4 L5 L6 L7 G
+
+T1 Goal hijack
+T2 Tool misuse
+T3 Confused deputy
+T4 Tool supply chain
+T5 Code exec / escape
+T6 Exfiltration
+T7 Memory poisoning
+T8 Runaway action
+T9 Inter-agent spoofing
+T10 Repudiation
+
+◦
+•
+
+•
+•
+•
+◦
+
+◦
+◦
+◦
+
+◦
+
+◦
+•
+
+◦
+◦
+•
+
+◦
+◦
+
+•
+•
+
+◦
+
+•
+•
+◦
+•
+
+•
+
+◦
+◦
+•
+•
+•
+
+•
+•
+
+◦
+◦
+◦
+◦
+•
+◦
+
+•
+•
+◦
+
+•
+
+◦
+•
+
+◦
+
+•
+
+Evaluation
+
+We evaluate the framework qualitatively, through threat coverage and adversarial walkthroughs, and we
+propose a methodology for empirical validation. We do not report attack-success rates, latency, or cost
+overheads; those require the experiments described in Section 7.4.
+
+7.1
+
+Threat–Control Coverage
+
+Table 4 maps each threat to the layers that provide primary (•) or supporting (◦) mitigation. Two properties
+are worth noting. First, every threat has at least two mitigating layers, and for every threat at least one primary
+control is enforced outside the agent process; no threat relies solely on model behavior (P1). Second, the
+injection-driven threats (T1, T2, T6) are each covered by a preventive control at the tool boundary (L5) and
+an independent control at a different enforcement point (L2 at the API server, L4 in the CNI), so a single
+misconfiguration does not lead to harm.
+
+16
+
+P REPRINT
+
+7.2
+
+Securing AI Agents on Kubernetes
+
+Attack Walkthroughs
+
+S1: Injection through a log line (T1, T2). An attacker who controls a workload in prod-payments
+writes a log line instructing any reading agent to “free capacity by scaling checkout to zero.” In a naive
+deployment with a broadly privileged agent, this succeeds if the model follows the instruction. In the reference
+architecture, the log is read by the quarantined reader, whose output reaches the planner as quoted data (L6);
+if the planner nonetheless proposes k8s_scale with replicas: 0, the gateway policy denies it (L5,
+Listing 4); were the gateway misconfigured, the VAP rejects the request at the API server (L2, Listing 1); and
+the cluster of denials raises an alert (L7). The attack must defeat three independent enforcement points to
+cause harm.
+S2: Tool poisoning with exfiltration (T4, T6). A third-party MCP server, approved months earlier, updates
+its tool description to instruct the agent to read a configuration secret and include it in a parameter of the
+server’s own tool. The gateway detects that the server’s tool-metadata hash has changed and quarantines
+it pending review (L5). Independently, the agent cannot read secrets—no tool returns them and no RBAC
+grants them (L2, L6)—and the server’s pod, under default-deny egress, cannot reach an arbitrary external
+host (L4). The combination of untrusted input and external communication exists in the compromised server,
+but the sensitive-access leg is absent.
+S3: Malicious generated code (T5). Injected content causes the agent to generate a script that attempts to
+read a ServiceAccount token and then exploit a kernel vulnerability. The sandbox has no token mounted
+(L1); Tetragon terminates the process on access to the token path (L7, Listing 5); the gVisor or Kata runtime
+interposes a separate kernel boundary, so a host-kernel exploit must also defeat the user-space or guest kernel
+(L3); and with no egress, the sandbox cannot fetch a second-stage payload or exfiltrate results (L4). The
+residual risk is a vulnerability in the isolation runtime itself.
+S4: Runaway remediation (T8). With no adversary, the agent repeatedly restarts a deployment whose
+failures are caused by a downstream database, worsening the incident. Per-object mutation budgets and the
+circuit breaker (G) stop the loop after a bounded number of attempts and escalate to a human; gateway rate
+limits (L5) cap the rate in the meantime; and audit-log baselines flag the burst (L7).
+
+7.3
+
+Residual Risk
+
+Several risks are reduced but not eliminated.
+• Harmful but policy-compliant actions. Policy can forbid known-bad arguments; it cannot judge
+whether a permitted action is wise. A restart that is allowed may still be wrong. Approval gates and
+GitOps review move this judgment to humans, at the cost of latency and of approval fatigue.
+• Integrity attacks within scope. An injected agent can still produce misleading summaries or propose
+subtly harmful pull requests. Review quality, not infrastructure, is the control.
+• Exfiltration through the model channel. The model endpoint is, by necessity, an allowed egress
+destination. Sensitive data in the context is sent to the model provider by design; contractual and
+data-residency controls apply, and L6 minimizes what enters the context.
+• Isolation-runtime and policy-engine vulnerabilities. These components join the trusted computing
+base.
+• Policy drift. The layered design produces many policies across tools; their consistency must itself be
+tested.
+
+17
+
+P REPRINT
+
+7.4
+
+Securing AI Agents on Kubernetes
+
+Proposed Methodology for Empirical Validation
+
+To move from qualitative to quantitative claims, we propose the following experiments, which we leave to
+future work.
+1. Kubernetes-native injection benchmark. Adapt the structure of AgentDojo [5]—paired user tasks
+and injection tasks in a realistic environment—to a cluster environment, with injections placed in logs,
+events, annotations, ConfigMaps, tickets, and MCP tool metadata. Measure benign task utility and
+targeted attack success rate (ASR) under ablations: no controls; prompt-level defenses only; each layer
+added in isolation; and the full stack.
+2. Bypass testing. For each enforcement point, disable the layers above it and confirm the lower layer
+alone prevents the harmful outcome, verifying the independence claimed in Table 4.
+3. Overhead. Measure added latency per tool call at the gateway and policy engine, sandbox acquisition
+time with and without warm pools, and syscall-heavy workload slowdown under gVisor and Kata,
+building on prior characterizations [34].
+4. Operator burden. Measure approval volume and approval latency per incident under each autonomy
+tier, as a proxy for approval fatigue.
+
+8
+
+Discussion
+
+Why not rely on better models? Model-level robustness to injection is improving, and design-level defenses
+such as CaMeL [38] show that strong guarantees are possible when control and data flow are separated.
+Infrastructure controls are complementary: they bound the damage of the residual failures, they apply
+uniformly across models and frameworks, and they are already familiar to platform teams. A platform that
+assumes compromise remains safe when the model is swapped.
+Utility trade-offs. Every layer constrains the agent. Default-deny egress breaks tools that fetch documentation; approval gates slow remediation; quarantined readers lose nuance. We view the autonomy tiers as the
+primary dial: organizations can begin with observe-and-propose in production and expand autonomy per
+action class as evidence accumulates.
+Agents as tenants. The framework is, in effect, multi-tenant platform engineering with the agent as the
+untrusted tenant. Much existing practice—namespace isolation, admission control, network segmentation,
+runtime detection—transfers directly. What is new is the tool boundary, where authorization must consider
+arguments and provenance, and the need to treat natural-language metadata as code.
+Standardization gaps. Several needed primitives lack standards today: a common schema for tool-call
+authorization requests, signed and versioned tool metadata in MCP, a standard for propagating delegated user
+identity through multi-agent chains, and conventions for tracing agent reasoning across OpenTelemetry spans.
+Progress on these would make the controls here portable across gateways and frameworks.
+Limitations. This work is a framework and design study. Its evaluation is analytical rather than empirical; the
+coverage matrix reflects our assessment rather than measurement; and the artifacts, while concrete, have not
+been subjected to a red-team exercise reported here. The ecosystem is moving quickly, and specific projects
+or API versions cited may change.
+
+18
+
+P REPRINT
+
+9
+
+Securing AI Agents on Kubernetes
+
+Related Work
+
+Prompt injection. Greshake et al. introduced indirect prompt injection against LLM-integrated applications [4]. AgentDojo provides a dynamic benchmark of attacks and defenses for tool-using agents [5]. CaMeL
+defends by design, separating control and data flow with capability tracking [38]. Our L6 information-flow
+separation adopts this idea at the level of pods and identities.
+Agent and MCP security. OWASP has published threats and mitigations for agentic AI [10], a Top 10 for
+agentic applications [11], and an MCP security cheat sheet [7], alongside its LLM Top 10 [39]. The Cloud
+Security Alliance’s MAESTRO framework offers a layered threat-modeling method for agentic systems [40].
+Tool poisoning was disclosed by Invariant Labs [6], and surveys systematize MCP threats [13, 14]. These
+works characterize threats and general mitigations; we contribute a concrete mapping onto Kubernetes
+enforcement points and a reference architecture.
+Risk management. The NIST AI Risk Management Framework [41] provides organizational structure for
+AI risk; our governance layer is one operational instantiation for infrastructure agents.
+Cloud-native isolation and policy. Sandboxed runtimes [16, 17, 34], admission control [15], policy as
+code [36], eBPF runtime security [20, 21], workload identity [32], and software signing [37] are established.
+The Agent Sandbox project [35], kagent [2], and agentgateway [3] bring agent-specific constructs to Kubernetes. Our contribution is the composition of these into a principled posture whose guarantees hold under full
+agent compromise.
+
+10
+
+Conclusion
+
+AI agents turn content into commands. On Kubernetes, where the cost of a wrong command is measured in
+outages, the safe response is to treat the agent as an untrusted tenant and rebuild the data/control boundary
+in infrastructure. We presented a threat model, nine principles, a seven-layer framework with concrete
+Kubernetes artifacts, and a reference architecture in which every action is mediated, every guarantee survives
+full agent compromise, and autonomy is earned per action class. The most important next step is empirical: a
+Kubernetes-native injection benchmark that measures utility and attack success under layered ablations, so
+that platform teams can choose their autonomy tiers on evidence.
+
+References
+[1] Model Context Protocol, “Specification,” [Online]. Available: https://modelcontextprotoc
+ol.io/specification
+[2] kagent Project (CNCF), “kagent: Cloud native agentic AI,” [Online]. Available: https://kagent
+.dev
+[3] agentgateway Project (Linux Foundation), “agentgateway,” [Online]. Available: https://agentg
+ateway.dev
+[4] K. Greshake, S. Abdelnabi, S. Mishra, C. Endres, T. Holz, and M. Fritz, “Not what you’ve signed up
+for: Compromising real-world LLM-integrated applications with indirect prompt injection,” in Proc.
+16th ACM Workshop on Artificial Intelligence and Security (AISec), 2023. arXiv:2302.12173.
+
+19
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+[5] E. Debenedetti, J. Zhang, M. Balunović, L. Beurer-Kellner, M. Fischer, and F. Tramèr, “AgentDojo:
+A dynamic environment to evaluate prompt injection attacks and defenses for LLM agents,” in Advances in Neural Information Processing Systems (NeurIPS) Datasets and Benchmarks Track, 2024.
+arXiv:2406.13352.
+[6] Invariant Labs, “MCP security notification: Tool poisoning attacks,” Apr. 2025. [Online]. Available:
+https://invariantlabs.ai/blog/mcp-security-notification-tool-poiso
+ning-attacks
+[7] OWASP Cheat Sheet Series, “MCP (Model Context Protocol) security cheat sheet,” [Online]. Available:
+https://cheatsheetseries.owasp.org/cheatsheets/MCP_Security_Cheat_
+Sheet.html
+[8] J. H. Saltzer and M. D. Schroeder, “The protection of information in computer systems,” Proc. IEEE,
+vol. 63, no. 9, pp. 1278–1308, 1975.
+[9] N. Hardy, “The confused deputy (or why capabilities might have been invented),” ACM SIGOPS
+Operating Systems Review, vol. 22, no. 4, pp. 36–38, 1988.
+[10] OWASP GenAI Security Project, “Agentic AI – Threats and mitigations,” Agentic Security Initiative,
+2025. [Online]. Available: https://genai.owasp.org
+[11] OWASP GenAI Security Project, “OWASP Top 10 for agentic applications (2026),” Dec. 2025. [Online].
+Available: https://genai.owasp.org
+[12] S. Yao, J. Zhao, D. Yu, N. Du, I. Shafran, K. Narasimhan, and Y. Cao, “ReAct: Synergizing reasoning
+and acting in language models,” in Proc. Int. Conf. Learning Representations (ICLR), 2023.
+[13] X. Hou, Y. Zhao, S. Wang, and H. Wang, “Model Context Protocol (MCP): Landscape, security threats,
+and future research directions,” arXiv:2503.23278, 2025.
+[14] “Systematization of knowledge: Security and safety in the Model Context Protocol ecosystem,”
+arXiv:2512.08290, 2025.
+[15] Kubernetes Documentation, “Validating admission policy,” [Online]. Available: https://kubern
+etes.io/docs/reference/access-authn-authz/validating-admission-pol
+icy/
+[16] gVisor Project, “gVisor: The container security platform,” [Online]. Available: https://gvisor.d
+ev
+[17] Kata Containers Project, “Kata Containers,” [Online]. Available: https://katacontainers.io
+[18] Cilium Project, “DNS-based (FQDN) network policy,” Cilium Documentation. [Online]. Available:
+https://docs.cilium.io
+[19] Kubernetes Documentation, “Auditing,” [Online]. Available: https://kubernetes.io/docs
+/tasks/debug/debug-cluster/audit/
+[20] Tetragon Project, “Tetragon: eBPF-based security observability and runtime enforcement,” [Online].
+Available: https://tetragon.io
+[21] Falco Project (CNCF), “Falco: Cloud native runtime security,” [Online]. Available: https://falc
+o.org
+20
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+[22] Amazon Web Services, “EKS Pod Identity” and “IAM roles for service accounts,” Amazon EKS User
+Guide. [Online]. Available: https://docs.aws.amazon.com/eks/
+[23] Microsoft, “Use Microsoft Entra Workload ID with Azure Kubernetes Service (AKS),” Microsoft Learn.
+[Online]. Available: https://learn.microsoft.com/azure/aks/workload-identit
+y-overview
+[24] Google Cloud, “About Workload Identity Federation for GKE,” GKE Documentation. [Online]. Available: https://cloud.google.com/kubernetes-engine/docs/concepts/worklo
+ad-identity
+[25] Google Cloud, “About GKE Agent Sandbox,” GKE Documentation. [Online]. Available: https:
+//docs.cloud.google.com/kubernetes-engine/docs/concepts/machine-lea
+rning/agent-sandbox
+[26] Microsoft, “Pod Sandboxing with Azure Kubernetes Service (AKS),” Microsoft Learn. [Online].
+Available: https://learn.microsoft.com/azure/aks/use-pod-sandboxing
+[27] Kubernetes SIG Apps, “Enabling Kata Containers on AKS,” Agent Sandbox Documentation. [Online].
+Available: https://agent-sandbox.sigs.k8s.io/docs/use-cases/examples/ka
+ta-aks-sandbox/
+[28] Microsoft, “FQDN filtering with Advanced Container Networking Services (ACNS),” Microsoft Learn.
+[Online]. Available: https://learn.microsoft.com/azure/aks/container-netwo
+rk-security-fqdn-filtering-concepts
+[29] Google Cloud, “Control Pod egress traffic using FQDN network policies,” GKE Documentation.
+[Online]. Available: https://docs.cloud.google.com/kubernetes-engine/docs/h
+ow-to/fqdn-network-policies
+[30] S. Willison, “The lethal trifecta for AI agents: Private data, untrusted content, and external communication,” Jun. 2025. [Online]. Available: https://simonwillison.net
+[31] Meta AI, “Agents rule of two: A practical approach to AI agent security,” 2025. [Online]. Available:
+https://ai.meta.com/blog/
+[32] SPIFFE Project (CNCF), “SPIFFE: Secure production identity framework for everyone,” [Online].
+Available: https://spiffe.io
+[33] M. Jones, A. Nadalin, B. Campbell, J. Bradley, and C. Mortimore, “OAuth 2.0 token exchange,” IETF
+RFC 8693, Jan. 2020.
+[34] E. G. Young, P. Zhu, T. Caraza-Harter, A. C. Arpaci-Dusseau, and R. H. Arpaci-Dusseau, “The true
+cost of containing: A gVisor case study,” in Proc. 11th USENIX Workshop on Hot Topics in Cloud
+Computing (HotCloud), 2019.
+[35] Kubernetes SIG Apps, “Agent Sandbox,” [Online]. Available: https://github.com/kuberne
+tes-sigs/agent-sandbox
+[36] Open Policy Agent Project (CNCF), “Open Policy Agent,” [Online]. Available: https://www.op
+enpolicyagent.org
+[37] Z. Newman, J. S. Meyers, and S. Torres-Arias, “Sigstore: Software signing for everybody,” in Proc.
+ACM SIGSAC Conf. Computer and Communications Security (CCS), 2022.
+21
+
+P REPRINT
+
+Securing AI Agents on Kubernetes
+
+[38] E. Debenedetti, I. Shumailov, T. Fan, J. Hayes, N. Carlini, D. Fabian, C. Kern, C. Shi, A. Terzis, and
+F. Tramèr, “Defeating prompt injections by design,” arXiv:2503.18813, 2025.
+[39] OWASP GenAI Security Project, “OWASP Top 10 for LLM applications 2025,” Nov. 2024. [Online].
+Available: https://genai.owasp.org
+[40] K. Huang, “Agentic AI threat modeling framework: MAESTRO,” Cloud Security Alliance, Feb. 2025.
+[Online]. Available: https://cloudsecurityalliance.org/blog
+[41] National Institute of Standards and Technology, “Artificial intelligence risk management framework (AI
+RMF 1.0),” NIST AI 100-1, Jan. 2023.
+
+22
+

@@ -1,0 +1,850 @@
+When Does Learning Beat Heuristics? A Case Study in
+Kubernetes Scheduler Score Plugins
+Wang Xuying
+I. Razzakov Kyrgyz State Technical University
+
+arXiv:2609.22142v1 [cs.DC] 25 Aug 2026
+
+Zhibek Sarypbekova
+I. Razzakov Kyrgyz State Technical University
+Abstract
+
+constraints. All code, data pipelines, and experiment
+scripts are released for reproducibility.
+
+Kubernetes
+scheduler
+plugins
+that
+score
+candidate nodes are,
+in production,
+handtuned
+heuristics
+(NodeResourcesFit,
+NodeResourcesBalancedAllocation) [1].
+We ask
+whether a learned scoring function — trained on real
+placement decisions from a production cluster trace —
+can match or exceed these heuristics, and if not, why.
+We implement AIScore, an external HTTP-backed
+Score plugin for the kube-scheduler-simulator,
+and evaluate two learned models (a Random Forest
+over engineered features, and a GraphSAGE-based
+encoder [2] over per-job task-dependency graphs)
+trained on the Alibaba Cluster Trace v2018 [3].
+Using standard regression fit (R²), both models show
+modest but monotonically improving quality across
+four feature-engineering iterations, culminating at
+R² ≈ 0.042. However, when we instead evaluate
+the models on the metric that actually matters for
+scheduling — Top-1 ranking accuracy, i.e., whether
+the model assigns the highest score to the machine
+the production scheduler (Fuxi) actually chose —
+both learned models are outperformed by a trivial
+single-feature heuristic (rank by free CPU: 74–84%
+accuracy vs. 65–66% for either learned model). We
+show this gap is best explained by an objective
+mismatch: both models were trained with pointwise
+regression (MSE) rather than a ranking-specific
+objective, echoing a long-standing distinction in the
+learning-to-rank literature [4, 5]. This result closely
+parallels prior evidence that learned, RL-trained
+schedulers such as Decima [6] and DeepRM [7] can
+substantially outperform heuristics when the training
+objective is aligned with the deployment task, and suggests that objective misalignment — not architecture
+— is the primary obstacle in our setting. We further
+report a systematic ablation of the resource-occupancy
+reconstruction required to make offline trace data
+usable at all (naive features yield R² ≈ 0), a controlled
+comparison between the Random Forest and GNN
+models isolating the effect of feature richness and data
+volume, and a production-oriented sensitivity analysis
+of inference latency and serving-container memory
+
+Keywords: Kubernetes scheduler; machine learning
+for systems; learning to rank; cluster trace analysis;
+Random Forest; graph neural networks; ranking accuracy vs. regression fit; production cluster scheduling;
+scheduling framework score plugin; reproducible systems research.
+
+1.Introduction
+Kubernetes’ default scheduler ranks feasible nodes
+for each pod using a weighted sum of plugin scores,
+each implementing a hand-designed heuristic [1].
+NodeResourcesBalancedAllocation, for instance, favors nodes where CPU and memory utilization are similar after placement — a reasonable, general-purpose
+rule, but one fixed at the time the plugin was written,
+blind to workload-specific or cluster-specific patterns
+that a learned model might exploit.
+This raises a natural question, revisited periodically
+in the systems literature — from flow-based optimal schedulers like Firmament [8] to learned, DAGaware schedulers like Decima [6] (Section 2): can a
+model trained on historical placement data do better? We investigate this question empirically, using kube-scheduler-simulator (kubernetes-sigs) as
+a lightweight, reproducible testbed, and the Alibaba
+Cluster Trace v2018 [3] as a source of real production
+placement decisions.
+Our investigation proceeds in four stages, each motivated by the failure or limitation of the previous one:
+1. We first validate the experimental pipeline on synthetic data (Section 4.1), confirming a custom
+ScorePlugin can be wired into the simulator and
+meaningfully affect placement.
+2. We train a Random Forest on real trace data, discovering that a naive feature construction is uninformative by construction (R² ≈ 0) unless node occupancy is reconstructed at the correct point in time
+via a sweep-line algorithm (Section 4.2). Four subsequent feature-engineering refinements each yield
+1
+
+measurable, monotonic improvement.
+3. We build a graph-structured alternative (GraphSAGE [2] over per-job DAGs) to test whether the
+full dependency structure — not just aggregate
+degree statistics — carries additional signal (Section 4.3).
+4. Critically, we discover that the standard regression
+metric (R²) used in Stages 2–3 does not correlate with what actually matters for scheduling: whether the model ranks the real chosen machine above its competitors. Under a Top-1 ranking
+evaluation, both learned models lose to a one-line
+heuristic (Section 4.4) — a result that reframes the
+entire comparison and, we argue, is itself a transferable methodological lesson for ML-for-systems work.
+
+of several widely-used centralized and distributed
+schedulers, and was later integrated with Kubernetes
+as the Poseidon-Firmament scheduler. Firmament
+represents the high-quality-optimization end of the
+design space our single-HTTP-call AIScore plugin sits
+at the opposite (low-latency, per-node-scoring) end
+of. More recently, Pollux [12] co-adaptively tunes
+both per-job training configuration and cluster-wide
+resource allocation for deep-learning workloads using
+a “goodput” objective combining throughput and
+statistical efficiency, reporting 37–50% reductions in
+average job completion time over prior DL-cluster
+schedulers — a further data point that objective
+design, not just model architecture, drives the gains
+reported by learned schedulers. Two recent surveys
+— Rejiba and Chamanara [13] on custom Kubernetes
+We close with a production-facing sensitivity analysis
+scheduling broadly, and Senjab et al. [14] specifically
+(latency, memory) that is largely orthogonal to model
+on Kubernetes scheduling algorithms including AIquality, but necessary for any deployment discussion
+focused approaches — position our narrower, empirical
+(Sections 4.5–4.7).
+contribution (an explicit R²-vs-ranking-accuracy comparison on one plugin) against the wider landscape of
+Contributions:
+proposed Kubernetes scheduler modifications.
+• An open-source, reproducible pipeline for training
+and evaluating custom Kubernetes scheduler score
+2.2.Learned Schedulers
+plugins against a real production trace, including
+the (non-obvious) occupancy-reconstruction step re- The most directly related prior work is Decima [6],
+quired to make the trace usable at all.
+which trains a graph neural network to embed job de• An empirical demonstration that regression-based pendency DAGs and feeds the resulting representation
+training metrics can be systematically misleading into a reinforcement-learning policy that jointly decides
+for scheduling-relevant ranking quality, with a con- which job to schedule next and how much parallelism to
+trolled comparison isolating this effect from feature grant it, reporting at least 21% improvement in average
+quality and model capacity.
+job completion time over hand-tuned heuristics on a 25• A controlled Random-Forest-vs-GNN comparison node Spark cluster. Our GNN prototype (Sections 4.3)
+that disentangles architecture from data volume and uses the same high-level idea — a graph encoder over
+feature richness — a confound we argue is under- job DAGs — but in a narrower role (scoring individexamined in prior comparisons of this kind.
+ual node–task pairs for a ScorePlugin, rather than
+• Production-sensitivity measurements (inference la- jointly deciding scheduling order and resource allocatency overhead, memory-constraint robustness) for tion via RL) and evaluates it specifically against the
+an HTTP-served ML scoring plugin, of independent ranking metric that governs deployment behavior (Secpractical interest for anyone deploying similar archi- tion 4.4), a comparison we are not aware of being made
+tectures.
+explicit in prior learned-scheduler evaluations. Earlier RL-based resource managers such as DeepRM [7]
+established that policy-gradient RL can outperform
+2.Related Work
+heuristics like Shortest-Job-First and Tetris on synthetic packing workloads, predating Decima’s DAG2.1.Cluster Scheduling Architectures
+aware extension. RLScheduler [9] extends this line
+Kubernetes’ scheduler exposes an extensible frame- of work to HPC batch scheduling, using a kernelwork of filter and score plugins (NodeResourcesFit, based neural network and trajectory filtering to learn
+NodeResourcesBalancedAllocation,
+scheduling policies directly from trial and error, withTaintToleration, etc.), each a hand-designed out hand-designed priority functions, and reports staheuristic, formalized in the upstream Scheduling ble performance even on unseen workloads — reinforcFramework design proposal [1]; AIScore (Section 3) ing that RL-trained (rather than pointwise-regressionis implemented as one such drop-in plugin rather trained) schedulers are the setting in which learned apthan a scheduler replacement.
+Two influential proaches have most convincingly outperformed heurisnon-learned cluster schedulers are relevant context: tics to date. Closer to our GNN prototype’s architecFirmament [8] reduces placement to a min-cost tural choice, Zhao et al. [15] use a graph neural netmax-flow optimization over a flow network, achiev- work directly for distributed scheduling decisions, ening sub-second placement at 10,000+-machine scale coding jobs and machines as distinct node types — a
+while matching or exceeding the placement quality design pattern our per-task GraphSAGE encoder (Sec2
+
+tion 3) shares, though applied here to per-candidate
+scoring rather than joint distributed decision-making.
+Lyra [16] more recently demonstrates that elastic,
+GPU-sharing-aware scheduling for deep-learning clusters can substantially improve cluster-wide GPU utilization, further illustrating the breadth of scheduling
+sub-problems (beyond the single-node-scoring problem
+we study) to which learned or adaptive techniques have
+been successfully applied.
+
+loop, we evaluate directly against real historical placement decisions from a production scheduler (Fuxi)
+recorded in a public trace, isolating the supervisedlearning question of whether a model can reproduce
+those decisions before any RL-based sequencing or
+resource-allocation logic is layered on top; (b) we explicitly and quantitatively demonstrate the gap between a standard regression-fit metric (R²) and ranking
+accuracy on the same models and data — a distinction
+implicit in the learning-to-rank literature [4, 5] but, to
+our knowledge, not previously demonstrated as a con2.3.Cluster Traces for Scheduling Research
+crete pitfall in the ML-for-scheduling context; and (c)
+We use the Alibaba Cluster Trace v2018 our sweep-line occupancy-reconstruction methodology
+(alibaba/clusterdata) [3], one of a series of pro- (Section 3), needed to make the trace’s static snapshots
+duction traces Alibaba has released for cluster- usable for training at all, may be a reusable recipe for
+management research. The Google Cluster Trace other researchers working with the same or structurally
+family (2011 and 2019 releases) [10,11] is the other ma- similar traces.
+jor public trace lineage used in this line of research; the
+2019 release extends coverage to eight clusters and enables direct comparison of scheduling behavior across 3.Methodology
+Borg deployments, complementing the single-cluster,
+batch-scheduler-focused view of the Alibaba trace we 3.1.Environment
+use here.
+All experiments run on kube-scheduler-simulator
+
+(kubernetes-sigs), deployed via Docker Compose with
+KWOK providing a lightweight kube-apiserver/kubelet
+emulation. We implement a custom ScorePlugin,
+AIScore, registered into the simulator’s debuggable
+scheduler via debuggablescheduler.WithPlugin,
+consistent with the extensible plugin design described
+in the Kubernetes Scheduling Framework proposal [1].
+On every Score() invocation the plugin performs
+a synchronous HTTP POST to an external Python
+(FastAPI) inference service, carrying node- and podlevel features, and receives back an integer score in [0,
+100].
+
+2.4.Learning-to-Rank
+Our diagnosis in Section 4.4 — that a model trained
+via pointwise regression can underperform on a ranking task it is not directly optimized for — echoes a
+foundational distinction in the learning-to-rank literature. RankNet [4] first framed relevance ordering
+as a pairwise classification problem trained via crossentropy on score differences, rather than pointwise regression to an absolute relevance label; LambdaRank
+and LambdaMART, surveyed in [5], further shape gradients directly by the ranking-metric impact of swapping a given pair, rather than by a smooth pointwise
+loss. Our proposed next step (Section 7) — retraining
+with a pairwise margin loss — is a direct application
+of this pairwise framing to the scheduling-placement
+setting, which, to our knowledge, is not standard practice in the learned-scheduler literature reviewed above
+(Decima and DeepRM both use RL rather than a supervised ranking loss).
+
+3.2.Data Source
+
+We use the Alibaba Cluster Trace v2018
+(alibaba/clusterdata) [3], covering ∼4000 machines
+over an 8-day window, including batch task/instance
+placement decisions made by Alibaba’s production
+Fuxi scheduler. Four tables are used: machine_meta,
+machine_usage, batch_task, batch_instance. Per
+the trace’s documented schema, CPU fields use a “100
+2.5.GNNs for Systems Problems
+units = 1 core” convention (converted to milliCPU via
+Beyond Decima’s use of a GNN for job-DAG embed- ×10); memory fields are normalized to [0, 100] relative
+ding, graph neural networks such as GraphSAGE [2] to an undisclosed reference and are used in this norhave been applied to a range of adjacent systems prob- malized form throughout, since absolute byte values
+lems where the input is naturally graph-structured, cannot be recovered.
+motivating the DAG-encoder design used in Sections 4.3 of this paper.
+3.3.Label Construction as Learning-to-Rank
+The trace records only the machine actually selected
+for each instance, not scores for the alternatives Fuxi
+considered. We frame training as learning to rank,
+in the spirit of [4, 5]: the chosen machine is a positive
+example (label 100); other resource-feasible machines
+available at the same historical timestamp are nega-
+
+2.6.Positioning
+Relative to this body of work, we see this paper’s contribution as threefold: (a) unlike Decima and DeepRM,
+which are evaluated via simulated or live-cluster jobcompletion-time improvements under an RL training
+3
+
+tive examples (label 20), restricted (in later iterations)
+to the same failure domain as the chosen machine, to
+better approximate Fuxi’s plausible candidate set.
+
+uled, OOM kills) under artificial network delay and
+memory constraints.
+
+4.Results
+
+3.4.Occupancy Reconstruction
+
+4.1.Sanity Check: Synthetic Workload
+
+Free node capacity must reflect actual concurrent occupancy at an instance’s start time — not simply (allocatable − this instance’s own request). We verified this is not optional: the naive approximation
+produced a model indistinguishable from noise (R²
+≈ 0; Section 4.2). We reconstruct true occupancy via
+a sweep-line algorithm: occupancy-change events
+(+request at start, −request at end) are built per
+instance–machine pair, sorted by time, and cumulatively summed per machine; a query at any historical
+timestamp is served via pandas.merge_asof.
+
+Before using real trace data, we validate the plugin
+pipeline end-to-end: AIScore, trained on a synthetic
+label penalizing post-placement CPU/memory imbalance, is compared against the scheduler with AIScore
+disabled (default plugins only) on a controlled workload (5 profiles × 8 instances = 40 pods, 3 heterogeneous nodes).
+Table 1: Synthetic workload: balancing stddev comparison.
+
+3.5.Models
+• Random Forest (scikit-learn, 150 trees, max
+depth 10) over a flat feature vector: reconstructed
+free CPU/memory, requested CPU/memory, failuredomain identifiers, and (in later iterations) DAGderived features (in-degree, out-degree, job width,
+root/leaf indicators) parsed from the trace’s documented task-naming convention.
+• GNN prototype: a 2-layer GraphSAGE [2] encoder producing per-task embeddings from a job’s
+dependency graph (nodes = tasks, edges = dependencies parsed from task_name), combined via a 3layer MLP with the same machine-level features used
+by the Random Forest. This follows the general
+graph-encoder design used for job DAGs by Decima [6], applied here to a per-candidate scoring role
+rather than an RL policy.
+
+Metric
+
+Baseline
+
+AIScore
+
+CPU utilization, stddev
+Memory utilization, stddev
+
+4.54%
+4.56%
+
+4.87%
+5.13%
+
+This is single run: the small baseline advantage is expected, since the synthetic label imitates rather than
+improves upon the target heuristic.
+This confirms the plugin and benchmark harness function correctly and can detect meaningful (if small) differences in placement quality.
+4.2.Random Forest on Real Trace Data: Feature
+Ablation
+We evaluate four progressively refined training configurations, each addressing a specific limitation identified
+in the previous one:
+
+3.6.Evaluation Metrics
+
+Table 2: Random Forest feature ablation results.
+
+• R² on the held-out regression task (both models
+trained via MSE against the 100/20 label scheme),
+reported for comparability with standard ML practice.
+• Top-1 ranking accuracy: for each group of one
+positive and up to three negative candidates sharing
+a group_id, whether the model assigns the positive
+example the highest score in its group — the metric
+that directly answers “would the model reproduce
+Fuxi’s decision.”
+• Synthetic
+load-balancing
+benchmark:
+standard-deviation of per-node CPU/memory
+utilization across a controlled workload (5 pod-size
+profiles, 3 heterogeneous nodes), used both as an
+independent sanity check (Section 4.1) and to characterize homogeneous-vs-heterogeneous workload
+sensitivity (Section 4.7).
+• Operational metrics: HTTP round-trip inference latency (measured inside the Go plugin via
+time.Since()), and container behavior (pods sched-
+
+Variant
+A
+
+B
+
+C
+
+D
+
+4
+
+Change
+Uniformrandom negative sampling;
+flat
+resource
+features only
++
+failuredomain identifiers as features
+Negative sampling restricted
+to chosen machine’s failure
+domain
++
+DAGderived
+features
+(in/out-degree,
+job
+width,
+root/leaf)
+
+Train R²
+
+Test R²
+
+0.0250
+
+0.0249
+
+0.0289
+
+0.0285
+
+0.0331
+
+0.0327
+
+0.0420
+
+0.0415
+
+group, does the model’s highest score fall on the positive (chosen) machine? We compare against two baselines — a random score, and a one-line heuristic ranking candidates purely by reconstructed free CPU.
+
+Random Forest, trained on ∼2.9M positive examples.
+These come from a 3M-row sample of batch_instance
+(after cleaning, ∼2.94M valid records remained), joined
+against the full batch_task table for job/DAG metadata. job width ranked 2nd in feature importance
+(0.170).
+
+Table 4: Top-1 ranking accuracy comparison.
+
+A naive occupancy approximation (allocatable − this
+instance’s own request, ignoring concurrently running
+instances) was tested prior to Variant A and produced
+R² ≈ 0 for both train and test splits — the positive and
+negative examples were statistically indistinguishable
+given that feature construction. This motivates the
+sweep-line reconstruction described in Section 3 as a
+necessary, not optional, step.
+Feature importances for Variant D place job_width
+(the number of tasks in the parent job) second overall (0.170), ahead of node_free_mem (0.112) — a
+cheap, purely structural feature that required no occupancy reconstruction at all, unexpectedly rivaling the
+resource-based features that motivated most of the engineering effort.
+
+Method
+
+RF
+GNN
+dataset dataset
+(n≈2.9M)(n≈72.7K)
+
+Random baseline
+Max free CPU (heuristic)
+Random Forest, Variant D
+GNN prototype
+
+25.2%
+74.0%
+65.4%
+—
+
+25.3%
+84.3%
+—
+65.8%
+
+Neither learned model beats the trivial heuristic. The
+two datasets differ in size and coverage, so heuristic
+accuracy is not directly comparable across the two
+columns, but the model-vs-heuristic comparison within
+each column is valid.
+
+4.3.Graph Neural Network: Full DAG Structure vs. Aggregate Statistics
+
+Two findings follow from this table:
+
+To test whether the full dependency graph carries sig- 1. Both learned models lose to the heuristic, on
+nal beyond the aggregate degree statistics of Variant D,
+their respective datasets, by a wide margin (8.6 and
+we parse task_name into an explicit edge list per job
+18.5 percentage points respectively). Given that re(rather than only degree counts) and train a Graphconstructed free CPU is also the dominant feature
+SAGE [2] encoder. From a 500K-row batch_task samby importance in the Random Forest (Section 4.2),
+ple, 71,124 job graphs were constructed (2–127 tasks
+this suggests Fuxi’s real decisions are substantially
+per job, median 3).
+explained by a CPU-availability signal that a handwritten rule captures more directly than a model
+Table 3: GNN vs. Random Forest regression perfortrained to regress toward an arbitrary numeric lamance.
+bel.
+2. The Random Forest and GNN achieve nearModel
+R²
+identical Top-1 accuracy (65.4% vs. 65.8%)
+despite the ∼40× data-volume and featureRandom Forest, Variant D
+0.0420
+richness gap. Read together with Section 4.3,
+GNN prototype (5 epochs) 0.021–0.028
+this reframes the earlier R² comparison: the GNN’s
+apparently weaker fit is plausibly an artifact of
+the sample-size and feature asymmetry between the
+The GNN was trained on 72,734 positive examples —
+two pipelines, not evidence of an architectural disroughly 40× fewer than Variant D — using only 2
+advantage — the two models appear comparably
+node features (plan_cpu, plan_mem) versus the Ran(in)effective once evaluated on the metric that matdom Forest’s 11 engineered features.
+ters.
+Taken at face value, this suggests the GNN underperforms. Section 4.4 shows this comparison is con- We attribute the shared shortfall to an objective mismatch: both models are trained with pointwise MSE
+founded.
+regression toward the 100/20 label, which does not di4.4.The Metric That Matters: Top-1 Ranking rectly optimize the within-group relative ordering that
+Top-1 accuracy measures. This is consistent with the
+Accuracy
+learning-to-rank literature’s long-standing observation
+R² measures fit to the arbitrary 100/20 label scheme, that pointwise regression objectives are a poor proxy
+not whether the model would reproduce Fuxi’s actual for ranking quality [4, 5]. A ranking-specific objective
+decision among the real candidates it faced. We com- (e.g., pairwise margin loss) is the natural next step
+pute Top-1 accuracy directly: for each candidate (Section 7).
+5
+
+likely garbage-collection pauses under memory pressure) rather than binary (crash/no-crash), with a clear
+inflection between 170MB and 150MB.
+
+4.5.Overhead and Latency Sensitivity
+
+We instrument the plugin with wall-clock timing
+around the HTTP call to the scoring service, and separately inject artificial delay into the service itself, to
+characterize production-relevant overhead independent 4.7.Homogeneous vs. Heterogeneous Workload
+of model quality.
+Finally, we isolate the effect of workload composition
+on balancing quality, independent of the scoring model:
+Table 5: Latency sensitivity under injected delay.
+a homogeneous workload (40 identical medium pods)
+versus the heterogeneous workload used elsewhere (5
+Injected Bench Pods
+Latency Latency
+mixed profiles).
+delay
+mark
+sched- mean
+p95
+run
+uled
+Table 7: Homogeneous vs. heterogeneous workload
+time
+balancing.
+0ms
+50ms
+100ms
+500ms
+1500ms
+
+31.2s
+31.2s
+31.6s
+42.7s
+81.1s
+
+40/40
+40/40
+40/40
+40/40
+40/40
+
+7.8ms
+10.4ms
+59.0ms 62.3ms
+108.9ms 111.7ms
+508.8ms 511.9ms
+1508.8ms 1513.1ms
+
+A fixed ∼8–9ms overhead (JSON serialization plus
+Docker-internal network round-trip) is added on top
+of the injected delay, independent of its magnitude.
+All 40 pods scheduled successfully at every tested delay; the plugin’s 2-second HTTP timeout was never
+triggered, leaving only a ∼25% safety margin at the
+highest tested delay.
+
+Workload
+
+ScheduledCPU
+(mean
+/stddev)
+
+Memory
+(mean
+/stddev)
+
+Homogeneous
+
+40/40
+
+Heterogeneous
+
+40/40
+
+41.7% /
+1.30%
+60.2% /
+8.93%
+
+41.7%/
+1.30%
+60.8%/
+9.01%
+
+Balancing stddev under the homogeneous workload is
+nearly 7× tighter than under the heterogeneous one.
+
+Notably, this ∼7.7-point stddev gap between workload
+4.6.Sensitivity to Serving-Container Memory types dwarfs the ∼0.3–0.6-point gap observed between
+baseline and AIScore scheduling in Section 4.1 — a
+Constraints
+caution against attributing observed balancing differWe separately constrain the scoring service’s container ences primarily to the scoring algorithm without conmemory (via Docker mem_limit) from 400MB down to trolling for workload composition.
+120MB — below the measured idle baseline of 160.8MB
+— while re-running the same 40-pod benchmark on a
+5.Discussion
+freshly recreated cluster at each limit.
+Regression fit is not a proxy for scheduling quality. The central empirical result of this paper (Section 4.4) is that R², the metric used throughout SecMemory Pods
+OOM
+Latency Latency
+tions 4.2–4.3 to guide feature engineering, is a poor prelimit
+sched- killed
+mean
+p95
+dictor of the metric that actually governs deployment
+uled
+behavior. A model can show monotonically improving
+R² across four increasingly sophisticated feature sets
+400MB 40/40
+No
+∼7.9ms ∼10.2ms
+(Section 4.2) while still losing to a one-line heuristic on
+250MB 40/40
+No
+∼7.9ms ∼10.2ms
+the ranking task the scheduler actually performs. This
+200MB 40/40
+No
+∼7.9ms ∼10.3ms
+mirrors the classical learning-to-rank critique of point170MB 40/40
+No
+∼7.8ms ∼11.6ms
+wise objectives [4, 5], now demonstrated concretely in
+150MB 40/40
+No
+∼20.9ms ∼13.3ms
+the ML-for-scheduling context. We consider this the
+120MB 40/40
+No
+∼33.0ms ∼14.7ms
+paper’s primary transferable lesson for ML-for-systems
+practitioners: when the deployed decision is a rankAveraged across two independent runs; separately con- ing/selection among candidates, evaluation should tarfirmed via continuous monitoring that the container get ranking metrics from the outset, not late in the
+operated at ∼100% of the 120MB limit during load, pipeline.
+with zero OOM kills.
+Architecture comparisons can be confounded by
+The service remains fully functional at every tested resourcing, not capability. The apparent Randomlimit, including 120MB — below its own idle foot- Forest-over-GNN advantage in Section 4.3 (R² 0.042
+print. Degradation is graceful (rising mean latency, vs. 0.021–0.028) evaporates once both models are
+Table 6: Memory constraint sensitivity.
+
+6
+
+evaluated on Top-1 accuracy with awareness of their • Memory-related features remain in Alibaba’s norrespective data budgets (Section 4.4) — the GNN
+malized [0,100] scale; absolute byte values are not
+achieves comparable ranking quality on ∼40× less data
+recoverable from the trace, limiting direct comparaand a far poorer feature set. We do not claim the
+bility to the synthetic experiments’ byte-based feaGNN is better, only that the earlier comparison was not
+tures.
+apples-to-apples, and caution against drawing architec- • pod_priority was not extracted from the real trace
+tural conclusions from R² comparisons across pipelines
+in any configuration.
+with materially different data volumes.
+• The GNN (Sections 4.3–4.4) used a smaller data
+sample and a substantially simpler node-feature set
+A cheap structural feature rivaled expensive
+than the Random Forest, as discussed in Section 5;
+resource-reconstruction features. job_width —
+this asymmetry is itself a finding but also limits the
+free to compute, requiring none of the sweep-line ocstrength of any architecture-level claim.
+cupancy machinery — ranked second in feature im- • Both models were trained with a pointwise regression
+portance, ahead of a resource feature that took subobjective; the central diagnosis in Section 4.4 has
+stantial engineering effort to construct correctly (Secnot yet been validated by retraining with an explicit
+tion 4.2). This suggests structural/job-level metadata
+ranking loss (proposed as future work, Section 7).
+deserves earlier and more thorough exploration in fu- • Sensitivity analyses (Sections 4.5–4.6) used a fixed,
+ture scheduling-ML work, potentially before investing
+modest workload (3 nodes, 40 pods); behavior under
+in fine-grained resource-state reconstruction.
+concurrent, production-scale request volume (many
+simultaneous Score() calls) was not tested.
+Production-facing robustness was better than
+•
+All
+experiments use a single trace (Alibaba Cluster
+expected. Both latency injection (up to 1.5s) and
+Trace
+v2018 [3]); generalization to other clusters/memory constraint (down to 120MB, below idle foottraces
+such as the Google Cluster Trace [10, 11] is
+print) produced graceful degradation rather than outuntested.
+right failure (Sections 4.5–4.6). This is a reassuring,
+if secondary, finding for anyone considering an HTTPserved ML scoring plugin in a real deployment, though 7.Conclusion and Future Work
+it was tested only at a single, modest cluster/workload
+scale.
+We built and evaluated AIScore, a learned Kubernetes
+scheduler score plugin, across a progression from synRelative to Decima [6] and DeepRM [7], our findthetic validation to real-trace training to a rigorous
+ing is not that graph-structured or learned representaranking-based evaluation. Our central finding is negtions are unhelpful for scheduling — Decima’s reported
+ative but instructive: despite substantial feature engigains over heuristics are substantial, and RLSchedneering (occupancy reconstruction, failure-domain feauler [9] similarly shows learned policies outperformtures, DAG-derived structural features) and a second
+ing heuristic priority functions in HPC batch schedulmodel architecture (a GraphSAGE-based GNN [2]),
+ing — but that isolating the supervised sub-problem
+neither learned model surpasses a trivial “rank by free
+(would a model reproduce a given historical decision?)
+CPU” heuristic on the metric that actually reflects
+from the RL training loop these systems use reveals a
+scheduling quality — Top-1 ranking accuracy — even
+metric-selection pitfall that an end-to-end RL evaluathough both show improving fit under the standard
+tion, reporting only downstream job-completion-time
+regression metric (R²). We attribute this to a misimprovements, would not surface directly. Decima and
+match between the pointwise regression training objecDeepRM optimize an RL reward tied directly to jobtive and the ranking-style deployment decision, consiscompletion time, sidestepping the pointwise-regression
+tent with the learning-to-rank literature [4,5] and with
+pitfall we identify by construction — a plausible reason
+the RL-based successes of Decima [6], DeepRM [7], and
+their reported gains over heuristics are more favorable
+RLScheduler [9], which sidestep this pitfall by optimizthan ours, and indirect support for our proposed fix
+ing an objective tied to the deployment outcome rather
+(Section 7) of adopting a ranking- or reward-aligned
+than to an arbitrary pointwise label.
+objective rather than pointwise MSE.
+Immediate next steps, several already scoped during
+this project:
+
+6.Threats to Validity
+
+1. Retrain both models with a ranking-specific
+• Single run per synthetic configuration (Section 4.1)
+loss (e.g., pairwise margin ranking, following
+and per parameter value in the sensitivity analyses
+RankNet/LambdaMART [4, 5]) to directly test
+(Sections 4.5–4.6); no confidence intervals from rewhether closing the objective mismatch closes the
+peated trials.
+gap to the heuristic.
+• Domain-restricted negative sampling (Section 3) is a 2. Re-run the Random-Forest-vs-GNN comparheuristic approximation of Fuxi’s true candidate set
+ison at matched data volume and feature
+at decision time, not verified ground truth.
+richness, to obtain an architecture comparison un7
+
+confounded by the asymmetries noted in Section 5.
+3. Investigate the job_width finding directly
+(e.g., stratifying by job-width buckets) to understand the underlying placement pattern it captures,
+and to inform reward design for an eventual RLbased scheduler.
+4. Extend the deep experimental evaluation
+with an oracle baseline (post-hoc optimal placement via a combinatorial solver), a makespan metric, dynamic/wave-arrival workloads replaying real
+trace timestamps, and node-failure injection —
+components scoped but not yet executed in this
+project.
+5. Repeat key experiments with confidence intervals across multiple random seeds, and validate
+findings against a second cluster trace such as the
+Google Cluster Trace [10, 11].
+
+# Homogeneous vs. heterogeneous
+workload (Section 4.7)
+python3 benchmark/run_benchmark.py
+--label homogeneous_medium --n 8
+--homogeneous medium
+python3 benchmark/run_benchmark.py
+--label heterogeneous_mixed --n 8
+python3 benchmark/run_benchmark.py
+--compare homogeneous_medium
+heterogeneous_mixed
+
+All code — the plugin, training pipelines, evaluation scripts, and sensitivity-analysis harnesses — is
+publicly available at https://github.com/1901asyl/
+aiscore-scheduler (commit ab53a9f).
+
+References
+
+All code — the plugin, training pipelines, evaluation
+scripts, and sensitivity-analysis harnesses — is available for reproduction in the accompanying artifact
+repository.
+
+[1] Kubernetes
+Enhancements
+SIG-Scheduling.
+Scheduling Framework KEP [Electronic resource]
+//
+GitHub,
+kubernetes/enhancements repository. — 2018. — URL: https:
+//github.com/kubernetes/enhancements/
+blob/master/keps/sig-scheduling/
+624-scheduling-framework/README.md
+(accessed: 05.08.2026).
+
+Appendix: Reproducibility
+Data
+source:
+Alibaba
+Cluster
+Trace
+v2018,
+alibaba/clusterdata
+repository
+(cluster-trace-v2018) [3].
+
+[2] Hamilton W. Inductive Representation Learning
+on Large Graphs / W. Hamilton, Z. Ying, J.
+Leskovec // Advances in Neural Information Processing Systems (NeurIPS). — 2017. — P. 1024–
+1034.
+
+git clone
+https://github.com/1901asyl/aiscore-scheduler
+cd aiscore-scheduler
+
+[3] Alibaba. Cluster Trace v2018 [Electronic resource]
+// GitHub, alibaba/clusterdata repository. —
+2018. — URL: https://github.com/alibaba/
+clusterdata (accessed: 05.08.2026).
+
+# Synthetic sanity check (Section 4.1)
+python3 benchmark/run_benchmark.py
+--label baseline2 --n 8
+python3 benchmark/run_benchmark.py
+--label aiscore2 --n 8
+python3 benchmark/run_benchmark.py
+--compare baseline2 aiscore2
+
+[4] Burges C. Learning to Rank Using Gradient Descent / C. Burges, T. Shaked, E. Renshaw, et al.
+// Proceedings of the 22nd International Conference on Machine Learning (ICML). — 2005. — P.
+89–96.
+
+# Random Forest on real trace (Section
+4.2)
+python3 data/build_training_set.py
+python3 ml-server/train.py
+
+[5] Burges C.J.C. From RankNet to LambdaRank to
+LambdaMART: An Overview: Technical Report
+MSR-TR-2010-82. — Redmond: Microsoft Research, 2010. — 19 p.
+
+# GNN prototype (Section 4.3)
+python3 data/build_job_graphs.py
+python3 data/build_training_set_gnn.py
+python3 ml-server/train_gnn.py
+
+[6] Mao H. Learning Scheduling Algorithms for Data
+Processing Clusters / H. Mao, M. Schwarzkopf,
+S.B. Venkatakrishnan, Z. Meng, M. Alizadeh //
+Proceedings of the ACM Special Interest Group on
+Data Communication Conference (SIGCOMM).
+— 2019. — P. 270–288.
+
+# Ranking evaluation (Section 4.4)
+python3 data/evaluate_ranking.py
+python3 data/evaluate_ranking_gnn.py
+# Latency sensitivity (Section 4.5)
+bash run_latency_experiment.sh
+
+[7] Mao H. Resource Management with Deep Reinforcement Learning / H. Mao, M. Alizadeh, I.
+Menache, S. Kandula // Proceedings of the 15th
+ACM Workshop on Hot Topics in Networks (HotNets). — 2016. — P. 50–56.
+
+# Memory sensitivity (Section 4.6)
+bash run_memory_experiment.sh
+
+8
+
+[8] Gog I. Firmament: Fast, Centralized Cluster
+Scheduling at Scale / I. Gog, M. Schwarzkopf, A.
+Gleave, R.N.M. Watson, S. Hand // Proceedings
+of the 12th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI). —
+2016. — P. 153–167.
+[9] Zhang D. RLScheduler: An Automated HPC
+Batch Job Scheduler Using Reinforcement Learning / D. Zhang, D. Dai, Y. He, F.S. Bao, B.
+Xie // Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis (SC). — 2020. —
+arXiv:1910.08925.
+[10] Reiss C. Google Cluster-Usage Traces: Format +
+Schema: Technical Report / C. Reiss, J. Wilkes,
+J.L. Hellerstein. — Mountain View: Google Inc.,
+2011. — 14 p.
+[11] Tirmazi M. Borg: The Next Generation / M. Tirmazi, A. Barker, N. Deng, M.E. Haque, et al. //
+Proceedings of the Fifteenth European Conference
+on Computer Systems (EuroSys). — 2020. — P.
+1–14.
+[12] Qiao A. Pollux: Co-adaptive Cluster Scheduling
+for Goodput-Optimized Deep Learning / A. Qiao,
+S.K. Choe, S.J. Subramanya, W. Neiswanger,
+Q. Ho, H. Zhang, G.R. Ganger, E.P. Xing //
+Proceedings of the 15th USENIX Symposium on
+Operating Systems Design and Implementation
+(OSDI). — 2021. — P. 1–18.
+[13] Rejiba Z. Custom scheduling in Kubernetes: A
+survey on common problems and solution approaches / Z. Rejiba, J. Chamanara // ACM
+Computing Surveys. — 2022. — Vol. 55, № 7, Article 151. — P. 1–37.
+[14] Senjab K. A survey of Kubernetes scheduling algorithms / K. Senjab, S. Abbas, N. Ahmed, A.U.R.
+Khan // Journal of Cloud Computing. — 2023. —
+Vol. 12, № 1, Article 87. — 20 p.
+[15] Zhao Z. Distributed scheduling using graph neural
+networks / Z. Zhao, G. Verma, C. Rao, A. Swami,
+S. Segarra // Proceedings of the IEEE International Conference on Acoustics, Speech and Signal
+Processing (ICASSP). — 2021. — P. 4720–4724.
+[16] Li J. Lyra: Elastic scheduling for deep learning
+clusters / J. Li, H. Xu, Y. Zhu, Z. Liu, C. Guo, C.
+Wang // Proceedings of the Eighteenth European
+Conference on Computer Systems (EuroSys). —
+2023. — P. 835–850.
+
+9
+

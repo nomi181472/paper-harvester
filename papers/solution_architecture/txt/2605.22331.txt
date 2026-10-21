@@ -1,0 +1,630 @@
+SepsisAI Orchestrator: A Containerized and Scalable Platform
+for Deploying AI Models and Real-Time Monitoring in Early
+Sepsis Detection
+Santiago Ospitia1
+John Sanabria1
+John García-Henao2,3
+
+arXiv:2605.22331v1 [cs.LG] 21 May 2026
+
+1
+
+School of Systems Engineering and Computing, University of Valle, Cali, Colombia
+2
+Digital Medicine Unit, Balgrist University Hospital, Zurich, Switzerland
+3
+Nucleus-AI Research, Medellin, Colombia
+
+Abstract
+Despite strong predictive results in the clinical machine learning literature, the translation of these models into bedside use remains limited by systems-level barriers: heterogeneous data representations, the absence of standardized deployment workflows, and a mismatch between research prototypes and the concurrency and latency requirements of hospital
+environments. We present the SepsisAI-Orchestrator, an open-source modular platform that
+addresses this deployment gap for early sepsis detection. The platform integrates HL7 FHIRinspired Clinical Document Architecture (CDA) preprocessing, NoSQL storage, a containerized LightGBM classifier served via REST APIs, and a Streamlit clinical dashboard, orchestrated with Docker and Kubernetes. A previously validated LightGBM model (F1 0.87-0.94
+on PhysioNet 2019) is reused without modification; the contribution lies in the surrounding
+infrastructure and its empirical characterization under load. Using k6 with 50-1000 concurrent virtual users, we find that replica count must be matched to the physical CPU thread
+count of the host: scaling from 3 to 12 replicas on a 12-thread CPU reduces p95 latency from
+3.3 s to 1.41 s (57.3 % reduction) and eliminates all request failures, while over-provisioning
+to 24 or 48 replicas degrades performance due to scheduler contention. To our knowledge
+this U-shaped scaling behavior has not been quantified previously for clinical AI inference
+workloads. We do not claim prospective clinical validation. Source code and deployment
+manifests are available at https://github.com/nucleusai/sepsisai-orchestrator.
+
+Keywords: Sepsis detection, clinical decision support, MLOps, horizontal scaling, Kubernetes, containerization, HL7 FHIR, LightGBM.
+
+1
+
+Introduction
+
+Despite a decade of strong predictive results in the clinical machine learning literature, the gap
+between published models and bedside deployment remains wide, and the bottleneck is increasingly recognized as systems-level rather than algorithmic Mitchell et al. (2025); Esteva et al.
+(2019). Heterogeneous data representations across hospitals, the absence of standardized deployment workflows, and mismatches between research prototypes and the concurrency, latency,
+and fault-tolerance requirements of hospital environments jointly prevent otherwise accurate
+models from delivering clinical value. Sepsis, a life-threatening condition that affected more
+than 50 million people worldwide and caused approximately 11 million deaths in 2017 Brant
+et al. (2022), is a paradigmatic instance of this gap: it is high-stakes, time-critical, requires
+continuous monitoring, and depends on heterogeneous data sources, thereby exercising every
+component of a realistic clinical AI deployment pipeline.
+
+1
+
+This work addresses the deployment gap as a systems-for-machine-learning problem, with
+early sepsis detection as the concrete case study. General-purpose model-serving stacks such
+as KServe, Seldon Core, BentoML, and NVIDIA Triton, as well as healthcare-oriented stacks
+such as MONAI Deploy and Clara, provide important building blocks. What remains missing
+is an end-to-end, openly available reference architecture that ties these pieces together for
+clinical AI specifically, combining HL7 FHIR-based interoperability, container orchestration,
+real-time inference, and clinician-facing visualization and that empirically characterizes how
+such a system behaves under realistic hospital concurrency. We position our contribution at
+this gap; a detailed review of sepsis prediction models and clinical AI deployment infrastructure
+is deferred to Section 2.
+We present the SepsisAI-Orchestrator, an open-source, modular platform that standardizes raw electronic health records into HL7 FHIR-inspired Clinical Document Architecture
+(CDA) structures, stores them in a NoSQL database, exposes a containerized LightGBM classifier via REST APIs, and provides a Streamlit-based clinical dashboard. Docker is used for
+portability and Kubernetes for orchestration, with each component mapped to an appropriate resource type (Deployments for stateless compute, StatefulSet for the database, Jobs for
+batch preprocessing). The LightGBM classifier is taken from prior work Toro Beltrán et al.
+(2022); the contribution lies in the deployment infrastructure around it and in its empirical
+characterization under load. Evaluation on the PhysioNet/Computing in Cardiology Challenge
+2019 dataset Reyna et al. (2020) with k6 load tests of 50-1000 concurrent virtual users yields
+our central finding: replica count must be matched to the physical CPU thread count of the
+host. Scaling from 3 to 12 replicas on a 12-thread CPU reduced p95 latency from 3.3 s to
+1.41 s (57.3% reduction) and eliminated all request failures, whereas over-provisioning to 24 or
+48 replicas degraded performance due to context-switching and scheduler contention. While
+CPU oversubscription is well known in systems literature, to our knowledge the resulting Ushaped scaling curve has not been quantified for clinical AI inference workloads on commodity
+hardware.
+The contributions of this work are:
+• An end-to-end open-source reference architecture for clinical AI deployment, integrating
+HL7 FHIR-inspired preprocessing, NoSQL storage, containerized REST-served inference,
+and a clinician-facing dashboard, released publicly at https://github.com/nucleusai/
+sepsisai-orchestrator.
+• An empirical characterization of horizontal scaling for containerized clinical ML inference
+under realistic concurrency (50-1000 virtual users), revealing a U-shaped latency curve
+and identifying CPU-thread count as the practical optimum for replica provisioning on
+single-node deployments.
+• A reproducible deployment recipe (Docker images, Kubernetes manifests, load-testing
+scripts) that practitioners can adapt to clinical prediction tasks beyond sepsis.
+We intentionally scope the contribution to deployment systems rather than predictive modeling, and we do not claim prospective clinical validation. The platform is designed in alignment
+with HIPAA and GDPR principles through container isolation, role separation, and controlled
+data access; clinical deployment is left to future work. The remainder of the paper is organized as follows. Section 2 reviews related work on sepsis prediction models and clinical AI
+deployment infrastructure. Section 3 describes the architecture and services of the SepsisAIOrchestrator. Section 4 presents the experimental setup and the scalability analysis. Section 5
+discusses implications, limitations, and future work.
+
+2
+
+2
+
+State of the Art
+
+The prediction of sepsis with clinical data is an active research area that has progressed quickly
+in recent years. The literature can be grouped into two main perspectives: predictive models
+and infrastructures that support their deployment and monitoring in real environments. This
+section reviews both perspectives and identifies the main research gaps.
+Initial methods for sepsis risk assessment used scoring systems such as SOFA and qSOFA,
+but their sensitivity and specificity were limited Fahrmeir et al. (2021). The availability of large
+scale EHR datasets made it possible to apply ML models such as logistic regression, Support
+Vector Machines (SVM), Random Forest, and XGBoost, which performed better than traditional scores Henry et al. (2015). More recent studies applied deep learning techniques including
+Recurrent Neural Networks (RNN), Long Short Term Memory (LSTM), and Gated Recurrent
+Units (GRU). Komorowski et al. Komorowski et al. (2018) used reinforcement learning to predict sepsis and suggest treatment strategies. Henry et al. Henry et al. (2015) showed that time
+series models can better forecast septic shock compared to static predictors. However, the lack
+of transparency of deep models has limited clinical trust, and explainable AI (XAI) methods
+such as those proposed by Tonekaboni et al. Tonekaboni et al. (2019) are needed to improve
+adoption.
+Strong predictive models cannot be used in practice without infrastructures that allow secure, efficient, and reliable deployment. This challenge is often described as the “lab to live gap”
+Kent et al. (2020), and the following are some of the most relevant issues related to this gap:
+Health information systems use heterogeneous formats and standards, which create silos and
+errors. Standards such as HL7 FHIR, SNOMED CT, and OMOP CDM were developed to unify
+health data Brat et al. (2020); Torab-Miandoab and Xu (2023); Nan and Xu (2023). Effective
+interoperability, however, requires infrastructures that can handle diverse data flows Yoo et al.
+(2022). MLOps applies DevOps principles to ML workflows. It provides reproducibility, traceability, and compliance with regulatory requirements such as HIPAA and GDPR. MLOps in
+healthcare must also monitor model drift, ensure data quality, and support reliable deployment
+of AI models Kent et al. (2020). Docker allows applications to run with all their dependencies, while Kubernetes provides orchestration, scaling, and fault tolerance. These technologies
+enable high availability, workload balancing, and portability across cloud and on premise infrastructures. In clinical environments they make it possible to run patient specific predictions
+in parallel and ensure continuity of service under failures Dias and Torkamani (2019); Nan and
+Xu (2023).
+The literature shows agreement in three areas: (1) deep learning dominates predictive modeling for sepsis, (2) HL7 FHIR is the most accepted interoperability standard, and (3) container
+based MLOps is the foundation for clinical AI deployment. Still, most studies treat these aspects
+separately. Few works provide an integrated infrastructure that connects data preprocessing,
+interoperability, predictive models, and clinical dashboards. This research addresses this gap
+by presenting a modular and scalable infrastructure that supports sustainable deployment of
+AI for early sepsis detection.
+
+3
+
+Materials and Methods
+
+3.1
+
+Study Design
+
+This study followed an experimental design in which we integrated a previously developed
+ML-based model for sepsis prediction, using missing data imputation and FHIR interoperability Toro Beltrán et al. (2022), into the modular platform of the SepsisAI-Orchestrator.
+The platform addresses interoperability, scalability, and adoption challenges by combining containerization with Docker and orchestration with Kubernetes. It implements the full workflow
+
+3
+
+for early sepsis detection, including data preprocessing, model deployment, and real-time monitoring. The design consisted of four stages: (i) data preprocessing and standardization, (ii) AI
+model deployment, (iii) orchestration with Kubernetes, and (iv) clinical monitoring through a
+dashboard.
+
+3.2
+
+Dataset
+
+We used the dataset released in the PhysioNet/Computing in Cardiology Challenge 2019 Reyna
+et al. (2020), which contains time series clinical records from intensive care patients in three
+hospital systems. The dataset includes hourly measurements of vital signs (8 attributes), laboratory tests (26 attributes), and demographic variables (7 attributes). Data from two hospitals
+were made publicly available for training and validation, while a third was reserved for hidden
+testing. The dataset is imbalanced, with fewer septic than non septic patient records, and
+contains missing values.
+
+3.3
+
+SepsisAI-Orchestrator: A Containerized and Scalable Platform
+
+To address the interoperability, scalability, and adoption challenges identified in Section 2, we
+propose the SepsisAI-Orchestrator, a modular infrastructure for AI deployment and realtime monitoring in early sepsis detection. The platform was designed in two versions. The
+first is a baseline architecture that integrates the core components required for deployment
+across different hospital environments. The second is a scalable architecture that extends the
+baseline with orchestration mechanisms to support high workloads through dynamic replication.
+Both versions share the same functional modules but differ in how resources are managed and
+distributed under concurrent access.
+3.3.1
+
+Baseline Architecture
+
+The baseline version integrates four containerized modules, as shown in Fig. 1. The first module
+is the CDA Preprocessing Service, which transforms raw patient records into the HL7 FHIRinspired format to ensure data standardization across hospitals. The second is the MongoDB
+Database, a NoSQL store that holds the structured patient data in JSON format for efficient
+querying and aggregation. The third is the AI Prediction Service, a containerized LightGBM
+model exposed through REST APIs using FastAPI, which receives patient identifiers and returns
+sepsis risk scores. The fourth is the Monitoring Dashboard, a Streamlit-based web interface
+that allows clinicians to visualize patient data and prediction results in real time.
+Each module runs inside an independent Docker container. This design ensures portability
+and reproducibility, allowing the platform to be deployed across heterogeneous hospital environments without modifications to the underlying code.
+
+Figure 1: Baseline architecture of the SepsisAI-Orchestrator, integrating CDA preprocessing,
+MongoDB, AI service, and dashboard. Each component runs in an independent Docker container.
+
+4
+
+3.3.2
+
+Scalable Architecture with Orchestration
+
+The scalable version extends the baseline architecture by adding Kubernetes orchestration for
+automated deployment, load balancing, and replica management, as illustrated in Fig. 2. In this
+configuration, the AI Prediction Service can be scaled horizontally by increasing the number
+of replicas according to available hardware resources and user demand. The dashboard and
+preprocessing services can also be replicated to handle higher concurrent loads.
+Each component type is mapped to an appropriate Kubernetes resource. The AI service
+and dashboard are deployed as Deployments, which allow Kubernetes to maintain the desired
+number of running replicas and restart failed instances automatically. MongoDB is managed
+as a StatefulSet to preserve data consistency and stable network identities across pod restarts.
+The CDA preprocessing tasks are executed as Jobs, since they run once per dataset and do not
+require persistent availability. Services provide internal communication between all components
+through stable endpoints, regardless of how many replicas are active.
+This architecture supports thousands of concurrent users and provides the fault tolerance
+required for large-scale hospital network deployments. The separation between stateless compute components (AI service, dashboard) and stateful storage (MongoDB) enables independent
+scaling of each layer based on the observed bottleneck.
+
+Figure 2: Kubernetes-based scalable architecture of the SepsisAI-Orchestrator. AI and dashboard modules are deployed as Deployments, MongoDB as a StatefulSet, CDA tasks as Jobs,
+and Services manage inter-component communication.
+
+3.4
+
+SepsisAI-Orchestrator Workflow
+
+The end-to-end workflow of the SepsisAI-Orchestrator consists of three sequential stages: data
+ingestion and standardization, AI inference, and clinical visualization. Fig. 1 illustrates the
+data flow across these stages.
+In the first stage, patient records in pipe-separated value (PSV) format are ingested by
+the CDA Preprocessing Service. This service transforms the raw records into HL7 FHIRinspired Clinical Document Architecture (CDA) structures and stores them in the MongoDB
+Database.
+In the second stage, a clinician selects a patient through the Monitoring Dashboard,
+which sends a prediction request to the AI Prediction Service. The service retrieves the
+corresponding CDA record from MongoDB, extracts the relevant clinical features, and computes
+a sepsis risk score using the trained LightGBM model. The predicted probability and any
+triggered alerts are returned to the dashboard.
+5
+
+In the third stage, the dashboard displays the prediction results alongside the patient’s
+clinical history, enabling the clinician to assess the sepsis risk in context.
+This modular workflow decouples data standardization, model inference, and visualization
+into independent services. As a result, each component can be developed, tested, and scaled
+separately, which improves maintainability and facilitates deployment across different hospital
+environments.
+
+3.5
+
+CDA Preprocessing Service
+
+The CDA Preprocessing Service enables interoperability across heterogeneous hospital systems
+by transforming raw electronic health records (EHR) into a unified format. Records from
+hospitals A and B were converted into HL7 FHIR-compliant Clinical Document Architecture
+(CDA) documents through a pipeline that performs three main operations.
+First, the pipeline verifies each record for completeness and consistency. Second, it applies temporal alignment to synchronize measurements taken at different time points. Third, it
+groups clinical variables into three categories: vital signs, laboratory results, and demographic
+information. Missing values were handled using interpolation and statistical aggregation methods described in Toro Beltrán et al. (2022). Derived clinical scores, including SOFA and SIRS,
+were computed and appended to each patient record.
+The resulting standardized resources were serialized into JSON format and stored in the
+MongoDB Database. This structured representation enables efficient querying and aggregation
+by downstream services, particularly the AI Prediction Service.
+
+3.6
+
+AI Prediction Service
+
+The AI Prediction Service performs real-time inference and serves as the connection between
+the data layer and the clinical dashboard. It is implemented as a containerized LightGBM
+model wrapped in a FastAPI application that exposes REST endpoints for prediction requests.
+When the service receives a request containing a patient identifier, it queries MongoDB for
+the corresponding CDA record. It then extracts the required clinical features and passes them
+to the LightGBM model, which computes the sepsis risk score. The result is returned to the
+requesting client as a JSON response containing the predicted probability and any associated
+alerts.
+In addition to serving real-time requests from the dashboard, the service can operate independently through a command-line interface (CLI). This mode supports batch inference, model
+validation, and standalone evaluation without requiring the full platform to be running. The
+service is packaged in a Docker container and managed by Kubernetes, which enables horizontal
+scaling through replica creation and automatic load balancing across instances.
+
+3.7
+
+Monitoring Dashboard
+
+The Monitoring Dashboard is the visualization layer of the SepsisAI-Orchestrator and serves
+as the primary interface for clinical users. It is built with Streamlit and integrates two data
+flows. The first flow retrieves patient records from MongoDB in HL7 FHIR-inspired format.
+The second flow obtains sepsis predictions from the AI Prediction Service through its REST
+API.
+The interface refreshes automatically every 10 seconds to reflect the most recent data. It
+displays patient demographics, vital signs, laboratory results, derived clinical scores (SOFA,
+SIRS), temporal timelines, and sepsis probability estimates. When a prediction exceeds a
+predefined risk threshold, the dashboard generates a visual alert to notify the clinician.
+The dashboard runs inside a Docker container managed by Kubernetes, which ensures scalability and high availability during concurrent use by multiple clinicians. Fig. 3 shows the clinical
+
+6
+
+dashboard in operation.
+
+3.8
+
+Performance and Scalability Analysis
+
+The performance of the SepsisAI-Orchestrator was evaluated using load testing with k6, an
+open-source tool for simulating concurrent users and generating reproducible stress-test scenarios. The analysis focused on scalability and responsiveness under increasing workloads, using
+two main metrics: throughput (requests per second) and end-to-end latency (p95 response
+time). In this study, end-to-end latency is defined as the complete execution path from a REST
+prediction request issued by the dashboard to the delivery of the corresponding response after
+data retrieval, model inference, and result visualization. Additional indicators included failure
+rate (%), iteration execution time, and network traffic to further characterize system behavior
+under load. Scalability experiments simulated 50, 100, and 1000 virtual users (VUs), representing clinicians issuing real-time prediction requests. To assess Kubernetes orchestration, the AI
+inference service was deployed with varying replicas, and system logs were analyzed to confirm
+balanced load distribution. These experiments allowed both baseline validation of functionality
+and extended evaluation of system robustness under high concurrency.
+
+4
+
+Experiments and Results
+
+The SepsisAI-Orchestrator was evaluated in terms of interoperability, baseline functionality,
+and scalability under increasing workloads. The evaluation combined data preprocessing and
+CDA standardization, AI inference validation, load testing with k6, Kubernetes orchestration
+analysis, and usability validation through the monitoring dashboard.
+
+4.1
+
+Experimental Setup
+
+Experiments were conducted on a workstation equipped with an AMD Ryzen 5 5600 CPU, 32 GB
+RAM, NVIDIA RTX 4060 GPU, 1 TB SSD, and Windows 11. The SepsisAI-Orchestrator was
+deployed on a Kubernetes cluster, where all components (CDA preprocessing service, MongoDB
+database, AI prediction service, and monitoring dashboard) were encapsulated in Docker containers.
+The ML approach builds on previous work on missing data imputation and FHIR interoperability for sepsis prediction Toro Beltrán et al. (2022). That study compared Gradient Boosting
+Classifier (GBC) and Light Gradient Boosting Machine (LightGBM) models, with and without kNN-based imputation. LightGBM with imputation consistently outperformed the other
+methods. For instance, when trained on hospital A, LightGBM achieved an F1-score of 0.87
+and AUC of 0.91, compared to 0.77 and 0.83 with GBC. Similarly, when trained on hospital
+B, LightGBM reached an F1-score of 0.88 and AUC of 0.91, surpassing GBC’s 0.76 and 0.82.
+The best results were obtained by training on the combined data from both hospitals, where
+LightGBM achieved F1-scores of 0.93 and 0.94, with corresponding AUC values of 0.95.
+Based on these outcomes, LightGBM was selected as the prediction model and integrated
+into the SepsisAI-Orchestrator for deployment and scalability testing. The model was implemented as a LightGBM classifier with parameters loss=log_loss, learning_rate=0.01,
+n_estimators=200, and max_depth=3.
+
+4.2
+
+Deployment of the SepsisAI-Orchestrator
+
+To assess interoperability and functionality, all clinical records from the two available hospitals in
+the PhysioNet dataset were processed through the CDA preprocessing service and transformed
+7
+
+Figure 3: Monitoring Dashboard of the SepsisAI-Orchestrator showing patient p000009. The
+interface displays a sepsis detection alert (top banner), followed by time-series plots of eight
+vital signs (heart rate, O2 saturation, temperature, mean arterial pressure, systolic and diastolic blood pressure, and respiratory rate) over ICU length of stay (ICULOS). The left panel
+allows data source selection (MongoDB or CSV), and navigation tabs provide access to clinical
+variables, laboratory data, prediction scores, and AI model queries.
+
+8
+
+into HL7 FHIR-compliant structures. The AI prediction service was then executed on these
+standardized records to generate sepsis risk scores. The monitoring dashboard was used to
+visualize patients, clinical variables, and predicted outcomes, providing a qualitative check of
+the end-to-end workflow. This baseline evaluation confirmed that the SepsisAI-Orchestrator
+correctly ingested raw data, produced predictions, and displayed results in the dashboard.
+
+4.3
+
+Scalability Evaluation of the SepsisAI-Orchestrator
+
+Scalability was tested with k6 by simulating concurrent clinicians (virtual users, VUs) issuing
+prediction requests. Success criteria were defined as: (i) 95% of requests with latency < 500
+ms, and (ii) failure rate < 1%. Three scenarios were tested with 50, 100, and 1000 VUs. An
+additional experiment evaluated Kubernetes load balancing with three replicas of the AI prediction service exposed via NodePort. Metrics collected included throughput (requests/s), average
+prediction time, p95 latency, and active AI pods.
+
+4.3.1
+
+Baseline Scalability Analysis
+
+The SepsisAI-Orchestrator satisfied the success criteria in the 50 and 100 VU scenarios. For
+example, with 50 VUs and three AI replicas, the average response time was 28.64 ms with no
+failures and a p95 latency of 89.3 ms. Logs confirmed that requests were evenly distributed
+across replicas.
+4.3.2
+
+High-Concurrency Scalability Analysis
+
+At higher concurrency, the system showed performance degradation. In the 50 VU scenario, the
+average response time was 28.64 ms with a p95 latency of 89.3 ms and no failures, confirming
+that requests were evenly balanced across replicas. At 100 VUs, performance remained within
+acceptable limits, with a p95 latency of 259.3 ms and a very low failure rate of 0.03%, caused
+only by minor execution delays. At 1000 VUs, however, the system exceeded the latency
+threshold, with a p95 latency of 3.3 s and a failure rate of 17.4%. Despite this, all responses were
+valid, indicating robustness of the service under stress. Iteration-level analysis showed longer
+execution times as concurrency increased, while network metrics reflected proportional growth
+in data exchange. Overall, the platform remained functional but would require optimization to
+support very high user loads.
+Fig. 4 shows the extended evaluation metrics, including latency thresholds, HTTP performance, iteration execution, and network traffic.
+4.3.3
+
+Scalability with 1000 VUs via AI Replica Scaling
+
+The baseline evaluation with three AI replicas under 1000 VUs yielded a p95 latency of 3.3 s
+and a failure rate of 17.4 %, both well above the target thresholds (p95 < 500 ms, failures < 1 %).
+To investigate whether horizontal scaling could recover acceptable performance, subsequent
+experiments held the load constant at 1000 VUs while varying the number of AI model replicas
+across 8, 12, 24, and 48 instances.
+As shown in Fig. 5, increasing replicas from 3 to 12 produced consistent improvements
+across all latency percentiles: the p95 latency decreased from 3.3 s to 1.41 s (57.3 % reduction),
+the average response time dropped to 706 ms, and the failure rate fell to 0.00 %. The 12replica configuration corresponds to the number of hardware threads available on the AMD
+Ryzen 5 5600 processor (6 cores, 12 threads), representing the point at which each replica can
+be scheduled on a dedicated thread without contention.
+Beyond this point, adding more replicas degraded performance rather than improving it.
+With 24 replicas, the p95 latency rose to 1.58 s and the maximum response time increased to
+9
+
+(a) HTTP response time distribution. The
+500 ms p95 target (dashed) is met at 50 and
+100 VUs but exceeded at 1000 VUs.
+
+(b) p95 latency and failure rate vs. concurrency
+(dual axes). At 1000 VUs, p95 reaches 3.3 s with
+17.4 % failures.
+
+(c) Iteration execution metrics showing superlinear growth at high concurrency.
+
+(d) Network traffic showing sublinear growth
+with concurrency.
+
+VUs
+
+Avg (ms)
+
+p90 (ms)
+
+p95 (ms)
+
+Max (ms)
+
+Failed (%)
+
+Recv (MB)
+
+Sent (MB)
+
+50
+100
+1000
+
+28.64
+118.52
+1471.29
+
+52.1
+225.6
+2370.0
+
+89.3
+259.3
+3300.0
+
+210
+520
+8540
+
+0.00
+0.03
+17.40
+
+5.0
+7.3
+8.7
+
+4.2
+6.2
+7.4
+
+Success criteria: p95 < 500 ms and failure rate < 1 %. Three AI replicas via NodePort.
+
+(e) Consolidated baseline scalability metrics (3 AI replicas). Shaded row exceeds both success criteria.
+
+Figure 4: Extended scalability evaluation of the SepsisAI-Orchestrator under 50, 100, and
+1000 concurrent virtual users with 3 AI replicas. (a) HTTP response time distribution across
+percentiles. (b) p95 latency and failure rate on dual axes, showing both success criteria are
+met at 50 and 100 VUs but exceeded at 1000 VUs. (c) Iteration execution times. (d) Network
+traffic. (e) Consolidated numerical summary. The 1000 VU results motivate the replica scaling
+experiments in Section 4.3.3.
+5.05 s. At 48 replicas, four times the available thread count the p95 latency further increased to
+1.86 s with a maximum of 5.91 s. This U-shaped behavior (Fig. 5b) is consistent with CPU oversubscription: when the number of active processes exceeds the hardware parallelism, contextswitching overhead and kernel scheduler contention outweigh the benefits of additional replicas.
+Although none of the tested configurations met the strict p95 < 500 ms threshold, the 12replica setup eliminated all request failures and achieved the lowest latency attainable on the
+available hardware. Meeting the sub-second target would likely require either vertical scaling (higher core-count processors), infrastructure-level optimizations (e.g., connection pooling,
+caching of frequent predictions), or distributing replicas across multiple nodes in a multi-node
+Kubernetes cluster.
+10
+
+(a) Response time distribution by replica count.
+Replicas
+3 (baseline)†
+8
+12 ⋆
+24
+48
+
+(b) p95 and average latency vs. replica count.
+
+Avg (ms)
+
+p90 (s)
+
+p95 (s)
+
+Max (s)
+
+Failed (%)
+
+—
+820.93
+706.38
+749.28
+798.19
+
+—
+1.41
+1.28
+1.42
+1.58
+
+3.30
+1.53
+1.41
+1.58
+1.86
+
+—
+4.21
+3.99
+5.05
+5.91
+
+17.40
+0.00
+0.00
+0.00
+0.00
+
+∆ p95 vs. 3 rep.
+—
+−53.6 %
+−57.3 %
+−52.1 %
+−43.6 %
+
+⋆ Optimal configuration (matches CPU thread count). † Baseline from Section 4.3.2; only p95 and failure rate reported.
+
+(c) Summary of HTTP performance metrics across replica configurations (1000 VUs).
+
+Figure 5: Effect of AI replica scaling on HTTP performance under 1000 concurrent virtual users.
+(a) Response time distribution (avg, p90, p95, max) for each replica count, with the 500 ms p95
+target shown as a dashed line. (b) p95 and average latency as a function of replica count,
+showing a U-shaped curve. The 12-replica configuration, which matches the CPU thread count
+of the test hardware (AMD Ryzen 5 5600, 6 cores, 12 threads), yields optimal performance:
+p95 latency of 1.41 s, average latency of 706 ms, and 0.00 % failure rate. Increasing replicas
+to 24 or 48 worsens all latency percentiles due to context-switching overhead and scheduler
+contention. (c) Consolidated performance metrics across all configurations. The 12-replica
+optimum reduces p95 latency by 57.3 % relative to the 3-replica baseline and eliminates all
+request failures, although meeting the strict p95 < 500 ms threshold would require additional
+hardware resources or architectural optimizations.
+
+5
+
+Conclusions and Future Work
+
+This work introduced SepsisAI-Orchestrator, a modular and containerized infrastructure for
+early sepsis detection that integrates data preprocessing, database management, predictive AI,
+and real-time monitoring. By leveraging Docker and Kubernetes, the system achieved portability, scalability, and resilience, handling up to 1000 virtual users without critical service failures.
+Key features include HL7 FHIR-inspired CDA preprocessing, MongoDB storage, LightGBM
+inference via FastAPI, and a Streamlit-based clinical dashboard.
+Beyond demonstrating technical feasibility, the results highlight several broader implications. The platform shows that predictive models can be moved from research environments to
+near-clinical settings by addressing interoperability and scalability challenges. Building entirely
+on open-source tools demonstrates that advanced healthcare infrastructures can be developed
+with limited resources, lowering entry barriers for hospitals with constrained budgets. While
+the architecture is generic by design, sepsis was intentionally selected as a representative, highstakes clinical use case requiring strict interoperability, low latency, and continuous monitoring.
+As a result, the modular design makes the platform adaptable to other clinical prediction tasks
+11
+
+and decision-support scenarios. While prior studies predominantly focus on predictive models,
+data preprocessing pipelines, or isolated clinical decision-support systems, this work provides
+an end-to-end, containerized platform that integrates interoperability (HL7 FHIR), scalable
+orchestration, real-time inference, and performance evaluation within a single open-source architecture. Stress tests revealed that while Kubernetes scaling improves performance, hardware
+resource limits must be carefully matched to replica counts to avoid negative overhead. This
+insight is relevant for institutions planning real-world deployments. The monitoring dashboard
+illustrates the importance of intuitive visualization tools for clinicians, which are crucial for
+adoption and trust in AI-based decision support systems.
+Although this study does not involve direct patient deployment, the proposed architecture
+is designed in alignment with HIPAA/GDPR principles through container isolation, role separation, and controlled data access.
+In summary, the SepsisAI-Orchestrator demonstrates that robust and interoperable healthcare AI infrastructures are attainable with current open-source technologies, provided that
+attention is given to both the computational and clinical integration dimensions.
+Future work will focus on: (i) clinical validation with retrospective data in hospital environments, (ii) broader interoperability with HL7/FHIR, SNOMED-CT, and OMOP-CDM, (iii)
+explainability to improve clinical trust, (iv) compliance with ethical and regulatory frameworks
+(HIPAA, GDPR), (v) continuous model adaptation, and (vi) extension to sepsis risk detection
+in other departments such as emergency care. These efforts aim to foster real-world adoption
+and improve patient outcomes.
+
+Acknowledgements
+The authors thank AMD Colombia and AMD for providing server infrastructure support.
+
+References
+Brant, E. B., Kennedy, J. N., King, A. J., Gerstley, L. D., Mishra, P., Schlessinger, D., Shalaby,
+J., Escobar, G. J., Angus, D. C., Seymour, C. W., and Liu, V. X. (2022). Developing a
+shared sepsis data infrastructure: a systematic review and concept map to fhir. npj Digital
+Medicine, 5(1):44.
+Brat, G. et al. (2020). Fhir as an enabler of interoperable machine learning in healthcare.
+Journal of Biomedical Informatics.
+Dias, R. and Torkamani, A. (2019). Overfitting and black-box challenges in genomic predictions.
+Nature Genetics.
+Esteva, A., Robicquet, A., Ramsundar, B., Kuleshov, V., DePristo, M., Chou, K., Cui, C.,
+Corrado, G., Thrun, S., and Dean, J. (2019). A guide to deep learning in healthcare. Nature
+Medicine, 25(1):24–29.
+Fahrmeir, L. et al. (2021). Clinical scoring systems for sepsis: strengths and limitations. Critical
+Care Medicine.
+Henry, K. et al. (2015). Targeted real-time early warning score (trewscore) for septic shock.
+Science Translational Medicine.
+Kent, J. et al. (2020). Mlops for healthcare ai: principles and frameworks. Artificial Intelligence
+in Medicine.
+Komorowski, M. et al. (2018). Artificial intelligence in sepsis management: Reinforcement
+learning approach. Nature Medicine.
+12
+
+Mitchell, W. G. et al. (2025). Rebooting artificial intelligence for health. PLOS Global Public
+Health.
+Nan, X. and Xu, L. (2023). Scalable infrastructures for healthcare ai. IEEE Transactions on
+Medical Informatics.
+Reyna, M. A., Josef, C. S., Jeter, R., Shashikumar, S. P., Westover, M. B., Nemati, S., Clifford, G. D., and Sharma, A. (2020). Early prediction of sepsis from clinical data: The
+physionet/computing in cardiology challenge 2019. Critical Care Medicine, 48(2):210–217.
+Tonekaboni, S. et al. (2019). What clinicians want: Contextualizing explainable machine learning for clinical end use. Machine Learning for Healthcare.
+Torab-Miandoab, S. and Xu, L. (2023). Data interoperability in healthcare: barriers and opportunities. Health Informatics Journal.
+Toro Beltrán, C. F., Villarreal Ibañez, E. D., Orejuela Ruiz, V. M., and García Henao, J. A.
+(2022). A machine learning-based missing data imputation with fhir interoperability approach
+in sepsis prediction. In Communications in Computer and Information Science. Springer.
+Yoo, S. et al. (2022). Leveraging interoperability for clinical decision support. Journal of the
+American Medical Informatics Association.
+
+13
+

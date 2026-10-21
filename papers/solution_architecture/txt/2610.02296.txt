@@ -1,0 +1,860 @@
+Line-Rate GTP-U Admission Control at the Edge of
+a Cloud-Native 5G Core: An XDP-Based Design
+for Kubernetes-Hosted User Plane Functions
+Simhadri Podala Narasimha
+
+arXiv:2610.02296v1 [cs.NI] 1 Oct 2026
+
+Independent Researcher
+Littleton, Colorado, USA
+podalas@gmail.com
+Abstract—The User Plane Function (UPF) of a 5G Standalone
+core terminates every GPRS Tunnelling Protocol user-plane
+(GTP-U) packet arriving from the radio access network, which
+makes its N3 interface both the busiest and the most exposed
+point of the mobile data path. As operators migrate the core
+onto Kubernetes and public cloud, the UPF increasingly shares a
+general-purpose Linux kernel with other workloads, and kernelbypass frameworks such as DPDK become harder to operate.
+This paper presents GTP-Guard, a design for line-rate GTPU admission control built on the eXpress Data Path (XDP)
+hook of the Linux kernel. GTP-Guard drops illegitimate tunnel
+traffic in the network driver, before socket-buffer allocation, using
+six ordered stages: peer allow-listing, GTP-U header validation,
+Tunnel Endpoint Identifier (TEID) admission against session
+state derived from the Packet Forwarding Control Protocol
+(PFCP), bounded extension-header parsing, inner-packet antispoofing with GTP-in-GTP detection, and per-session policing.
+We formalize stage ordering as a cost-minimization problem
+and show that sorting stages by the ratio of per-packet cost to
+rejection probability minimizes expected per-packet work, which
+motivates run-time reordering through tail-call program arrays
+when traffic mix shifts under attack. We further describe a
+Kubernetes deployment model based on a node-level DaemonSet
+with pinned eBPF maps that survive agent upgrades, discuss
+constraints specific to public-cloud virtual NICs, and define a
+reproducible evaluation methodology, with explicit hypotheses,
+for throughput, latency, CPU efficiency and attack resilience.
+This paper presents the design and methodology; experimental
+results will be reported in a subsequent version.
+Index Terms—eBPF, XDP, 5G core, UPF, GTP-U, packet
+filtering, Kubernetes, DDoS mitigation, cloud-native network
+functions
+
+I. I NTRODUCTION
+In a 5G Standalone (SA) system, the UPF anchors user
+sessions and forwards traffic between the radio access network
+(RAN) and external data networks [1]. Uplink traffic arrives
+on the N3 reference point encapsulated in GTP-U over UDP
+port 2152 [2], and the UPF is programmed by the Session
+Management Function (SMF) over the N4 interface using
+PFCP [3]. Because the UPF must accept tunnelled packets
+from a large population of gNBs and, in roaming and multiUPF topologies, from peer UPFs on N9, its ingress is a natural
+target for volumetric floods, TEID scanning, spoofed inner
+sources and GTP-in-GTP injection [4].
+Historically, high-capacity UPFs have relied on kernelbypass frameworks such as DPDK [5], which dedicate polling
+
+cores and take the NIC away from the kernel. That model fits
+poorly with cloud-native operations: Kubernetes schedulers,
+container network interfaces, observability agents and publiccloud virtual NICs all assume the kernel owns the device. The
+eXpress Data Path (XDP) [6] offers a middle ground. An XDP
+program is an eBPF program that runs in the driver’s receive
+path before the kernel allocates a socket buffer, can return
+a verdict for each frame (drop, pass, transmit, or redirect),
+and co-exists with the regular networking stack. XDP has
+been used for in-kernel UPFs [7]–[9] and for GTP-U-aware
+receive-side scaling [10], [11], but considerably less attention
+has been paid to XDP as a dedicated admission-control layer
+placed in front of an existing UPF, regardless of how that UPF
+implements forwarding.
+This paper addresses that gap. Our contributions are:
+1) A six-stage XDP pipeline, GTP-Guard, that validates
+GTP-U traffic against PFCP-derived session state and
+drops illegitimate packets in the driver (Section V).
+2) A cost model for ordering filter stages, with a closedform optimal order and a mechanism for re-ordering at
+run time without detaching the program (Section V-D).
+3) A Kubernetes deployment model, including state persistence across upgrades, privilege scoping, and publiccloud NIC considerations (Section VI).
+4) A reproducible evaluation methodology for XDP-based
+user-plane protection, stated as testable hypotheses (Section VII). Measured results are deferred to a later version
+of this paper.
+II. BACKGROUND
+A. eBPF and the XDP Hook
+eBPF lets user space load verified bytecode into the kernel
+and attach it to hooks. Before a program is accepted, the
+in-kernel verifier proves memory safety and termination by
+symbolically executing every path, rejecting out-of-bounds
+packet access, unbounded loops and unchecked pointer dereferences [12]. Programs share state with user space through
+maps: hash tables, arrays, longest-prefix-match (LPM) tries,
+per-CPU variants, ring buffers and program arrays used for
+tail calls [13].
+XDP is the earliest programmable hook on the receive
+path [6]. The program receives a context pointing at the raw
+
+TABLE I
+XDP ATTACH MODES AND THEIR RELEVANCE TO UPF HOSTS
+
+TABLE II
+T HREATS ADDRESSED AND THE STAGE THAT MITIGATES EACH
+
+Mode
+
+Where it runs
+
+UPF implications
+
+Threat
+
+Stage
+
+Map
+
+Verdict
+
+Native
+
+NIC driver, before skb
+allocation
+
+Target mode for N3; requires
+driver support and, on some
+virtual NICs, MTU/queue
+constraints
+Functional fallback for testing
+and veth; little performance
+gain
+Highest efficiency; limited
+map and helper support
+
+Off-path source
+flooding N3
+Malformed / fuzzed
+GTP-U
+TEID scanning / stale
+tunnels
+Inner source spoofing
+GTP-in-GTP injection
+Per-subscriber flood
+
+S1
+
+LPM trie
+
+DROP
+
+S2,
+S4
+S3
+
+–
+
+DROP
+
+Hash (TEID)
+
+DROP
+
+S5
+S5
+S6
+
+Hash (TEID)
+–
+Per-CPU
+array
+
+DROP
+DROP
+DROP
+
+Generic
+
+After skb allocation
+
+Offload
+
+SmartNIC hardware
+
+frame in the driver’s DMA buffer and returns one of five
+actions: XDP_DROP, XDP_PASS (continue into the stack),
+XDP_TX (bounce out of the same interface), XDP_REDIRECT
+(to another interface, CPU, or an AF XDP socket), or
+XDP_ABORTED. In the original evaluation, an XDP program dropping packets reached roughly 24 Mpps on a single
+core [6], illustrating why dropping early is far cheaper than
+dropping after socket-buffer allocation.
+B. Attach Modes and AF XDP
+Table I summarizes the three attach modes. Native mode
+runs inside the driver and requires driver support; generic
+mode runs after socket-buffer allocation and works on any
+interface (including veth), but forfeits most of the performance benefit; offload mode executes on capable SmartNICs.
+AF XDP sockets [14] complement XDP by letting a program
+redirect selected frames into a user-space memory region
+(UMEM), optionally with zero copy. In GTP-Guard, AF XDP
+is the hand-off path to user-space UPFs, while the filtering
+itself stays in XDP.
+C. The 5G User Plane and GTP-U
+The GTPv1-U header [2] is eight bytes: a flags octet (3-bit
+version, protocol-type bit, and the E, S and PN bits), a message
+type, a 16-bit length and a 32-bit TEID. If any of E, S or PN
+is set, four optional bytes follow (sequence number, N-PDU
+number and next-extension-header type). On N3, the E bit is
+normally set because the PDU Session Container extension
+header carries the QoS Flow Identifier (QFI) [15]. User data
+uses message type 255 (G-PDU); signalling messages include
+Echo Request/Response, Error Indication and End Marker. The
+UPF learns valid TEIDs, UE addresses and QoS Enforcement
+Rules (QERs) from PFCP Session Establishment and Modification messages carrying Packet Detection Rules (PDRs) and
+Forwarding Action Rules (FARs) [3].
+
+XDP underpins L4 load balancing such as Katran [17] and
+Kubernetes service acceleration in Cilium [18].
+XDP for the 5G user plane. Navarro do Amaral et al.
+proposed upf-bpf, an in-kernel UPF for MEC environments
+based on XDP [7], and later reduced BPF program injection
+time from about 27 ms to 1 ms through a decoupled design
+while reaching roughly 10–11 Mpps across six cores [8].
+Scheich et al. extended a UPF with XDP GTP-U handling
+and an XDP receive-side-scaling scheme keyed on GTPU headers [10], [11]. The open-source eUPF attaches an
+XDP program that performs PDR detection, gating, QoS and
+forwarding and has been tested with free5GC, Open5GS and
+OpenAirInterface [9]. Deshpande and Bera analysed eBPFenabled containerized 5G cores and showed that the sharedkernel model exposes network functions to cross-container
+threats [19].
+Positioning. Prior work uses XDP to be the UPF. GTPGuard instead treats XDP as a UPF-agnostic front door: it
+protects any UPF, kernel-based, AF XDP-based or DPDKadjacent, by admitting only traffic consistent with current
+PFCP state, and it focuses on stage ordering, run-time adaptation and cloud-native lifecycle concerns not addressed in
+earlier designs.
+IV. T HREAT M ODEL
+We consider an adversary who can inject packets towards
+the UPF’s N3 or N9 address, either from a compromised or
+misconfigured RAN node, from a subscriber device that crafts
+packets inside its own tunnel, or from any network segment
+that can reach the transport network. We assume the N4 control
+channel and the Kubernetes control plane are trusted. Table II
+maps the threats we address to pipeline stages.
+Out of scope are attacks on PFCP itself, encrypted payload
+attacks, and denial of service that saturates the physical link
+before the host; the latter must be absorbed upstream.
+
+III. R ELATED W ORK
+XDP and eBPF data planes. Høiland-Jørgensen et al.
+introduced XDP and showed that it combines programmability
+and kernel integration with performance competitive with
+kernel bypass [6]. Vieira et al. survey eBPF/XDP concepts
+and applications [13], and Miano et al. report lessons from
+building chained network services in eBPF [16]. In production,
+
+V. GTP-G UARD D ESIGN
+A. Design Goals
+GTP-Guard is guided by four goals: (G1) drop early, so that
+every rejected packet costs as little as possible; (G2) stay UPFagnostic, so the guard can front any UPF implementation;
+(G3) never be the source of truth, so that session state is
+
+always derived from PFCP and a guard failure can degrade
+to pass-through; and (G4) be operable on Kubernetes, with
+declarative configuration, rolling upgrades and Prometheusnative telemetry.
+B. Pipeline
+Fig. 1 shows the pipeline, and Fig. 2 gives a condensed
+implementation of the IPv4 path.
+Pre-classification. Frames that are not IPv4/UDP to port
+2152 receive XDP_PASS immediately, so the guard is transparent to management, PFCP and N6 traffic sharing the
+interface.
+S1 – Peer allow-list. The outer source address is looked
+up in an LPM trie holding gNB and N9 peer prefixes. The
+trie is populated from operator inventory (for example, via a
+Kubernetes custom resource) rather than from PFCP, because
+gNB addressing changes far less frequently than sessions.
+S2 – Header validation. The guard enforces version 1 and
+the protocol-type bit, and passes non-G-PDU messages (Echo,
+End Marker, Error Indication) to the UPF unmodified, since
+their volume is low and their semantics belong to the UPF.
+S3 – TEID admission. The TEID indexes a hash map
+whose entries mirror the uplink PDRs currently installed by
+the SMF. A miss means the tunnel does not exist on this UPF
+and the packet is dropped. This single lookup removes TEID
+scanning and traffic for torn-down sessions.
+S4 – Extension-header walk. The optional fields and
+extension-header chain are traversed in a loop bounded by
+a compile-time constant, satisfying the verifier while accommodating the PDU Session Container that is ubiquitous on
+N3 [15]. Chains that exceed the bound or overrun the frame
+are rejected.
+S5 – Inner checks. The inner source address must equal
+the UE address bound to the TEID, which defeats spoofing
+of other subscribers’ addresses. An inner UDP datagram
+addressed to port 2152 indicates GTP-in-GTP injection and
+is dropped.
+S6 – Policing. A token bucket keyed by QER index enforces
+a per-session ceiling. Admitted packets are redirected to an
+AF XDP socket bound to the receive queue when the UPF is
+an AF XDP application; otherwise the XDP_PASS fallback
+of bpf_redirect_map delivers them to the kernel stack.
+C. State Model and Control-Plane Synchronization
+GTP-Guard holds three kinds of state: the peer allow-list
+(operator-managed), session state (PFCP-derived) and policing state (data-plane-owned). Session entries map a TEID
+to a compact record containing the UE IPv4 address, an
+IPv6 prefix, and a QER index. To satisfy G3, a user-space
+agent subscribes to session lifecycle events exported by the
+UPF, translating PFCP Session Establishment, Modification
+and Deletion into map updates. Where the UPF exposes no
+such interface, the agent can derive the same state from the
+N4 exchange it terminates; we prefer the event-export path
+because it avoids re-implementing PFCP parsing and remains
+correct if N4 is protected by IPsec.
+
+Two consistency properties matter. First, insert-before-use:
+a TEID must be present before the gNB sends traffic on
+it. Because PFCP establishment precedes the N2 signalling
+that hands the TEID to the gNB, an agent that applies
+updates within the PFCP round trip satisfies this naturally.
+Second, delete-after-drain: entries are removed only after
+session deletion is acknowledged, so in-flight uplink packets
+are not penalized. A watchdog compares map cardinality
+with the UPF’s session count and flips the guard into a
+pass-through mode through a single control-map flag if drift
+exceeds a threshold, preferring availability over filtering when
+state cannot be trusted.
+D. Stage Ordering
+Stages are independent tests that each either reject or
+forward a packet. Let stage i cost ci cycles and let pi be
+the probability that a packet reaching it is forwarded. For an
+order π, the expected per-packet cost is
+E[Cπ ] =
+
+n
+X
+k=1
+
+cπ(k)
+
+k−1
+Y
+
+pπ(j) .
+
+(1)
+
+j=1
+
+Proposition 1. E[Cπ ] is minimized by ordering stages in
+ascending order of ri = ci /(1 − pi ), with ri = ∞ when
+pi = 1.
+Proof. Consider two adjacent stages a followed by b, preceded
+by stages with joint forwarding probability P . Their contribution is P (ca + pa cb ), and swapping gives P (cb + pb ca ).
+Placing a first is no worse iff ca + pa cb ≤ cb + pb ca , i.e.
+ca (1 − pb ) ≤ cb (1 − pa ), i.e. ra ≤ rb . Stages outside the
+pair are unaffected, so any order containing an inversion can
+be improved by an adjacent swap, and the sorted order is
+optimal.
+Under benign load almost every packet passes every stage
+(pi ≈ 1), so ordering barely matters. Under attack it matters
+a great deal: in a TEID-scanning flood, S3 rejects most traffic
+while S1 rejects almost none, so r3 ≪ r1 even though the
+LPM lookup is cheaper. Dependencies constrain the order (S3–
+S6 need the parsed GTP-U header), but S1, S3 and S6 can
+be permuted. GTP-Guard implements each permutable stage
+as a separate program in a BPF_MAP_TYPE_PROG_ARRAY
+and chains them with tail calls. The agent estimates pi from
+per-stage counters, recomputes ri , and atomically rewrites
+program-array slots, re-ordering the pipeline without detaching
+XDP from the interface. The tail-call indirection adds a small
+fixed cost per stage, so the agent uses a single fused program
+in steady state and switches to the re-orderable chain only
+when drop rates cross a configured threshold.
+E. Policing and Receive-Side Scaling
+Per-session policing must reconcile two facts. Token buckets
+require shared state, but XDP runs concurrently on every
+receive queue, and atomic updates to a shared bucket serialize
+cores. Conversely, NIC receive-side scaling usually hashes
+the outer five-tuple, which for GTP-U carries little entropy
+
+Pinned eBPF maps: peer_allow (LPM) · teid_sess (hash) · qer_bucket (per-CPU) · stats (per-CPU) · stages (prog array)
+
+N3 NIC
+RX queue
+
+S1 Peer
+allow-list
+
+S2 GTP-U
+header check
+
+S3 TEID
+admission
+
+S4 Ext.-header
+walk (bounded)
+
+S5 Inner
+anti-spoof
+
+S6 Per-session
+policing
+
+peer drop
+
+malformed
+
+unknown TEID
+
+bad ext. chain
+
+spoof / nested
+
+over rate
+
+AF XDP /
+stack → UPF
+
+non-GTP-U and GTP signalling (echo, end marker, error indication) take XDP_PASS early
+
+Fig. 1. GTP-Guard XDP pipeline on the N3 receive path. Each stage either rejects in the driver or hands the frame to the next stage; only admitted G-PDUs
+reach the UPF.
+
+when few gNBs serve many subscribers, so one subscriber’s
+packets generally land on one queue. GTP-Guard therefore
+keeps buckets in a per-CPU array and assigns each CPU a
+share of the session rate. When outer-header entropy is too
+low to spread load, a dispatcher stage redirects packets to a
+CPU map keyed by a hash of the TEID, the technique shown
+by Scheich et al. to improve uplink capacity substantially [10],
+[11]; this also makes per-CPU bucket shares exact, since all
+packets of a session then reach the same CPU.
+VI. C LOUD -NATIVE D EPLOYMENT ON K UBERNETES
+A. Packaging and Lifecycle
+GTP-Guard ships as a DaemonSet scheduled onto UPF
+nodes by node affinity (Fig. 3). The agent loads a CO-RE
+(compile once, run everywhere) object built against BTF, so
+a single image runs across kernel versions in a mixed fleet.
+Maps and links are pinned under /sys/fs/bpf; on restart,
+the agent re-opens pinned objects rather than re-creating them,
+so a rolling upgrade of the agent never interrupts filtering or
+loses session state, the same persistence property eUPF relies
+on for datapath continuity [9]. Program upgrades use atomic
+replacement of the attached link, so the interface is never left
+without a program. Where other XDP programs must share
+the interface, the libxdp multi-program dispatcher [20] chains
+them with defined priorities.
+B. Interface Attachment
+On bare-metal or private-cloud clusters, N3 is typically an
+SR-IOV virtual function plumbed into the UPF pod through
+Multus. Native XDP must then attach to the VF in the host
+namespace before it is moved, or inside the pod namespace
+by an init container; the latter couples guard lifecycle to the
+UPF and is therefore avoided. On public cloud, N3 is usually a
+dedicated elastic network interface on the node, and the guard
+attaches in the host namespace.
+C. Privilege Scoping
+Loading XDP requires CAP_BPF and CAP_NET_ADMIN
+on modern kernels; older kernels require CAP_SYS_ADMIN.
+Deshpande and Bera note that eBPF-enabled 5G pods commonly run with broad capabilities and that the shared kernel
+then becomes an attack path [19]. GTP-Guard confines all
+privileged operations to the agent, keeps the UPF container
+unprivileged when it uses the kernel path, restricts map access
+
+by pinning under a directory readable only by the agent, and
+exposes telemetry through an unprivileged sidecar.
+D. Public-Cloud NIC Considerations
+Virtual NICs impose constraints absent on bare metal. Native XDP support in cloud NIC drivers may require a reduced
+MTU, a limited number of queues, or specific buffer sizes,
+and loaders that do not meet these requirements can silently
+fall back to generic mode. A practitioner report on AWS
+describes AF XDP on the ENA driver falling back to generic
+mode with about a quarter of packets lost unnoticed, and
+reaching lossless operation only after adjusting buffer sizing,
+at which point the instance’s packets-per-second allowance
+became the bottleneck [21]. GTP-Guard’s agent therefore (i)
+requests native mode explicitly and fails closed to an alert
+rather than silently accepting generic mode, (ii) exports the
+effective attach mode and per-queue counters as metrics, and
+(iii) treats the provider’s per-instance packet-rate allowance as
+a first-class capacity limit in planning.
+VII. E VALUATION M ETHODOLOGY
+A. Per-Packet Budget
+For minimum-size Ethernet frames, line rate is 14.88 Mpps
+at 10 Gb/s, 37.2 Mpps at 25 Gb/s and 148.8 Mpps at 100 Gb/s.
+At a 3 GHz clock, one core sustaining 14.88 Mpps has a budget
+of about 200 cycles per packet. Real N3 frames are larger,
+because GTP-U, the PDU Session Container and inner headers
+add at least 50 bytes, so the packet rate per link is lower;
+however, attack traffic need not respect realistic sizes. We
+therefore report both packet rate and bit rate, and treat cycles
+per packet as the primary efficiency metric.
+B. Testbed and Workloads
+The reference testbed comprises a traffic generator capable
+of stateless GTP-U generation (e.g., TRex with GTP-U templates), a device under test running a recent long-term-support
+kernel with a native-XDP-capable NIC, an open-source 5G
+core (Open5GS or free5GC) with a UPF in either kernel or
+AF XDP mode, and UERANSIM or PacketRusher for session
+establishment. A second profile repeats the experiments on a
+managed Kubernetes cluster in public cloud. Workloads are:
+4
+6
+• W1 Benign: 10 –10 active TEIDs, IMIX-like inner
+payloads.
+
+SEC("xdp")
+int gtp_guard(struct xdp_md *ctx)
+3 {
+4
+void *data = (void *)(long)ctx->data, *end = (void *)(long)ctx->data_end;
+5
+struct ethhdr *eth = data;
+6
+if ((void *)(eth + 1) > end)
+return drop(R_MALFORMED);
+7
+if (eth->h_proto != bpf_htons(ETH_P_IP))
+return XDP_PASS;
+8
+struct iphdr *oip = (void *)(eth + 1);
+9
+if ((void *)(oip + 1) > end)
+return drop(R_MALFORMED);
+10
+if (oip->protocol != IPPROTO_UDP || oip->ihl != 5) return XDP_PASS;
+11
+struct udphdr *udp = (void *)(oip + 1);
+12
+if ((void *)(udp + 1) > end)
+return drop(R_MALFORMED);
+13
+if (udp->dest != bpf_htons(GTPU_PORT))
+return XDP_PASS;
+/* not GTP-U */
+1
+2
+
+14
+
+struct lpm_v4 pk = { .prefixlen = 32, .addr = oip->saddr };
+/* S1: peer allow-list */
+if (!bpf_map_lookup_elem(&peer_allow, &pk))
+return drop(R_PEER);
+
+15
+16
+17
+
+struct gtpu_hdr *g = (void *)(udp + 1);
+/* S2: header sanity */
+if ((void *)(g + 1) > end)
+return drop(R_MALFORMED);
+if ((g->flags >> 5) != 1 || !(g->flags & GTP_PT)) return drop(R_HDR);
+if (g->type != GTP_GPDU)
+return XDP_PASS;
+/* echo, end marker, err-ind */
+
+18
+19
+20
+21
+22
+
+struct sess *s = bpf_map_lookup_elem(&teid_sess, &g->teid);
+/* S3: TEID admission */
+if (!s)
+return drop(R_TEID);
+
+23
+24
+25
+
+__u8 *p = (__u8 *)(g + 1);
+/* S4: bounded ext-header walk */
+if (g->flags & (GTP_E | GTP_S | GTP_PN)) {
+if (p + 4 > (__u8 *)end)
+return drop(R_MALFORMED);
+__u8 nxt = (g->flags & GTP_E) ? p[3] : 0;
+p += 4;
+#pragma unroll
+for (int i = 0; i < MAX_EXT_HDRS; i++) {
+if (!nxt) break;
+if (p + 4 > (__u8 *)end)
+return drop(R_MALFORMED);
+__u32 len = (__u32)p[0] * 4;
+/* length in 4-octet units */
+if (len == 0 || len > MAX_EXT_LEN || p + len > (__u8 *)end) return drop(R_MALFORMED);
+nxt = p[len - 1];
+p += len;
+}
+if (nxt)
+return drop(R_HDR);
+/* chain longer than bound */
+}
+
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+
+struct iphdr *iip = (void *)p;
+/* S5: inner checks */
+if ((void *)(iip + 1) > end)
+return drop(R_MALFORMED);
+if (iip->version != 4)
+return XDP_PASS;
+/* IPv6 path omitted */
+if (iip->saddr != s->ue_ipv4)
+return drop(R_SPOOF);
+if (iip->protocol == IPPROTO_UDP && iip->ihl == 5) {
+struct udphdr *iu = (void *)(iip + 1);
+if ((void *)(iu + 1) <= end && iu->dest == bpf_htons(GTPU_PORT)) return drop(R_NESTED);
+}
+
+43
+44
+45
+46
+47
+48
+49
+50
+51
+
+if (!police(s->qer_idx, ctx->data_end - ctx->data)) return drop(R_RATE); /* S6: policing */
+return bpf_redirect_map(&xsks, ctx->rx_queue_index, XDP_PASS);
+/* AF_XDP, else stack */
+
+52
+53
+54
+
+}
+
+Fig. 2. Condensed GTP-Guard XDP program (IPv4 path). drop() increments a per-CPU reason counter and returns XDP_DROP; map definitions and the
+IPv6 path are omitted for space.
+
+W2 TEID scan: benign background plus random-TEID
+G-PDUs at rates up to line rate.
+• W3 Spoof: valid TEIDs carrying forged inner sources.
+• W4 Nested: GTP-in-GTP inner datagrams.
+• W5 Churn: PFCP establishment and deletion at increasing rates, measuring map-update latency and insertbefore-use violations.
+
+•
+
+C. Baselines and Metrics
+We compare (B0) no filtering, (B1) equivalent rules in
+nftables, (B2) GTP-Guard in generic mode, (B3) GTPGuard in native mode with a fused program, and (B4)
+native mode with adaptive ordering. Metrics are zero-loss
+throughput (RFC 2544 style), drop capacity per core, cycles
+per packet (from perf and bpftool prog profile),
+
+p50/p99/p99.9 added latency for admitted packets, CPU consumed by the UPF under attack, and false-drop rate for legitimate traffic. Table IV lists the hypotheses each experiment is
+designed to test. Literature figures in Table III provide context
+for expected magnitudes but are not directly comparable
+because hardware and pipelines differ.
+VIII. D ISCUSSION AND L IMITATIONS
+Verifier constraints. The 512-byte stack, bounded loops
+and instruction complexity limits shape the design: extensionheader walks must be bounded, and IPv6 inner packets with
+extension headers need a separately bounded parser. Splitting
+stages into tail-called programs also keeps each program’s
+verification cost manageable.
+
+TABLE IV
+H YPOTHESES THE EVALUATION IS DESIGNED TO TEST
+
+SMF
+Kubernetes worker node
+N3
+
+gNB
+
+N4 PFCP
+
+N3 NIC (VF/ENI)
++ XDP GTP-Guard
+
+UPF pod
+(AF XDP or kernel)
+
+admitted
+
+lookups
+
+session events
+
+Pinned maps
+/sys/fs/bpf
+
+map updates
+
+t,
+-lis
+
+w
+allo
+
+Policy CR
+(GitOps)
+
+ID
+
+Hypothesis
+
+Test
+
+H1
+
+Native-mode GTP-Guard adds negligible
+latency and no throughput loss for benign
+traffic relative to B0
+Native-mode drop capacity per core
+substantially exceeds nftables and
+generic mode
+Early dropping keeps UPF CPU near its
+benign level during TEID-scan floods
+Adaptive ordering lowers cycles per packet
+versus the fused program when the attack
+mix shifts
+PFCP-to-map latency stays below the N2
+signalling delay, so no insert-before-use
+violations occur
+
+W1: B0 vs. B3
+
+H2
+
+Guard agent
+(DaemonSet)
+
+H3
+
+metrics
+
+H4
+
+Prometheus
+
+H5
+
+its
+
+lim
+
+W2: B1, B2, B3
+W2: B0 vs. B3
+W2: B3 vs. B4
+W5
+
+Fig. 3. Deployment on a Kubernetes worker node. The agent owns program
+lifecycle and map population; the XDP program and its maps outlive agent
+restarts.
+TABLE III
+R EPORTED XDP PERFORMANCE IN PRIOR WORK ( CONTEXT ONLY )
+Work
+
+Reported result
+
+XDP [6]
+upf-bpf [8]
+
+≈24 Mpps drop on a single core
+≈10 Mpps downlink, 11 Mpps uplink on six
+cores; program injection reduced from 27 ms to
+1 ms
+XDP UPF throughput well above user-space UPF;
+TEID-keyed CPU redirect improves uplink by
+about 2.5×
+
+XDP GTP-U
+ext. [10]
+
+Fragmentation. Outer IP fragments carry no UDP header
+after the first fragment and cannot be validated in XDP. GTPGuard passes fragments to the stack, where reassembly occurs
+before the UPF; the transport MTU should be engineered so
+that N3 fragmentation does not occur in normal operation, and
+fragment rate is exported as a metric because a surge is itself
+an attack signal.
+State divergence. A guard that drops on TEID miss can
+black-hole legitimate traffic if session state lags PFCP. The
+watchdog and pass-through flag bound the impact, but operators should monitor insert-to-first-packet latency (W5) before
+enabling strict mode.
+Shared-kernel risk. XDP improves isolation of the UPF
+from hostile traffic, but it enlarges the trusted computing base
+on the node. Loading must remain limited to a single audited
+agent, and program signing should be adopted where the
+platform supports it [19].
+Scope of filtering. GTP-Guard does not inspect payloads,
+enforce full PDR precedence, or apply downlink policy on N6;
+the latter can reuse the same framework with a UE-addresskeyed map.
+IX. C ONCLUSION AND F UTURE W ORK
+GTP-Guard places a PFCP-aware, line-rate admission layer
+in the driver receive path of a Kubernetes-hosted UPF, removing illegitimate GTP-U traffic before it consumes socket
+buffers or UPF cycles while remaining agnostic to the UPF’s
+
+own forwarding technology. The stage-ordering result gives
+a principled basis for reconfiguring the pipeline when traffic
+shifts under attack, and the deployment model addresses
+lifecycle, privilege and public-cloud NIC constraints that determine whether XDP is practical in production. The immediate
+next step is to execute the evaluation of Section VII and test
+hypotheses H1–H5; further work will extend the pipeline to
+IPv6 and N6, evaluate hardware offload on SmartNICs, and
+close the loop between per-stage telemetry and an automated
+controller that adjusts allow-lists, ordering and policing thresholds as part of a self-healing operations framework.
+R EFERENCES
+[1] 3GPP, “System architecture for the 5G system (5GS),” 3rd Generation
+Partnership Project, TS 23.501.
+[2] ——, “General packet radio system (GPRS) tunnelling protocol user
+plane (GTPv1-U),” 3rd Generation Partnership Project, TS 29.281.
+[3] ——, “Interface between the control plane and the user plane nodes,”
+3rd Generation Partnership Project, TS 29.244.
+[4] GSMA, “GPRS tunnelling protocol (GTP) security,” GSM Association,
+Permanent Reference Document FS.20.
+[5] DPDK Project, “Data plane development kit,” https://www.dpdk.org,
+accessed: Sep. 2026.
+[6] T. Høiland-Jørgensen, J. D. Brouer, D. Borkmann, J. Fastabend, T. Herbert, D. Ahern, and D. Miller, “The eXpress data path: Fast programmable packet processing in the operating system kernel,” in Proc.
+14th Int. Conf. Emerging Networking EXperiments and Technologies
+(CoNEXT), 2018, pp. 54–66.
+[7] T. A. N. do Amaral, R. V. Rosa, D. F. C. Moura, and C. E. Rothenberg,
+“An in-kernel solution based on XDP for 5G UPF: Design, prototype and
+performance evaluation,” in Proc. 17th Int. Conf. Network and Service
+Management (CNSM), 2021, pp. 146–152.
+[8] ——, “Run-time adaptive in-kernel BPF/XDP solution for 5G UPF,”
+Electronics, vol. 11, no. 7, p. 1022, 2022.
+[9] Edgecom LLC, “eUPF: 5G user plane function based on eBPF,” https:
+//github.com/edgecomllc/eupf, accessed: Sep. 2026.
+[10] C. Scheich, M. Corici, H. Buhr, and T. Magedanz, “eXpress data path
+extensions for high-capacity 5G user plane functions,” in Proc. 1st
+Workshop on eBPF and Kernel Extensions (eBPF ’23), 2023, pp. 86–88.
+[11] ——, “Receive side scaling analysis of eXpress data path extensions for
+5G user plane functions,” in Proc. IEEE Wireless Communications and
+Networking Conf. (WCNC), 2024.
+[12] E. Gershuni, N. Amit, A. Gurfinkel, N. Narodytska, J. A. Navas,
+N. Rinetzky, L. Ryzhyk, and M. Sagiv, “Simple and precise static
+analysis of untrusted Linux kernel extensions,” in Proc. 40th ACM
+SIGPLAN Conf. Programming Language Design and Implementation
+(PLDI), 2019.
+
+[13] M. A. M. Vieira, M. S. Castanho, R. D. G. Pacı́fico, E. R. S. Santos,
+E. P. M. C. Júnior, and L. F. M. Vieira, “Fast packet processing with
+eBPF and XDP: Concepts, code, challenges, and applications,” ACM
+Computing Surveys, vol. 53, no. 1, 2020.
+[14] Linux Kernel Documentation, “AF XDP,” https://docs.kernel.org/
+networking/af xdp.html, accessed: Sep. 2026.
+[15] 3GPP, “NG-RAN; PDU session user plane protocol,” 3rd Generation
+Partnership Project, TS 38.415.
+[16] S. Miano, M. Bertrone, F. Risso, M. Tumolo, and M. V. Bernal,
+“Creating complex network services with eBPF: Experience and lessons
+learned,” in Proc. IEEE 19th Int. Conf. High Performance Switching and
+Routing (HPSR), 2018.
+[17] Meta Platforms, “Katran: A high performance layer 4 load balancer,”
+https://github.com/facebookincubator/katran, accessed: Sep. 2026.
+[18] Cilium Project, “Kubernetes without kube-proxy: XDP acceleration,”
+https://docs.cilium.io, accessed: Sep. 2026.
+[19] Y. Deshpande and S. Bera, “Vulnerability analysis of eBPF-enabled
+containerized deployments of 5G core networks,” arXiv:2603.19867,
+2026.
+[20] xdp-project, “xdp-tools and libxdp: Multi-program XDP dispatcher,”
+https://github.com/xdp-project/xdp-tools, accessed: Sep. 2026.
+[21] A. Toonk, “Line-rate packet processing in Go with AF XDP,”
+https://toonk.io/line-rate-packet-processing-in-go-with-af xdp/, 2026,
+accessed: Sep. 2026.
+

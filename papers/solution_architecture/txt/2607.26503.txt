@@ -1,0 +1,1130 @@
+IEEE TRANSACTIONS ON CLOUD COMPUTING, VOL. XX, NO. XX, 2026
+
+1
+
+Safety-Gated Autoscaling: A Multi-Layered
+Defense Architecture for Kubernetes Vertical
+Resource Optimization
+Azra Karakaya
+Dept. of Computer Engineering
+Istanbul Medipol University
+azra.karakaya@std.medipol.edu.tr
+
+arXiv:2607.26503v1 [cs.DC] 29 Jul 2026
+
+Erva Şengül
+Dept. of Computer Engineering
+Istanbul Medipol University
+erva.sengul@std.medipol.edu.tr
+Ahmet Kaplan , Member, IEEE
+Dept. of Computer Engineering
+Istanbul Medipol University
+ahmet.kaplan@medipol.edu.tr (corresponding author)
+
+Abstract—Kubernetes has become the standard platform for
+orchestrating containerized applications, yet resource management on it remains difficult. To stay safe, engineers typically overprovision CPU and memory, leaving large amounts of reserved
+but unused capacity, often called slack, that is the main source
+of wasted cost in a cluster. The built-in Horizontal and Vertical
+Pod Autoscalers are reactive: they act only after a threshold is
+crossed, which causes lag, over-provisioning, and, more seriously,
+can mask software defects by silently granting a leaking workload
+more memory. Most predictive autoscalers in the literature focus
+on improving forecasting accuracy or run only inside proprietary
+infrastructure, and across all of this work anomaly detection
+is used to raise alerts, never to stop a harmful scaling action.
+The Intelligent Cluster Optimizer is an open-source, cloudagnostic Kubernetes operator that vertically right-sizes container
+workloads while treating safety as a first-class concern. Its central
+contribution is a five-layer safety pipeline in which a memoryleak detector, based on linear regression with R2 scoring, acts as
+a blocking gate: if a leak is detected the scaling recommendation
+is rejected, so the optimizer never hides a bug by enlarging a
+broken container. The pipeline further combines SLA monitoring,
+a circuit breaker, HPA/PDB conflict detection, and a five-action
+policy engine, with an automatic rollback mechanism and a dryrun mode for human-in-the-loop approval. Recommendations
+are produced by percentile-based statistical analysis and HoltWinters forecasting and balanced through multi-objective Pareto
+optimization with crowding distance applied at the per-container
+level. We validated the system with 1118 automated tests at 80.3%
+merged coverage and a live deployment on Google Kubernetes
+Engine, where vertical right-sizing produced estimated cost
+savings in the 20–40% range in what-if projections and the
+memory-leak gate reached 83% detection accuracy.
+Index Terms—Kubernetes, autoscaling, vertical scaling, resource optimization, anomaly detection, memory-leak detection,
+multi-objective optimization, Pareto optimization, cloud computing, safety.
+
+I. I NTRODUCTION
+HE primary challenge we address is to minimize the
+financial slack in the orchestration of containerized applications. Kubernetes provides built-in tools for resource management, but these often lack customizable safety guidelines
+and granular policy engines, and they do not allow organizations to define operational constraints based on their own
+risk tolerance. A major problem in Kubernetes environments
+is slack: unused capacity that is reserved but not used, resulting
+in resource waste [1]. To stay safe, engineers usually set CPU
+and memory requests far higher than a workload actually
+needs, and this reserved-but-idle capacity is the dominant
+source of wasted cost.
+Kubernetes ships with the Horizontal Pod Autoscaler (HPA)
+and the Vertical Pod Autoscaler (VPA), but both are reactive.
+Reactive scaling means responding only after a threshold is
+hit: servers are brought up and down in reaction to changes in
+workloads, so the system reacts after a problem has already
+emerged. This approach causes longer restart times and lowers
+service quality [2], and VPA in particular must restart pods to
+apply new limits, which makes it hard to use in production.
+A proactive approach instead uses analytics to anticipate
+future workload demand and act before a spike. This enables
+more efficient resource management than traditional reactive
+methods.
+Much of the work on predictive scaling focuses on improving forecasting accuracy by a few percent, or runs only
+inside one company’s proprietary infrastructure. The recurring
+gap is the absence of operational governance and safety:
+existing tools decide what to change but give operators little
+control over whether a change should be allowed. Worse,
+
+T
+
+IEEE TRANSACTIONS ON CLOUD COMPUTING, VOL. XX, NO. XX, 2026
+
+an autoscaler that blindly trusts demand can mask defects.
+A container with a memory leak appears to need ever more
+memory; a naive optimizer would keep granting it and hide
+the bug until an outage occurs. Our key insight is therefore
+that anomaly detection should gate scaling, not merely alert.
+We are not aware of another published open-source autoscaler
+that combines an explicit anomaly-gating mechanism with a
+layered safety pipeline that blocks scaling recommendations
+based on the health of the workload being scaled.
+Over-provisioning directly inflates cloud bills, and idle reserved capacity still consumes energy. Changing the resources
+of a live workload is also inherently risky: an automated
+system that resizes the wrong workload at the wrong moment
+can cause an outage. We therefore treat safety as the organizing
+principle of the system. Native Kubernetes tools often lack
+the specific safety mechanisms that organizations need, such
+as custom circuit breakers or SLA-aware reconciler logic.
+Without these tailored safety layers, automation can become a
+risk rather than an advantage. An optimizer must be reliable
+and trustworthy before it is aggressive, so that operators are
+willing to let it act on production resources.
+The Intelligent Cluster Optimizer is an open-source, cloudagnostic operator written in Go that addresses this gap. Its
+contributions are:
+Memory-leak detection as a blocking gate. The system
+detects memory leaks using linear regression with R2
+scoring, and if a leak is found the scaling recommendation is blocked, preventing the autoscaler from masking
+bugs by giving a leaking container more memory. Among
+published academic systems, anomaly detection is used
+only to alert operators; none uses it as a blocking gate
+for scaling decisions.
+• A five-layer safety pipeline. Before any recommendation
+is applied it must pass a leak-detection gate, SLA monitoring, a circuit breaker, HPA/PDB conflict detection, and
+a policy engine, complemented by an automatic rollback
+mechanism.
+• Per-container Pareto optimization. We apply multiobjective Pareto optimization with crowding distance
+directly to per-container CPU and memory sizing, generating several trade-off solutions per workload, rather than
+to VM placement or scheduling as in prior work.
+• Dry-run mode with human-in-the-loop approval. Recommendations can be queued for human review before
+they are applied, a governance capability absent from
+other academic autoscalers.
+•
+
+In experiments on GKE with two synthetic workloads,
+the memory-leak gate achieved 83% detection accuracy and
+the optimizer produced estimated cost savings of 20–40% in
+what-if projections against the default resource configuration.
+We validated the system with automated tests and a live
+deployment on Google Kubernetes Engine (GKE). Section II
+reviews related work and summarizes the gaps. Section III
+describes the system architecture. Section IV covers the implementation. Section V presents the evaluation. Section VI
+discusses findings and limitations, and Section VII concludes.
+
+2
+
+II. R ELATED W ORK
+Resource management in Kubernetes has been studied in
+both academic and industrial settings. We organize the literature into reactive and predictive autoscaling, multi-objective
+optimization, anomaly detection, and safety and governance,
+and we close with a summary of the gaps our work fills.
+A. Reactive and Predictive Autoscaling in Kubernetes
+The default reaction to changing demand in Kubernetes is
+reactive autoscaling, in which the system observes a metric
+crossing a threshold and only then adds capacity. The recognized weakness of this model is response delay: because
+scaling happens after a problem has emerged, it incurs longer
+restart times and degrades service quality during the interval
+before new capacity becomes ready. Much of the recent work
+therefore aims to make scaling predictive, forecasting demand
+so that capacity can be provisioned in advance.
+Yuan and Liao [2] built a predictive autoscaling operator
+that combines the Holt-Winters method with a Gated Recurrent
+Unit network. Their hybrid approach predicted resource needs
+before demand spikes and improved service availability from
+80% to 87%. The limitation, for our purposes, is that their
+solution is horizontal only: it adds and removes pods but
+never adjusts the CPU or memory of an individual container.
+The case for complex models is not universally accepted.
+Christofidi et al. [3] tested forecasting on real traces from
+several major cloud providers and found that resource usage
+varies only around 3.29% on average, so that a simple shift
+predictor competes with an LSTM; their result is an empirical
+analysis rather than a deployed autoscaler, and it suggests
+that the marginal accuracy gains of heavier models may not
+justify their cost on stable workloads. Ghorab and Doudali
+[4] pursued representation learning that turns time-series data
+into embeddings, but their work stayed at the prototype
+stage and was never integrated into a working autoscaler.
+Other forecasting studies apply ensemble methods [5], Prophet
+combined with LSTM [6], and time-series foundation models
+[7], [8]; the last of these is directly relevant to our own use of
+Chronos and confirms that foundation models are a credible
+direction for cloud forecasting, though none of these works
+couples forecasting to a safety mechanism.
+Predictive scaling has been demonstrated at production
+scale. Google’s Autopilot [1] right-sizes resources vertically
+across billions of containers using a moving-window recommender for CPU and a meta-algorithm that selects among
+several predictors for memory, and it reduced resource slack
+from 46% to 23%. This is strong evidence that vertical sizing
+genuinely saves money, and it is the closest industrial analogue
+to our own goal. However, Autopilot is deeply tied to Google’s
+internal Borg system, has no open-source release, and includes
+no leak detection, no policy engine, and no governance layer,
+so it cannot be deployed or audited outside Google. The PASS
+system [9] handles hundreds of enterprise web services using
+ensemble learning together with queuing theory as a reactive
+fallback, but it is horizontal only and locked to its operator’s infrastructure. Alibaba’s AHPA [10] performs adaptive
+horizontal pod autoscaling on a public cloud, and archetype-
+
+IEEE TRANSACTIONS ON CLOUD COMPUTING, VOL. XX, NO. XX, 2026
+
+or confidence-aware predictive autoscalers [11] continue the
+same horizontal direction. Across these systems the pattern
+is consistent: they either add replicas or move pods, and the
+strongest vertical system is proprietary.
+B. Multi-Objective Optimization for Cloud Resources
+Resource management is sometimes treated as a multiobjective problem. Chen, Du and Xiao [12] apply Pareto
+optimization to balance cost and response time, but at the
+virtual-machine level for emergency resource allocation, not
+for container-level right-sizing. Genetic-algorithm approaches
+to multi-objective container allocation [13] and Pareto-based
+scheduling frameworks likewise operate at the placement or
+scheduling level. No prior system, to our knowledge, applies
+Pareto optimization with crowding distance directly to percontainer CPU and memory sizing.
+C. Scheduling and Learning-Based Approaches
+Several recent papers target scheduling rather than sizing.
+Senjab et al. [14] survey more than fifty Kubernetes scheduling
+algorithms; Dakic et al. [15] build a custom machine-learning
+scheduler that beats the default by 1–18% on a small cluster;
+Rubak and Taheri [16] test classifiers such as SVM and
+Random Forest to reduce SLA violations; and deep-learning
+and reinforcement-learning schedulers [17] alongside MLdriven container management surveys [18] continue this line.
+All of these decide where a pod should run, not how much
+resource it should receive, which is a different problem from
+ours.
+D. Anomaly Detection in Cloud Systems
+The cloud-computing literature includes extensive work on
+anomaly detection for time series. Zamanzadeh Darban et al.
+[19] survey more than 150 deep-learning anomaly detection
+methods, but none of these methods are connected to an
+autoscaling decision: they are used to raise an alert, not to
+stop a bad scaling action. Kardani-Moghaddam et al. [20]
+propose ACAS, an anomaly-based cause-aware auto-scaling
+framework, but there anomaly detection triggers scaling, the
+opposite direction from our work. Most relevant to us, Chuang
+et al. [21] introduce “anomaly gating” in SecurePredictScale;
+however, their gating filters poisoned or corrupted machinelearning inputs to defend the forecasting model, not to block
+a scaling recommendation based on the health of the workload
+being scaled. Our memory-leak gate has a fundamentally
+different objective: it protects the production workload from
+being wrongly resized, whereas SecurePredictScale protects
+the predictor from adversarial data.
+E. Safety and Governance in Autoscaling
+Among the systems that combine vertical and horizontal
+scaling, safety is usually omitted. KOSMOS [22] performs
+both vertical and horizontal scaling yet has no safety layer,
+no policy engine, and no leak gating. Themis [23] reconciles horizontal and vertical scaling for inference serving
+
+3
+
+systems but again provides no safety mechanisms. SLOdriven frameworks [24] remain design papers rather than fully
+implemented and tested systems, and security-oriented work
+such as SPARK [25] uses eBPF for network-level protection
+rather than autoscaling safety. Studies of VPA and HPA
+in resource-constrained or edge environments [26] analyze
+fragility without adding new safety mechanisms, and vertical
+autoscalers for specialized workloads [27] do not address
+governance.
+Beyond these academic systems, Kubernetes provides several built-in safety mechanisms that operators commonly use.
+PodDisruptionBudgets (PDBs) protect against voluntary disruptions by ensuring a minimum number of replicas remain
+available during evictions. Taints and tolerations prevent pods
+from being scheduled on inappropriate nodes. Priority classes
+and resource quotas establish a hierarchy of resource entitlement across tenants. These mechanisms are orthogonal to
+autoscaling safety: they protect against scheduling and eviction
+risks but do not prevent the autoscaler itself from making
+harmful sizing decisions. The Intelligent Cluster Optimizer’s
+safety pipeline complements these mechanisms by governing
+the scaling decision itself rather than the execution of the
+scaled workload.
+
+F. Summary of Gaps
+Table I summarizes how representative systems compare
+against ours across the dimensions that matter for safe vertical
+optimization. While individual capabilities appear in isolation
+across the literature, no existing published open-source system combines vertical right-sizing, a layered safety pipeline,
+anomaly-based gating of scaling, a policy engine, and multiobjective optimization. This combination is the space the
+Intelligent Cluster Optimizer fills.
+
+III. S YSTEM A RCHITECTURE
+A. Overview and Design Principles
+The Intelligent Cluster Optimizer is designed as a set of
+components, each with a specific purpose, that together form a
+decision pipeline. It follows the Kubernetes operator pattern: it
+is configured through a custom resource (the OptimizerConfig
+CRD) and driven by a reconciliation loop that runs every
+30 seconds. The architecture, shown in Fig. 1, consists of a
+metrics collection layer that gathers CPU and memory data
+through the Kubernetes Metrics API, an analysis engine, a
+recommendation engine, a policy engine, and an application
+layer that safely executes approved changes with rollback
+support. The controller runs inside a single pod, and a dry-run
+queue exposes a REST interface and a web dashboard so that a
+human can approve or reject each recommendation before it is
+applied. The guiding design principle is that automation must
+not become a risk: without tailored safety layers, an autoscaler
+can do more harm than good, so every recommendation passes
+through the safety pipeline described in Section III-G before
+it reaches a workload.
+
+IEEE TRANSACTIONS ON CLOUD COMPUTING, VOL. XX, NO. XX, 2026
+
+4
+
+TABLE I
+C OMPARISON OF R EPRESENTATIVE AUTOSCALING S YSTEMS AGAINST THE I NTELLIGENT C LUSTER O PTIMIZER
+
+System
+Kubernetes VPA
+Autopilot [1]
+PASS [9]
+AHPA [10]
+KOSMOS [22]
+Themis [23]
+ACAS [20]
+SecurePredictScale [21]
+Intelligent Cluster Optimizer
+
+Vertical
+Scaling
+
+Safety
+Layers
+
+Anomaly
+Gating
+
+Policy
+Engine
+
+MultiObjective
+
+Open
+Source
+
+Yes
+Yes
+No
+No
+Yes
+Yes
+No
+No
+Yes
+
+No
+No
+No
+No
+No
+No
+Partial
+Partial
+Yes (5)
+
+No
+No
+No
+No
+No
+No
+Trigger
+Input filter
+Yes (block)
+
+No
+No
+No
+No
+No
+No
+No
+No
+Yes
+
+No
+No
+No
+No
+No
+No
+No
+No
+Yes
+
+Yes
+No
+No
+No
+No
+No
+No
+No
+Yes
+
+(P95 and P99) with a safety margin, detects memory leaks with
+trend analysis, searches for time-based patterns, and detects
+anomalies. Anomaly detection uses a consensus of Z-Score,
+Interquartile Range, and Moving-Average methods so that a
+single noisy method cannot trigger a false alarm. Formally,
+given a window of resource samples {x1 , . . . , xn } with mean
+µ and standard deviation σ, the Z-Score method flags sample
+xi as anomalous when
+xi − µ
+> τz ,
+σ
+
+(1)
+
+with τz = 3 by default. The Interquartile Range method flags
+xi when it falls outside the whiskers
+xi < Q1 − 1.5 IQR
+
+or
+
+xi > Q3 + 1.5 IQR,
+
+(2)
+
+where IQR = Q3 −Q1 and Q1 , Q3 are the first and third quartiles. A sample is declared anomalous only when a majority of
+the three detectors agree, which suppresses false positives from
+any single noisy method. Percentile calculations are required
+to be accurate within ±1%.
+D. Time-Series Forecasting
+Fig. 1. Architecture of the Intelligent Cluster Optimizer on GKE. The decision
+pipeline runs inside a single controller pod, and the dry-run queue enables
+human-in-the-loop approval before any scaling action is applied.
+
+B. Metrics Collection and Storage Pipeline
+The foundation of any optimization system is data. The
+system collects CPU and memory metrics for all running containers through the Kubernetes Metrics API at least every 60
+seconds, and records usage, requests, and limits at containerlevel granularity. Metrics are kept in an in-memory store with
+a configurable retention window, by default 24 hours. Garbage
+collection removes expired metrics, and dead-pod pruning
+prevents the storage itself from leaking memory. Because a
+trial cluster cannot always be kept running, metrics history is
+also backed up to and restored from a persistent volume so
+that it survives controller restarts.
+C. Statistical Analysis Engine
+Raw metrics are transformed into insights through several
+analytical methods. The engine computes statistical percentiles
+
+Proactive sizing requires a forecast of near-future demand
+rather than a reaction to past usage. We use Holt-Winters triple
+exponential smoothing with additive trend and seasonality,
+which captures both the daily cycles and the slow drift typical
+of containerized workloads at low computational cost. Let yt
+denote the observed resource usage at time t, m the season
+length, and α, β, γ ∈ [0, 1] the smoothing parameters for
+the level, trend, and seasonal components, respectively. The
+level ℓt , trend bt , and seasonal st components are updated
+recursively as
+ℓt = α (yt − st−m ) + (1 − α) (ℓt−1 + bt−1 ),
+
+(3)
+
+bt = β (ℓt − ℓt−1 ) + (1 − β) bt−1 ,
+
+(4)
+
+st = γ (yt − ℓt−1 − bt−1 ) + (1 − γ) st−m ,
+
+(5)
+
+and the h-step-ahead forecast combines the three components,
+ŷt+h = ℓt + h bt + st−m+((h−1) mod m)+1 .
+
+(6)
+
+The forecast ŷt+h feeds the recommendation engine so that
+resources are sized for anticipated demand. Fitting stable
+seasonal parameters requires a sufficiently long observation
+window, a constraint we return to in Section VI.
+
+IEEE TRANSACTIONS ON CLOUD COMPUTING, VOL. XX, NO. XX, 2026
+
+5
+
+E. Recommendation Engine
+
+G. Safety Pipeline
+
+The recommendation engine produces resource suggestions
+from the analyzed data. Using a P95-based value plus a 20%
+safety margin, it labels each workload as scale-up, scaledown, or block, identifying both over-provisioning and underprovisioning based on real workload behavior. Concretely,
+for a container whose observed usage distribution has 95th
+percentile P95 (u), the recommended request is
+
+The safety framework is the component that most clearly
+differentiates this system from existing solutions. A recommendation must pass through all of the following layers, in
+order, before it is applied:
+1) Memory-leak detection gate. The leak detector applies
+linear regression with R2 scoring to the memory-usage
+trend of the workload. Specifically, it fits a line M̂ (t) =
+a t + b to the memory samples {(ti , Mi )} by ordinary
+least squares, where the slope is
+P
+(ti − t̄)(Mi − M̄ )
+,
+(10)
+a= i P
+2
+i (ti − t̄)
+
+R = P95 (u) (1 + δ),
+
+δ = 0.20,
+
+(7)
+
+where the safety margin δ absorbs short-term bursts above
+the historical percentile. The value δ = 0.20 was chosen as
+a conservative default; a sensitivity analysis varying δ under
+different workload burst profiles would establish whether this
+choice is broadly appropriate. When the engine recommends
+a scale-up to protect performance, that decision is prioritized
+over saving money; the system never sacrifices reliability for
+cost.
+
+F. Multi-Objective Pareto Optimization
+Rather than optimizing for a single goal, the system evaluates each candidate against several objectives: cost reduction,
+performance headroom, safety margin, resource efficiency,
+and configuration stability. Cost reduction is the difference
+between current and recommended resource cost under the
+cluster’s pricing model. Performance headroom is the gap
+between the recommended request and the P99 observed
+usage, measured as a fraction. Safety margin is a binary
+objective: configurations that trigger any safety-layer block
+receive a penalty. Resource efficiency is the ratio of observed
+usage to the recommended request, where values near 1 are
+preferred. Configuration stability penalizes changes from the
+current configuration, weighted by change magnitude. Let each
+candidate configuration x be evaluated by the objective vector
+f (x) = (f1 (x), . . . , fk (x)) over the k = 5 objectives. A
+solution x dominates y, written x ≺ y, when
+∀i ∈ {1, . . . , k} : fi (x) ≤ fi (y) ∧ ∃j : fj (x) < fj (y). (8)
+The Pareto frontier is the set of all non-dominated solutions. To
+keep this set diverse and avoid collapsing onto a single region,
+the crowding distance of solution i sums the normalized
+objective gaps to its nearest neighbors along each objective,
+di =
+
+X f (i+1) − f (i−1)
+k
+
+k
+
+k
+
+fkmax − fkmin
+
+,
+
+(9)
+
+with boundary solutions assigned infinite distance so that
+extreme trade-offs are preserved. The system generates at least
+six candidate solutions per optimization run, and selection
+strategies then pick among the non-dominated solutions according to the priorities of the system, so the operator sees an
+explicit cost-versus-SLA trade-off instead of a single blackbox answer.
+
+and the goodness of fit is the coefficient of determination
+P
+(Mi − M̂i )2
+2
+.
+(11)
+R = 1 − Pi
+2
+i (Mi − M̄ )
+A leak is flagged, and the scaling recommendation
+blocked, when the trend is both upward and well explained by the linear model, that is, a > 0 and R2 ≥
+τR . The threshold τR trades sensitivity against false
+positives, and its calibration yields the 83% detection
+accuracy reported in Section V. This prevents the system
+from shrinking, or worse, enlarging, a workload that is
+actually broken, and it is a layer that no prior published
+autoscaler provides.
+2) SLA monitoring. The system monitors SLA metrics
+including latency, error rate, availability, throughput, and
+startup time, and refuses changes that would risk a
+breach.
+3) Circuit breaker. A circuit breaker activates after three
+consecutive failures, giving the system the ability to
+protect itself by halting further scaling until conditions
+recover.
+4) HPA/PDB conflict detection. The system detects any
+conflict between its decisions and an existing Horizontal
+Pod Autoscaler or Pod Disruption Budget with 100%
+accuracy, so it never fights another controller.
+5) Policy engine. Finally, the policy engine evaluates organizational rules (Section III-H).
+In addition, a rollback system preserves state, applies confidence scores, and sets change limits to prevent sudden updates;
+when health degradation is detected, it begins reverting within
+60 seconds. Any configuration that is invalid is rejected by an
+admission webhook validator.
+The leak-detection gate deserves a closer description because it is the central novelty of the system. For each container,
+the detector maintains the recent series of memory-usage
+samples and fits a linear regression to that series. The slope of
+the fitted line estimates the rate at which memory consumption
+grows over time, and the coefficient of determination, R2 ,
+measures how well a monotonic linear trend explains the
+observed data. A workload is flagged as leaking when the slope
+is positive and the R2 value is high, indicating a sustained,
+consistent upward trend rather than transient fluctuation. To
+avoid acting on too little evidence, the detector requires a
+minimum of 30 samples (corresponding to 30 minutes of
+
+IEEE TRANSACTIONS ON CLOUD COMPUTING, VOL. XX, NO. XX, 2026
+
+data at the default 60-second collection interval) before it
+will produce a verdict. The window is configurable via the
+OptimizerConfig CRD. Linear regression was chosen for its
+low computational cost and interpretability: the slope directly
+estimates the leak rate in bytes per second, and the R2
+value gives operators an intuitive measure of confidence in
+the detected trend. We acknowledge that more sophisticated
+methods (e.g., change-point detection, Bayesian structural time
+series, or LSTMs) could capture non-linear trends; we leave
+comparison against such methods to future work. When a
+leak is flagged, the recommendation for that container is
+rejected outright and surfaced to the operator with the reason,
+so that the underlying defect can be investigated rather than
+masked by additional memory. This is the inversion of how
+anomaly detection is used elsewhere in the literature: instead
+of triggering or informing a scaling action, the signal vetoes
+it.
+H. Policy Engine
+The policy engine determines rules that control system
+behavior and sits between the recommendation and its application. It supports five actions: allow, deny, skip, modify,
+and require-approval. Policies are written as expressions and
+evaluated by priority, with each evaluation completing within
+50 milliseconds per recommendation. This lets organizations
+encode hard rules such as forbidding changes during critical
+business hours or enforcing security standards, which ensures
+the optimizer is not just an automated tool but one that fits an
+organization’s needs and standards.
+I. Application Layer and Rollback
+Approved changes are applied by the application layer
+through an in-place Kubernetes rolling update. The system
+does not kill the pod abruptly; Kubernetes replaces it with a
+new pod carrying the updated resource values, which ensures
+zero downtime during the transition. A background process
+then monitors the rollout for up to five minutes, and if the
+update fails, resources are reverted to their previous state.
+Every decision is recorded in a scaling-history audit trail with
+the affected workload, the change made, and a timestamp.
+
+6
+
+TABLE II
+T EST C OVERAGE OF C RITICAL PACKAGES
+
+Package
+
+Coverage
+
+events
+applier
+cost
+scheduler
+pareto
+recommendation
+leak detector
+webhook
+controller
+
+100.0%
+98.1%
+97.5%
+97.4%
+96.4%
+90.0%
+83.1%
+56.8%
+45.7%
+
+Merged (unit + integration)
+
+80.3%
+
+the current window, and the Holt-Winters forecaster produces
+a 1-hour-ahead demand prediction; (3) recommendation generation, where the Pareto optimizer enumerates candidate configurations and evaluates them against the five objectives; and (4)
+policy enforcement, where the safety pipeline evaluates the top
+candidate through each gate in sequence. If a gate blocks the
+recommendation, the reason is logged and the cycle terminates
+without applying a change. Approved recommendations are
+applied via a Kubernetes rolling update, and a background
+goroutine monitors the rollout for up to five minutes, triggering
+rollback on failure.
+Around the core engine, the system provides a commandline tool, optctl, for managing and monitoring the optimizer, including a dashboard command, a cost calculator supporting common cloud pricing models, optimization-history
+tracking, and a manual rollback command, together with a
+JSON output format for automation. A web dashboard exposes
+seven pages for cluster monitoring and optimization. The system integrates with existing DevOps workflows by exporting
+recommendations to GitOps formats such as Kustomize and
+Helm, and it exposes 39 Prometheus metrics for observability.
+Structured logging and recorded system events complete the
+operational picture.
+The codebase is organized into the packages shown in
+Table II, with the Pareto optimizer, recommendation engine,
+leak detector, and safety-pipeline logic in separate packages.
+The full source code is available at https://github.com/
+medipol-srg/ico.
+
+IV. I MPLEMENTATION
+The optimizer is implemented in Go and deployed as a
+Kubernetes controller using controller-runtime, with the OptimizerConfig CRD defining its configuration and the reconciliation loop driving its behavior. Predictive sizing is driven by
+Holt-Winters time-series forecasting, which we selected as the
+active forecaster because it is robust and inexpensive to run.
+The core data structure is the ContainerMetrics object, which holds a ring buffer of usage samples indexed
+by container ID and time stamp. Each reconciliation cycle
+(every 30 seconds) proceeds through four phases: (1) metric
+collection via the Kubernetes Metrics API into the ring buffer,
+with expired entries (older than the 24-hour retention window)
+garbage-collected; (2) analysis, where the statistical engine
+computes percentiles, the leak detector fits its regression over
+
+V. E VALUATION
+A. Experimental Setup
+We deployed the optimizer on a Google Kubernetes Engine
+(GKE) cluster, using Artifact Registry for container images
+and Persistent Disk for metrics retention. Because of the
+limits of a GCP trial account, both test workloads ran with
+low CPU and memory requests on e2-small nodes, which
+limits the scale of the demonstration and means productionscale behavior is not fully validated. Table III summarizes
+the setup. Two workloads were used: stress-master, a stable,
+continuously running workload with consistent CPU usage that
+represents long-running services, and stress-cyclic, a workload
+with a periodic CPU pattern that alternates between high and
+low values to replicate real applications.
+
+IEEE TRANSACTIONS ON CLOUD COMPUTING, VOL. XX, NO. XX, 2026
+
+7
+
+TABLE III
+E XPERIMENTAL S ETUP
+
+TABLE IV
+S UCCESS C RITERIA V ERIFICATION
+
+Parameter
+
+Value
+
+Criterion
+
+Result
+
+Platform
+Node type
+Image registry
+Metrics retention
+Reconciliation interval
+Metrics collection interval
+Forecaster (active)
+Workloads
+
+Google Kubernetes Engine (GKE)
+e2-small
+Google Artifact Registry
+Persistent Disk, 24-hour window
+30 seconds
+60 seconds
+Holt-Winters
+stress-master, stress-cyclic
+
+Reconciliation cycle completes
+within 30 s
+Percentile (P95/P99) accuracy
+within ±1%
+Memory-leak detector accuracy ≥
+85%
+At least six Pareto candidate solutions
+Circuit breaker after 3 consecutive
+failures
+HPA/PDB conflict detection 100%
+Rollback begins within 60 s
+Policy evaluation < 50 ms
+Test coverage > 80%
+Cost savings in 20–40% range
+
+Met
+
+B. Test Coverage and Validation
+The system was validated with 1118 automated tests organized into three layers: unit tests that verify individual
+packages in isolation, integration tests that connect previously
+validated packages to exercise the data pipeline end-to-end
+using the Kubernetes fake client, and end-to-end tests that
+deploy the compiled controller to a single-node kind cluster
+to validate the CRD lifecycle, pod recovery, dry-run mode,
+namespace isolation, and rollback timing. Coverage is measured with Go’s built-in tooling in atomic mode, and the
+production codebase is kept separate from the test files so
+that coverage can be measured cleanly across all packages.
+The merged statement coverage of unit and integration tests
+is 80.3%, which exceeds our 80% target. The two lowestcoverage packages, the controller (45.7%) and the webhook
+(56.8%), both require a live API server to be exercised
+meaningfully and were instead validated through the end-toend layer.
+C. Safety Mechanism Effectiveness
+Each safety layer was tested separately. The memory-leak
+gate correctly blocks recommendations for workloads whose
+memory trend indicates a leak; the detector reaches 83% accuracy, as discussed below. The circuit breaker activates after
+three consecutive failures. HPA/PDB conflict detection identifies conflicts with 100% accuracy. The admission webhook
+rejects invalid configurations, and the rollback mechanism
+begins reverting within 60 seconds when health degradation is
+detected, with the background process monitoring each rollout
+for up to five minutes. Policy evaluation completes within
+50 milliseconds per recommendation, and the reconciliation
+loop completes each cycle within 30 seconds. Table IV maps
+each measurable success criterion defined for the system to its
+observed result, with each criterion verified by an automated
+test.
+D. Recommendation Accuracy
+Percentile calculations (P95/P99) are accurate within ±1%,
+and the recommendation engine correctly labels workloads as
+scale-up, scale-down, or block on the live GKE workloads,
+where the recommendation package reaches 90.0% test coverage. The memory-leak detector reaches 83% accuracy. In dryrun mode, each recommendation is queued for human review
+with its current and suggested CPU and memory requests, a
+
+Met
+83% (partially met)
+Met
+Met
+Met
+Met
+Met
+80.3% (met)
+Met (what-if)
+
+Fig. 2. Dry-run queue showing vertical scaling recommendations. Each entry
+lists the current and suggested CPU and memory requests, a confidence score,
+and the estimated savings, and waits for human approval before being applied.
+
+confidence score, and the estimated monthly savings. Fig. 2
+illustrates the web interface showing these items queued for
+approval; once approved, the change is applied through a
+rolling update with zero downtime and recorded in the scalinghistory audit trail.
+E. Cost Analysis
+Fig. 3 shows the CPU usage of the stress-cyclic workload
+over 48 hours in live mode. The optimizer tracks the cyclic pattern using Holt-Winters forecasts and applies vertical scaling
+automatically, reporting the estimated savings (for example,
+$2.82 per month in this run, based on the applied optimizations). Across the experiments, vertical right-sizing produced
+savings within the targeted 20–40% range in what-if simulations. The what-if calculation compares the actual requested
+resources against the optimizer’s recommended resources at
+each reconciliation cycle, using the cluster’s current cloud
+pricing model (GKE standard pricing for e2-small nodes).
+It assumes that all recommendations would be applied at
+their recommended value and that workload behavior remains
+stationary during the evaluation window. These assumptions
+mean the what-if figures represent an upper bound on achievable savings; actual savings depend on workload stability,
+
+IEEE TRANSACTIONS ON CLOUD COMPUTING, VOL. XX, NO. XX, 2026
+
+8
+
+Fig. 3. CPU usage of the stress-cyclic workload over 48 hours in live mode. The optimizer tracks the cyclic pattern using Holt-Winters forecasts and applies
+vertical scaling automatically, reporting the estimated savings.
+
+the operator’s approval rate in dry-run mode, and whether
+the system repeatedly oscillates between recommendations.
+We report both the what-if projection and, where available,
+actual measured cost changes from applied recommendations
+(e.g., $2.82/month for the example run in Fig. 3) to give the
+reader a conservative lower bound alongside the optimistic
+projection. Because stress-cyclic is at times under-provisioned
+and requires extra CPU, some recommendations are scaleup decisions rather than cost-saving ones; in those cases the
+system prioritizes performance and reliability over cost, which
+is the intended behavior. Horizontal scaling is also supported
+but is applied manually, so operators keep full control over
+replica counts, and the load redistribution it causes is reflected
+back into subsequent vertical recommendations.
+F. Comparison with Existing Tools
+Compared with the standard Kubernetes VPA, which provides vertical sizing but no safety pipeline, no anomaly gating,
+no policy engine, and no multi-objective optimization, the
+Intelligent Cluster Optimizer adds all of these capabilities, as
+summarized in Table I. We note explicitly that this comparison
+is based on the documented behavior of VPA, KEDA, and
+Goldilocks rather than on a live, parallel benchmark; deploying
+and stress-testing multiple tools simultaneously would have
+consumed significantly more cluster resources than our constraints allowed, which limits the strength of the conclusions
+that can be drawn and is revisited in Section VI.
+VI. D ISCUSSION
+A. Key Findings
+The evaluation demonstrates that the system can safely
+resize container workloads on a live cluster. The memoryleak gate proved especially important: without it, a leaking
+
+workload appears simply to need more memory, and a normal
+optimizer would keep granting it and hide the underlying
+defect. Using anomaly detection as a gate that blocks harmful
+recommendations, rather than only for alerting, is the design
+decision that most clearly separates this work from existing
+tools. The Pareto approach with crowding distance avoided
+narrow convergence and consistently surfaced several balanced
+solutions, and the policy engine made the system trustworthy
+enough to act on live production resources.
+B. Limitations
+Several constraints limit the conclusions that can be drawn
+from this evaluation. The most significant one was cloudresource availability. After an external research-grant application was not approved, GCP promotional credits were our
+only funding source. Holt-Winters requires keeping a cluster
+running continuously for days or weeks to fit stable seasonal
+parameters, which was not feasible within these credits, so
+time-series forecasting stability under long-running production
+conditions could not be fully confirmed. The evaluation was
+limited to two synthetic workloads on e2-small nodes; realistic
+workloads with heterogeneous resource profiles, traffic bursts,
+and multi-level seasonality were not tested. Public cluster
+traces (e.g., Azure, Alibaba, or Google cluster data) would
+provide a more objective evaluation but were not incorporated
+in this study.
+The memory-leak detector reached 83% accuracy against
+an 85% target; this was a deliberate trade-off to avoid falsepositive blocking of healthy workloads, since reducing false
+blockings is essential to operator trust. However, accuracy
+alone is an incomplete metric for anomaly detection, especially under class imbalance. A full characterization requiring
+precision, recall, the confusion matrix, and an ROC analysis
+
+IEEE TRANSACTIONS ON CLOUD COMPUTING, VOL. XX, NO. XX, 2026
+
+across the threshold range was not completed and is needed
+before the detector’s practical utility can be fully assessed.
+The safety pipeline’s end-to-end latency through all five layers
+was not measured; individual component latencies (e.g., 50 ms
+policy evaluation) are reported, but combined overhead under
+worst-case conditions remains uncharacterized.
+Finally, the comparison against VPA, KEDA, and
+Goldilocks was based on documented behavior and published
+benchmarks rather than direct, live measurement, which limits
+the strength of the conclusions that can be drawn from it.
+A controlled head-to-head experiment on identical workloads
+would provide stronger evidence for the claimed advantages of
+our approach. In addition, the paper provides no ablation study
+that isolates the contribution of each system component; the
+relative importance of the leak-detection gate, Pareto optimization, Holt-Winters forecasting, and the policy engine cannot be
+determined from the current evaluation. Ablation experiments
+testing the system with and without each component would
+establish which parts of the design drive the observed results.
+C. Threats to Validity
+Internal validity is affected by the limited cluster scale
+(e2-small nodes, two synthetic workloads), which exercises
+the optimizer’s logic correctly but not at production scale.
+External validity is limited because results were obtained on
+a single cloud provider with synthetic workloads, so generalization to large, heterogeneous production clusters remains
+to be demonstrated. Construct validity is supported by 1118
+automated tests at 80.3% coverage, but the lower coverage of
+the controller and webhook packages, validated only through
+end-to-end tests, means some integration behavior is exercised
+less exhaustively than the algorithmic core.
+
+9
+
+The system relies on Kubernetes network policies and authentication for queue access, but hardened transport-layer security
+and audit logging are essential for production deployment.
+Fourth, an adversary could craft workload memory patterns
+that trigger the leak-detection gate, causing a denial-of-service
+condition by preventing legitimate scaling. This is a direct
+security implication of the safety-first design: the gate that
+protects against defects can itself be weaponized. Rate-limiting
+the gate’s verdicts and requiring sustained patterns over multiple reconciliation cycles would raise the attacker’s cost.
+Finally, the policy engine expressions (Section III-H) could
+contain injection vulnerabilities if policy inputs are not sanitized. Policy evaluation is sandboxed and completes within
+50 ms, but a rigorous security audit of the expression evaluator
+is needed before production deployment. We identify these
+attack surfaces as open problems and leave systematic security
+hardening to future work.
+E. Generalizability of the Safety Architecture
+While the five-layer safety pipeline was designed for Kubernetes vertical autoscaling, the architectural pattern is general. The sequence of health check, SLA monitoring, circuit
+breaker, conflict detection, and policy evaluation applies to
+any autonomous control loop that modifies a live system.
+The anomaly-gating principle in particular (using a health
+signal to veto rather than trigger an action) is a generalizable
+design pattern for trustworthy autonomous systems. Adapting
+the pipeline to other domains would require domain-specific
+replacements for the leak-detection gate (e.g., a query-latency
+gate for database tuning) but the layered structure and the veto
+semantics transfer directly.
+F. Safety Framework Connection
+
+D. Security Considerations
+An autoscaler that controls resource allocation introduces
+several attack surfaces that must be considered. First, the
+metrics pipeline is the primary input to all decisions: an
+adversary who can inject fabricated CPU or memory readings
+through the Kubernetes Metrics API could force the optimizer
+to scale workloads up (causing financial cost) or down (causing
+performance degradation). The system partially mitigates this
+through the consensus-based anomaly detector (Section III.C),
+which filters out outlier metrics, but this detector was designed
+for natural anomalies rather than adversarial manipulation and
+has not been stress-tested against a targeted injection attack.
+Second, the controller pod itself is a single point of failure.
+Compromise of the controller would grant an attacker control
+over all resource decisions in the cluster. Standard Kubernetes
+RBAC controls apply, and the controller runs with the minimum necessary permissions following the principle of least
+privilege, but an attacker who gains access through a software
+vulnerability in the controller’s REST API or web dashboard
+could bypass the safety pipeline entirely.
+Third, the dry-run queue (Section III.A) is exposed through
+a REST interface. If not properly secured, an attacker could
+approve harmful recommendations or delete legitimate ones.
+
+Established safety engineering frameworks provide a lens
+for understanding the five safety layers. Following the STPA
+(System-Theoretic Process Analysis) method [28], the optimizer is a safety-critical controller that enforces resourceallocation constraints on a controlled process (the Kubernetes
+cluster). Each safety layer addresses a distinct class of unsafe
+control actions: the leak-detection gate prevents the controller
+from acting on a workload in a broken state (unsafe due to
+uncontrolled process degradation); the circuit breaker prevents
+repeated application of a failing action (unsafe due to feedback
+loops); the HPA/PDB conflict detection prevents the controller
+from acting at cross-purposes to other controllers (unsafe due
+to coordination failure); and the policy engine encodes organizational safety constraints that the system designer cannot
+anticipate (unsafe due to incomplete hazard identification).
+This mapping is informal but demonstrates that the layer
+choices are not arbitrary; each addresses a distinct failure mode
+class. A formal STPA or HAZOP analysis of the optimizer
+remains as future work.
+VII. C ONCLUSION AND F UTURE W ORK
+Resource optimization in Kubernetes can be made safe
+and policy-aware using only open-source components. Our
+
+IEEE TRANSACTIONS ON CLOUD COMPUTING, VOL. XX, NO. XX, 2026
+
+main finding is that combining statistical forecasting with
+multi-objective optimization and a layered safety architecture
+produces a more reliable system than any of these parts alone,
+and that using anomaly detection as a gate that blocks harmful
+recommendations before they are applied is a design decision
+that separates our work from existing tools. The optimizer
+moves the optimization focus from infrastructure placement
+to container-level vertical scaling, applies changes through inplace rolling updates without downtime, and identifies coststability trade-offs that a simple threshold-based scaler would
+miss.
+Future work follows directly from the limitations. The most
+immediate direction is to evaluate the Chronos-2 foundation
+forecaster [8], which has been fine-tuned and integrated at
+the architecture level but not yet tested on a live cluster; a
+direct comparison against Holt-Winters on identical workloads
+under production conditions is the natural next step. We also
+plan to run longer experiments so that seasonal parameters
+stabilize and forecasting stability can be confirmed; to take
+advantage of native in-place pod resize in recent Kubernetes
+releases; to improve the memory-leak detector toward the 85%
+target without adding false positives; and to extend the system
+with automated horizontal scaling that is coordinated with
+vertical sizing. Each of these directions builds naturally on
+the foundation already established.
+ACKNOWLEDGMENTS
+AI-assisted tools were used for language editing and structuring of this manuscript. All technical content, system design,
+implementation, and experimental results are the original work
+of the authors.
+R EFERENCES
+[1] K. Rzadca, P. Findeisen, J. Swiderski, P. Zych, P. Broniek, J. Kusmierek,
+P. Nowak, B. Strack, P. Witusowski, S. Hand, and J. Wilkes, “Autopilot:
+Workload autoscaling at Google,” in Proceedings of the 15th European
+Conference on Computer Systems (EuroSys), 2020.
+[2] H. Yuan and S. Liao, “A time series-based approach to elastic Kubernetes
+scaling,” Electronics, vol. 13, no. 2, p. 285, 2024.
+[3] G. Christofidi, K. Papaioannou, and T. D. Doudali, “Is machine learning
+necessary for cloud resource usage forecasting?” in Proceedings of the
+2023 ACM Symposium on Cloud Computing (SoCC), 2023, pp. 544–554.
+[4] R. M. Ghorab and T. D. Doudali, “Toward using representation learning
+for cloud resource usage forecasting,” in Proceedings of the 2024
+Workshop on AI for Systems (AI4Sys), 2024, pp. 13–19.
+[5] M. Chen, M. A. Rodriguez, P. Arroba, and R. Buyya, “EN-Beats: A
+novel ensemble learning-based method for multiple resource predictions
+in cloud,” in Proceedings of the 2023 IEEE 16th International Conference on Cloud Computing (CLOUD), 2023, pp. 144–154.
+[6] P. B. Guruge and Y. H. P. P. Priyadarshana, “Time series forecastingbased Kubernetes autoscaling using Facebook Prophet and long shortterm memory,” Frontiers in Computer Science, vol. 7, 2025.
+[7] H. Wang, K. J. Mathews, M. Golec, S. S. Gill, and S. Uhlig, “AmazonAICloud: Proactive resource allocation using Amazon Chronos based
+time series model for sustainable cloud computing,” Computing, vol.
+107, no. 3, 2025.
+[8] A. F. Ansari, L. Stella, C. Turkmen, X. Zhang, P. Mercado, H. Shen,
+O. Shchur, S. S. Rangapuram, S. Pineda Arango, S. Kapoor, J. Zschiegner, D. C. Maddix, M. W. Mahoney, K. Torkkola, A. Gordon Wilson,
+M. Bohlke-Schneider, and Y. Wang, “Chronos: Learning the language
+of time series,” Transactions on Machine Learning Research, 2024.
+[9] Y. Guo, J. Ge, P. Guo, Y. Chai, T. Li, M. Shi, Y. Tu, and J. Ouyang,
+“PASS: Predictive auto-scaling system for large-scale enterprise web
+applications,” in Proceedings of the ACM Web Conference (WWW),
+2024, pp. 2747–2758.
+
+10
+
+[10] Z. Zhou, C. Zhang, L. Ma, J. Gu, H. Qian, Q. Wen, L. Sun, P. Li,
+and Z. Tang, “AHPA: Adaptive horizontal pod autoscaling systems on
+Alibaba cloud container service for Kubernetes,” in Proceedings of the
+37th AAAI Conference on Artificial Intelligence, vol. 37, no. 13, 2023,
+pp. 15 621–15 629.
+[11] G. Zhang, S. Vippagunta, R. Nandagopal, S. Raman, J. Xu, M. Pfeiffer,
+S. Chatterjee, Z. Tan, W. Guo, and H. Jiang, “AAPA: An archetypeaware predictive autoscaler with uncertainty quantification for serverless
+workloads on Kubernetes,” 2025.
+[12] J. Chen, T. Du, and G. Xiao, “A multi-objective optimization for resource
+allocation of emergent demands in cloud computing,” Journal of Cloud
+Computing: Advances, Systems and Applications, vol. 10, p. 20, 2021.
+[13] C. Guerrero, I. Lera, and C. Juiz, “Genetic algorithm for multi-objective
+optimization of container allocation in cloud architecture,” 2024.
+[14] K. Senjab, S. Abbas, N. Ahmed, and A. u. R. Khan, “A survey
+of Kubernetes scheduling algorithms,” Journal of Cloud Computing:
+Advances, Systems and Applications, vol. 12, no. 1, 2023.
+[15] V. Dakić, G. Ðambić, J. Slovinac, and J. Redžepagić, “Optimizing
+Kubernetes scheduling for web applications using machine learning,”
+Electronics, vol. 14, no. 5, 2025.
+[16] A. Rubak and J. Taheri, “Machine learning for predictive resource
+scaling of microservices on Kubernetes platforms,” in Proceedings of
+the 16th IEEE/ACM International Conference on Utility and Cloud
+Computing (UCC), 2023, pp. 1–8.
+[17] Z. Xu, Y. Gong, Y. Zhou, Q. Bao, and W. Qian, “Enhancing Kubernetes
+automated scheduling with deep learning and reinforcement techniques
+for large-scale cloud computing optimization,” in Proceedings of the
+9th International Symposium on Advances in Electrical, Electronics and
+Computer Engineering (ISAEECE), Proc. SPIE 13291, 2024.
+[18] O. P. Egbuna, “Machine learning applications in Kubernetes for
+autonomous container management,” Journal of Artificial Intelligence
+Research, vol. 4, no. 1, pp. 196–219, 2024. [Online]. Available:
+https://thesciencebrigade.com/JAIR/article/view/235
+[19] Z. Zamanzadeh Darban, G. I. Webb, S. Pan, C. C. Aggarwal, and
+M. Salehi, “Deep learning for time series anomaly detection: A survey,”
+ACM Computing Surveys, vol. 57, no. 1, pp. 1–42, 2024.
+[20] S. Kardani-Moghaddam, R. Buyya, and K. Ramamohanarao, “ACAS:
+An anomaly-based cause aware auto-scaling framework for clouds,”
+Journal of Parallel and Distributed Computing, vol. 126, 2019.
+[21] A. Chuang, M. Moh, and T.-S. Moh, “SecurePredictScale: Anomalygated predictive autoscaling for robust cloud resource management,”
+in Proceedings of the 2026 International Conference on Computing,
+Networking and Communications (ICNC), 2026.
+[22] L. Baresi, D. Y. X. Hu, G. Quattrocchi, and L. Terracciano, “KOSMOS: Vertical and horizontal resource autoscaling for Kubernetes,” in
+Proceedings of the 19th International Conference on Service-Oriented
+Computing (ICSOC), 2021.
+[23] K. Razavi, M. Salmani, M. Mühlhäuser, B. Koldehofe, and L. Wang,
+“A tale of two scales: Reconciling horizontal and vertical scaling for
+inference serving systems,” 2024.
+[24] V. Punniyamoorthy, B. Kumar, S. Saha, L. Butra, M. Palanigounder,
+A. K. Agarwal, and K. Kannan, “An SLO-driven and cost-aware
+autoscaling framework for Kubernetes,” 2025.
+[25] Z. Jiang and A. Milani Fard, “SPARK: Secure predictive autoscaling for
+robust Kubernetes,” 2026.
+[26] D. Spatharakis, I. Dimolitsas, E. Vlahakis, D. Dechouniotis, N. Athanasopoulos, and S. Papavassiliou, “Distributed resource autoscaling in
+Kubernetes edge clusters,” in Proceedings of the 18th International
+Conference on Network and Service Management (CNSM), 2022, pp.
+163–169.
+[27] D. Medeiros, J. J. Williams, J. Wahlgren, L. Saud Maia Leite, and
+I. Peng, “ARC-V: Vertical resource adaptivity for hpc workloads in
+containerized environments,” 2025.
+[28] N. G. Leveson, Engineering a Safer World: Systems Thinking Applied
+to Safety. MIT Press, 2011.
+

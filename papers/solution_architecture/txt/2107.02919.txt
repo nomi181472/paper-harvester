@@ -1,0 +1,2154 @@
+DISTRIBUTED STOCHASTIC OPTIMIZATION WITH LARGE DELAYS
+
+arXiv:2107.02919v1 [math.OC] 6 Jul 2021
+
+ZHENGYUAN ZHOU∗ , PANAYOTIS MERTIKOPOULOS] , NICHOLAS BAMBOS ,
+PETER W. GLYNN , AND YINYU YE
+
+Abstract. One of the most widely used methods for solving large-scale stochastic
+optimization problems is distributed asynchronous stochastic gradient descent (DASGD),
+a family of algorithms that result from parallelizing stochastic gradient descent on
+distributed computing architectures (possibly) asychronously. However, a key obstacle in
+the efficient implementation of DASGD is the issue of delays: when a computing node
+contributes a gradient update, the global model parameter may have already been updated
+by other nodes several times over, thereby rendering this gradient information stale. These
+delays can quickly add up if the computational throughput of a node is saturated, so
+the convergence of DASGD may be compromised in the presence of large delays. Our
+first contribution is that, by carefully tuning the algorithm’s step-size, convergence to
+the critical set is still achieved in mean square, even if the delays grow unbounded at a
+polynomial rate. We also establish finer results in a broad class of structured optimization
+problems (called variationally coherent), where we show that DASGD converges to a
+global optimum with probability 1 under the same delay assumptions. Together, these
+results contribute to the broad landscape of large-scale non-convex stochastic optimization
+by offering state-of-the-art theoretical guarantees and providing insights for algorithm
+design.
+
+1. Introduction
+With the advent of high-performance computing infrastructures that are capable of
+handling massive amounts of data, distributed stochastic optimization has become the
+predominant paradigm in a broad range of applications in operations research [15, 16, 30,
+32, 44, 45, 50]. Starting with a series of seminal contributions by Tsitsiklis et al. [49], recent
+years have witnessed a commensurate surge of interest in the parallelization of first-order
+methods, ranging from ordinary (stochastic) gradient descent [1, 11, 18, 31, 35, 40, 42], to
+coordinate/dual coordinate descent [2, 17, 33, 34, 46, 47], randomized Kaczmarz algorithms
+[34], online methods [22, 24, 26, 41], block coordinate descent [36, 51, 52], ADMM [23, 53],
+and many others.
+This popularity is a direct consequence of Moore’s law of silicon integration and the
+commensurately increased distribution of computing power. For instance, in a typical
+supercomputer cluster, up to several thousands of “workers” (or sometimes tens of thousands)
+perform independent computations with little to no synchronization – as the cost of such
+coordination quickly becomes prohibitive in terms of overhead and energy spillage. Similarly,
+massively parallel computing grids and data centers (such as those of Google, Amazon,
+∗ Stern School of Business, New York University, NYC, USA.
+] Univ.
+
+Grenoble Alpes, CNRS, Inria, Grenoble INP, LIG, 38000, Grenoble, France.
+
+ Department of Management Science and Engineering, Stanford University.
+
+E-mail addresses: zzhou@stern.nyu.edu, panayotis.mertikopoulos@imag.fr, bambos@stanford.edu,
+glynn@stanford.edu, yinyu-ye@stanford.edu.
+2020 Mathematics Subject Classification. Primary 90C15, 90C26; secondary 90C25, 90C06.
+Key words and phrases. Distributed optimization; delays; stochastic gradient descent; stochastic
+approximation.
+1
+
+2
+
+Z. ZHOU, P. MERTIKOPOULOS, N. BAMBOS, P. W. GLYNN, AND N. BAMBOS
+
+IBM or Microsoft) may house up to several million computing nodes and/or servers, all
+working asynchronously to execute a variety of different tasks. Finally, taking the concept of
+distributed computing to its logical extreme, volunteer computing grids (such as Berkeley’s
+BOINC infrastructure or Stanford’s folding@home project) essentially span the entire globe
+and harness the computing power of a vast, heterogeneous network of non-clustered nodes
+that receive and process computational requests in a non-concurrent fashion, rendering
+syncrhonization impossible. In this way, by eliminating the required coordination overhead,
+asynchronous operations become simultaneously more appealing (in physically clustered
+systems) and more scalable (in massively parallel and/or volunteer computing grids).
+In this broad context, perhaps the most widely deployed method is distributed asynchronous stochastic gradient descent (DASGD) and its variants. In addition to its long history
+in mathematical optimization, DASGD has also emerged as one of the principal algorithmic schemes for training large-scale machine learning models. In “big data” applications
+in particular, obtaining first-order information on the underlying learning objective is a
+formidable challenge, to the extent that the only information that can be readily computed is
+an imperfect, stochastic gradient thereof [13, 14, 27, 40, 54, 55]. This information is typically
+obtained from a group of computing nodes (or processors) working in parallel, and is then
+leveraged to provide the basis for a distributed descent step.
+Depending on the specific computing architecture, the resulting DASGD scheme varies
+accordingly. More concretely, there are two types of distributed computing architectures
+that are common in practice: The first is a cluster-oriented, multi-core, shared memory
+architecture where different processors independently compute stochastic gradients and
+update a global model parameter [11, 18, 31]. The second is a “master-worker” architecture
+used predominantly in computing grids (and, especially, volunteer computing grids): here,
+each worker node independently – and asynchronously – computes a stochastic gradient
+of the objective and sends it to the master; the master then updates the model’s global
+parameter and sends out new computation requests [1, 31]. In both cases, DASGD is
+inherently susceptible to delays, a key impediment that is usually absent in centralized
+stochastic optimization settings. For instance, in a master-worker system, when a worker
+sends its gradient update to the master, the master may have already updated the model
+parameters several times (using updates from other workers), so the received gradient is
+already stale by the time it is received. In fact, even in the perfectly synchronized setting
+where all workers have the same speed and send input to the master in an exact round-robin
+fashion, there is still a constant delay that grows roughly proportionally to the number of
+workers in the system [1].
+This situation is exacerbated in volunteer computing grids: here, workers typically
+volunteer their time and resources following a highly erratic and inconstant update/work
+schedule, often being turned off and/or being used for different tasks for hours (or even days)
+on end. In such cases, there is no lower bound on the fraction of resources used by a worker
+to compute an update at any given time (this is especially true in heterogeneous computing
+grids such as BOINC and SimGrid), meaning in turn that there is no upper bound on the
+induced delays. This can also happen in parallel computing environments where many tasks
+with different priorities are executed at the same time across different machines and, likewise,
+even in multi-core infrastructures with a shared memory, memory-starved processors can
+become arbitrarily slow in performing gradient computations.
+From a theoretical standpoint, the issue of delays and asynchronicities has been studied
+from the early days of distributed computing [7], and one of the principal results in the field is
+the subsequential convergence of DASGD with probability 1 when no constraints are present
+and when the observed delays grow moderately with time – i.e., sublinearly relative to a
+
+DISTRIBUTED STOCHASTIC OPTIMIZATION WITH LARGE DELAYS
+
+3
+
+global clock [48, 49]. In several current systems (for example, in volunteer computing grids),
+as slower workers become saturated and accumulate computation requests over time while
+new (and possibly faster) workers enter the system, delays can quickly add up and grow at a
+superlinear rate relative to the system’s global timer. Further, in several applications, there
+are natural constraints imposed on a subset (or all) of the decision variables that represent
+the model parameters. In such contexts, the following questions remain open: How robust is
+the performance envelope of DASGD for constrained optimization under large delays and
+asynchronicities? Can this robustness be leveraged from a theoretical viewpoint in order to
+design new and more efficient algorithms?
+1.1. Our Contributions and Related Work. Our aim in this paper is to establish the convergence of DASGD in the presence of large, superlinear delays, in as wide a class of objectives
+as possible and in the presence of constraints where efficient projection can be performed. To
+that end, we focus on the following classes of problems, where different convergence results
+can be obtained:
+General non-convex objectives. We first consider the class of general smooth non-convex
+functions, with no structural assumption on the objectives. In this (difficult) case, Tsitsiklis
+et al. [49] showed that, under sublinear delays, DASGD converges to a level set of the
+objective which contains a critical point with probability 1; in particular, if every such
+point is a global minimizer (e.g., if the problem is pseudo-convex) and the method is run
+with an Ω(1/n) step-size schedule, DASGD converges to the problem’s solution set. More
+recently, Lian
+Pnet al. [31] derived an estimate for the rate of convergence of the surrogate
+length n−1 k=1 E[k∇ f (Xk )k22 ] as n → ∞ under the assumption that the delays affecting
+the algorithm are bounded. Our first contribution is to show that these assumptions on the
+delays are not needed: specifically, as we show in Theorem 1, by tuning the algorithm’s
+step-size appropriately, it is possible to retain this convergence guarantee, even if delays grow
+as polynomials of arbitrary degree.
+Variationally coherent objectives. Albeit directly applicable to general non-convex stochastic optimization, Theorem 1 only guarantees convergence to stationarity in the mean square
+sense; to ensure global optimality, stronger structural assumptions on the objectives must be
+imposed. The “gold standard” of such assumptions (and by far the most widely studied one)
+is convexity: in the context of distributed stochastic convex optimization, recent works by
+Agarwal and Duchi [1] and Recht et al. [42], have established convergence for DASGD under
+bounded delays for each of the two distributed computing architectures, while Chaturapruek
+et al. [11] and Feyzmahdavian et al. [18] extended the bounded delays assumption to a
+setting with finite-mean i.i.d. delays. To go beyond this framework, we focus the class of
+mean variationally coherent optimization problems [56, 57], which includes pseudo-, quasiand/ star-convex problems, as well as many other classes of functions with non-convex
+profiles. Our main result here is that, in such problems, the global state parameter Xn of
+DASGD converges to a global minimum with probability 1, even when the delays between
+gradient updates and requests grow at a polynomial rate (and this, without any distributional
+assumption on how the underlying delays are generated).
+To go beyond this framework, we focus on a class of unimodal problems, which we call
+variationally coherent, and which properly includes all pseudo-, quasi- and/ star-convex
+problems, as well as many other classes of functions with highly non-convex profiles. Our
+main result here may be stated as follows: in stochastic variationally coherent problems,
+provided a lazy descent scheme is used (akin to dual averaging) to mesh with the constraint
+set in the distributed procedure, the global state parameter Xn of DASGD converges to a
+global minimum with probability 1, even when the delays between gradient updates and
+
+4
+
+Z. ZHOU, P. MERTIKOPOULOS, N. BAMBOS, P. W. GLYNN, AND N. BAMBOS
+
+requests grow at a polynomial rate (and this, without any distributional assumption on how
+the underlying delays are generated).
+This result extends the works mentioned above in several directions: specifically, it shows
+that
+1. Convexity is not required to obtain global convergence results.
+2. Constraints do not hinder almost sure convergence under a suitable lazy projection
+scheme.
+3. The robustness of DASGD is guaranteed even under large, superlinear delays.
+We find these outcomes particularly appealing because, coupled with the existing rich
+literature on the topic, they help explain and reaffirm the prolific empirical success of
+DASGD in large-scale machine learning problems, and offer concrete design insights for
+fortifying the algorithm’s distributed implementation against delays and asynchronicities.
+Techniques. Our analysis relies on techniques and ideas from stochastic approximation
+and (sub-)martingale convergence theory. A key feature of our approach is that, instead of
+focusing on the discrete-time algorithm, we first establish the convergence of an underlying,
+deterministic dynamical system by means of a particular energy (Lyapunov) function which
+is decreasing along continuous-time trajectories and “quasi-decreasing” along the iterates of
+DASGD. To control this gap, we connect the continuous- and discrete-time frameworks via
+the theory of asymptotic pseudotrajectories (APTs), as pioneered by Benaïm and Hirsch [4].
+By itself, the APT method does not suffice to establish convergence under delays. However,
+if the step-size of the method is chosen appropriately (following a quasi-linear decay rate
+for polynomially growing delays), it is possible to leverage Lp martingale tail convergence
+results to show that the problem’s solution set is recurrent under DASGD. This, combined
+with the above, allows us to prove our core convergence results.
+Even though the ordinary differential equation (ODE) approximation of discrete-time
+Robbins–Monro algorithms has been widely studied in control and optimization theory
+[20, 28], transferring the convergence guarantees of an ODE solution trajectory to a discretetime algorithm is a fairly subtle affair that must be done on a case-by-case basis. Further, even
+if this transfer is complete, the results typically have the nature of convergence-in-probability:
+almost-sure convergence is usually much harder to obtain [9]. Specifically, exisiting stochastic
+approximation results cannot be applied to our setting because a) the non-invertibility of
+the projection map makes the underlying dynamical system on the problem’s feasible region
+non-autonomous (so APT results do not apply); b) unbounded delays only serve to aggravate
+this issue, as they introduce a further disconnect between the DASGD algorithm and its
+continuous-time version. To control the discrepancy between discrete and continuous time
+requires a more fine-grained analysis, for which we resort to a sharper law of large numbers
+for Lp -bounded martingales. Finally, we also mention that the recent work of Lian et al. [32]
+has also considered distributed zeroth-order methods (where only the function value, rather
+than the gradient is available) and used techniques that are different from gradient-based
+analyses.
+
+2. Problem Setup
+d
+
+Let X be a subset of R and let (Ω, F, P) be some underlying (complete) probability space.
+Throughout this paper, we focus on the following stochastic optimization problem:
+minimize f (x)
+subject to x ∈ X ,
+
+(Opt)
+
+DISTRIBUTED STOCHASTIC OPTIMIZATION WITH LARGE DELAYS
+
+where the objective function f : X → R is of the form
+Z
+f (x) = E[F (x; ω)] =
+F (x; ω) d P(ω)
+
+5
+
+(1)
+
+Ω
+
+for some random function1 F : X × Ω → R. Using standard optimization terminologies,
+(Opt) is called an unconstrained stochastic optimization problem if X = Rd , and is called
+a constrained stochastic optimization problem otherwise. In this paper, we study both
+unconstrained and constrained stochastic problems under smooth objectives. Specifically, we
+make the following regularity assumptions for the rest of the paper, which are standard in
+the literature:
+Assumption 1. We assume the following:
+(1) F (x; ω) is differentiable in x for P-almost all ω ∈ Ω.
+(2) ∇ F (x; ω) has2 finite second moment, that is, supx∈X E[k∇F (x; ω)k22 ] < ∞.
+(3) ∇F (x; ω) is Lipschitz continuous in the mean: E[∇F (x; ω)] is Lipschitz on X .
+Remark 1.
+Assumptions 1 and 2 together imply that f is differentiable, because finite
+second moment (by Statement 2) implies finite first moment: E[k∇F (x; ω)k2 ] < ∞ for
+all x ∈ X ; and hence the expectation E[∇F (x; ω)] exists. By a further application of the
+dominated convergence theorem, we have ∇f (x) = ∇ E[F (x; ω)] = E[∇F (x; ω)]. Additonally,
+Assumption 3 implies that ∇f is Lipschitz continuous. In the deterministic optimization
+literature, f is sometimes called L-smooth, where L is the Lipschitz constant.
+One important class of motivating applications that can be cast in the current stochastic
+optimization problem (Opt) is empirical risk minimization (ERM) in machine learning. As
+is well-known in the distributed optimization/learning literature [1, 27, 31, 40, 54], the
+expectation in Eq. (1) contains as a special case the common machine learning objectives of
+PN
+the form N1 i=1 fi (x), where each fi (x) is the loss associated with the i-th training sample.
+This setup corresponds to ERM without regularization. With regularization, ERM takes the
+PN
+form N1 i=1 fi (x) + r(x), where r(·) is a regularizer (typically convex and known), which is
+again a special case of (Opt). Other related examples that are also special cases of (Opt)
+PN
+include the objective i=1 vi fi (x), which are standard in curriculum learning: vi are weights
+(between 0 and 1) generated from a learned curriculum that indicates how much emphasis
+each loss fi should be given.
+In the large-scale data setting (N is very large), such problems are typically solved in
+practice using stochastic gradient descent (SGD) on a distributed computing architecture.
+SGD3 is widely used primarily because in many applications, stochastic gradient, computed
+by first drawing a sub-batch of data and then computing the average of the gradients on that
+sub-batch, is the only type of information that is computationally feasible and practically
+convenient to obtain4. Further, such problems are generally solved on a distributed computing
+architecture because: 1) Computing gradients is typically the computational bottleneck.
+Consequently, having multiple processors compute gradients in parallel can harness the
+available computing power in modern distributed systems. 2) The data (which determine
+1It is understood that a random function here means that F (x; ·) : Ω → R is a measureable function for
+each x ∈ X .
+2It is understood here that the gradient ∇ F (x; ω) is only taken with respect to x: no differential structure
+is assumed on Ω.
+3In vanilla SGD (i.e. centralized/single-processor setting), an iid sample of the gradient of F at the
+current iterate is used to make a descent step (with an appropriate projection made in the constrained
+optimization case).
+4
+For instance, Google’s Tensorflow system does automatic differentiation on samples for neural networks
+(i.e. fi (·)’s are parametrized neural networks).
+
+6
+
+Z. ZHOU, P. MERTIKOPOULOS, N. BAMBOS, P. W. GLYNN, AND N. BAMBOS
+
+MASTER
+
+PROCESSOR 1
+
+...
+
+WORKER 1
+
+PROCESSOR k
+
+WORKER k
+
+SHARED
+MEMORY
+
+...
+
+...
+...
+WORKER K
+
+PROCESSOR K
+
+Figure 1. Two commonly used distributed computing architecutures: (a) masterworker (left) and multi-processorwith shared memory (right).
+
+the individual cost functions fi ’s) may simply be too large to fit on a single machine; and
+hence a distributed system is necessary even from a storage perspective.
+With the above background, our goal in this paper is to study and establish theoretical
+convergence guarantees for applying stochastic gradient descent (SGD) to solve (Opt) on a
+distributed computing architecture. Two common distributed computing architectures that
+are widely delpoyed in practice (see also Fig. 1):
+(1) Master-worker system. This architecture is mostly used in data-centers and parallel
+computing grids (each computing node is a single machine, virtual or physical).
+(2) Multi-processor system with shared memory. This architecture is mostly used in
+multi-core machines or GPU computing: in the former, each processor is a CPU,
+while in the latter, each processor is a GPU.
+In the next two subsections (Sections 2.1 and 2.2), we describe the standard procedure
+of parallelizing SGD on each of the two distributed computing architectures. Although
+running SGD on these two architectures have some differences, in Section 2.3 we give a meta
+algorithmic description, called distributed asynchronous stochastic gradient descent (DASGD)
+that unifies these two parallelizations on the same footing.
+2.1. SGD on Master-Worker Systems. Here we consider the first distributed computing
+architecture: the master-worker system. The standard way of deploying stochastic gradient
+descent in such systems – and that which we adopt here – is for the workers to asychronously
+compute stochastic gradients and then send them to the master,5 while the master updates
+the global state of the system and pushes the updated state back to the workers ([1, 31]).
+This process is presented in Algorithm 1.
+Due to the distributed nature of the master-worker system, a gradient received by the
+master on any given iteration can be stale. As a simple example, consider a fully coordinated
+update scheme where each worker sends the computed gradient to and receives the updated
+iterate from the master following a round-robin schedule. In this case, each worker’s gradient
+is received with a delay exactly equal to K − 1 (K is the number of workers in the system),
+because by the time the master receives worker K’s computed gradient, the master has
+already applied K − 1 gradient updates from workers 1 to K − 1 (and since the schedule is
+round-robin, this delay of K − 1 is true for any one of the K workers).
+However, delays can be much worse since we allow full asynchrony: workers can compute
+and send (stochastic) gradients to the master without any coordinated schedule. In the
+5As alluded to before, in machine learning applications, this is done by sampling a subset of the training
+data, computing the gradient for each datapoint and averaging over all datapoints in the sample.
+
+DISTRIBUTED STOCHASTIC OPTIMIZATION WITH LARGE DELAYS
+
+7
+
+Algorithm 1. Running SGD on a Master-Worker Architecture
+
+Require: 1 Master and K workers, k = 1, . . . , K
+1: Each worker is seeded with the same inital iterate
+2: repeat
+3:
+Master:
+(a) Receive a stochastic gradient from worker k
+(b) Update current iterate.
+(c) Send updated iterate to worker k
+4:
+Workers:
+(a) Receive iterate
+(b) Compute an i.i.d. stochastic gradient (at the received iterate)
+(c) Send the computed gradient to master
+5: until end
+asynchronous setting, fast workers (workers that are fast in computing gradients) will cause
+disproprotionately large delays to gradients produced by slow workers (workers that are slow
+in computing gradients): when a slower worker has finished computing a gradient, a fast
+worker may have already computed and communicated many gradients to the master. Since
+the master updates the global state of the system (the current iterate), one can gain a clearer
+representation of this scheme by looking at the master’s update. This is given in Section 2.3.
+2.2. SGD on Multi-Processor Systems with Shared Memory. Here we consider the second
+distributed computing architecture: multi-processor system with shared memory. In this
+architecture, all processors can access a global, shared memory, which holds all the data
+needed for computing a (stochastic) gradient, as well as the current iterate (the global state
+of the system). The standard way of deploying stochastic gradient descent in such systems
+([11, 31]) is for each processor to independently and asychronously read the current global
+iterate, compute a stochastic gradient 6, and then update the global iterate in the shared
+memory. This process is given Algorithm 2:
+Algorithm 2. Running SGD on a Multi-Processor System with Shared Memory
+
+Require: K processors and global (shared) memory.
+1: The initial iterate in the global memory.
+2: repeat
+3:
+(a) Each proceesor reads the current global iterate.
+(b) Each processor reads data from memory and computes a stochastic gradient.
+(c) Each processor updates the global iterate.
+4: until end
+The key difference from Algorithm 1 is that there is no central entity that updates the
+global state; instead, each processor can both read the global state and update it. Since each
+processor is performing the operations asynchronously, different processors may be reading
+the same global iterate at the same time. Further, the delays in this case is again caused by
+the heterogeneity across different processors: if a processor is slow in computing gradients,
+then by the time it finishes computing its gradient, the global iterate has been updated by
+other, faster processors many times over, thereby causing its own gradient stale. Here, we
+6This is again done by sampling a subset of the training data in the global memory and computing the
+gradient at the iterate for each datapoint and averaging over all the comptued gradients in the sample.
+
+8
+
+Z. ZHOU, P. MERTIKOPOULOS, N. BAMBOS, P. W. GLYNN, AND N. BAMBOS
+
+also adopt a common assumption that updating the global iterate is an atomic operation
+(and hence no two processors will be updating the global iterate at the same time). This is
+justified7 because performing gradient update is a simple arithemtic operation, and hence
+takes negligible time compared to reading data and computing a stochastic gradient, which
+is the main computational bottleneck in practice. However, despite a cheap computation,
+performing the whole gradient update (typically achieved via locking) does have overhead.
+In particular, a less stringent model would be only updating one coordinate at a time: this is
+known as an inconsistent write/read model since different processors are updating different
+components of the global parameters and hence can read in elements of different ages. For
+simplicity, we do not consider this case, as our focus in this paper is on delays. See [31] and
+[34] for lucid discussions and analyses on this model. Finally, one can gain a clearer picture
+of this update scheme by tracking the update to the global iterate in the shared memory.
+This is given in Section 2.3.
+2.3. DASGD: A Unifying Algorithmic Representation. In this subsection, we present a
+unified algorithmic description, aptly called distributed asynchronous stochastic gradient
+descent (DASGD), that formally captures both Algorithm 1 and Algorithm 2, where their
+differences are reflected in the assumptions of the meta algorithm’s parameters. We start
+with the unconstrained case, see Algorithm 3.
+Algorithm 3. Distributed asynchronous stochastic gradient descent
+
+Require: Initial state X0 ∈ Rd , step-size sequence αn
+1: n ← 0;
+2: repeat
+3:
+Xn+1 = Xn − αn+1 ∇F (Xs(n) , ωn+1 );
+4:
+n ← n + 1;
+5: until end
+6: return solution candidate Xn
+
+Algorithm 4. Distributed asynchronous stochastic gradient descent with projection
+
+Require: Initial state Y0 ∈ Rd , step-size sequence αn
+1: n ← 0;
+2: repeat
+3:
+Xn = prX (Yn );
+4:
+Yn+1 = Yn − αn+1 ∇F (Xs(n) , ωn+1 );
+5:
+n ← n + 1;
+6: until end
+7: return solution candidate Xn
+In more detail, n is a global counter and is incremented every time an update occurs to the
+current solution candidate Xn (the global iterate): in the master-worker systems, the master
+updates it; in the multi-processor systems, each processor updates it. Since there are delays
+in both systems, the gradient applied to the current iterate Xn can be a gradient associated
+with a previous time step. This fact is abstractly captured by Line 3 in Algorithm 4. In full
+7On a related note, we also note that our analysis can be further extended to cases where only one variable
+or a small block of variables are being updated at a time. We omit this discussion because the resulting
+notation is quite onerous, and will obscure the main ideas behind the already complex theoretical framework
+developed here.
+
+DISTRIBUTED STOCHASTIC OPTIMIZATION WITH LARGE DELAYS
+
+9
+
+generality, we will write s(n) for the iteration from which the gradient received at time n
+originated. In other words, the delay associated with iteration s(n) is n − s(n), since it took
+n − s(n) iterations for the gradient computed on iteration s(n) to be received at stage n.
+Note that s(n) is always no larger than n; and if n = s(n), then there is no delay in iteration
+n.
+Now, the difference between the two distributed computing archecitures is reflected in
+the assumption of s(n). Specifically, in the master-worker systems, each s(·) is a one-toone function8, because no two workers will ever receive same iterates from the master per
+Algorithm 1. On the other hand, in multi-processor systems, s(n) can be the same for
+different n’s (since different processors may read the current iterate at the same time);
+however, it is easy to observe that the same s will appear at most K times for different
+n’s, since there are K processors in total. As an important note, our analysis is agnostic
+to whether s(n) is one-to-one or not. Consequently, in establishing theoretical guarantees
+for the meta algorithm DASGD, we obtain the same guarantees for both architectures
+simultaneously.
+Notation-wise, we will write dn for the delay required to compute a gradient requested
+at iteration n. This gradient is received at iteration n + dn . Following this notation, the
+delay for a gradient received at n is ds(n) = n − s(n). Note also we have chosen the subscript
+associated with ω to be n + 1: we can do so because ωn ’s are iid (and hence the indexing
+is irrelevant). Finally, in constrained optimization case (where X is a strict subset of Rd ),
+projection must be performed. This results in DASGD with projection9, which is formally
+given in Algorithm 4.
+3. General Nonconvex Objectives
+In this section, we take X = Rd (i.e. unconstrained optimization) and consider general
+non-convex objectives. Note that for a general non-convex objective where no further
+structural assumption (e.g. convexity) is made, convergence to an optimal solution (even a
+local optimal solution) cannot be expected, and will not hold in general, even in the absence
+of both noise and delays (i.e. single machine deterministic optimization). In such cases, the
+best one can hope for, which is also the standard metric to determine the stability of the
+algorithm, is that the gradient vanishes in the limit10.
+3.1. Delay Assumption. Our goal here is to establish convergence guarantees (in mean
+square) of DASGD for a general non-convex objective in the presence of delays. In fact, a
+large family of unbounded delay processes can be tolerated. We state our main assumption
+regarding the delays and step-sizes:
+Assumption 2. The gradient delay process dn and the step-size sequence αn of DASGD
+(Algorithms 3 and 4) satisfy one of the following conditions:
+(1) Bounded
+delays: supn dn ≤ D for some positive number D and
+P∞
+α
+=
+∞.
+n
+n=1
+
+P∞
+
+2
+n=1 αn < ∞,
+
+(2) Sublinearly growing delays: dn = O(np ) for some 0 < p < 1 and αn ∝ 1/n.
+8Except initially if all the workers have the same initial point.
+9This tpe of projection is technically known as lazy projection.
+10An alternative phrase that is commonly used is that the criticality gap vanishes. This is also colloquially
+
+referred to as convergence to a stationary point/critical point in the machine learning community. Note
+further that convergence to second-order-stationary points can be achieved by stochastic gradient descent
+(and its variants) under weaker assumptions (than convexity): Lipschitz Hessian and strict saddle point
+property. See [19, 25, 29] for this line of work.
+
+10
+
+Z. ZHOU, P. MERTIKOPOULOS, N. BAMBOS, P. W. GLYNN, AND N. BAMBOS
+
+(3) Linearly growing delays: dn = O(n) and αn ∝ 1/(n log n).
+(4) Polynomially growing delays: dn = O(nq ) for some q ≥ 1 and αn ∝ 1/(n log n log log n).
+Note that as delays get larger, we need to use less aggressive step-sizes. This is to be
+expected, because the larger the delays, the more “averaging" one needs perform in order
+to remove the staleness that is caused by the delays; and smaller step-sizes correspond to
+averaging over a longer horizon. This is a one of the important insights that occur throughout
+the paper. Another thing to note that is the Assumption 2 also highlights the quantitative
+relationship between the class of delays and the class of step-sizes. For instance, when the
+1
+delays increase from a linear rate to a polynomial rate, only a factor of log log
+n needs to
+be added (which is effectively a constant). From a practical standpoint, this means that a
+step-size on the order of 1/(n log n) will be a good model-agnostic choice and more-or-less
+sufficient for almost all delay processes.
+3.2. Controlling the Tail Behavior of Second Moments. We now turn to establish the theoretical convergence guarantees of DASGD for general non-convex objectives. Our first step
+lies in controlling the tail behavior of the second moments of the gradients that are generated
+from DASGD. By leveraging the Lipschitz continuity of the gradient, its telescoping sum,
+appropriate conditionings and a careful analysis of the interplay between delays and step-sizes,
+we show that (next lemma) a particularly weighted tail sum of the second moments are
+vanishingly small in the limit (see appendix for a detailed proof).
+Lemma 1.
+
+Under Assumptions 1 and 2, if inf x∈X f (x) > −∞, then
+∞
+X
+αn+1 E[k ∇ f (Xn )k22 ] < ∞.
+
+(2)
+
+n=0
+
+P∞
+Remark 2. Since n=0 αn+1 = ∞, Lemma 1 implies that lim inf n→∞ E[k ∇ f (Xn )k22 ] = 0
+(see Appendix A of [6]). Note that the converse is not true: when a subsequence of
+E[k ∇ f (Xn )k22 ] converges to 0, the sum in Equation (5) need not be finite. As a simple
+example, consider αn+1 = n1 , and
+(
+1
+, if n = 2k
+2
+E[k ∇ f (Xn )k2 ] = n
+(3)
+1, otherwise.
+Then the subsequence on indicies 2n converges to 0, but the sum still diverges. Consequently,
+Lemma 1 is stronger than subsequence convergence.
+3.3. Bounding the Successive Differences. However, Lemma 1 is still not strong enough to
+guarantee that limn→∞ E[k ∇ f (Xn )k22 ] = 0. This is because the convergent sum given in
+Equation (5) only limits the tail growth somewhat, but not completely. To demonstrate this
+point, let ct be the following boolean variable:
+(
+1, if n contains the digit 9 in its decimal expansion,
+cn =
+(4)
+0, otherwise.
+(
+1
+, if cn = 1
+1
+2
+For instance, c9 = 1, c11 = 0. Now define αn+1 = n , and E[k ∇ f (Xn )k2 ] = n
+1, if cn = 0.
+As first-year Berkeley Math
+PhDs
+delightfully
+found
+out
+during–
+or
+painfully
+found
+out after
+P∞
+– their qualifying exam, n=1 αn+1 E[k ∇ f (Xn )k22 ] < ∞ (see Problem 1.3.24 in [12]), even
+though the limit E[k ∇ f (Xn )k22 ] does not exist. This indicates that to obtain convergence
+of E[k ∇ f (Xn )k22 ], we need to impose more stringent conditions to ensure its sufficient tail
+decay. Note that one issue that is revealed by the above counter-example is that the distance
+
+DISTRIBUTED STOCHASTIC OPTIMIZATION WITH LARGE DELAYS
+
+11
+
+between two successive terms is always bounded away from 0, no matter how large n is. This
+obviously makes it possible for convergence to occur: a necessary condition for convergence is
+that the difference converges to 0. Note that intuitively, this pathological case cannot occur
+for gradient descent, because the step-size is shrinking to 0, hence making the successive
+difference converge to 0 (at least in expectation). Consequently, we can bound the difference
+between every two successive terms in terms of a decreasing sequence that is converging to
+0. This ensures that E[k ∇ f (Xn )k22 ] cannot change two much from iteration to iteration.
+Further, the change between two successive terms will be vanishing. This result is formalized
+in the following lemma (the proof is given in the appendix):
+Lemma 2.
+n,
+
+Under Assumptions 1 and 2, there exists a constant C > 0 such that for every
+E[k ∇ f (Xn+1 )k22 ] − E[k ∇ f (Xn )k22 ] ≤ Cαn+1 .
+
+3.4. Main Convergence Result. Putting the above two characterizations together, we obtain:
+Theorem 1.
+Let Xn be the DASGD iterates generated from Algorithm 3. Under Assumptions 1 and 2, if inf x∈X f (x) > −∞, then
+lim E[k ∇ f (Xn )k22 ] = 0.
+
+n→∞
+
+(5)
+
+Remark 3. Three remarks are in order here. First, note that the condition inf x∈X f (x) >
+−∞ means that the optimization problem (Opt) has a solution. This is necessary, because
+otherwise, a stationary point may not exist in the first place, and DASGD (or even simple
+gradient descent) may continue decrease the objective value ad infinitum. Note that since f
+is smooth, a minimum point is necessarily a stationary point.
+Second, the above convergence is a fairly strong characterization of the fact that the
+gradient vanishes. In particular, it means that the gradient of the DASGD iterates converges
+to 0 in mean square. Consequently, this implies that the norm of the gradient vanishes in
+expectation, and that the gradient converges to 0 with high probability. Note further that
+if we strengthen Assumption 1 to require that all stochastic gradients are bounded almost
+surely (as opoosed to just bounded in second moments), then a similar analysis ensures
+almost sure convergence of k ∇ f (Xn )k2 . We omit the details due to space limitation. Finally,
+that Theorem 1 is a direct consequence of Lemmas 1 and 2 is a simple excercise in elementary
+series theory (in particular, Lemma A.4).
+4. Variationally Coherent Problems
+In this section, our goal is to establish global optimality convergence guarantees of DASGD
+in as wide a class of optimization problems as possible. Since global convergence cannot
+be expected to hold for all non-convex optimization problems (even without delays). a
+standard structural assumption to make in the existing literature on the objectives (even in
+the no-delay case) is convexity. Here we instead consider a much broader class of stochastic
+optimization problems than convex problems. Further, we allow for constrained optimization;
+in particular, X is assumed to be a convex and compact subset of Rd throughout the section.
+We first discuss the class of objectives and then present global convergence results and their
+analyses in the subsequent two subsections. We focus on the class of mean variationally
+coherent optimization problems [37, 38, 57, 58], defined here as follows:
+Assumption 3.
+mean if
+
+The optimization problem (Opt) is called variationally coherent in the
+
+E[h∇ F (x; ω), x − x∗ i] ≥ 0,
+for all x∗ ∈ X ∗ and all x ∈ X with equality only if x ∈ X ∗ .
+
+(VC)
+
+12
+
+Z. ZHOU, P. MERTIKOPOULOS, N. BAMBOS, P. W. GLYNN, AND N. BAMBOS
+
+�
+
+�
+
+�
+
+-�
+
+-�
+-�
+
+-�
+
+�
+
+�
+
+�
+
+-���
+
+���
+
+���
+
+���
+
+���
+
+���
+
+���
+
+-���
+
+-���
+-���
+
+Figure 2. Examples of variationally coherent objectives: on the top row, the Beale
+function f (x1 , x2 ) = (1.5 − x1 + x1 x2 )2 + (2.25 − x1 + x1 x22 )2 + (2.625 − x1 + x1 x32 )2
+over the benchmark domain [−4, 4] × [−4, 4]; on the bottom row, the polar example
+f (r, θ) = (3 + sin(5θ) + cos(3θ))r2 (5/3 − r) over the unit ball 0 ≤ r ≤ 1. In both
+figures, the black curves indicate a sample trajectory of DASGD with linearly
+growing delays.
+
+Note that we do not impose the “if" condition for equality: if x ∈ X ∗ , then the equality
+may or may not hold. By Assumption 1, we can interchange expectation and differentiation
+in (VC) to obtain
+h∇f (x), x − x∗ i ≥ 0,
+(6)
+∗
+∗
+for all x ∈ X , x ∈ X . As a result, mean variational coherence can be interpreted as
+an averaged coherence condition for the deterministic optimization problem with objective
+f (x). Mean variationally coherent optimization problems include convex programs, pseudoconvex programs, non-degenerate quasi-convex programs and star-convex programs as
+special cases. For instance, if g is star-convex, then h∇f (x), x − x∗ i ≥ f (x) − f (x∗ ) for
+all x ∈ X , x∗ ∈ X ∗ . This is easily seen to be a special case of variational coherence
+because h∇f (x), x − x∗ i ≥ f (x) − f (x∗ ) ≥ 0, with the last inequality strict unless x ∈ X ∗ .
+Note that star-convex functions contain convex functions as a subclass (but not necessarily
+pseudo/quasi-convex functions). See [56, 57] for a more detailed discussion on why these
+various classes of optimization problems are special cases. Fig. 2 also provides two more
+
+DISTRIBUTED STOCHASTIC OPTIMIZATION WITH LARGE DELAYS
+
+13
+
+elaborate examples of a variationally coherent optimization problem that are not quasi-convex.
+Put together, these examples indicate that variationally coherent objectives can have highly
+non-convex profiles. Nevertheless, for the class of variationally coherent functions, it is
+possible to establish almost sure convergence guarantees (which we do so in the subsequent
+sections).
+4.1. Deterministic Analysis: Convergence to Global Optima. To streamline our presentation and build intuition along the way, we will begin with the deterministic case in this
+subsection, where there is no randomness in the calculation of a gradient update. In this case,
+DASGD boils down to distributed asynchronous gradient descent (DAGD), as illustrated in
+Algorithm 5:
+Algorithm 5. Distributed Asynchronous Gradient Descent (DAGD)
+
+Require: Initial state y0 ∈ Rd , step-size sequence αn
+1: n ← 0
+2: repeat
+3:
+xn = prX (yn );
+4:
+yn+1 = yn − αn+1 ∇f (xs(n) );
+5:
+n ← n + 1;
+6: until end
+7: return solution candidate xn
+4.1.1. Energy Function. We start with an energy function that measures on how “optimal"
+the dual variable y is: the smaller the energy (i.e. the closer it is to 0), the better the dual
+variable.
+Definition 1.
+
+Let x∗ ∈ X ∗ . Define the energy function E : Rd → R as follows:
+
+E(y) = ∗inf ∗ Ex∗ (y), where Ex∗ (y) = kx∗ k22 − kprX (y)k22 + 2hy, prX (y) − x∗ i.
+x ∈X
+
+(7)
+
+Note that one can think of Ex∗ (y) as the energy of y with respect to a fixed optimal
+solution x∗ , while E(y) is the best (smallest) energy for a given y. We next characterize a
+few of its useful properties.
+Lemma 3.
+
+For all y ∈ Rd , we have:
+
+(1) E(y) ≥ 0 with equality if and only if prX (y) ∈ X ∗ .
+11
+∗
+(2) Let {yn }∞
+n=1 be a given sequence. If limn→∞ E(yn ) = 0, then prX (yn ) → X as
+n → ∞.
+
+Remark 4. The proof is given in the appendix, but it is helpful to make a few quick remarks.
+The first statement justifies the terminology of “energy", as E(y) is always non-negative.
+This energy function will also be the tool we use to establish an important component of
+the global convergence result. Further, given that E(y) ≥ 0, it should also be clear that
+when prX (y) ∈ X ∗ ⊂ X , we can choose a particular x∗ = prX (y) such that E(y) = 0 (but
+that E(y) = 0 implies prX (y) ∈ X ∗ is less obvious). Statement 2 of the lemma provides us
+with a way to establish convergence to optimal solutions. If we can show that E(yn ) → 0,
+then xn = prX (yn ) → X ∗ . Nevertheless, as we shall see later, unlike many other Lyapunov
+11Following the convention in point-set topology, a sequence s
+
+n converges to a set S if dist(sn , S) → 0,
+with dist(·, ·) being the standard point-to-set distance function: dist(sn , S) , inf s∈S dist(sn , s), where
+dist(sn , s) is the Euclidean distance between sn and s.
+
+14
+
+Z. ZHOU, P. MERTIKOPOULOS, N. BAMBOS, P. W. GLYNN, AND N. BAMBOS
+
+functions in optimization, E(yn ) does not decrease monotonically; consequently, it is difficult
+to directly establish E(yn ) → 0. In fact, a finer-grained analysis is required to characterize
+the convergence behavior of E(yn ) (see Section 4.1.2).
+We also assume that the converse of Statement 2 of the above lemma holds:
+Assumption 4.
+
+If limn→∞ E(yn ) = 0, then prX (yn ) → X ∗ as n → ∞.
+
+Assumption 4 can be seen as a primal-dual analogue of the reciprocity conditions for
+the Bregman divergence. This assumption usually holds (e.g. when the feasible set X is a
+polytope), unless X is pathological.
+Lemma 4.
+
+Fix any x∗ ∈ X ∗ .
+
+(1) k prX (y) − ŷk22 − k prX (ŷ) − ŷk22 ≤ ky − ŷk22 , for any y, ŷ ∈ Rd .
+(2) Ex∗ (y + ∆y) − Ex∗ (y) ≤ 2h∆y, prX (y) − x∗ i + k∆yk22 , for any y, ∆y ∈ Rd .
+Remark 5. The first statement of the above lemma serves as an important intermediate
+step in proving the second statement, and is established by leveraging the envelop theorem
+and several important properties of Euclidean projection. To see that this is not trivial,
+consider the quantity k prX (y) − ŷk2 − k prX (ŷ) − ŷk2 , which we know by triangle’s inequality
+satisfies:
+k prX (y) − ŷk2 − k prX (ŷ) − ŷk2 ≤ k prX (y) − prX (ŷ)k2 ≤ ky − ŷk2 ,
+
+(8)
+
+where the last inequality follows from the fact that projection is a non-expansive map. However, this inequality is not sufficient for our purposes because in quantifying the perturbation
+E(y + ∆y) − E(y), we also need the squared term k∆yk22 , which is not easily obtainable
+from Equation (8). In fact, a tighter analysis is needed to establish that ky − ŷk22 is an upper
+bound on k prX (y) − ŷk22 − k prX (ŷ) − ŷk22 .
+4.1.2. Main Convergence Result. An intermediate result, interesting on its own and useful
+also as a heavy-lifting tool for our convergence analysis is then provided by the following
+technical result:
+Under Assumptions 1 to 4, DAGD admits a subsequence xnk that converges
+Proposition 1.
+to X ∗ as k → ∞.
+We highlight the main steps below and refer the reader to the appendix for the details:
+(1) Letting bn = ∇ f (xs(n) ) − ∇ f (xn ), we can rewrite the gradient update in DAGD as:
+yn+1 = yn − αn+1 ∇ f (xs(n) )
+= yn − αn+1 ∇ f (xn ) − αn+1 {∇ f (xs(n) ) − ∇ f (xn )}
+= yn − αn+1 (∇ f (xn ) + bn ).
+
+(9)
+
+Recall here that s(n) denotes the previous iteration count whose gradient becomes
+available only at the current iteration n. By bounding the magnitude of bn using
+the delay sequence through a careful analysis, we establish that under any one of
+the conditions in Assumption 2, limn→∞ kbn k2 = 0. The analysis here, particularly
+the one for the last three conditions, reveals the following pattern: as the magnitude
+of the delays gets larger and larger in the order of growth, one needs to use a more
+conservative step-size sequence in order to mitigate the damage done by the stale
+gradient information. Intuitively, smaller step-sizes are more helpful in larger delays
+because they carry a better “amortization" effect that makes DAGD more tolerant
+to delays.
+
+DISTRIBUTED STOCHASTIC OPTIMIZATION WITH LARGE DELAYS
+
+15
+
+(2) With the defintion of bn , DAGD can be written as:
+xn = prX (yn ),
+yn+1 = yn − αn+1 (∇ f (xn ) + bn ).
+
+(10)
+
+We then use the energy function to study the behavior of yn and xn . More specifically,
+we look at the quantity E(yn+1 ) − E(yn ) and, using Lemma 4, we bound this onestep change using the step size αn , the bn sequence and the defining quantity
+h∇ f (xn ), xn − x∗ i of a variationally coherent function (as well as another term that
+will prove inconsequential). We then telescope on E(yn+1 ) − E(yn ) to obtain an
+upper bound for E(yn+1 ) − E(y0 ). Since the energy function is always non-negative,
+E(yn+1 ) − E(y0 ) is at least −E(y0 ) for every n. Then, utilizing the fact that bn
+converges to 0 and that h∇ f (xn ), xn − x∗ i is always positive (unless the iterate is
+exactly an optimal solution, in which case it is 0), we show that the upper bound will
+approach −∞ if Xn only enters N (X ∗ , ), an open -neighborhood of X ∗ , a finite
+number of times (for an arbitrary  > 0). This generates an immediate contradiction,
+and thereby establishes that Xn will get arbitrarily close to X ∗ for an infinite number
+of times. This then implies that there exists a subsequence of DAGD iterates that
+converges to the solution set of (Opt), i.e, xnk → X ∗ as k → ∞.
+Theorem 2. Under Assumptions 1 to 4, the global state variable xn of DAGD (Algorithm 5)
+converges to the solution set X ∗ of (Opt).
+We give an outline of the proof below, referring to the appendix for the details.
+Fix a δ > 0. Since xnk → x∗ , as k → ∞ (per Proposition 1), we have E(ynk ) → 0
+as k → ∞ per Lemma 3. So we can pick an n that is sufficiently large and E(yn ) < δ.
+Our goal here is to show that for n large enough, once E(yn ) < δ, it will stay so forever:
+E(ym ) < δ, ∀m ≥ n. Note in particular that the above statement is not true for all n, but
+only for n large enough.
+However, the behavior of E(yn ) is not very regular: it can certainly increase from iteration
+to iteration for any n. Nevertheless, we can precisely quantify how large this increment (if
+any) can be. This leads us to break it down to two cases:
+(1) Case 1: E(yn ) < δ/2.
+(2) Case 2: δ/2 ≤ E(yn ) < δ.
+For Case 1, we show in the appendix that
+2
+E(yn+1 ) − E(yn ) ≤ 2BC4 αn+1 + 2αn+1
+(C2 + B 2 ),
+
+(11)
+
+for suitable constants B and C‘s. Now for n sufficiently large, we can make the right-hand
+arbitrarily small, and in particular, smaller than δ/2. This means E(yn+1 ) ≤ E(yn ) + 2δ < δ.
+Consequently, in this case, the energy stays within the δ bound in the next iteration.
+For Case 2, we show in the appendix that
+ha
+i
+E(yn+1 ) − E(yn ) ≤ −2αn+1
+− αn+1 (C2 + B 2 ) ,
+(12)
+2
+where a is a positive constant that depends only on δ. Again, since n is sufficiently large,
+we can make a2 − αn+1 (C2 + B 2 ) positive, thereby making the right-hand side negative.
+Consequently, E(yn+1 ) < E(yn ) < δ. Hence, again, the energy stays within the δ bound in
+the next iteration.
+The key conclusion from the above is that, for large enough n, once E(yn ) is less than δ,
+E(yn+1 ) is less than δ as well and so are all the iterates afterwards. Since δ is arbitrary, it
+follows E(yn ) → 0, and therefore xn → X ∗ by Lemma 3.
+
+16
+
+Z. ZHOU, P. MERTIKOPOULOS, N. BAMBOS, P. W. GLYNN, AND N. BAMBOS
+
+4.2. Stochastic Analysis: Almost Sure Convergence to Global Optima. Having established
+deterministic global convergence of DAGD, we now proceed to study stochastic global
+convergence of DASGD. Compared to the deterministic analysis, the stochastic case is much
+more involved because randomness can lead to very volatile behavior in the presence of
+delays; in particular, the simple approach employed in Theorem 2 (to establish that once
+E(yn ) is less than δ, it will always remain so) no longer works. To deal with both delays and
+noise, a much more sophisticated analysis framework needs to be developed, which requires
+several news ideas. To streamline our presentation, we break the theoretical development into
+four subsections, each comprising an important component and step of the overall analysis.
+4.2.1. Recurrence of DASGD. Our first step lies in generalizing Proposition 1 to the stochastic case. Specifically, in the presence of noise, we show that the iterates of DASGD visit
+any neighorhood of X ∗ infinitely often almost surely.
+Proposition 2.
+Under Assumptions 1 to 4, DASGD admits a subsequence Xnk that converges to X ∗ almost surely: Xnk → X ∗ with probability 1 as k → ∞.
+We outline the two main steps of the proof below, referring the reader to the appendix for
+the details.
+(1) We begin by rewriting the gradient update step in DASGD as:
+Yn+1 − Yn
+= −∇F (Xs(n) , ωn+1 )
+αn+1
+= − ∇ f (Xn )
+− [∇ f (Xs(n) ) − ∇ f (Xn )]
+− [∇F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )].
+
+(13)
+
+Letting Bn = ∇ f (Xs(n) ) − ∇ f (Xn ) and Un+1 = ∇F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) ), we
+can rewrite the DASGD update as
+Yn+1 = Yn − αn+1 {∇ f (Xn ) + Bn + Un+1 }.
+
+(14)
+
+PnWe then establish the following two facts in this step. First, we ∞verify that
+r=0 Un+1 is a martingale adapted to Y1 , Y2 . . . , Yn+1 , where {Un+1 }n=0 is a L2 bounded martingale difference sequence. Second, we show that limn→∞ kBn k2 =
+0, a.s..
+The second claim is done by first giving an upper bound on kBn k2 by writing
+∇ f (Xs(n) ) − ∇ f (Xn ) as a sum of one-step changes (∇ f (Xs(n) ) − ∇ f (Xs(n)+1 ) +
+∇ f (Xs(n)+1 ) − · · · + ∇ f (Xn−1 ) − ∇ f (Xn )) and analyzing each such successive
+change. We then break that upper bound into two parts, one deterministic and one
+stochastic. For the deterministic part, the same analysis in the proof of Proposition 1
+yields convergence to 0.
+The stochastic part turns out to be the tail of a martingale. By leveraging
+the property of the step-size and a crucial property of martingale differences (two
+martingale differences at different time steps are uncorrelated), we establish that
+said martingale is L2 -bounded. Then, by applying a version of Doob’s martingale
+convergence theorem, it follows that said martingale converges almost surely to a
+limit random variable with finite second moment (and hence almost surely finite).
+Consequently, writing the tail as a difference between two terms (each of which
+converges to the same limit variablewith probability 1), we conclude that the tail
+converges to 0 (a.s.).
+
+DISTRIBUTED STOCHASTIC OPTIMIZATION WITH LARGE DELAYS
+
+17
+
+(2) The full DASGD update may then be written as
+Xn = prX (Yn )
+Yn+1 = Yn − αn+1 [∇ f (Xn ) + Bn + Un+1 ].
+
+(15)
+
+As in Step 2 of the proof of Proposition 1, we again bound the one-step change
+of the energy function E(Yn+1 ) − E(Yn ) and then telescope the differences. The
+two distinctions from the determinstic case are: 1) Everything is now a random
+variable. 2) We have three terms: in addition to the random gradient ∇ f (Xn ) and
+the random drift Bn , we also have a martingale term Un+1 . Since Bn converges
+to 0 almost surely (as shown in the previous step), its effect can be shown to be
+negligible. Futher, the analysis utilizes law of large numbers for martingale as well as
+Doob’s martingale convergence theorem to bound the effect of the various martingale
+terms and to establish that the final dominating term converges to −∞ almost surely
+(which generates a contradiction since the energy function is always positive) unless
+a subsequence Xnk converges almost surely to X ∗ .
+
+Even though recurrence, which can be seen as the counterpart of Proposition 1, holds
+as per the above proposition, the random iterates Xn are much more irregular than their
+deterministic counterpart xn in DAGD. To deal with this complexity, we work with and
+characterize the sample trajectories “generated" (to be made precise later) by Xn (rather
+than individual iterates Xn ). To work towards this general direction, we first push the
+DASGD update into a determinstic ordineary differential equation (ODE), as explained in
+the next subsection.
+4.2.2. Mean-Field Approximation of DASGD. We can rewrite the DASGD update as:
+Xn = prX (Yn )
+Yn+1 = Yn − αn+1 {∇ f (Xn ) + Bn + Un+1 }.
+
+(16)
+
+Written in this way, DASGD can be viewed as a discretization of the “mean-field” ODE
+x = prX (y),
+ẏ = − ∇ f (x).
+
+(17)
+
+The intuition is that this ODE provides a “mean" approximation of the DASGD update,
+because in (16), the noise term Un+1 has 0 mean, and the term Bn converges to 0 (and
+therefore has negilible effect in the long run). Thes leaves only the term Yn+1 = Yn −
+αn+1 ∇ f (Xn ), which can be seen as a Euler discretization of the ODE. (Of course, that
+Equation (17) is a good-enough approximation of Equation (16) for global almost sure
+convergence purposes here will be rigorously justified later.)
+Next, writing Equation (17) solely in terms of y yields ẏ = − ∇ f (prX (y)). Since ∇ f
+and prX are both Lipschitz continuous and X is a compact set, the composition ∇ f ◦ prX
+is itself Lipschitz continuous and bounded. Standard results from the theory of dynamical
+systems then show that (17) admits a unique global solution y(t) for any initial condition
+y(0). On the other hand, since prX is not a one-to-one map, it is not invertible; consequently,
+there need not exist a unique solution trajectory for x(t). By this token, the rest of our
+analysis will focus on the trajetory of y(t).
+With the guarantee of the existence and uniqueness of the y trajectory, let P : R+ × Rd →
+Rd be the semiflow12 of (17), i.e., P (t, y0 ) denotes the state of (17) at time t when the
+initial condition is y0 . In other words, when viewed as a function of time, P (·, y0 ) is the
+solution trajectory to ẏ = − ∇ f (prX (y)). It is worth pointing out that writing it in this
+12See Appendix A for a more rigorous definition. Furthermore, R
+
++ is the set of non-negative reals.
+
+18
+
+Z. ZHOU, P. MERTIKOPOULOS, N. BAMBOS, P. W. GLYNN, AND N. BAMBOS
+
+double-argument form also allows us to interpret P as a function of the initial condition:
+for a fixed t, P (t, ·) gives different states at t when the ODE starts from different initial
+conditions (in particular, P (0, y) = y). Both views will be useful later.
+It turns out that with the energy function introduced here, E(P (t, y)) is always nonincreasing. Furthermore, it is also decreasing at a meaingful rate. We end this subsection
+with a “sufficient decrease” property of the mean dynamics (17) (the proof given in the
+appendix due to space limitation):
+Lemma 5.
+
+With notation as above, we have:
+
+(1) If prX (P (t, y)) ∈
+/ X ∗ , then E(P (t, y)) is strictly decreasing in t for all y ∈ Rd .
+(2) For all δ > 0, there exists some T ≡ T (δ) > 0 such that, for all t ≥ T , we have
+supy {E(P (t, y)) − E(y) : E(P (t, y)) ≥ δ/2} ≤ −δ/2.
+
+(18)
+
+Lemma 5 essentially says E(P (t, y)) is strictly and uniformly (across all y) decreasing
+at a non-vanishing rate. More specifically, to give some intuition of the second part of
+Lemma 5, note that E(P (t, y)) − E(y) is the energy change at time t when starting at y.
+The first part says this quantity is always non-negative. While the second part says provided
+E(P (t, y)) ≥ δ/2, the decrease in energy will be at least 2δ , no matter what the initial point
+y is. If E(P (t, y)) ≥ δ/2 does not hold, that means the energy at time t is already really
+small (i.e. E(P (t, y)) < δ/2). Consequently, the mantra of the above lemma can be stated
+succinctly as follows: either the energy is already close to 0, or the energy will decrease
+towards 0.
+In fact, by some additional analysis, one can further show13 that Lemma 5 implies
+P (t, y) → X ∗ , ∀y as t → ∞. Now, despite being an interesting result on its own (which
+establishes that the continuous dynamics of DASGD converges to X ∗ ), it is still some distance
+away from our final desideratum: our goal is to establish (almost sure) convergence of the
+discrete-time process in DASGD. So unless we can somehow relate the discrete-time iterates
+to the continuous-time trajectories, the convergence of DASGD is still uncertain. We fulfill
+this taks in the next subsection.
+4.2.3. Relating DASGD Iterates to ODE Trajectories. Our goal here is to establish a quantitative connection between the DASGD iterates and the ODE trajectory studied in the
+previous subsection. Our general idea is that if we show the trajectory generated by the
+discrete-time iterates of DASGD is path-by-path “close" to the continuous-time trajectory
+P (t, y), then likely almost-sure convergence of the DASGD iterates can be guaranteed as
+well.
+To be more specific, there are two things that need to be more precisely defined from the
+preceding high-level discussion. First, what does it mean to be a trajectory generated by
+the discrete-time iterates of DASGD? Second, what does it mean for this trajectory to be
+“close" to the ODE trajectory? In general, the answers to these questions can vary depend
+on the specific goal at hand. In the current context, our goal is to establish global almost
+sure convergence (a very strong result). Consequently, we need to choose the answers rather
+judiciously: on the one hand, the answers must be stringent enough to ensure global almost
+sure convergence in the end (for instance, for the second question, a fairly strong notion of
+“closeness" is needed); on the other hand, they must also be flexible enough to fit in the
+current context.
+13Although this is an interesting conclusion, we do not prove it here because we are mainly concerned
+with establishing convergence of the DASGD iterates, rather than the ODE solution trajectory.
+
+DISTRIBUTED STOCHASTIC OPTIMIZATION WITH LARGE DELAYS
+
+19
+
+As it turns out, the answer to the first question is rather intuitive: (perhaps) the simplest
+way to generate a continuous trajectory from a sequence of discrete
+points is the affine
+Pn=1
+interpolation: connect the iterates Y0 , Y1 , . . . , Yn at times 0, α1 , . . . , r=1 αr . We call this
+curve the affine interpolation curve of DASGD and denote it by A(t). Note that A(t) is a
+random curve because the DASGD iterates Y0 , Y1 , . . . , Yn are random. To avoid confusion,
+we summarize the three different objects discussed so far:
+(1) The DASGD iterates Y0 , Y1 , . . . , Yn .
+(2) The affine interpolation curve A(t) of Yn .
+(3) The flow P (t, y) of the ODE (17).
+The answer to the second question lies in the notion of an asymptotic pseudotrajectory
+(APT) , a concept introduced by Benaïm and Hirsch [4] and Benaïm and Schreiber [5].
+Specifically, in our current context, a continuous curve s(t) is considered close to ODE
+solution P (t, y) if the following holds:
+Definition 2.
+
+A continuous function s : R+ → Rd is an APT for P if for every T > 0,
+lim
+
+sup d(s(t + h), P (h, s(t))) = 0,
+
+t→∞ 0≤h≤T
+
+(19)
+
+where d(·, ·) is the Euclidean metric14 in Rd .
+Intuitively, the definition matches exactly the naming: s is an APT for P if, for sufficiently
+large t, the flow lines of P remain arbitrarily close to s(t) over a time window of any (fixed)
+length. More precisely, for each fixed T > 0, one can find a large enough t0 , such that for all
+t > t0 , the curve s(t + h) approximates the trajectory P (h, s(t)) on the interval h ∈ [0, T ]
+with any predetermined degree of accuracy.
+With this definition in place, to push through the agenda, we need to establish that A(t),
+the affine interpolation curve of the DASGD iterates, is an APT for the flow P (t, y) induced
+by the ODE (17). More precisely, we establish that A(t) is an APT for the flow P (t, y)
+almost surely, because as mentioned before, A(t) is a random curve.
+Lemma 6.
+Let A(t) be the random affine interpolation curve generated from the DASGD
+iterates. Then A(t) is an APT of P (t, y) almost surely.
+Note that this result means any resulting affine interpolation curve of DASGD is close to
+the ODE trajectory. This also forms the basis for reasoning convergence on a path-by-path
+scale. However, more work still remains to be done because, unfortunately, the condition
+that A(t) is an APT for P almost surely does not guarantee that the discrete-time iterates
+of DASGD converge to X ∗ (for many counterexamples in general dynamical systems, see
+Benaïm [3]). In other words, the notion of APT is not sharp enough to ensure direct
+convergence result. We fulfill this final gap in the next subsection.
+4.3. Main Convergence Result. Even though A(t) being an APT for P almost surely does
+not itself guarantee that the discrete-time iterates of DASGD converge to X ∗ , we can use the
+energy function to further sharpen this result. Specifically, we use E(A(t)) to further control
+the behavior of the affine interpolation curve. In fact, the advantage of working with the
+affine interpolation curve A(t) is that once we show E(A(t)) is bounded by some δ almost
+surely from some point onwards, then we know E(Yn ) is bounded by δ almost surely (also
+from some point onwards): this is because the discrete-time iterates and the affine curve
+14As should be obvious from the definition, APTs can be defined more generally in metric spaces in
+exactly the same way.
+
+20
+
+Z. ZHOU, P. MERTIKOPOULOS, N. BAMBOS, P. W. GLYNN, AND N. BAMBOS
+
+coincide at discrete time points. Consequently, we focus on boudning E(A(t)), which will
+enable us to obtain our main convergence result:
+Theorem 3.
+Under Assumptions 1 to 4, the global state variable Xn of DASGD (Algorithm 4) converges (a.s.) to the solution set X ∗ of (Opt).
+Again, we only give an outline of the proof below. By Proposition 2, Xn gets arbitrarily
+close to X ∗ infinitely often. Thus, it suffices to show that, if Xn ever gets -close to X ∗ , all the
+ensuing iterates are -close to X ∗ (a.s.). The way we show this “trapping" property is to use
+the energy function. Specifically, we consider E(A(t)) and show that no matter how small 
+is, for all sufficiently large t0 , if E(A(t0 )) is less than  for some t0 , then E(A(t)) < , ∀t > t0 .
+This would then complete the proof because A(t) actually contains all the DASGD iterates,
+and hence if E(A(t)) < , ∀t > t0 , then E(Yn ) <  for all sufficiently large n. Furthermore,
+since A(t) contains all the iterates, the hypothesis that “ if E(A(t0 )) is less than  for some
+t0 " will be satisfied due to Proposition 2.
+We expand on one more layer of detail and defer the rest into appendix. To obtain control
+E(A(t)), we control two things: the energy on the ODE path E(P (t, y)) and the discrepancy
+between E(P (t, y)) and E(A(t)). The former can be made arbitrarily small as a result of
+Lemma 5 (we have a direct handle on how the ODE path would behave). The latter can also
+be made arbitrarily small as a result of Lemma 6: since A(t) is an APT for P , the two paths
+are close. Therefore, the discrepancy between E(P ) and E(A) should also be vanishingly
+small. Consequently, since E(A(t)) = E(P (t, y)) + {E(A(t)) − E(P (t, y))}, and both terms
+on the right can be made arbitrarily small, so can E(A(t)) be made arbitrarily small.
+5. Discussion
+We end the paper with a short simulation discussion that reveals an interesting practical
+observation. Specifically, we test the convergence of Algorithm 4 against a Rosenbrock
+test function with d = 1001 degrees of freedom, a standard non-convex global optimization
+benchmark [43]. Specifically, we consider the objective
+fRos (x) =
+
+1000
+X
+
+[1000(xi+1 − x2i )2 + (1 − xi )2 ],
+
+(20)
+
+i=1
+
+with xi ∈ [0, 2], i = 1, . . . , 1001. The global minimum of fRos is located at (1, . . . , 1), at the
+end of a very thin and very flat parabolic valley which is notoriously difficult for first-order
+methods to traverse [43]. Since the minimum of the Rosenbrock function is known, (VC) is
+easily checked over the problem’s feasible region.
+For our numerical experiments, we considered a) a synchronous update schedule as a
+baseline; and b) an asynchronous master-worker framework with random delays that scale
+as dn = Θ(n). In both cases, Algorithm 4 was run with a decreasing step-size of the form
+αn ∝ 1/(n log n) and stochastic gradients drawn from a standard multivariate Gaussian
+distribution (i.e., zero mean and identity covariance matrix).
+Our results are shown in Fig. 3. Starting from a random (but otherwise fixed) initial
+condition, we ran S = 105 realizations of DASGD (with and without delays). We then
+plotted a randomly chosen trajectory (“test sample” in Fig. 3), the sample average, and the
+min/max over all samples at every update epoch. For comparison purposes, we also plotted
+the value of the so-called “ergodic average”
+Pn
+k=1 αk Xk
+X̄n = P
+,
+(21)
+n
+k=1 αk
+
+DISTRIBUTED STOCHASTIC OPTIMIZATION WITH LARGE DELAYS
+
+����� ����������� (�������� ���� �=��� �������)
+
+21
+
+����� ����������� (�������� ���� �=��� �������� ������������)
+
+�△◦
+�△◦
+
+△
+△
+
+△
+
+◦
+
+△
+
+◦
+◦
+
+◦
+
+�����
+
+△ △
+
+△△
+
+△
+◦
+
+△
+◦
+
+△ △ △
+◦
+
+△ △ △△
+
+◦ ◦
+◦ ◦ ◦ ◦
+
+△△△△△
+△△△△△△△
+◦ ◦ ◦ ◦ ◦ ◦◦◦◦◦◦◦◦ △△△△△△△△△△△△△△△△△△△△△△△△△△△△△△△△△△△
+◦◦ ◦◦ ◦ ◦ ◦◦◦◦◦◦ ◦ ◦◦◦ ◦◦◦ ◦◦◦◦ ◦◦ ◦◦◦◦◦
+△△△△△△△△△△△△△△△△△△△△△△△△△△△△
+◦◦◦◦◦◦◦◦
+◦◦◦◦◦◦ ◦◦◦◦
+△△△△△△△△△△△△
+◦◦◦ ◦◦◦
+△△△△△△
+◦◦◦ ◦◦
+△△△△
+◦◦ ◦◦
+△△
+◦◦
+◦◦
+
+�������� �����
+
+△
+◦
+
+△
+
+◦◦
+
+◦◦
+
+◦
+
+◦
+
+◦
+
+◦
+◦
+◦
+◦
+
+�����
+
+����
+
+�������� �����
+
+◦
+
+◦
+
+◦
+
+◦
+
+�����
+
+◦
+
+����
+
+◦
+
+���� ������
+
+◦
+
+◦
+
+������ �������
+
+△
+
+������� �������
+
+◦
+◦
+
+◦◦
+
+������ ���/���
+
+��-�
+�
+
+�
+
+��
+
+��
+���������
+
+���
+
+���
+
+����
+�
+
+����
+
+(a) Convergence with no delays between gradient
+updates
+
+���� ������
+
+△
+
+△
+◦ ◦
+◦ ◦ △ △△
+◦ ◦ △△△△△△
+△△ △
+◦◦
+△△△
+◦◦
+△△△
+◦◦
+◦◦
+△△
+◦◦
+△
+◦◦
+△△
+◦ ◦◦
+△
+◦◦
+△
+△
+◦
+△
+◦
+△
+◦
+△
+◦
+△
+◦
+◦
+△
+◦
+△
+△
+◦
+△
+◦
+△
+◦
+△
+△
+◦◦
+△
+△
+◦
+△
+◦
+△
+◦
+△
+◦
+△
+◦
+△△
+◦
+△△
+◦
+◦◦
+△△
+△△
+◦◦
+△△
+◦
+△△
+◦
+◦◦
+△△
+◦
+△△
+◦◦
+△△
+◦
+△△
+◦◦
+△△
+◦◦
+△△△△
+◦◦
+△△△△
+◦ ◦◦
+△△△△
+◦◦ ◦◦
+△△
+◦◦ ◦◦◦
+◦◦◦◦ ◦◦◦◦◦ △△△△△△△△△△△△△△
+◦◦◦◦ ◦◦◦◦ ◦◦◦
+△△△△△△△△△△
+◦◦◦ ◦◦
+△△△△△
+◦◦ ◦◦
+△△△△
+◦◦ ◦
+◦◦
+◦◦
+◦◦
+◦◦
+◦◦
+◦
+◦
+
+◦
+
+������ �������
+
+△
+
+������� �������
+
+������ ���/���
+��
+
+���
+���������
+
+���
+
+����
+
+(b) Convergence with linearly growing delays
+
+Figure 3. Value convergence in a non-convex stochastic optimization problem
+with d = 1001 degrees of freedom.
+
+which is often used in the analysis of DASGD in the convex case (see e.g., 1). Even though
+this averaging leads to very robust convergence rate estimates in the convex case, we see here
+that it performs worse than the worst realization of DASGD. The reason for this is the lack
+of convexity: due to the ridges and talwegs of the Rosenbrock function, Jensen’s inequality
+fails dramatically to produce an improvement over Xn (and, in fact, causes delays as it causes
+Xn to deviate from its gradient path). Consequently, this simple simulation indicates that
+establishing convergence of the iterate Xn itself is not only theoretically stronger (and hence
+more difficult) than convergence of the ergodic average, but also more practically relevant.
+A. Auxiliary Results
+We collect here in one place all the auxiliary results in the existing literature that will be
+used in our proofs subsequently. The first one is a well-known characterization of convex
+sets and the projection operator given in [39]:
+Lemma A.1.
+
+Let X be a compact and convex subset of Rd . Then for any x ∈ X , y ∈ Rd :
+hprX (y) − x, prX (y) − yi ≤ 0.
+
+(A.1)
+
+The second one is an Lp -bounded martingale convergence theorem given in [21]:
+Lemma A.2.
+Let Sn be a martingale adapted to the filtration Sn . If for some p ≥ 1,
+supn≥0 E[|Sn |p ] < ∞, then Sn converges almost surely to a limiting random variable S∞
+with E[|S∞ |p ] < ∞.
+Remark 6.
+
+Note that E[|S∞ |p ] < ∞ for p ≥ 1 obviously implies S∞ is finite almost surely.
+
+The third one is the classical envelope theorem (see [10]).
+Lemma A.3.
+Let f : Rn × Rm → R be a continuously differentiable function. Let U be a
+compact set and consider the problem
+max f (x, θ).
+x∈U
+
+(A.2)
+
+Let x∗ : O → Rm be a continuous function defined on an open set O ⊂ Rm such that
+for each θ ∈ O, x∗ (θ) solves the problem in Equation A.2. Define V : Rm → R where
+V (θ) = f (x∗ (θ), θ). Then V (θ) is differentiable on O and:
+∇ V (θ) = ∇ f (x∗ (θ), θ).
+
+(A.3)
+
+22
+
+Z. ZHOU, P. MERTIKOPOULOS, N. BAMBOS, P. W. GLYNN, AND N. BAMBOS
+
+The fourth one is an elementary sequence result (see [8]).
+P∞
+P∞
+Lemma A.4. Let an , bn be two non-negative sequences such that n=1 an = ∞, n=1 an bn <
+∞. If there exists a real number K > 0 such that |bn+1 − bn | ≤ Kan . Then, limn→∞ bn = 0.
+The fifth one is law of large numbers for martingales given in [21]:
+Pn
+Lemma A.5.
+Let Mn = k=0 dk be a martingale adapted to (Fn )∞
+let (un )∞
+n=0
+n=0 be a
+P∞and−p
+nondecreasing sequence of positive numbers with limn→∞ un = ∞. If n=0 un E[|dk |p |Fn ] <
+∞ for some p ∈ [1, 2] (a.s.), then:
+lim
+
+Mn
+
+n→∞ un
+
+=0
+
+(a.s.)
+
+(A.4)
+
+Finally, we recall the standard notion of semiflow.
+Definition 3.
+
+A semiflow P on a metric space (M, d) is a continuous map P : R+ ×M → M :
+(t, x) → Pt (x),
+
+such that the semi-group properties hold: P0 = identity, Pt+s = Pt ◦Ps for all (t, s) ∈ R+ ×R+ .
+Remark 7. A standard way to induce a semiflow is via an ODE. Specifically, if F : Rm →
+Rm is a continuous function and if the following ODE has a unique solution trajectory for
+each initial point x̃ ∈ Rm :
+dx
+=
+dt
+x(0)
+
+F (x),
+= x̃,
+
+then Pt (x̃) defined by the solution trajectory x(t) ∈ Rm as follows is a semiflow: Pt (x̃) , x(t)
+with x(0) = x̃. We say P defined in this way is the semiflow induced by the corresponding
+ODE.
+
+B. Technical Proofs
+B.1. General Nonconvex Objectives.
+
+B.1.1. Proof of Lemma 1. Proof: We start by rewriting the delayed gradient update Xn+1 =
+Xn − αn+1 ∇F (Xs(n) , ωn+1 ) in Algorithm 3 in two forms as follows, both of which will be
+used subsequently:
+!
+Xn+1 = Xn − αn+1
+
+∇ f (Xs(n) ) + ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )
+!
+
+= Xn − αn+1
+
+∇ f (Xn ) + ∇ f (Xs(n) ) − ∇ f (Xn ) + ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) ) .
+(B.1)
+
+DISTRIBUTED STOCHASTIC OPTIMIZATION WITH LARGE DELAYS
+
+23
+
+Denoted B , supx∈X E[k∇F (x, ω)k22 ] per Assumption 1. Since ∇ f (x) = E[∇ F (x, ω)] is
+Lipschitz per Assumption 1, letting L be the Lipschitz constant, we have:
+f (Xn+1 ) − f (Xn ) ≤ h∇ f (Xn ), Xn+1 − Xn i +
+
+L
+kXn+1 − Xn k22
+2
+
+L
+kαn+1 ∇F (Xs(n) , ωn+1 )k22
+2
+= −αn+1 h∇ f (Xn ), ∇ f (Xn ) + ∇ f (Xs(n) ) − ∇ f (Xn ) + ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )i
+L 2
++ αn+1
+k ∇ f (Xs(n) ) + ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )k22
+2
+= −αn+1 k ∇ f (Xn )k22 − αn+1 h∇ f (Xn ), ∇ f (Xs(n) ) − ∇ f (Xn )i
+= −αn+1 h∇ f (Xn ), ∇F (Xs(n) , ωn+1 )i +
+
+− αn+1 h∇ f (Xn ), ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )i
+L 2
+k ∇ f (Xs(n) ) + ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )k22
++ αn+1
+2
+≤ −αn+1 k ∇ f (Xn )k22 + αn+1 k ∇ f (Xn )k2 k ∇ f (Xs(n) ) − ∇ f (Xn )k2
+− αn+1 h∇ f (Xn ), ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )i
+o
+L 2 n
+2k ∇ f (Xs(n) )k22 + 2k ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )k22
++ αn+1
+2
+√
+≤ −αn+1 k ∇ f (Xn )k22 + Bαn+1 k ∇ f (Xs(n) ) − ∇ f (Xn )k2
+− αn+1 h∇ f (Xn ), ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )i
+o
+n√
+2
+B + k ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )k22 ,
+≤ Lαn+1
+where in the last inequality follows because by Jensen’s inequality, we have:
+k ∇ f (Xn )k22 ≤ sup k E[∇F (x, ω)]k22 ≤ sup E[k∇F (x, ω)k22 ] ≤ B.
+x∈X
+
+x∈X
+
+Denote the filtration generated by X0 , X1 , . . . , Xn to be Fn . We take the expectation of
+both sides of Equation (B.2) and obtain:
+√
+E[f (Xn+1 ) − f (Xn )] ≤ −αn+1 E[k ∇ f (Xn )k22 ] + Bαn+1 E[k ∇ f (Xs(n) ) − ∇ f (Xn )k2 ]
+√ 2
+− αn+1 E[h∇ f (Xn ), ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )i] + L Bαn+1
+2
++ Lαn+1
+E[k ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )k22 ]
+√
+= −αn+1 E[k ∇ f (Xn )k22 ] + Bαn+1 E[k ∇ f (Xs(n) ) − ∇ f (Xn )k2 ]
+(
+)
+n
+o
+− αn+1 E E h∇ f (Xn ), ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )i Fn
+
+√ 2
+2
++ L Bαn+1
++ Lαn+1
+E[k ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )k22 ]
+√
+= −αn+1 E[k ∇ f (Xn )k22 ] + Bαn+1 E[k ∇ f (Xs(n) ) − ∇ f (Xn )k2 ]
+(
+)
+n
+o
+− αn+1 E h∇ f (Xn ), E ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) ) Fn i
+√ 2
+2
++ Lαn+1
+E[k ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )k22 ]
++ L Bαn+1
+√
+√ 2
+= −αn+1 E[k ∇ f (Xn )k22 ] + Bαn+1 E[k ∇ f (Xs(n) ) − ∇ f (Xn )k2 ] + L Bαn+1
+2
++ Lαn+1
+E[k ∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) )k22 ]
+√
+√ 2
+2
+≤ −αn+1 E[k ∇ f (Xn )k22 ] + Bαn+1 E[k ∇ f (Xs(n) ) − ∇ f (Xn )k2 ] + L Bαn+1
++ 4LBαn+1
+,
+
+24
+
+Z. ZHOU, P. MERTIKOPOULOS, N. BAMBOS, P. W. GLYNN, AND N. BAMBOS
+
+where the third equality follows from E
+
+n
+
+∇ F (Xs(n) , ωn+1 ) − ∇ f (Xs(n) ) Fn
+
+o
+
+= 0, since
+
+ωn+1 is independent of Fn , and the last inequality follows from E[k ∇ F (Xs(n) , ωn+1 ) −
+∇ f (Xs(n) )k22 ] ≤ supx∈X E[k ∇ F (x, ωn+1 ) − ∇ f (x)k22 ] ≤ 4B. Since ∇ f is L-Liptchiz continuous, we have:
+k ∇ f (Xs(n) ) − ∇ f (Xn )k2 ≤ LkXs(n) − Xn k2
+= L Xs(n) − Xs(n)+1 + Xs(n)+1 − Xs(n)+2 + · · · + Xn−1 − Xn
+=L
+
+n−1
+X
+
+n
+o
+Xr − Xr+1
+
+r=s(n)
+
+=L
+2
+
+n−1
+X
+
+αr+1 ∇F (Xs(r) , ωr+1 )
+
+r=s(n)
+
+2
+n−1
+X
+
+≤L
+2
+
+αr+1 ∇F (Xs(r) , ωr+1 )
+
+r=s(n)
+
+.
+2
+
+(B.2)
+Taking the expectation of both sides of the above equation then yields:
+E[k ∇ f (Xs(n) ) − ∇ f (Xn )k2 ] ≤ L
+
+n−1
+X
+
+αr+1 E[k∇F (Xs(r) , ωr+1 )k2 ]
+
+r=s(n)
+
+≤L
+
+n−1
+X
+
+αr+1 sup E[k∇F (x, ωr+1 )k2 ]
+
+r=s(n)
+
+≤ LB̄
+
+n−1
+X
+
+(B.3)
+
+x∈X
+
+αr+1 ,
+
+(B.4)
+
+r=s(n)
+
+where B̄ , supx∈X E[k∇F (x, ωr+1 )k2 ] < ∞ per Remark 1. Combining Equation (B.3) with
+Equation (B.2) then yields:
+n−1
+X
+√
+√ 2
+2
+E[f (Xn+1 )] − E[f (Xn )] ≤ −αn+1 E[k ∇ f (Xn )k22 ] + LB̄ Bαn+1
+αr+1 + L Bαn+1
++ 4LBαn+1
+.
+r=s(n)
+
+(B.5)
+Telescoping Equation (B.5) then yields:
+− ∞ < inf f (x) − f (X0 ) ≤ E[f (XT +1 )] − f (X0 ) =
+x∈X
+
+≤−
+
+T
+X
+
+T n
+X
+
+o
+E[f (Xn+1 )] − E[f (Xn )]
+
+n=0
+
+T 
+n−1
+T
+
+X
+X
+X
+√
+2
+αn+1
+.
+αn+1
+αr+1 + (L B + 4LB)
+αn+1 E[k ∇ f (Xn )k22 ] + LB̄ B
+
+√
+
+n=0
+
+n=0
+
+r=s(n)
+
+n=0
+
+(B.6)
+Taking T → ∞, the above equation yields:
+−∞<−
+
+∞
+X
+n=0
+
+∞ 
+n−1
+∞
+
+X
+X
+√ X
+√
+2
+αn+1 E[k ∇ f (Xn )k22 ] + LB̄ B
+αn+1
+αr+1 + (L B + 4LB)
+αn+1
+.
+n=0
+
+r=s(n)
+
+n=0
+
+(B.7)
+P∞
+2
+Note that
+in all cases in Assumption
+2, we have n=0 αn+1
+< ∞. We next proceed to bound
+
+
+P∞
+Pn−1
+n=0 αn+1
+r=s(n) αr+1 and show that it is finite in each of the cases in Assumption 2.
+
+DISTRIBUTED STOCHASTIC OPTIMIZATION WITH LARGE DELAYS
+
+25
+
+(1) In the bounded delays case, since supn dn ≤ D, it follows that s(n) + D ≥ n and
+hence:
+∞
+n−1
+∞ 
+n
+∞ 
+
+ X
+
+
+X
+X
+X
+X
+αn+1
+αr+1 ≤
+αn+1
+αr+1 ≤ (D + 1)
+αn+1
+max
+αr+1
+n=0
+
+n=0
+
+r=s(n)
+
+≤ (D + 1)
+≤ (D + 1)
+
+∞ 
+X
+n=0
+∞ 
+X
+
+max
+r∈{n−1−D,...,n}
+n
+X
+
+2
+αr+1
+
+αr+1 ·
+
+r∈{n−1−D,...,n}
+
+n=0
+
+r=n−1−D
+
+max
+r∈{n−1−D,...,n}
+
+∞ 
+
+X
+αr+1 = (D + 1)
+n=0
+
+max
+r∈{n−1−D,...,n}
+
+2
+αr+1
+
+
+
+
+
+n=0 r=n−1−D
+∞
+X
+2
+= (D + 1)2
+αn+1
+< ∞,
+n=0
+
+where all the terms αr are defined to be 0 when r drops below 0.
+(2) In the sublinearly growing delays case, since dn = O(np ), it follows that s(n) +
+Ksp (n) ≥ n for some positive number K, which further implies that s(n) + Ks(n) ≥
+n
+s(n) + Ksp (n) ≥ n, thereby leading to s(n) ≥ K+1
+. Consequently, we have:
+∞ 
+X
+
+αn+1
+
+n=0
+
+n−1
+X
+r=s(n)
+
+≤ (K + 1)−p
+
+n
+∞
+∞ 
+∞
+∞
+ X
+X
+X
+1
+1 p−1
+n
+1 X 1  X  1 Ksp (n) 
+αr+1 ≤
+s (n) ≤ K
+(
+)p−1
+≤
+=K
+n
+r
+n
+s(n)
+n
+n
+K
++
+1
+n=0
+n=0
+n=0
+n=0
+
+∞
+X
+
+r=s(n)
+
+np−2 < ∞.
+
+n=0
+
+(B.8)
+(3) In the linearly growing delays case, since dn = O(n), it follows that s(n) + Ks(n) ≥ n
+n
+for some positive number K and hence again s(n) ≥ K+1
+. Consequently, we have:
+∞ 
+n−1
+∞ 
+ X
+X
+X
+αn+1
+αr+1 ≤
+n=0
+
+n=0
+
+r=s(n)
+
+≤
+=
+≤
+
+∞ 
+X
+n=0
+∞ 
+X
+n=0
+∞ 
+X
+
+s(n)+Ks(n)
+n
+∞
+X
+X
+1  X 1
+1 
+1
+≤
+n log n
+r log r
+n log n
+r log r
+n=0
+r=s(n)
+
+1
+n log n
+
+r=s(n)
+
+Z s(n)+Ks(n)
+s(n)
+
+∞ 
+X
+
+1
+1
+log(s(n) + Ks(n)) 
+dr =
+log
+r log r
+n log n
+log s(n)
+n=0
+
+
+∞
+1
+log(K + 1) + log s(n)  X  1
+log(K + 1) 
+log
+=
+log(1 +
+)
+n log n
+log s(n)
+n log n
+log s(n)
+n=0
+∞
+1 log(K + 1)  X  1
+log(K + 1)
+≤
+n log n log s(n)
+n log n log n − log(K + 1)
+n=0
+
+n=0
+∞
+X
+
+∼K
+
+1
+< ∞.
+n(log n)2
+n=0
+
+(B.9)
+
+(4) In the polynomially growing delays case, since dn = O(nq ), it follows that s(n) +
+1
+Ksq (n) ≥ n for some positive number K. Note that in this case, s(n) = Ω(n 2q ),
+1
+1
+because otherwise, s(n) + Ksq (n) = O(n 2q + Kn 2 ) = o(n), which is a contradiction.
+Consequently, we have:
+∞ 
+n−1
+∞ 
+ X
+X
+X
+αn+1
+αr+1 ≤
+n=0
+
+r=s(n)
+
+n=0
+
+n
+
+X
+1
+1
+n log n log log n
+r log r log log r
+r=s(n)
+

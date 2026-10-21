@@ -1,0 +1,2178 @@
+Comparing UPF Dataplane I/O Modes in a
+Cloud-Native 5G Core: AF_PACKET, AF_XDP, CNDP, and
+DPDK on SD-Core BESS-UPF
+Shiva Valia1 , Nitin Rajput1 , Aditya Gairola1 , and Vipin Rathi2
+1
+
+2
+
+coRAN Labs Private Limited, New Delhi, India
+Ramanujan College, University of Delhi, New Delhi, India
+
+arXiv:2608.14589v1 [cs.NI] 22 Jun 2026
+
+Abstract
+
+scriber traffic, not just synthetic load. We also
+share the deployment issues we ran into during
+real runs and the fixes that resolved them.
+On a single Intel XXV710 / i40e testbed
+(dual-socket Xeon Gold 6148, RT kernel, 25 GbE
+SR-IOV with on-chip VEB hairpin) and the
+same BESS-UPF pipeline, we report Non-Drop
+Rate (NDR) measurements per RFC 2544 /
+ETSI NFV-TST 009 across 1–8 datapath workers. Because the lab optics negotiated 1 GbE,
+all rates above ≈1.488 Mpps/port are measured
+VEB-internal through the on-chip i40e switch
+and therefore characterise the UPF’s internal
+processing capacity rather than wire-forwarded
+throughput. At 64 B, CNDP sustains 2.65 /
+5.52 Mpps (1w / 2w, 2.09× scaling), AF_XDP
+sustains 3.69 / 6.47 Mpps (1w / 2w, 1.75× scaling), and DPDK (native net_iavf PMD over
+vfio-pci) sustains 2.99 / 5.56 / 10.30 Mpps (1w
+/ 2w / 4w, 3.44× scaling) and 16.0 Mpps bidirectional at 8 workers, with the lowest latency of the
+three (8.1 µs average, 16.2 µs P99). AF_PACKET
+sits an order of magnitude lower at 0.25 Mpps,
+consistent with the kernel-stack cost of every
+packet traversal. At matched worker counts
+the three kernel-bypass modes are close: at 2
+workers, AF_XDP (6.47 Mpps) leads, with DPDK
+(5.56 Mpps) and CNDP (5.52 Mpps) within
+measurement noise; per core, AF_XDP also leads
+(3.69 versus 2.99 for DPDK and 2.65 for CNDP).
+DPDK’s absolute lead emerges only above two
+workers, where its native PMD over vfio-pci
+escapes the per-netdev AF_XDP socket limit that
+pins CNDP and AF_XDP at two workers, letting
+it scale to 10.30 Mpps (4w) and 13.09 Mpps
+(8w). A key deployment finding: the original
+DPDK result was capped at 6.2 Mpps until we
+
+The User Plane Function (UPF) carries every
+byte of user-plane traffic in a 5G network, handling GTP-U tunneling, packet detection rules,
+and QoS enforcement between the gNodeB and
+the data network. Its throughput depends heavily on how packets move between the network
+interface card and the user-plane application,
+which in turn depends on the packet I/O mode
+used. Modern open-source UPF implementations support several such modes, among the
+most widely used being AF_PACKET, AF_XDP, the
+Cloud Native Data Plane (CNDP), and the Data
+Plane Development Kit (DPDK). Each takes a
+different approach to balancing performance, kernel feature reuse, and ease of deployment in a
+cloud-native environment.
+This paper presents a study comparing these
+four dataplane modes on a single open-source
+UPF. We use SD-Core BESS-UPF, deployed as
+a Charmed operator (Juju-orchestrated charmed
+sd-core / aether-onramp bundle) on Intel
+XXV710 NICs in a Canonical Kubernetes cluster on an x86_64 platform, and run the same
+packet-processing pipeline (GTP-U encap/decap,
+PDR/FAR/QER enforcement) under each mode
+by changing only the BESS port driver. For
+each mode we describe its architecture, datapath,
+memory model, and deployment requirements,
+and we measure throughput, latency, CPU usage,
+and stability under sustained load using coRANUPF-Bench, our UPF benchmarking framework.
+The deployed UPF is additionally validated endto-end against a disaggregated 5G RAN, an
+OCUDU 7.2-split CU/DU with a Liteon RU and
+a commercial UE, confirming it carries real sub-
+
+1
+
+discovered the pod’s Kubernetes limits.cpu
+was smaller than the datapath worker count,
+causing CFS to throttle the polling workers to
+∼49 % CPU; raising the limit lifted throughput
+to 10.3 Mpps cleanly. CNDP and AF_XDP remain the cloud-native sweet spot when vfio-pci
+binding, hugepages, and isolated cores are unaffordable; DPDK is justified where the operator
+owns the NIC and can absorb the deployment
+footprint. The paper provides a side-by-side reference for operators choosing a UPF dataplane
+mode in a cloud-native 5G deployment.
+
+side look at all four on the same UPF pipeline,
+under the same workload, with a real 5G control
+plane in the loop. Operators choosing a UPF
+dataplane today often have to combine results
+from different testbeds and different applications
+to make a decision.
+This paper presents that comparison. We deploy the open-source SD-Core BESS-UPF on
+an Intel XXV710 NIC as a Charmed operator [3] (the upstream charmed sd-core bundle,
+orchestrated by Juju on top of Canonical Kubernetes), and we run the same BESS packetprocessing pipeline (GTP-U encap/decap and
+PDR/FAR/QER enforcement) under all four
+I/O modes. The only thing that changes between runs is the BESS port driver. For each
+mode we walk through its architecture, datapath,
+memory model, and deployment requirements,
+and we report throughput, latency and jitter,
+CPU and core scaling, and stability under sustained load. We also document the operational
+problems we ran into during real deployments
+and the fixes that brought each mode to a stable
+state.
+
+Keywords: 5G UPF, BESS, SD-Core, aetheronramp, AF_PACKET, AF_XDP, CNDP, DPDK,
+GTP-U, Packet I/O, Cloud-Native 5G Core, Kernel Bypass, Packet Processing.
+
+1
+
+Introduction
+
+The User Plane Function (UPF) is a core component of every 5G network. As specified in 3GPP
+TS 23.501 [1], it anchors PDU sessions, enforces
+per-packet rules in the form of Packet Detection
+Rules (PDRs), Forwarding Action Rules (FARs),
+QoS Enforcement Rules (QERs), and Usage Reporting Rules (URRs), and tunnels user traffic
+between the gNodeB and the data network using GTP-U over UDP [2]. Every byte that a
+subscriber sends or receives passes through the
+UPF. This makes its throughput a direct factor
+in how many users a single server can handle,
+and therefore in the cost of running the network.
+How the UPF actually moves packets between
+the network interface card and the application is
+the main lever for that throughput. The Linux
+kernel and the open-source ecosystem provide
+several ways to do this. Standard kernel networking uses AF_PACKET, the same socket family
+that tools like tcpdump rely on. AF_XDP uses
+eBPF and XDP sockets to bypass most of the
+kernel stack while still keeping the kernel driver.
+The Cloud Native Data Plane (CNDP) builds
+a userspace abstraction on top of AF_XDP and
+offers a DPDK-like programming model without
+DPDK’s heavier requirements. The Data Plane
+Development Kit (DPDK) goes the furthest, taking the NIC fully into userspace through a PollMode Driver.
+Each of these modes is well-described on its
+own, and several papers compare them in pairs
+(most often AF_XDP against DPDK) on synthetic
+packet generators. What is missing is a side-by-
+
+1.1
+
+Contributions
+
+This paper makes the following contributions:
+• A side-by-side comparison of four widely-used
+UPF packet I/O modes (AF_PACKET, AF_XDP,
+CNDP, and DPDK) on a single UPF pipeline,
+with the I/O backend as the only variable.
+• Architectural walkthroughs of each mode, covering datapath flow, memory model, execution model, and deployment requirements.
+• Benchmark results from a real testbed (Intel XXV710/i40e on x86_64, Canonical Kubernetes, charmed sd-core / aether-onramp)
+covering throughput, latency and jitter, CPU
+and core scaling, and stability under sustained
+load.
+• Operational findings from running each mode
+in production, including the failure modes we
+encountered and the fixes that resolved them.
+• A short decision guide for operators on which
+mode fits which deployment.
+• Deployment of the UPF as a Charmed operator (Juju-orchestrated) within the charmed
+
+2
+
+sd-core bundle on Kubernetes, demonstrating that the cloud-native dataplane comparison holds under a production-grade operator
+lifecycle (rolling upgrades, declarative config,
+atomic relations).
+
+with the Session Management Function (SMF)
+instructing the UPF over the N4 interface using
+the Packet Forwarding Control Protocol (PFCP),
+defined in 3GPP TS 29.244 [4]. The UPF’s main
+interfaces are:
+
+• End-to-end functional validation against a
+disaggregated 5G RAN with an OCUDU 7.2split CU/DU pair, a Liteon Open RAN radio
+unit (RU), and a commercial UE, exercising
+the deployed UPF through the full UE →
+gNB → UPF → data-network path.
+
+• N3: connects the gNodeB to the UPF, carrying user data inside a GTP-U tunnel over
+UDP. Each tunnel is identified by a Tunnel
+Endpoint Identifier (TEID), and the inner
+packet is the actual IP packet for the user
+equipment.
+
+• coRAN-UPF-Bench, our UPF benchmarking
+framework built to drive every measurement
+in this paper. It orchestrates synthetic load
+generation, in-pipeline BESS probe insertion,
+soak runs, and drop/forwarding-efficiency reconciliation into a single mode-agnostic harness over the four dataplane backends.
+
+• N6: connects the UPF to the data network
+(the Internet or a private network), carrying
+the decapsulated user traffic.
+
+1.2
+
+• N9: connects two UPFs when traffic chains
+through more than one UPF.
+For every PDU session, the SMF programs
+the UPF with four classes of rules:
+
+Paper Organization
+
+• Packet Detection Rules (PDRs) match
+an incoming packet against fields such as the
+TEID, source and destination IP and port,
+and QoS Flow Identifier.
+
+Section 2 introduces the 5G UPF, the Linux
+packet I/O primitives, and the BESS port abstraction that makes the four modes interchangeable. Section 3 walks through each of the four
+dataplane modes in turn. Section 4 brings the
+architectural differences together in a single comparison. Section 5 describes the testbed and
+methodology, and Section 6 presents the benchmark results. Section 7 reports the deployment
+pitfalls we hit and the fixes that resolved them.
+Section 8 situates the work against prior art,
+and Section 9 translates the comparison into a
+decision framework for operators. Section 10
+discusses limitations and future work, and Section 11 concludes.
+
+2
+
+• Forwarding Action Rules (FARs) describe what do with a matched packet: forward, drop, buffer, or encapsulate.
+• QoS Enforcement Rules (QERs) apply
+per-flow rate limiting.
+• Usage Reporting Rules (URRs) drive
+charging and quota.
+Every user packet, in both directions, is
+matched against the PDR table, mutated by its
+FAR (typically a GTP-U encap or decap and a
+routing decision), and metered against its QER,
+all at line rate. This per-packet rule processing
+is the UPF’s main computational workload, and
+the I/O backend is what feeds it.
+Several open-source UPF implementations exist. The Aether project’s SD-Core distribution [5], which we use in this paper, ships a UPF
+built on BESS, the Berkeley Extensible Software
+Switch [6], and supports multiple packet I/O
+backends through BESS’s port abstraction (§2.3).
+Other open-source UPFs include free5GC [7],
+which has both a kernel-module (gtp5g) datapath and a DPDK-based userspace datapath, and
+eUPF [8], an eBPF-only UPF that runs entirely
+
+Background
+
+This section sets up the three pieces of vocabulary the rest of the paper depends on: the 5G
+UPF and its user-plane interfaces (§2.1), the
+Linux packet I/O primitives that all four modes
+are built on (§2.2), and the BESS port abstraction that makes the four modes interchangeable
+on a single pipeline (§2.3).
+
+2.1
+
+The 5G UPF and the User Plane
+
+The UPF is part of the 5G Core’s Service Based
+Architecture and handles all user-plane traffic for
+a 5G network. The control plane sits separately,
+3
+
+at the XDP hook. Each project picks a different
+default I/O mode; this paper holds the UPF
+(SD-Core BESS-UPF) constant and varies the
+I/O.
+
+2.2
+
+pays one extra copy from kernel space to user
+space per packet. The combined cost of sk_buff
+allocation, stack traversal, and the copy-to-user
+is what kernel-bypass techniques try to eliminate.
+
+Linux Packet I/O Primitives
+
+Every dataplane mode in this paper is, at some
+level, a different answer to the same question:
+where in the Linux packet I/O pipeline do we
+intercept the packet, and what do we hand to
+the application? A short tour of the underlying
+primitives makes the later per-mode sections
+easier to follow.
+NIC and descriptor rings. A modern NIC
+exposes one or more queue pairs, each made up
+of an RX (receive) and TX (transmit) descriptor
+ring in host memory. Each descriptor is a small
+fixed-size record (typically 16–32 bytes) pointing
+at a packet buffer and carrying packet metadata.
+The NIC writes incoming packets into the buffers
+via DMA, advances a hardware head pointer, and
+signals the host with an MSI-X interrupt.
+
+Figure 2: Linux NAPI packet processing flow illustrating interrupt mitigation through hybrid interruptdriven activation and polling-based packet processing
+(adapted from [11]).
+
+Zero-copy and shared memory. Zero-copy
+packet I/O removes the kernel-to-user memcpy
+by exposing the NIC’s DMA buffers directly
+to the application, usually through a sharedmemory region. The buffer is filled by the NIC,
+processed in place by the application, and returned to the NIC, with no copy and no sk_buff.
+AF_XDP achieves this through its UMEM construct (§3.2); DPDK achieves it through its mbuf
+pool over hugepages (§3.4).
+Hugepages. Conventional Linux pages are
+4 KB. A typical packet buffer pool of tens of thousands of packets quickly exceeds the Translation
+Lookaside Buffer (TLB) capacity, which causes
+TLB misses on every buffer access. Hugepages
+(2 MB or 1 GB on x86) reduce TLB pressure
+by several orders of magnitude. DPDK requires
+hugepages; AF_XDP can use them as an optimization but does not require them.
+
+Figure 1: RX descriptor ring structure showing the
+circular buffer, descriptors, head and tail pointers,
+and DMA packet flow between the NIC and host
+memory (adapted from [9]).
+
+Interrupts, NAPI, and the kernel stack.
+In the standard Linux datapath, an MSI-X
+interrupt wakes the NIC driver, which enters
+NAPI [10] (a hybrid interrupt-plus-poll scheme
+designed to avoid livelock under heavy load).
+The driver pulls descriptors from the RX ring
+in batches and processes incoming packets using
+NAPI polling rather than handling every packet
+through a separate interrupt. The driver then allocates a kernel socket buffer (sk_buff) for each
+packet and hands the chain to the network stack.
+The stack performs L2/L3/L4 demultiplexing,
+runs netfilter and traffic-control hooks, and finally puts the packet on a destination socket. A
+userspace application reading from that socket
+
+VFIO and IOMMU. Userspace direct DMA
+needs both safety (the application must not be
+able to DMA into arbitrary kernel memory)
+and isolation (one tenant must not be able to
+DMA into another’s). The IOMMU provides the
+hardware boundary, and Linux’s VFIO subsystem (vfio-pci) exposes a NIC to a privileged
+userspace process as a member of an IOMMU
+group. DPDK depends on VFIO; AF_XDP and
+CNDP do not.
+
+4
+
+Poll-mode
+vs.
+interrupt-mode. An
+interrupt-driven datapath is event-triggered: the
+CPU is idle until the NIC raises an interrupt.
+A poll-mode datapath dedicates one or more
+CPU cores to spinning on the RX ring, trading
+CPU cycles for sub-microsecond reaction
+times. AF_PACKET is interrupt-driven, DPDK
+is poll-mode, and AF_XDP and CNDP can be
+configured either way through their busy_poll
+setting.
+
+wrapped around a Linux AF_PACKET raw
+socket.
+• PMDPort with net_af_xdp for the AF_XDP
+mode, DPDK’s PMD wrapped around an
+XDP socket.
+• CNDPPort for the CNDP mode, a separate port type that calls Intel’s CNDP library
+directly.
+• PMDPort with a native DPDK driver
+(net_iavf, net_i40e, net_ice) for the
+DPDK mode, the NIC is bound to vfio-pci
+and accessed by the corresponding PMD.
+
+RSS and multi-queue. A single CPU core
+can only process so many packets per second. All
+four modes scale horizontally by binding multiple worker threads to multiple NIC RX queues,
+with incoming packets steered across queues by
+Receive-Side Scaling (RSS), which is a hash over
+selected packet fields. This works well for plain
+IP/TCP traffic but is less straightforward for
+GTP-U, since the default RSS hash does not
+look at the inner packet’s headers.
+
+2.3
+
+This is what makes the experiment in this
+paper possible. The BESS module graph, the
+PFCP/PDR tables, the GTP-U logic, the metering rules, everything above PortInc and
+PortOut, stays bit-identical across all four
+modes. The only thing that changes is which
+port driver fills and drains those two endpoints.
+Any performance difference we observe is therefore attributable to the I/O backend rather than
+to a difference in the pipeline.
+
+BESS-UPF and the Port Abstraction
+
+The Berkeley Extensible Software Switch
+(BESS) [6] is a programmable soft-switch that
+represents a packet-processing pipeline as a directed graph of modules. Each module performs
+a small, well-defined operation: match against
+a table, encap or decap a header, drop, meter, or count. Packets traverse the graph in
+batches for cache efficiency. SD-Core’s BESSUPF builds the 5G UPF datapath as such a
+graph: a PortInc module reads batches from
+the N3 interface, a GtpuDecap module strips the
+GTP-U header and recovers the inner IP packet,
+a WildcardMatch module implements the PDR
+table, FAR actions are applied by a chain of
+mutators, a metering module enforces QER rate
+limits, and a PortOut module writes the packet
+to the N6 interface. The symmetric path handles
+the return direction.
+The part that matters for this paper is BESS’s
+port abstraction. A BESS port is an endpoint
+that exposes RecvPackets and SendPackets
+primitives, and everything below those two methods (driver, ring, memory model, kernel involvement) is encapsulated by the port type. BESSUPF picks one of several port types based on
+configuration:
+
+3
+
+The Four Dataplane Modes
+
+This section walks through the four dataplane
+modes one at a time. Each mode is described using the same seven-point structure (overview, architecture, datapath packet flow, memory model,
+deployment requirements, advantages and limitations, and key findings) so that the modes can be
+compared like-for-like in Section 4. We present
+them in order of increasing kernel bypass, from
+AF_PACKET (full kernel stack) to DPDK (full kernel bypass), with AF_XDP and CNDP in between.
+
+3.1
+
+AF_PACKET (Static Kernel Module
+Mode)
+
+Overview. AF_PACKET is the standard Linux
+raw-socket family used by tools like tcpdump
+and Wireshark. It is the oldest and most compatible of the four modes: the packet travels
+through the full Linux network stack, and the
+application reads it from a raw socket. In BESSUPF, AF_PACKET is exposed through DPDK’s
+net_af_packet poll-mode driver, which wraps
+a Linux PF_PACKET socket behind DPDK’s port
+API. No special NIC driver, no hugepages, no
+VFIO, and no kernel patching are required,
+
+• PMDPort with net_af_packet for the
+AF_PACKET mode, DPDK’s poll-mode driver
+5
+
+Figure 3: The SD-Core BESS-UPF pipeline. The module graph above the dashed line (PDR/FAR/QER
+processing, GTP-U encap/decap) is invariant across all four dataplane modes. Only the PortInc/PortOut
+port driver changes, isolating the I/O backend as the single experimental variable.
+
+which makes this mode the easiest to deploy
+in a generic container environment. We use it
+as the baseline against which the three faster
+modes are compared.
+
+BESS-UPF Pipeline
+PortInc → GTP-U decap → PDR/FAR/QER → PortOut
+copy to/from
+user space
+
+net_af_packet PMD
+DPDK port wrapping a raw socket
+user | kernel
+
+Architecture. Figure 4 shows the AF_PACKET
+datapath. A packet arriving at the NIC is
+processed by the kernel NIC driver, passed up
+through the standard network stack (NAPI →
+sk_buff → IP/UDP demultiplexing), and finally
+placed on a PF_PACKET raw socket bound to
+the interface. BESS’s PortInc module, via the
+net_af_packet PMD, reads from this socket using recvmsg() (or the TPACKET_V3 ring-buffer
+interface if available). The packet is then handed
+to the BESS module graph for GTP-U decap,
+PDR/FAR/QER processing, and forwarding.
+The reverse path on transmit goes from the BESS
+PortOut module back into the kernel through
+the same raw socket, then out through the standard stack to the NIC.
+
+PF_PACKET Raw Socket
+recvmsg() / optional TPACKET_V3 ring
+
+Linux Network Stack
+
+full stack
+traversal
+
+L2/L3/L4 demux, netfilter, tc
+
+sk_buff
+per packet
+
+sk_buff allocation per packet
+
+NIC Driver + NAPI
+kernel | NIC
+
+DMA +
+MSI-X IRQ
+
+Network Interface Card
+RX / TX descriptor rings
+
+Figure 4: AF_PACKET datapath in SD-Core BESSUPF. Packets traverse the full Linux network stack:
+NAPI allocates an sk_buff for each packet, the
+stack performs L2/L3/L4 demultiplexing (plus any
+active netfilter and tc hooks), the kernel clones
+the packet onto a PF_PACKET raw socket, and the
+net_af_packet DPDK PMD copies it to user space
+for the BESS pipeline. The transmit path is symmetric. No hugepages, VFIO, or kernel-bypass drivers
+are required.
+
+Datapath packet flow. On receive, a single
+packet traverses the following stages:
+1. The NIC writes the packet into an RX descriptor ring via DMA and raises an MSI-X
+interrupt.
+
+2. The kernel NIC driver enters NAPI, pulls
+a batch of descriptors, and allocates an
+sk_buff for each.
+6
+
+• CNI: any CNI works, since the NIC is
+owned by the kernel. We use the standard
+Calico/host-device setup with no extra plumbing.
+
+3. The packet is pushed up through the network
+stack: L2 demultiplexing, IP/UDP protocol
+handlers, netfilter and traffic-control hooks.
+4. Because the AF_PACKET socket is bound to the
+interface in promiscuous (or directed) mode,
+the kernel clones the packet to the socket’s
+receive queue.
+
+Advantages and Limitations. Advantages.
+AF_PACKET is the easiest mode to deploy in a
+generic cloud-native environment: no kernel tuning, no hardware constraints, no privileged containers. Standard kernel features (tc, iptables,
+netfilter, eBPF tracing, etc.) remain available
+because the packet still traverses the full stack.
+This makes the mode useful for development and
+debugging, and for deployments where compatibility matters more than raw throughput.
+Limitations. The same property that makes
+AF_PACKET compatible is what makes it slow.
+Every packet pays for an sk_buff allocation, full
+stack traversal, and a kernel-to-user copy. CPU
+usage per packet is the highest of the four modes,
+and the per-core packets-per-second ceiling is
+correspondingly the lowest. Multi-queue/RSS
+scaling helps but cannot close the gap with the
+kernel-bypass modes.
+
+5. The application (BESS’s PMD, in our case)
+reads the packet from the socket. This involves a copy from kernel space to user space.
+6. The packet enters BESS’s module graph
+through the PortInc module and is processed
+by the rest of the UPF pipeline.
+The transmit path is symmetric: BESS writes
+the packet to the socket, the kernel allocates an
+sk_buff, and the packet is pushed back down
+through the stack and out the NIC.
+Memory model. AF_PACKET uses the kernel’s
+sk_buff for all packet representation. There
+is one sk_buff allocation per packet (typically
+from a slab cache), and at least one memory copy
+on every receive (kernel space → user space).
+The TPACKET_V3 interface can reduce per-packet
+overhead by exposing a ring buffer of fixed-size
+frame slots, but the underlying sk_buff allocation and kernel stack traversal are unchanged.
+No hugepages, no dedicated memory pools, and
+no IOMMU mappings are involved.
+
+Key findings. AF_PACKET serves as a stable
+baseline. Throughput is bounded primarily by
+per-packet CPU cost in the kernel stack, not by
+any BESS-side bottleneck. We observe that:
+• Throughput.
+AF_PACKET sustains
+0.252 Mpps full-pipeline at 86 B with
+two workers (0.224 Mpps single-worker),
+the lowest of the four modes by roughly an
+order of magnitude, bounded by per-packet
+sk_buff allocation and the kernel-to-user
+copy. The rate is essentially flat across frame
+sizes (0.252 → 0.233 Mpps from 86 B to
+1280 B), confirming the pps-bound character
+of the kernel-stack path.
+
+Deployment requirements. AF_PACKET is
+the most portable of the four modes. The requirements are:
+• NIC driver: any Linux-supported NIC. No
+XDP support, no DPDK PMD, and no VFIO
+binding are needed. The interface stays under
+the kernel.
+
+• CPU utilization climbs steeply with offered
+load, with the kernel softirq path dominating
+perf profiles.
+
+• Kernel features: a stock Linux kernel.
+CAP_NET_RAW is required to open a PF_PACKET
+socket; in a Kubernetes pod this is granted
+via the security context.
+
+• Deployment is the simplest of the four modes:
+no hugepages, no VFIO, no privileged container, no special CNI.
+
+• Hugepages: not required.
+• Memlock and privileged mode: not required. The pod can run with the default
+security profile in most clusters.
+
+• Latency under light load is comparable to
+AF_XDP, because the kernel stack is fast in
+the uncontended case; the gap appears under
+sustained load.
+
+7
+
+This makes AF_PACKET a reasonable choice for
+low-throughput edge deployments, lab testbeds,
+and any environment where the operational simplicity outweighs the throughput penalty.
+
+pletion Queue (CQ) returns transmitted frames
+to the application. Frames live in UMEM, an
+mmap’d contiguous region divided into fixed-size
+chunks (typically 2 KB).
+
+3.2
+
+Datapath packet flow. On receive, a single
+packet traverses the following stages:
+
+AF_XDP
+
+Overview. AF_XDP is a Linux socket family
+(PF_XDP) introduced in kernel 4.18 and matured through the 5.x series, designed for highperformance packet I/O without leaving the kernel. Packets arriving at the NIC are intercepted
+by an eBPF [12] program attached at the eXpress
+Data Path (XDP) [13] hook, a point in the NIC
+driver before the kernel allocates an sk_buff or
+runs the rest of the network stack. The XDP
+program redirects the packet to an XDP socket
+(XSK), which exposes it directly to userspace
+through a shared, memory-mapped region called
+UMEM. On drivers that support it, the entire
+datapath runs in zero-copy mode: the NIC writes
+packets via DMA into UMEM frames that the
+application reads in place, with no sk_buff allocation and no kernel-to-user copy.
+In BESS-UPF, AF_XDP is exposed through
+DPDK’s net_af_xdp poll-mode driver, which
+wraps an XDP socket behind the same port API
+used by AF_PACKET. Switching from AF_PACKET
+to AF_XDP is therefore a configuration change in
+the BESS port type, the BESS module graph
+above PortInc and PortOut stays bit-identical.
+
+1. The NIC writes the packet into a buffer whose
+UMEM address the driver has already taken
+from the Fill Queue. DMA goes directly into
+UMEM.
+2. The NIC raises an MSI-X interrupt (or the
+application is in busy-poll mode); the driver’s
+XDP hook runs the attached eBPF program.
+3. The program returns XDP_REDIRECT, with the
+target XSK looked up from an eBPF map
+keyed by the RX queue index.
+4. The kernel writes the frame’s UMEM offset
+and length into the XSK’s RX ring.
+5. The application (the BESS net_af_xdp
+PMD) polls the RX ring, reads the descriptor,
+and accesses the packet directly in UMEM.
+No copy.
+6. The packet enters BESS’s module graph
+through PortInc and is processed by the rest
+of the UPF pipeline.
+7. When the application is done with the frame,
+it returns the UMEM address to the Fill
+Queue so the driver can reuse it for another
+incoming packet.
+
+Architecture. Figure 5 shows the AF_XDP datapath as deployed in our Charmed BESS-UPF
+(single BESS worker on the net_af_xdp PMD
+against i40e PFs with busy_budget=64). An
+XDP program (eBPF bytecode loaded into the
+NIC driver) runs on every received packet before
+any sk_buff is allocated. The program returns
+one of several actions: XDP_PASS (forward up
+the stack), XDP_DROP (discard), XDP_TX (bounce
+back out), or XDP_REDIRECT, which steers the
+packet to an XSK listed in an eBPF map. The
+XSK is bound to a specific (netdev, queue index)
+pair, so multi-queue NICs scale horizontally by
+binding one XSK per RX queue.
+Each XSK exposes four ring queues that the
+application and the kernel share through mmap():
+the RX ring carries received packet descriptors
+to the application, the TX ring carries outgoing
+packet descriptors to the kernel, the Fill Queue
+(FQ) returns empty UMEM frames to the kernel
+for use as incoming receive buffers, and the Com-
+
+On transmit, the application places a descriptor (UMEM offset + length) on the TX ring, the
+kernel hands it to the driver for DMA, and the
+driver writes the completion back to the Completion Queue once the frame has been sent. Both
+directions stay inside the kernel’s NIC driver,
+only the rest of the network stack is bypassed.
+Memory model. AF_XDP’s central abstraction
+is the UMEM: a contiguous, memory-mapped
+region of userspace memory that both the application and the kernel can access. UMEM is
+divided into fixed-size frames (typically 2 KB),
+and every packet, received or transmitted, lives
+in a UMEM frame. Figures 6a and 6b show
+the layout of a buffer inside a UMEM chunk
+on the RX and TX sides respectively. The
+8
+
+Figure 5: AF_XDP datapath in the Charmed SD-Core BESS-UPF deployment. A single BESS worker (DPDK
+net_af_xdp PMD with busy_budget=64) binds an AF_XDP socket against the i40e access and core PFs (N3 /
+N6). Four ring queues (RX / Fill / Completion / TX, depth 4096) are mmap’d into the BESS worker’s address
+space; the kernel-side XDP program redirects incoming packets to the XSK via the XSKMAP, and zero-copy
+is confirmed active (XSK_BUFF_POOL). The Charm Container on the left manages lifecycle.
+
+Deployment requirements. AF_XDP sits between AF_PACKET and DPDK on the deployment
+scale: more setup than the kernel stack, considerably less than full kernel bypass.
+
+XDP_PACKET_HEADROOM reserves the first 256
+bytes of each frame for metadata: an MBUF
+header (64 B) plus 192 B of headroom that an
+application or PMD can use for tunneling headers or pipeline metadata.
+Multiple XSKs can share a single UMEM region with their own per-socket RX/TX/FQ/CQ
+ring sets. This is what allows a multi-worker
+UPF to scale horizontally across NIC RX queues
+without copying packets between sockets: a
+packet steered to a particular XSK by RSS can
+be processed and, if needed, handed to another
+worker by reference rather than by value.
+Unlike DPDK, AF_XDP does not strictly
+require hugepages.
+Allocating UMEM on
+hugepages is an optional optimization that reduces TLB pressure; the kernel will accept any
+properly aligned, locked region of memory. The
+RLIMIT_MEMLOCK limit, however, must be high
+enough to pin the UMEM, which in production
+deployments means raising it to unlimited.
+
+• NIC driver: the driver must support XDP
+at the native (xdpdrv) hook, and ideally the
+zero-copy AF_XDP path. Intel i40e and ice,
+Mellanox mlx5, Broadcom bnxt, and several
+others qualify. The iavf driver used by SRIOV virtual functions on Intel hardware does
+not expose the native XDP hook, which rules
+out VF-based AF_XDP deployments on Intel
+NICs.
+• Kernel: Linux 5.4 or later, with the PF_XDP
+socket family compiled in and eBPF enabled.
+• Hugepages: not required, but recommended
+for performance. Our deployment enables
+1 GB hugepages and configures umem.bufcnt
+large enough to keep the Fill Queue saturated.
+• memlock: RLIMIT_MEMLOCK must be raised
+to allow the UMEM region to be locked into
+9
+
+(a) RX side: Fill Queue → RX Ring.
+
+(b) TX side: TX Ring → Completion Queue.
+
+Figure 6: AF_XDP UMEM memory layout. The first 256 bytes of each UMEM frame (XDP_PACKET_HEADROOM)
+contain the MBUF header and headroom; the packet payload begins after the offset. RX and TX use
+mirror-image ring structures over the same UMEM region. Source: adapted from [14].
+
+memory. On a Kubernetes deployment this
+is configured by raising the limit on the underlying container runtime (e.g. via a systemd override for the Canonical Kubernetes
+k8s.service unit).
+• Privileged container: required for creating
+XDP sockets and loading the eBPF program.
+The finer-grained capabilities CAP_NET_RAW,
+CAP_NET_ADMIN,
+CAP_SYS_ADMIN,
+and
+CAP_BPF can substitute for full privileged
+mode in stricter environments.
+Figure 7: Kubernetes integration of AF_XDP via the
+AF_XDP Device Plugin and a CNI. The plugin creates
+a netdev subfunction, loads the XDP program, and
+passes the XSK map file descriptor to the application
+pod via a Unix Domain Socket. The upstream device
+plugin was archived in 2024; our deployment uses the
+host-device CNI pattern instead. Source: adapted
+from [14].
+
+• CNI: the pod must be given a real NIC
+PF (or queue), not a virtual interface that
+lacks an XDP-capable driver. We use the
+host-device CNI to move the physical
+XXV710 PFs directly into the UPF pod;
+macvlan and similar L2 virtual interfaces do
+not support XDP and cannot be used. Figure 7 shows the canonical Kubernetes wiring
+through an AF_XDP Device Plugin and CNI:
+the plugin creates a netdev subfunction (or
+claims a PF queue), loads the XDP program, and passes the XSK map file descriptor
+to the application pod through a Unix Domain Socket. We note that Intel’s upstream
+AF_XDP Device Plugin repository was archived
+in 2024 [15]; production deployments today increasingly rely on host-device CNI directly,
+or move to CNDP for a similar but bettermaintained abstraction.
+
+charge of the NIC: familiar tools (ethtool, ip,
+tc) keep working, and operators can fall back to
+the regular stack for out-of-band traffic by returning XDP_PASS instead of redirecting to the XSK.
+AF_XDP is also more cloud-native than DPDK
+in practice, no hugepages-only constraint, no
+vfio-pci binding, and a more conventional security profile.
+Limitations. The XDP-driver requirement is
+the main constraint. Older drivers, containerside virtual interfaces, and Intel SR-IOV VFs
+(iavf) all lack the native XDP hook. Performance also depends on the driver’s zero-copy support; copy-mode AF_XDP (the fallback when the
+driver lacks ZC) is still faster than AF_PACKET
+but loses a large fraction of the zero-copy advantage. RSS-based scaling across multiple XSKs is
+hampered for GTP-U traffic, because the default
+
+Advantages and Limitations. Advantages.
+AF_XDP delivers most of the throughput benefit of full kernel bypass without giving up the
+kernel driver. Zero-copy and the absence of the
+kernel network stack make it substantially faster
+than AF_PACKET, while the kernel remains in
+10
+
+RSS hash sees only the outer IP/UDP headers,
+not the inner UE flow; spreading traffic evenly
+requires either flow director rules (where supported) or RSS on inner headers through driverspecific extensions such as Intel ADQ.
+
+aplane library originally developed by Intel and
+now maintained by the CloudNativeDataPlane
+project. CNDP gives applications a DPDK-like
+programming model and performance, but layers
+its userspace stack on top of AF_XDP rather than
+direct vfio-pci kernel bypass. Packets enter
+and leave the application through XDP sockets, just as with plain AF_XDP (§3.2), while the
+application itself talks to a higher-level CNDP
+API that handles logical-port (lport) abstraction, mempool and MBUF management, threading, and metrics. The result is a deployment
+that keeps AF_XDP’s cloud-native properties, no
+hugepages, no VFIO, no PMD binding, kernel
+driver retained, while exposing an interface comparable in expressiveness to DPDK.
+In BESS-UPF, CNDP is the default I/O backend in the upstream omec-project/upf image.
+A CNDPPort port type calls the CNDP library directly, rather than going through a DPDK PMD
+wrapper, so the integration sits at a different abstraction layer than the AF_PACKET and AF_XDP
+modes in Sections 3.1 and 3.2.
+
+Key findings.
+• Zero-copy is the lever. The single biggest
+performance step from AF_PACKET to AF_XDP
+comes from eliminating the sk_buff allocation and the kernel-to-user copy. On
+our XXV710/i40e testbed, ethtool -i and
+ss –xdp confirm zero-copy is engaged in
+XDP_DRV (native driver) mode; dmesg reports
+MEM_TYPE_XSK_BUFF_POOL on the relevant
+RX ring.
+• Throughput. AF_XDP sustains 3.69 Mpps
+(1 worker) and 6.47 Mpps (2 workers) fullpipeline at 64 B, roughly 17× AF_PACKET
+and the highest per-core rate of the three
+kernel-bypass modes, reflecting the efficiency
+of the net_af_xdp PMD over the zero-copy
+AF_XDP datapath. RSS-based scaling beyond
+two workers is blocked by the per-netdev XSK
+socket limit; see §6.3.
+
+Architecture. Figure 8 shows the layered
+CNDP architecture. The Cloud Native Application sits above the CNDP API, which is implemented by a set of CNDP libraries (TCP/UDP
+stack, RIB/FIB, ACL, hash tables, CLI, JSON,
+packet interfaces, MBUF/mempool, lockless
+rings, metrics). The CNDP I/O layer below
+those libraries attaches to the kernel through
+AF_XDP sockets. The kernel side is unchanged
+from a plain AF_XDP deployment: XDP programs in the NIC driver redirect packets to XSKs
+through an eBPF XSKMAP. Kubernetes integration is handled by an optional CNDP Device Plugin and CNI; deployment can also use a generic
+CNI like host-device for simpler setups.
+CNDP exposes two device-layer choices, shown
+in Figure 9. The pktdev layer is a PMD-style
+interface modeled on DPDK’s rte_eth_dev: applications request packets via standard receive
+and transmit calls, and the PMD chooses which
+underlying transport (AF_XDP, an internal ring,
+etc.) to use. The xskdev layer is a thinner,
+AF_XDP-only interface for applications that want
+direct control. BESS-UPF’s CNDPPort uses the
+pktdev layer through CNDP’s AF_XDP PMD.
+
+• Driver support is the gatekeeper. Our
+deployment only works on physical functions
+with a native-XDP driver (i40e in our case);
+attempts to move the AF_XDP socket onto an
+SR-IOV VF (iavf driver) fail because that
+driver does not expose the native XDP hook.
+• Memlock and privileged are nonnegotiable.
+Without RLIMIT_MEMLOCK
+raised on the host, the BESS PMD fails to
+allocate the UMEM region on startup. Without privileged mode (or the right capabilities),
+the XDP program load fails. Both conditions
+are required for the pod to even start.
+• Multi-worker scaling is hampered by
+RSS. With the in-tree i40e driver’s default
+RSS profile, single-flow GTP-U traffic hashes
+to a single RX queue and therefore a single
+XSK, leaving additional worker threads idle.
+This matches the upstream observation in
+omec-project/upf issue [16] on multi-worker
+scaling caps.
+
+3.3
+
+CNDP
+
+Datapath packet flow. CNDP’s datapath
+mirrors AF_XDP’s at the kernel level: incoming
+packets are intercepted by an XDP program in
+
+Overview. The Cloud Native Data Plane
+(CNDP) [17] is an open-source userspace dat11
+
+Figure 8: CNDP architecture. Applications call CNDP libraries (TCP/UDP stack, RIB/FIB, MBUF/mempool, packet interfaces) which sit above the CNDP I/O layer. Packets reach the NIC through AF_XDP, with
+XDP attached to the kernel network drivers. Kubernetes integration uses CNI and Device Plugin components.
+Source: adapted from [18].
+
+Figure 9: CNDP’s two device-layer choices. The pktdev layer (left) exposes a PMD-style API that can sit
+on top of AF_XDP, an internal ring, or other transports. The xskdev layer (right) is a thinner, AF_XDP-only
+API for applications wanting direct access. Source: adapted from [18].
+
+the NIC driver and redirected to an XSK via
+the XSKMAP. CNDP adds a userspace abstraction on top called the logical port (lport): a
+named endpoint that hides the underlying (netdev, queue index) pair from the application. Figure 10 shows the relationship: multiple lports
+in userspace map to multiple XSKs in the kernel,
+each bound to a NIC RX queue, and the XDP
+program redirects each incoming packet to the
+right XSK using the queue index as the lookup
+key.
+On receive, a packet follows the same low-level
+steps as AF_XDP (§3.2, datapath flow), with one
+
+additional layer: the application reads it through
+the CNDP pktdev / lport API instead of directly from the XSK ring. The CNDP library
+handles descriptor unpacking, MBUF allocation
+from a per-port mempool, and batching. From
+the application’s point of view (BESS-UPF in our
+case), packets arrive as MBUFs from a CNDP
+port, the AF_XDP ring mechanics are invisible.
+Memory model. CNDP uses the same underlying UMEM mechanism as AF_XDP (every packet lives in a UMEM frame, accessible
+through mmap’d shared memory) but adds a
+12
+
+Deployment requirements. CNDP’s deployment requirements are essentially the union of
+AF_XDP’s requirements with a few CNDP-specific
+additions. Figure 12 shows the deployed CNDP
+datapath in our Charmed BESS-UPF, including
+the busy-poll workers and the shared UMEM
+region split between access and core ports.
+• NIC driver: same as AF_XDP, must support native XDP, ideally with zero-copy. Our
+measurements use the i40e driver on Intel
+XXV710 NICs.
+• Kernel: Linux 5.4+ with AF_XDP and eBPF
+enabled.
+
+Figure 10: CNDP logical ports (lport) above
+the AF_XDP sockets (XSK A–E). Each lport corresponds to one XSK, which is bound to one NIC
+RX queue. The XDP program in the kernel redirects
+packets to the correct XSK using the queue index as
+...the lookup key in the XSKMAP. Source: adapted
+from [18].
+
+• CNDP runtime: the CNDP libraries
+(libcndp.so, the cne libraries, and optional
+Go/Rust bindings) must be installed in the
+container image. The omec-project/upf default image already ships them.
+• Configuration file: CNDP is configured by a JSON file specifying defaults
+(bufcnt, threads, busy_poll), UMEM regions (umems), and logical ports (lports).
+BESS-UPF’s cndp_upf_Nworker.jsonc files
+are templated by the helm chart.
+• memlock and privileged: same as AF_XDP,
+with RLIMIT_MEMLOCK raised and the pod running privileged (or with the equivalent capability set).
+
+Figure 11: CNDP mempool with per-core object
+caches backed by a central cne_ring. Each CPU
+core maintains a private cache of MBUFs from the
+mempool; when the cache empties or fills, MBUFs are
+moved between the cache and the central ring. The
+design mirrors DPDK’s rte_mempool (see §3.4) and
+avoids cross-core contention on the hot path. Source:
+adapted from [18].
+
+• CNI: host-device for simple deployments,
+or a CNDP-aware CNI plus the CNDP Device
+Plugin for multi-port allocation.
+• No hugepages, no vfio-pci, no PMD
+binding: these are the practical advantages
+over DPDK that motivate CNDP in cloudnative settings.
+
+userspace mempool layer on top. Figure 11
+shows the per-CPU mempool design: each core
+has an object cache for the mempool’s MBUFs,
+with a central cne_ring backing store holding
+all free objects. The cache absorbs short-term
+allocation bursts without contention; the ring
+serves as the source of truth when caches drain
+or overflow.
+The umem.bufcnt parameter in CNDP’s
+JSON configuration sets the UMEM buffer count.
+In our deployment we raise this to 128 K buffers
+(a 4× increase over the upstream default) to keep
+the Fill Queue saturated under high-PPS load, a
+setting we discuss further in §7. As with AF_XDP,
+hugepages are not required but are supported as
+an optimization.
+
+Advantages and Limitations. Advantages.
+CNDP gives applications a DPDK-like programming model (pktdev ports, MBUF mempools,
+lockless rings) over the AF_XDP datapath. From
+the application’s perspective, the AF_XDP ring
+machinery is hidden behind a clean lport-based
+API, and switching between AF_XDP, an internal
+ring, or net_af_packet backends is a configuration change. CNDP is also more cloud-native
+than DPDK in operational terms, no hugepages
+or vfio-pci required, a smaller container image,
+and a more conventional security profile. The
+13
+
+Figure 12: CNDP datapath in the Charmed SD-Core BESS-UPF deployment. The CNDP runtime exposes its
+xskdev pkt_api to the BESS-UPF, configured through cndp_upf_2worker.jsonc. A shared UMEM region
+(umem0, 2 MB hugepages) is split into access and core sub-regions; the NIC DMAs incoming packets directly
+into these UMEM frames and userspace reads the same memory without a copy. Four XSK rings per lport
+(RX / Fill / Completion / TX) connect busy-poll workers W0/W1 to the kernel-side XDP redirect program
+(i40e driver). The Charm Container on the left manages lifecycle.
+
+omec-project/upf project has adopted CNDP
+as its default backend in recent releases, providing a stable upstream reference.
+Limitations. CNDP inherits AF_XDP’s constraints, driver-side native XDP support, no
+SR-IOV VFs on iavf, RSS hashing limitations on GTP-U traffic, and adds a few of
+its own. The userspace API surface is larger
+than AF_XDP’s, so debugging crosses more layers;
+fewer Linux distributions package the CNDP
+runtime than package libxdp. The upstream
+BESS-UPF integration also ships with a coreNAT
+max_allowed_workers=2 annotation; we patch
+this out for the present study (raised to 4 for
+AF_XDP/CNDP). The per-netdev AF_XDP socket
+limit then becomes the next ceiling, effectively
+restricting CNDP to two workers in practice (§7,
+§6.3).
+
+MEM_TYPE_XSK_BUFF_POOL on the relevant
+RX ring, and the XDP program is attached
+in driver-native mode (xdp_drv). The CNDP
+datapath benefits from the full zero-copy
+AF_XDP path.
+• Full-pipeline ceiling ≈5.52 Mpps at 2
+workers. At 64-byte frames, the BESS-UPF
+pipeline running over CNDP absorbs and forwards 5.52 Mpps with zero drops; the perframe sweep holds flat up to 512 B and starts
+to taper at 1024 B (byte-bound; see §6).
+
+Key findings.
+
+• End-to-end pipeline latency ∼12.9 µs
+mean. Across 109 million packets at 2 workers, the BESS-UPF pipeline adds a P50 of
+13.9 µs and a P99 of 14.3 µs end-to-end
+through PDR / QER / FAR lookups and the
+executeFAR action. P99.9 reaches 24.7 µs, reflecting contention on the kernel XDP-redirect
+path introduced by the second worker.
+
+• Zero-copy AF_XDP is engaged.
+On
+our XXV710/i40e testbed, dmesg reports
+
+• Production-stable. A 24-hour soak at 86 B
+with –txonly-multi-flow delivered 183 bil14
+
+lion packets through the full pipeline with zero
+drops at either AF_XDP port. Mean throughput across 24 hourly samples was 2.100 Mpps
+with 3.07% variance, and bessd’s resident
+memory held constant, no drift, no leak.
+
+the data-plane libraries used by the application:
+rte_mempool and rte_mbuf for packet memory,
+rte_ring for lockless inter-core communication,
+and helpers for flow tables, hashes, longest-prefix
+match, timers, and statistics. The DPDK I/O
+layer at the bottom of userspace is the PMD
+itself, a poll-mode driver that owns the NIC’s
+RX and TX descriptor rings and exposes packets
+to the application as rte_mbuf batches.
+The kernel side is reduced to a one-time
+setup role. vfio-pci handles the initial device handover (Base Address Register mapping,
+descriptor-ring mmap into the DPDK process),
+and the IOMMU is programmed once to translate and isolate the device’s DMA transactions
+to the userspace memory region holding the
+rte_mbuf pool. Once the PMD is initialized,
+the kernel network stack is bypassed on every
+packet: there are no syscalls, no sk_buff allocations, no netfilter or traffic-control hooks, and no
+sockets in the hot path. The kernel intervenes
+only on configuration changes and error paths.
+
+• Multi-worker scaling: stock cap lifted
+in our patched image.
+The upstream omec-project/upf BESS image carries a coreNAT max_allowed_workers=2 annotation that we patch out for this study
+(raised to 4 for AF_XDP/CNDP, 8 for DPDK;
+see §6.3). The per-netdev AF_XDP socket limit
+then becomes the next ceiling for CNDP, restricting it to 2 workers in practice.
+
+3.4
+
+DPDK
+
+Overview. The Data Plane Development Kit
+(DPDK) [19] is the original full-kernel-bypass
+userspace networking framework, and remains
+the reference for raw packet-processing performance on commodity NICs. Unlike AF_XDP and
+CNDP, which keep the kernel driver in charge
+of the NIC and intercept packets at the XDP
+hook, DPDK takes the NIC away from the kernel
+entirely: the device is unbound from its kernel
+driver, rebound to vfio-pci, and accessed directly from userspace by a Poll-Mode Driver
+(PMD). The kernel network stack is bypassed on
+every packet; no sk_buff is allocated, no socket
+is involved, and there are no MSI-X interrupts
+on the hot path. The trade-off is the heaviest deployment footprint of the four modes: hugepages,
+IOMMU, dedicated CPU cores, and a NIC that
+disappears from the kernel’s networking view.
+In BESS-UPF, DPDK is exposed through
+a PMDPort using a native DPDK PMD that
+matches the underlying NIC: net_i40e when the
+Intel i40e PF is bound to vfio-pci, net_iavf
+when an SR-IOV VF on the same family is bound
+instead, and net_ice for E810-class NICs. This
+is the same PMDPort integration point used by
+AF_PACKET and AF_XDP (§3.1, §3.2), but with
+a native NIC PMD underneath rather than a
+socket wrapper.
+
+Datapath packet flow. On receive, a single
+packet traverses the following stages:
+1. The NIC writes the packet into a buffer whose
+address the PMD has already populated in
+the RX descriptor ring. DMA goes directly
+into a hugepage-backed rte_mbuf sitting in
+the userspace mempool. The IOMMU translates the DMA address to ensure the NIC can
+only reach memory the application owns.
+2. The PMD’s poll loop on a dedicated CPU
+core reads the RX ring, observes that the
+NIC has advanced its producer index, and
+consumes the descriptor. No MSI-X interrupt
+fires; the CPU has been spinning on the ring
+the entire time.
+3. The PMD hands the rte_mbuf chain to
+BESS’s PortInc module. From here the
+packet flows through the BESS module graph
+(GTP-U decap, PDR lookup, QER metering,
+FAR action) on the same core, in a run-tocompletion model.
+
+Architecture. Figure 13 shows the layered
+DPDK architecture on the BESS-UPF pipeline.
+The Environment Abstraction Layer (EAL) is
+the foundation: it owns hugepage allocation,
+NUMA-aware memory placement, thread pinning, the DPDK device probe, and the ethdev
+API that PMDs implement. Above the EAL sit
+
+4. After processing, BESS’s PortOut module
+places the rte_mbuf on the TX descriptor
+ring of the destination port.
+5. The PMD’s poll loop writes the NIC’s TX
+doorbell register through a memory-mapped
+
+15
+
+Figure 13: DPDK datapath in the Charmed SD-Core BESS-UPF deployment. SR-IOV VFs (iavf N3 and
+N6) are rebound from the kernel to vfio-pci; the DPDK PMD polls four 4096-depth descriptor rings (TX +
+Q0–Q3) in run-to-completion across BESS workers W0–W3 pinned to CPUs 7–10. The rte_mempool sits in
+1 GiB hugepages with a 512-packet per-core cache. The Charm Container on the left manages lifecycle and
+config reconciliation; the kernel network stack is fully bypassed.
+
+I/O write. The NIC’s on-chip DMA engine
+reads the descriptor, fetches the packet from
+the hugepage mbuf pool, and transmits it.
+6. Once the NIC has acknowledged completion,
+the PMD reclaims the rte_mbuf and returns
+it to the mempool’s per-core cache for reuse.
+Both directions stay entirely in userspace memory accessible both to the PMD and to the
+BESS pipeline; the packet never crosses a kerneluserspace boundary, and there is no copy at any
+stage.
+
+Figure 14: DPDK rte_mempool with per-core object caches backed by a central rte_ring. Each CPU
+core maintains a private cache of rte_mbufs; when
+the cache empties or fills, MBUFs are moved between
+the cache and the central ring. The CNDP mempool
+(§3.3) follows the same design, the cache-plus-ring
+pattern is shared between DPDK and CNDP. Source:
+adapted from [19].
+
+Memory model. DPDK’s memory model centers on the rte_mempool, a hugepage-backed
+pool of fixed-size rte_mbufs used for both RX
+and TX packet buffers. Figure 14 shows the percore cache design: each CPU core that touches
+the mempool maintains a private cache of free
+MBUFs, with a central rte_ring as the backing
+store for all free objects. When a core’s cache
+empties it bulk-fetches from the ring; when it
+fills it bulk-returns to the ring. The cache absorbs most allocation traffic without touching
+
+the contended ring, which keeps the hot path
+lock-free.
+Memory is allocated from hugepages (typically 2 MB pages on x86, with 1 GB pages available on supporting CPUs). Hugepages serve two
+purposes: they reduce TLB misses on the large
+packet-buffer working set (one TLB entry covers
+
+16
+
+• No kernel networking from the NIC: the
+host cannot use the NIC for any other traffic,
+no ssh over the same interface, no kernel
+routing, no observability tools that depend
+on the kernel stack. This makes DPDK a
+poor fit for multi-tenant or mixed-purpose
+hosts.
+
+a 2 MB region instead of a 4 KB region), and
+they provide stable physical-to-virtual mappings
+that the IOMMU can program for NIC DMA
+without page-migration races. Hugepages are a
+hard requirement for DPDK, unlike AF_XDP and
+CNDP where they are an optimization.
+Deployment requirements. DPDK has the
+most demanding deployment footprint of the
+four modes:
+
+Advantages and Limitations. Advantages.
+DPDK delivers the highest single-host throughput and the lowest, most deterministic perpacket latency of any of the four modes.
+Zero-copy is the default rather than a driverdependent optimization, the absence of interrupts removes scheduler jitter, and the run-tocompletion model on isolated cores keeps the
+cache hot. DPDK is also the most mature of the
+four: it has been in production at line rate for
+over a decade, supports a wide range of NICs
+through vendor-maintained PMDs, and is the
+baseline against which all other userspace networking frameworks are measured.
+Limitations. The deployment footprint is the
+central drawback. Hugepages, IOMMU, isolated
+CPU cores, vfio-pci binding, and the loss of the
+NIC to the rest of the host all combine to make
+DPDK considerably harder to operate in a cloudnative multi-tenant environment than AF_XDP
+or CNDP. The application also loses access to
+the kernel’s networking features: tc, iptables,
+netfilter, eBPF tracing on the NIC, and standard observability tools all become unavailable
+on the bypassed interface. For a single dedicated
+UPF on a bare-metal or strongly-isolated host
+these costs are usually acceptable; in a Kubernetes cluster sharing nodes across workloads, the
+operational overhead frequently outweighs the
+performance gain.
+
+• NIC binding: the NIC (PF or SR-IOV VF)
+must be unbound from its kernel driver and
+rebound to vfio-pci. The interface disappears from ip link and similar kernel-side
+networking tools.
+• IOMMU: enabled in BIOS and Linux kernel
+(intel_iommu=on iommu=pt on Intel platforms, equivalent options on AMD). Without
+IOMMU, vfio-pci can only run in noiommu
+mode, which is unsafe for production deployments.
+• Hugepages: required. Typically 2 MB
+or 1 GB pages are reserved at boot time
+(hugepages=N kernel parameter) or at runtime via /sys/kernel/mm/hugepages. The
+DPDK application maps a configurable
+amount from this pool for its rte_mempool.
+• CPU isolation: the PMD’s poll loop runs
+at 100% CPU utilization by design. Dedicated cores should be removed from the
+kernel scheduler (isolcpus / nohz_full /
+rcu_nocbs boot parameters) and pinned to
+the BESS worker thread to avoid scheduler
+jitter.
+• Privileged container:
+required to
+bind vfio-pci, map hugepages, and access /dev/vfio/.
+Specific capabilities
+(CAP_IPC_LOCK, CAP_SYS_ADMIN) can substitute for full privileged mode in stricter
+environments.
+
+Key findings.
+• Zero-copy by construction.
+Unlike
+AF_XDP, where zero-copy is a driver-side optimization that may fall back to copy mode,
+DPDK’s datapath is zero-copy by design, the
+NIC DMA target is the rte_mbuf the application reads. There is no equivalent of AF_XDP’s
+copy-mode fallback.
+
+• CNI: the NIC is no longer a kernel netdev,
+so host-device and macvlan CNIs do not
+apply. The SR-IOV Network Device Plugin
+combined with the SR-IOV CNI is the canonical pattern for handing a vfio-pci-bound
+VF to a container; for PF-bound deployments,
+vfio-pci device passthrough is configured at
+pod admission time.
+
+• Throughput. DPDK sustains 10.30 Mpps
+at 4 workers and 13.09 Mpps at 8 workers (pipeline-forwarded, 64 B NDR), plus
+16.0 Mpps under bidirectional load, the highest of the four modes, 1.6–2.5× ahead of
+17
+
+CNDP/AF_XDP at matched worker counts.
+The native net_iavf PMD over vfio-pci
+avoids the kernel XDP hop and scales past
+the per-netdev AF_XDP socket limit that caps
+the other two modes; see §6.3.
+
+four modes form a clear spectrum of kernel involvement. AF_PACKET keeps the kernel network
+stack on the hot path; AF_XDP bypasses the stack
+but keeps the driver; CNDP wraps AF_XDP with
+a userspace abstraction that brings DPDK-like
+programming ergonomics; and DPDK takes the
+NIC away from the kernel entirely. Performance
+moves in lockstep with this progression, each
+step away from the kernel removes a class of
+per-packet overhead (sk_buff allocation, stack
+traversal, copy-to-user, interrupt handling) but
+adds a class of deployment complexity (XDPcapable driver, hugepages, vfio-pci binding,
+isolated cores).
+
+• Highest CPU efficiency per packet.
+Eliminating sk_buff allocation, the full kernel stack, and the interrupt path produces
+the lowest cycles-per-packet number of the
+four modes, which translates to the highest
+packets-per-second ceiling on the same hardware.
+• Heaviest deployment cost.
+On our
+testbed, bringing up DPDK required preboot hugepage reservation, kernel commandline changes for IOMMU and CPU isolation, container-level privileged access, and a
+separate management NIC for control traffic. These steps are not difficult individually but they add up to a substantially
+more infrastructure-heavy deployment than
+the other three modes, which can run on a
+stock Canonical Kubernetes cluster with minor configuration tweaks.
+
+The cloud-native gap. The axis that matters
+most to a Kubernetes operator is not raw performance but deployment ergonomics under cloudnative constraints. By this measure, AF_XDP and
+CNDP occupy a clear sweet spot: they deliver
+close to DPDK’s throughput with hugepages
+optional, no vfio-pci binding, and the NIC retained under the kernel for standard diagnostic
+tools. DPDK delivers higher throughput but at
+the cost of a substantially heavier operational
+footprint that is hard to justify on shared nodes.
+AF_PACKET delivers the lowest throughput but
+is the only mode that runs unmodified on any
+Kubernetes cluster, which makes it the right
+starting point for development and the wrong
+choice for production at scale.
+
+• Best fit for dedicated UPF hosts. The
+practical sweet spot for DPDK is a UPF deployment on a host dedicated to that role,
+bare metal or isolated VM, where the host’s
+NIC is owned by the UPF and no other workload competes for it. For shared cloud-native
+deployments, CNDP or AF_XDP give up some
+of the performance ceiling in exchange for
+substantially better operational ergonomics
+(§9).
+
+4
+
+The single experimental variable. For our
+measurements (Section 6), the design shown in
+Figure 3 ensures that the only variable between
+runs is the BESS port driver. The BESS module graph, the PFCP/PDR tables, the GTP-U
+logic, and the metering rules remain bit-identical
+across all four configurations. Any performance
+difference reported in Section 6 is therefore attributable to the I/O backend, not to differences
+in the pipeline.
+
+Comparative Analysis
+
+Having walked through each of the four modes
+in Section 3, we now compare them along the
+dimensions that matter most to a UPF operator:
+how the packet reaches the application, what
+hardware and kernel features the mode requires,
+what it can reuse from the existing Linux networking stack, and how much it costs to deploy.
+Table 1 summarises the architectural trade-offs
+side by side, and Figure 16 places the four modes
+on a two-axis design space of deployment complexity versus expected performance ceiling.
+
+5
+
+Experimental Methodology
+
+This section describes the testbed, metrics, traffic generation, and reproducibility setup used to
+evaluate the four UPF dataplane modes. Every
+measurement reported in this paper (throughput
+sweeps, latency distributions, multi-worker scaling, the 24-hour soak, and the real-RAN end-toend run) was produced by coRAN-UPF-Bench,
+
+The spectrum. Figure 15 and Table 1 present
+the comparison visually and dimensionally. The
+18
+
+Figure 15: Side-by-side architectural view of the three kernel-bypass dataplane modes on the deployed
+Charmed SD-Core BESS-UPF. The top block (Charm Container, web, pfcp-agent, bessd, routectl) and
+the BESS uplink and downlink pipelines are bit-identical across all three; only the per-mode I/O layer, ring
+structure, kernel-userspace boundary, and worker pinning change. AF_PACKET is omitted from this view because
+its datapath is qualitatively different (full kernel stack, no zero-copy); see Figure 4.
+
+our UPF benchmarking framework. Measurements were collected on a single physical testbed
+(§5.1). The control argument (§5.2) explains
+what is held constant across all runs; §5.3 defines
+the metrics; §5.4 describes the load generators
+and traffic profiles; and §5.5 lists the configuration files, scripts, and helm values used so the
+results can be reproduced.
+
+5.1
+
+ing capacity to be measured independently
+of the lab’s 1 GbE optics. CPU isolation
+is configured at boot (isolcpus=domain,0-15,
+rcu_nocbs=0-15, kthread_cpus=16-39); the
+bessd worker threads are pinned to cores 5–6
+for the CNDP and AF_XDP runs (1–2 workers)
+and to cores 7–10 for the DPDK runs (up to
+4 workers). Figure 17 shows the deployed pod
+composition when CNDP is the I/O backend;
+the same composition is used for the other three
+modes with only the BESS port driver swapped.
+The software stack (charmed sd-core / aetheronramp BESS-UPF, the helm chart, the PFCP
+control plane, and the BESS module graph) is
+identical across all four configurations. The only
+variable between runs is the BESS port driver
+and its underlying PMD or library.
+
+Testbed
+
+Testbed. All measurements were collected on
+a single host, server three (10.8.0.4): a dualsocket 2×Xeon Gold 6148 with 24 reserved
+1 GiB hugepages on NUMA node 0 and a PREEMPT_RT kernel (5.15.0-1079-realtime).
+The NIC is an Intel XXV710 25 GbE (i40e);
+its access and core PFs act as the N3 and
+N6 interfaces, with SR-IOV VFs hosting both
+the UPF datapath ports and the synthetic
+generators.
+The i40e on-chip VEB hairpins generator-VF traffic directly into the
+UPF access PF without crossing a physical
+wire, allowing the UPF’s internal process-
+
+Deployment model. The UPF is deployed
+as a Charmed operator within the upstream
+charmed sd-core bundle. A Juju controller
+manages the lifecycle of each Charmed unit
+(UPF, AMF, SMF, PCF, UDR, NRF, UDM,
+
+19
+
+Table 1: Architectural comparison of the four UPF dataplane modes across the dimensions that affect
+performance and deployment. Performance rankings are qualitative; absolute measured numbers are reported
+in Section 6.
+Dimension
+
+CNDP
+
+AF_PACKET
+
+AF_XDP
+
+Kernel bypass
+Zero-copy
+
+None
+No
+
+Partial (stack only)
+Driver-dependent
+
+Execution model
+
+Interrupt + NAPI
+
+Per-packet sk_buff
+Kernel-to-user copy
+
+Yes
+Yes
+
+DPDK
+
+Datapath properties
+Partial (stack only)
+Driver-dependent
+(via AF_XDP)
+Configurable (busy- Configurable (busypoll)
+poll)
+No
+No
+No (in ZC mode)
+No (in ZC mode)
+
+Full
+Yes by design
+Poll mode (run-tocompletion)
+No
+No
+
+Not required
+
+XDP-native driver XDP-native driver
+(no iavf VFs)
+(no iavf VFs)
+Optional
+Optional
+Not required
+Not required
+Optional
+(busy- Optional
+(busypoll)
+poll)
+Required
+Required
+
+Driver unbound, rebound to vfio-pci
+Required
+Required
+Required (poll loop
+≈100 %)
+Required
+
+CNI pattern
+
+Standard (any)
+
+host-device (PF)
+
+BESS port type
+
+PMDPort
++
+net_af_packet
+
+PMDPort
+net_af_xdp
+
+NIC visible to kernel
+Kernel
+feature
+reuse (tc, netfilter,
+eBPF)
+
+Yes
+
+Yes
+
+Yes
+
+Full
+
+Partial (XDP_PASS
+fallback)
+
+Partial (XDP_PASS
+fallback)
+
+SR-IOV CNI / device passthrough
+PMDPort + native
+PMD (net_i40e,
+net_ice,
+net_iavf)
+No (rebound to
+vfio-pci)
+None
+
+Low
+
+Medium
+
+Medium
+
+High
+
+High
+Lowest
+
+High
+Mid
+
+High
+Mid
+
+Low
+Highest
+
+Highest
+
+Mid
+
+Mid
+
+Lowest
+
+Hardware and kernel requirements
+NIC / driver requirement
+Hugepages
+IOMMU
+Dedicated
+CPU
+core
+Privileged container
+
+Any Linux driver
+Not required
+Not required
+Not required
+
+Deployment
+
++
+
+host-device
+CNDP CNI
+CNDPPort
+
+or
+
+Operational properties (qualitative)
+Deployment complexity
+Cloud-native fit
+Throughput ranking
+Latency ranking
+
+NSSF, AUSF) through a Unit Agent and a
+Python charm (charm.py) running inside the
+pod’s charm sidecar container. Configuration is declarative: the BESS port driver, the
+CNDP jsonc parameters, worker counts, and
+CPU pinning are set as charm config options
+that are reconciled through the Juju observe–
+analyse–act loop without re-rendering manifests
+by hand. This matters for the experiment in
+
+two ways. First, switching the dataplane between AF_PACKET, AF_XDP, CNDP, and DPDK
+is a one-line charm config change rather than a
+helm-chart edit, which keeps the everything-elseconstant guarantee easy to enforce. Second, the
+charm-mediated deployment is closer to what
+an operator would actually run in production
+than a hand-deployed pod, so the soak and realRAN results in Section 6 carry over without
+
+20
+
+Figure 16: Design space of UPF dataplane modes. AF_PACKET sits at low complexity and low performance;
+DPDK at high complexity and high performance; AF_XDP and CNDP cluster in the cloud-native middle, where
+stock-stack throughput is available without DPDK’s hugepage, VFIO, and isolated-core requirements.
+
+translation. Figure 17 shows the deployed pod
+composition, including the charm sidecar and
+the Juju controller relation.
+
+5.2
+
+Any performance difference we report in Section 6 is therefore attributable to the I/O backend, not to differences in the pipeline.
+One stimulus-side caveat applies to this attribution: the synthetic generator is not identical
+across modes (testpmd for the DPDK runs, kernel pktgen for AF_XDP and CNDP, for the RSS
+reason explained in §5.4). The UPF pipeline,
+NIC, kernel, and worker placement are held constant, so the I/O backend remains the controlled
+variable, but the generator difference is a known
+limit on the strict single-variable framing and is
+detailed in §5.4.
+
+Held Constant vs. Varied
+
+The central design choice of this study is to hold
+the entire UPF pipeline constant and vary only
+the BESS port driver.
+• Held constant across all runs: the BESS
+module graph (PortInc → GtpuDecap →
+WildcardMatch (PDR) → QER metering →
+FAR action → PortOut); the PFCP control
+plane; the PDR/FAR/QER rules installed via
+pybess; the metering thresholds; the helm
+chart used to template the pod; the CNI
+used to give the pod its PFs; and the BESS
+userspace code itself.
+
+5.3
+
+Metrics
+
+We report four classes of metrics.
+Throughput. Packets per second (Mpps) and
+bits per second (Gbps) sustained through the
+full BESS-UPF pipeline at the egress port, swept
+across frame sizes (64, 128, 256, 512, 1024,
+1518 B per RFC 2544). We distinguish absorbed
+(packets received by the ingress BESS port after
+the AF_XDP / DPDK ring) from forwarded (packets that successfully exit the egress port after
+
+• Varied per run: the BESS port type
+(PMDPort + DPDK PMD vs. CNDPPort), the
+underlying PMD or library (net_af_packet
+/ net_af_xdp / net_i40e / CNDP runtime), and the NIC binding (kernel driver
+vs. vfio-pci).
+
+21
+
+Table 2: Testbed configuration. All four dataplane modes were evaluated on the same host, same NIC, same
+kernel, same Kubernetes cluster, and the same BESS-UPF image. The only variable across runs is the BESS
+port driver.
+Component
+
+Configuration
+
+Platform
+Host
+
+x86_64 (Intel 64), little-endian, SSE4.2 / AVX2 baseline
+three (10.8.0.4), 2× Intel Xeon Gold 6148 @ 2.40 GHz, 40 cores
+total (20 cores/socket, 2 NUMA nodes, HT off)
+125 GiB; 24 × 1 GiB hugepages on NUMA node 0
+5.15.0-1079-realtime
+(PREEMPT_RT),
+mitigations=off,
+intel_pstate=disable, governor performance, idle=poll
+Intel XXV710 25 GbE (i40e), PCI 0000:18:00.x, on-chip VEB for
+hairpin
+18:0a.0–.5 (access/core PFs + generator VFs, all vfio-pci for
+DPDK; access/core PFs for AF_XDP/CNDP)
+isolcpus=domain,0-15 + isolcpus=0-25, rcu_nocbs=0-15,
+kthread_cpus=16-39, nohz/skew_tick
+cores 5–6 (1–2w CNDP/AF_XDP); cores 7–10 (4w DPDK); generator
+on cores 8–11
+intel_iommu=on iommu=pt
+Canonical Kubernetes (k8s) + charmed sd-core / aetheronramp [20]
+host-device (PF or VF in pod)
+omec-project/upf-bess (with mode-specific patches as documented in §7)
+
+Memory
+Kernel
+NIC
+SR-IOV VFs
+CPU isolation
+bessd worker pins
+IOMMU
+Kubernetes
+CNI
+BESS-UPF image
+
+Figure 17: Testbed deployment with CNDP as the I/O backend. The same pod composition, helm chart,
+and PFCP control plane are used for all four dataplane modes; only the BESS port type (CNDPPort here,
+PMDPort + a PMD for the other three) and the NIC binding change between runs.
+
+traversing the pipeline). The headline figure is
+forwarded throughput.
+
+(ingress, after parse) and executeFAR:1 (egress,
+after the FAR action) via the pybess gRPC interface. The measurement captures the time a
+packet spends in the entire stateful chain (PDR
+lookup, QER metering, FAR lookup, FAR action). We report mean, median (P50), P90, P95,
+
+Latency and jitter. End-to-end pipeline latency, measured by inserting BESS Timestamp
+and Measure module pairs at pktParse:1
+22
+
+P99, P99.9, and P99.99 percentiles, plus jitter
+at each percentile (defined as the deviation from
+the P50). All values are in nanoseconds with
+100 ns measurement resolution.
+
+for synthetic single-flow tests and for end-toend tests where the traffic originates from a UE
+attached over the RAN.
+End-to-end latency. ping (ICMP) and
+speedtest-cli (HTTPS) provide end-to-end
+round-trip-time and TCP-throughput measurements with the UE attached through the RAN,
+exercising the full path from UE through gNB
+and UPF to the data network.
+
+CPU and core scaling. Per run we record
+bessd worker CPU utilization, the number of
+active BESS workers, the per-worker packet rate,
+and the multi-worker scaling efficiency observed
+when we attempt to add workers. The stock upstream coreNAT max_allowed_workers=2 annotation was patched out for this study (raised
+to 4 for AF_XDP/CNDP and 8 for DPDK; see
+§6.3).
+
+RAN source. End-to-end measurements use
+two different RAN sources of increasing realism.
+The default driver is OAI rfsim acting as a software gNB on the N3 link, useful for control-plane
+plumbing and PFCP-path validation but not for
+throughput ceilings. For functional validation
+under real-radio conditions we additionally run
+a disaggregated 5G RAN : an OCUDU 7.2-split
+CU/DU pair (O-RAN-aligned, fronthaul over
+eCPRI) terminating in a Liteon Open RAN radio unit (RU), with a commercial UE attaching
+over the air. Registration, authentication, PDU
+session establishment, and bearer setup are all
+driven by the real UE through this disaggregated
+chain into the Charmed SD-Core control plane,
+with user-plane traffic landing on the deployed
+UPF unmodified. We note explicitly that both
+RAN sources cap the achievable RAN-to-UPF
+throughput well below what the testbed can sustain on the I/O side; for the I/O-ceiling measurements in Section 6, the synthetic testpmd generator is therefore the authoritative source. The
+disaggregated setup serves as functional ground
+truth (“does the deployed UPF actually carry
+real subscriber traffic end-to-end?”), not as a
+throughput benchmark.
+
+Loss and stability. Drops are tracked at both
+BESS ports (ingress and egress) and reconciled
+against the generator’s offered count. Stability
+is verified by 24-hour sustained-load soaks at saturation, recording cumulative RX/TX counters
+and bessd resident memory hourly.
+
+5.4
+
+Traffic and Tools
+
+We use both synthetic packet generators (for
+raw I/O ceilings) and real RAN-side traffic (for
+end-to-end measurements).
+Synthetic load. Two generators are used. For
+DPDK, we use testpmd in txonly mode with
+–txonly-multi-flow on a vfio-pci-bound VF,
+which works correctly with the native net_iavf
+PMD’s RSS profile. For AF_XDP and CNDP, however, testpmd –txonly-multi-flow varies the
+wrong field, the resulting packets all hash to a
+single RX queue (worker 1 idle, no measurable 2worker scaling). We therefore use kernel pktgen
+with IPDST_RND (destination IP randomised),
+which delivers a clean 50/50 queue split and the
+expected near-linear 1→2 worker scaling. Both
+generators hairpin through the on-chip i40e VEB
+into the UPF access PF and never cross a physical wire, isolating the UPF’s internal processing
+capacity from the lab’s 1 GbE optics. Frame
+sizes are swept across 64, 128, 256, 512, 1024,
+and 1518 B per RFC 2544. The 24-hour soak
+run is reported separately at the 86 B saturation
+point.
+
+5.5
+
+Reproducibility
+
+The pybess scripts that install the
+PDR/FAR/QER rules and insert the
+Timestamp/Measure latency probes,
+together with the testpmd, iperf3, and ping
+invocations, are described in this section so
+that the campaign can be reproduced on an
+equivalent testbed.
+
+6
+
+Stateful TCP/UDP load. iperf3 provides
+TCP and UDP load over the same pipeline, both
+
+Results and Evaluation
+
+This section reports the measurements collected
+on the testbed described in Section 5. We organise the results around the four metric classes
+23
+
+NDR throughput (Mpps)
+
+this to the single-worker run not fully saturating
+the scalar-Rx path and to the 3.07 % run-to-run
+variance reported in §6.4, not to any genuine
+super-linear effect. Per-core, AF_XDP leads at
+3.69 Mpps/core, with CNDP at 2.65 Mpps/core
+and DPDK at 2.99 Mpps/core, the i40e family’s
+scalar Rx caps every mode at ∼3 Mpps/core
+on this NIC (§6.3). Third, DPDK scales past
+two workers where CNDP and AF_XDP cannot
+(a per-netdev AF_XDP socket limit) and reaches
+10.30 Mpps at 4 workers and 13.09 Mpps at 8
+workers; bidirectional load further demonstrates
+16.0 Mpps across both directions. Large frames
+(1024 B+) become byte-bound at ≈28–92 Gbps
+internal VEB capacity depending on mode, with
+the higher-Mpps modes hitting the byte ceiling
+earlier.
+
+14
+12
+10
+8
+6
+4
+2
+0
+
+64
+
+128
+
+256
+
+512
+
+1024
+
+1518
+
+Frame size (B)
+CNDP 2w
+
+AF_XDP 2w
+
+DPDK 4w
+
+DPDK 8w
+
+Figure 18: NDR (Non-Drop Rate) throughput vs.
+frame size on the XXV710/i40e testbed. DPDK 8w
+leads through all frame sizes (13.1 Mpps at 64 B);
+DPDK 4w and AF_XDP 2w sit between ≈6.5 and
+10.3 Mpps at small frames; CNDP 2w sits just below at 5.5 Mpps. Large frames (1024 B+) become
+byte-bound at ≈28–92 Gbps internal VEB capacity.
+AF_PACKET (≈0.25 Mpps, flat across all frame sizes)
+is omitted from this chart for legibility; see Table 3.
+
+6.2
+
+Table 5 compares median and tail latency across
+the four modes, and Table 6 gives the full CNDP
+percentile distribution.
+For CNDP at 2 workers, the pipeline adds
+a median (P50) latency of 13.9 µs through the
+entire stateful chain. The tail is short up to P99
+(14.3 µs, only 0.4 µs above the median); P99.9
+rises to 24.7 µs. Adding the second worker reduces average latency slightly compared to the
+1-worker baseline (12.9 vs 13.6 µs) but introduces visible jitter at P99 (10.4 µs vs 0.2 µs)
+due to contention on the kernel XDP-redirect
+path. Across modes, latency follows the architectural ordering: AF_XDP and CNDP comparable
+in the middle, and DPDK lowest (8.1 µs average, the native PMD avoids both the kernel XDP
+hop and the userspace XSK descriptor handling).
+AF_PACKET, in the reference column, is lower in
+absolute terms only because it runs at ≈1/15
+the offered load.
+
+defined in §5.3: throughput (§6.1), latency and
+jitter (§6.2), and CPU and core scaling (§6.3)
+are reported as cross-mode comparisons; stability and production readiness (§6.4) are validated in depth on CNDP, the mode used in
+our production deployment. Throughput-ceiling
+and stability numbers are obtained with the
+synthetic testpmd generator at line rate; latency is measured in-pipeline via the BESS
+Timestamp/Measure probe pair.
+
+6.1
+
+Latency and Jitter
+
+Throughput
+
+Figure 18 plots forwarded full-pipeline throughput against frame size for all four modes, and
+Table 3 summarises the headline rate at the 64 B
+saturation point. Table 4 gives the detailed perframe sweep for all three kernel-bypass modes.
+The headline numbers are:
+AF_PACKET
+0.252 Mpps, CNDP 5.52 Mpps (2w), AF_XDP
+6.47 Mpps (2w), and DPDK 13.09 Mpps (8w),
+all at 64 B NDR. Three observations stand out.
+First, AF_PACKET sits an order of magnitude below the kernel-bypass modes, as expected from
+its kernel-stack traversal and copy-to-user. Second, CNDP and AF_XDP scale cleanly 1→2 workers (2.09× and 1.75× respectively). CNDP’s
+2.09× sits marginally above linear; we attribute
+
+6.3
+
+CPU and Core Scaling
+
+With the upstream BESS-UPF coreNAT
+max_allowed_workers cap lifted in the patched
+image (raised to 4 for AF_XDP/CNDP and 8 for
+DPDK), all three kernel-bypass modes scale horizontally with worker count. Table 7 summarises
+the measured scaling efficiency.
+Per-core efficiency. The single-worker rate
+is the cleanest cross-mode signal: AF_XDP delivers 3.69 Mpps/core, CNDP 2.65 Mpps/core,
+
+24
+
+Table 3: Cross-mode NDR throughput at 64 B (per RFC 2544 / ETSI NFV-TST 009) on the XXV710/i40e
+testbed. Fwd/Abs = 1.000 (zero pipeline loss) across all reported configurations. AF_PACKET is reported at
+86 B as a kernel-stack reference point; the kernel-bypass modes at 64 B.
+Mode
+AF_PACKET†
+CNDP (xskdev)
+AF_XDP (net_af_xdp)
+DPDK (net_iavf)
+DPDK bidirectional
+†
+
+1w
+
+2w
+
+4w
+
+8w‡
+
+Notes
+
+0.224
+2.65
+3.69
+2.99
+,
+
+0.252
+5.52
+6.47
+5.56
+,
+
+,
+,
+,
+10.30
+10.28
+
+,
+,
+,
+13.09
+16.0
+
+86 B reference
+64 B, 2.09× scaling
+64 B, 1.75× scaling
+64 B, 3.44× scaling 1w→4w
+64 B, UL+DL on same UPF
+
+AF_PACKET is reported as a qualitative kernel-stack reference; the order-of-magnitude gap to the kernel-bypass
+modes is structural to the AF_PACKET datapath (full kernel stack + copy-to-user).
+‡
+
+DPDK 8w numbers are obtained under VEB recirculation oversubscription, since the testpmd generator is
+CPU-bound at ≈10.5 Mpps (§5.4, §10). The 1w–4w points lie within the generator’s clean unidirectional range; the 8w
+points should be read as internal-capacity figures, not directly generated NDR points.
+
+Table 4: Per-mode NDR throughput sweep on XXV710/i40e, 64–1518 B, NDR at 0 % frame loss, 10 s
+snapshot-delta per point. CNDP and AF_XDP at 2 workers; DPDK at 4 and 8 workers.
+Frame (B)
+
+CNDP 2w
+
+AF_XDP 2w
+
+DPDK 4w
+
+DPDK 8w‡
+
+Limit
+
+64
+128
+256
+512
+1024
+1518
+
+5.52
+5.49
+5.41
+5.28
+3.38
+2.34
+
+6.47
+6.50
+6.47
+6.47
+5.81
+4.26
+
+10.30
+9.37
+8.99
+8.80
+7.87
+5.94
+
+13.09
+13.84
+13.45
+12.35
+10.37
+7.62
+
+CPU/packet
+CPU/packet
+CPU/packet
+mixed
+byte/bandwidth
+byte/bandwidth
+
+‡
+
+DPDK 8w numbers are obtained under VEB recirculation oversubscription, since the testpmd generator is
+CPU-bound at ≈10.5 Mpps (§5.4, §10). The 1w–4w points lie within the generator’s clean unidirectional range; the 8w
+points should be read as internal-capacity figures, not directly generated NDR points.
+
+Table 5: Cross-mode end-to-end pipeline latency at
+64 B saturation. CNDP at 2 workers (109 M samples),
+AF_XDP at 2 workers (480 M samples), DPDK at
+4 workers (109 M samples). AF_PACKET reference at
+86 B; lightly-loaded due to its throughput ceiling, so
+the absolute numbers reflect a lightly-loaded kernel
+stack, not an I/O advantage.
+Mode
+
+Avg
+(µs)
+
+P50
+(µs)
+
+P99
+(µs)
+
+P99.9
+(µs)
+
+AF_PACKET (86 B)†
+CNDP (2w)
+AF_XDP (2w)
+DPDK (4w)
+
+3.87
+12.9
+14.1
+8.1
+
+3.6
+13.9
+14.2
+8.2
+
+10.8
+14.3
+14.7
+16.2
+
+18.7
+24.7
+23.3
+20.3
+
+†
+
+Table 6: CNDP end-to-end pipeline latency distribution (64 B, 2 workers, 109 M-packet sample).
+Compared side-by-side with the 1-worker baseline to
+show the contention effect of adding a second worker
+on the XDP-redirect path.
+Metric
+Average
+Min
+Max
+P50
+P90
+P99
+P99.9
+Jitter P99
+Jitter P99.9
+
+AF_PACKET measured at ≈1/15 the load of the others
+(its throughput ceiling); the low numbers reflect a
+lightly-loaded kernel stack, not an I/O advantage.
+
+1 worker
+
+2 workers
+
+13.6 µs
+1.4 µs
+32.6 µs
+13.6 µs
+13.7 µs
+13.9 µs
+21.9 µs
+0.2 µs
+6.6 µs
+
+12.9 µs
+0.9 µs
+55.3 µs
+13.9 µs
+14.1 µs
+14.3 µs
+24.7 µs
+10.4 µs
+12.8 µs
+
+is then ∼13 % lower per-core than AF_XDP at 1
+worker because the iavf VF is stuck on scalar
+Rx: the AVX vector Rx path requires the
+RXDID_COMMS_OVS flexible descriptor, an E810
+
+and DPDK 2.99 Mpps/core. AF_XDP’s percore lead over CNDP comes from the DPDK
+net_af_xdp PMD’s batching being slightly more
+efficient than CNDP’s xskdev wrapper. DPDK
+25
+

@@ -1,0 +1,647 @@
+Netkit: Specializing Linux Packet Delivery for
+Container Networks
+Paul Chaignon∗
+
+Daniel Borkmann
+
+arXiv:2609.18633v1 [cs.OS] 16 Sep 2026
+
+Isovalent at Cisco
+Switzerland
+daniel@iogearbox.net
+
+Isovalent at Cisco
+France
+paul.chaignon@gmail.com
+
+Abstract
+
+1
+
+Cloud-native microservices architectures rely on network
+namespaces for isolation, with the overhead of container
+communications remaining a critical performance bottleneck. While colocating containers on the same host mitigates
+some of this overhead, it cannot match the performance of
+communication within a single network namespace. Existing
+solutions either require application rewrites or fail to support the full Linux network stack expected by containerized
+applications.
+In this paper, we present netkit, an eBPF-based datapath that specializes the Linux networking stack to eliminate
+redundant backlog queue traversals during network namespace transitions. netkit leverages eBPF to transparently redirect packets between namespaces, bypassing unnecessary
+buffering while preserving compatibility with existing container applications. Our implementation in the Linux kernel,
+integrated with minimal changes to the Cilium network plugin for Kubernetes, improves throughput by up to 37% and
+achieves parity between container-to-container and processto-process communications, effectively closing the performance gap introduced by namespace isolation.
+
+Containerized deployments have become the de facto standard for cloud-native applications, with microservices architectures driving the distribution of application components
+across multiple containers. As these distributed applications
+scale, the overhead of container-to-container communication
+becomes a critical performance bottleneck. While colocating containers on the same host can mitigate some of this
+overhead, it is not always feasible, and even then it cannot
+match the performance of communication within a single
+network namespace.
+The persistence of this overhead is particularly striking
+when considering the nature of network namespace switches.
+Intuitively, transitions between network namespaces should
+not incur any performance penalty, as they represent logical rather than physical boundaries. While copying data is
+necessary to enforce memory isolation when crossing the
+kernel-userspace boundary, no such requirement exists for
+network namespace boundaries.
+Significant work has gone into studying and improving
+the performance of the Linux networking stack, with recent
+efforts focusing on container networks as they become more
+prevalent. eBPF has emerged as a key technology in this
+space, offering new ways to hook into the stack [2, 11, 21]
+and enabling the replacement of legacy algorithms with more
+efficient implementations [4, 10, 16]. In the context of container networks, eBPF has been used to replace and specialize
+almost all aspects of the stack, from load balancing and policy enforcement [3] to quality of service (QoS) mechanisms
+[14] and proxy redirection [18, 22].
+However, even with BPF’s capabilities, the underlying
+packet delivery mechanism in Linux remains generic and unoptimized for the specific use case of container-to-container
+communication. As we show in Section 2, for short-lived
+connections, two processes in the same network namespace1
+achieve 31% higher throughput than two containers on the
+same host. Likewise, two hosts achieve 26% higher throughput than two containers communicating over the wire. This
+gap leaves a critical performance improvement untapped.
+Several new packet delivery mechanisms based on BPF
+have been proposed in the past. AF_XDP implements a form
+of partial kernel bypass, where an XDP program can send
+
+CCS Concepts: • Networks → Programming interfaces; Cloud
+computing; Network servers; • Software and its engineering → Communications management.
+Keywords: Linux, BPF, Container Networking
+ACM Reference Format:
+Daniel Borkmann and Paul Chaignon. 2026. Netkit: Specializing
+Linux Packet Delivery for Container Networks. In 4th Workshop
+on eBPF and Kernel Extensions (eBPF’26), September 29-October 02,
+2026, Prague, Czech Republic. ACM, New York, NY, USA, 7 pages.
+https://doi.org/10.1145/3837779.3838164
+∗ The authors are in alphabetical order.
+
+This work is licensed under a Creative Commons AttributionNonCommercial-NoDerivatives 4.0 International License.
+eBPF’26, September 29-October 02, 2026, Prague, Czech Republic
+© 2026 Copyright held by the owner/author(s).
+ACM ISBN 979-8-4007-2911-9/2026/09
+https://doi.org/10.1145/3837779.3838164
+
+Introduction
+
+1We use two processes in the host network namespace, with communication
+
+over the loopback device.
+
+2
+
+Background
+
+The Linux networking stack may employ a per-CPU backlog
+queue [20] to buffer incoming packets before they are processed by the protocol stack. Each CPU core maintains its
+own queue, allowing packets received by network devices to
+be distributed across cores, improving scalability on multicore systems. When a backlog queue is used, network device
+drivers enqueue received packets to the backlog queue of
+the target CPU, where they are later processed by the upper
+networking stack.
+Figure 1 illustrates the boundary between the driver and
+the upper stack. The majority of packet processing occurs in
+the upper stack, as it offers greater flexibility to implement
+a wide range of network features. For this same reason, container networking solutions typically hook into the upper
+stack, either using netfilter or the tc-bpf hook, to introduce
+custom packet handling, filtering, or forwarding logic.
+Packets received from the wire on a physical device typically do not go through the backlog queue2 . However, Virtual
+Ethernet (veth) devices, used to connect container network
+namespaces to the host, utilize the per-CPU backlog queue
+2 Unless Receive Packet Steering (RPS), the software counterpart of RSS, is
+
+enabled.
+
+Upper stack
+
+packets directly to userspace [21]. However, container applications typically listen on IPv4/IPv6 sockets, so AF_XDP
+either requires traffic to be reinjected into the kernel or the
+application to be rewritten. sockmap implements a socketlevel redirection to exchange messages between IPv4/IPv6
+sockets using a special BPF socket map [18, 22], but it only
+covers a subset of use cases, as applications often need to
+send and receive traffic from physical devices on the host.
+Both of these mechanisms are ultimately a poor fit for applications that expect a full Linux network stack in their
+network namespace, especially as such applications are becoming more common with containerized virtual machines,
+such as Kata Containers and KubeVirt.
+In this paper, we present netkit, a high-performance
+eBPF-based datapath for containers. netkit specializes the
+packet delivery mechanisms in the Linux network stack to
+eliminate all overhead associated with network namespace
+transitions. It leverages eBPF to implement routing and any
+required packet processing logic in the host network namespace, such as access control and traffic shaping. Crucially,
+netkit operates transparently to containerized applications
+and requires minimal modifications to integrate with existing BPF-based container datapaths, making it a practical
+solution for real-world deployments.
+We have contributed netkit to the Linux kernel [7, 8] and
+demonstrate that, with limited changes to the Cilium Kubernetes CNI, it improves throughput by up to 37% and matches
+process-to-process communications in both throughput and
+latency.
+
+Socket
+TCP
+
+sockmap
+
+Netfilter & IP
+Traffic Control
+
+tc-bpf
+
+Driver
+
+XDP
+
+Figure 1. Illustration of the usual TCP/IP networking stack
+and the main BPF networking hooks in Linux, on the receive side when traversing a backlog queue (illustrated with
+zigzags).
+Container 1
+
+Container 2
+
+veth pair
+
+veth pair
+
+2
+1
+
+Container 3
+
+veth pair
+
+3
+
+Physical device
+
+Packet path
+Backlog queue traversal
+Figure 2. Container-to-container packet paths through the
+Linux stack and veth device pairs, on a single host ( 2 ) and
+over the wire ( 3 and 1 ).
+for packet processing. veth devices operate as interconnected
+pairs, with one device residing in the container’s network
+namespace and the other in the host namespace. When a
+packet is transmitted from the container, it is received by
+the host device and enqueued to the per-CPU backlog queue
+of the target CPU for processing, mirroring the behavior of
+physical network devices. The same occurs in reverse via
+the veth pair.
+As a result, as shown in Figure 2, a packet traveling from
+one container to another on the same host (path 2 ) will
+traverse the per-CPU backlog queue twice. Similarly, a packet
+traveling from the wire to a container (path 1 ) (or vice
+versa, path 3 ) will also pass through the backlog queue at
+the destination container.
+In addition, in the veth case, processing of packets from
+the backlog queue may be deferred to a dedicated kernel
+thread, ksoftirqd, when under load. This thread runs at normal scheduling priority and competes with all other runnable
+
+Container 1
+
+Container 2
+
+netkit pair
+
+Container 3
+
+netkit pair
+
+netkit pair
+
+2
+1
+
+3
+
+Physical device
+
+Packet path
+Backlog queue traversal
+BPF redirect
+Figure 3. Overhead of network namespace transitions for
+containers on the same host and on different hosts, across
+the wire.
+tasks on the CPU, which can significantly increase latency.
+It also distorts scheduler accounting, as the cycles spent delivering the packet are no longer charged to the process that
+sent it.
+To measure this overhead, we run the netperf TCP_CRR
+benchmark between containerized processes across four distinct configurations: (1) same host, no network namespaces,
+(2) same host, with network namespaces, (3) different hosts,
+no network namespaces, and (4) different hosts, with network namespaces. In the first scenario, with the client and
+server processes in the same network namespace on the
+same host, communication occurs over the loopback device.
+For all other configurations, the processes use veth devices to establish connectivity. All tests run on an Intel Xeon
+CPU clocked at 3.1GHz, with 64KB, 2MB, and 24.8MB L1, L2,
+and L3 CPU caches. The tests are not limited by either the
+available memory or the Ethernet adapters’ capacity.
+The results, presented in Figure 3, reveal a notable throughput penalty when processes communicate across network
+namespace boundaries. Specifically, removing the network
+namespaces increases throughput by 31% for two processes
+on the same host and by 26% for a connection over the wire.
+
+3
+
+Design
+
+The design of netkit focuses on eliminating redundant backlog queue traversals during network namespace transitions.
+We start by addressing the simplest case: transitions from
+the physical device to the container namespace. Next, we
+introduce the new netkit device pairs required to remove
+backlog queue traversals when exiting containers. Finally,
+we detail the remaining traversals that cannot be eliminated
+on ingress into the host and container, and explain why.
+Figure 4 shows the different packet paths when using netkit.
+
+Figure 4. Container-to-container packet paths using BPF
+redirects and netkit device pairs, on a single host ( 2 ) and
+over the wire ( 3 and 1 ).
+
+3.1
+
+Cross Network Namespace Redirection
+
+We begin by addressing path 1 from Figure 2, which routes
+packets from the physical device to the container’s upper
+networking stack. This path goes through the per-CPU backlog when packets are received on the container’s veth device,
+before being processed by the container’s own upper networking stack.
+The core intuition behind netkit’s first optimization is that
+the receive-side code path of the physical device is functionally identical to the code path executed after the backlog
+queue of the veth device inside the container, albeit in a different network namespace. In both cases, the Linux upper
+networking stack logic is executed, with the set of tc-bpf programs, netfilter rules, IP routes, etc. belonging to either the
+host or the container network namespace. This redundancy
+presents an opportunity for optimization.
+Our design avoids the backlog queue traversal in the container network namespace by redirecting packets from the
+upper stack of the host straight to the upper stack of the
+container. This allows us to skip both the transmit code path
+of the veth device on the host side and the backlog queue
+traversal on the container side. This redirection is illustrated
+as path 1 in Figure 4.
+This approach only works if the Linux network stack is
+not required to enforce security policies, maintain Quality
+of Service (QoS), or implement Network Address Translation (NAT). These features are typically handled by either
+netfilter or BPF. Therefore, netkit assumes that all such functionality is implemented in BPF before the redirection to the
+container’s networking device. They can be implemented
+at the tc-bpf or the XDP hooks. In practice, this requires a
+container datapath that does not rely on netfilter in the host,
+
+as any rule there would be bypassed by the redirection. This
+has become a reasonable assumption as BPF-based datapaths gained adoption. The redirection also skips the host
+device, so any BPF program attached to it must move to the
+container’s device or to the physical device.
+This redirect is enabled by a new BPF redirect helper,
+bpf_redirect_peer, that switches the network namespace
+for the redirected packet. This helper is called from the tcbpf hook on the host, switches the packet to the network
+namespace of the target container, and recirculates it through
+the upper stack logic.
+It does not exist at XDP because XDP operates prior to
+Generic Receive Offload (GRO) and thus processes individual, non-aggregated packets. Implementing it there would
+require several redirects, whereas our design leverages GRO
+aggregation (including BIG TCP aggregations beyond 64KB),
+reducing the overhead to a single, consolidated packet.
+3.2
+
+The netkit Device Pair
+
+Eliminating the backlog queue traversal when leaving the
+container’s network namespace is trickier. This backlog queue
+is illustrated on paths 2 and 3 of Figure 2. We first focus
+on path 3 , specifically from the container to the physical
+device.
+On this packet path, the backlog queue resides on the receive side of the host’s veth device. To avoid this queue, we
+would need to jump directly from the container’s veth device to the physical device. However, this approach requires
+installing a BPF program within the container’s network
+namespace. Such a program may not only conflict with the
+application’s own BPF programs, but it could also be unloaded by the application. Depending on how policies are
+enforced, unloading a program can either bypass security
+measures or disrupt connectivity. In addition, a BPF program
+running in the network namespace of the container would
+have no access to information in the host namespace, such
+as the routing table.
+To address these challenges, we introduce netkit devices,
+a new type of paired devices that connect containers to the
+host. netkit devices treat BPF as a first-class citizen, enabling
+programs to be attached directly to the device without requiring to setup tc qdiscs and filters. The BPF programs attached
+to a netkit device are executed as part of the driver’s logic on
+the transmit path, immediately after the network namespace
+switch. This design allows a BPF program attached to the
+container’s netkit device to run in the context of the host’s
+network namespace, enabling it to resolve IP routes from the
+host and redirect packets to physical devices. netkit devices
+operate in layer 3 mode by default, which avoids the neighbor resolution that veth requires, and can be configured in
+layer 2 mode for containers that expect Ethernet semantics.
+netkit devices deliberately do not support XDP: the performance benefits of XDP on virtual devices remain unclear,
+
+and supporting it adds significant code complexity, as seen
+in the veth driver [1]. It also conflicts with our goal of running BPF programs on GRO-aggregated packets rather than
+on individual ones, and since container applications listen
+on regular IPv4/IPv6 sockets, packets seen by XDP must
+traverse the upper stack afterwards regardless.
+Unlike veth devices, the two devices in a netkit pair are not
+interchangeable: one is designated as the host (or primary)
+device, while the other is the peer device. The latter is intended to reside in the container’s network namespace. This
+distinction ensures that applications inside the container
+cannot attach or detach BPF programs on the peer device. Instead, only the control plane, Cilium in our case, can manage
+them through the primary device, even though the peer programs execute on the transmit path of the peer netkit device.
+This allows us to run BPF programs on the transmit path
+of the container’s device, before the backlog queue, while
+preventing containerized applications from tampering with
+them. When no program is attached, both devices fall back
+to a default policy which can be set to drop, so that no traffic
+leaks before the control plane attaches its programs.
+Thanks to this new netkit device, we can now use the
+standard BPF redirect helper to redirect packets from the
+container’s netkit device straight to the physical device on
+the host, as illustrated on path 3 of Figure 4. Note we don’t
+need our new helper here because netkit devices execute
+their BPF programs after the namespace switch. Since no
+backlog queue is involved, the packet remains in the context
+of the sending process, preserving scheduler accounting and
+avoiding the ksoftirqd handoff.
+Similarly, we avoid the backlog queue traversal on path
+2 of Figure 2 by redirecting from the host-side netkit
+device of the source container to the host-side netkit device
+of the destination container. This redirection is illustrated
+on path 2 of Figure 4. We explain in Section 3.3 why we
+can’t redirect inside the destination container.
+
+3.3
+
+Required Backlog Queue
+
+As is apparent in Figure 4, even with netkit devices, one backlog queue traversal remains. This last traversal happens on
+the receive path of the destination container when both containers reside on the same host. Unlike the other traversals
+discussed earlier, it cannot be eliminated without substantial
+refactoring of the Linux networking stack.
+For packets originating from another network namespace
+on the same host, at least one backlog queue traversal is
+required to transition from the transmit code path to the
+receive code path. In our design, we keep the backlog queue
+traversal at the destination by redirecting traffic from the
+container’s netkit device. Alternatively, we could have kept
+the backlog queue traversal at the source by redirecting traffic after the host’s backlog queue, using the tc-bpf hook of
+
+the host’s netkit device and the helper introduced in Section 3.1. We chose the former approach because it allows us
+to have a consistent attach point, netkit, instead of mixing
+netkit and tc-bpf hooks. The only way to avoid it entirely
+would be to bypass the networking stack via sockmap, which
+again assumes applications do not require the full stack.
+
+4
+
+Implementation & Evaluation
+
+Through our evaluation, we aim to answer three key questions:
+1. How much effort is required to implement netkit and
+integrate it with existing container networking software?
+2. What performance gains does netkit achieve?
+3. How close are we to fully eliminating the overhead of
+network namespace transitions?
+4.1
+
+Implementation
+
+Our new BPF redirect helper required only 78 new lines of
+code, as we could reuse most of the logic from the existing
+bpf_redirect helper. The new netkit device, however, introduced 1,048 lines of code, though a significant portion
+of this is boilerplate code for BPF links, netlink, and kernel
+module creation. The netkit device supports attaching multiple BPF programs via the bpf_mprog API. It supports the
+same program type as tc-bpf and can therefore use the same
+BPF helpers and kfuncs.
+The new bpf_redirect_peer helper was upstreamed in
+Linux v5.10 [7] and the netkit devices in v6.7 [8].
+Adding support in Cilium [3] for our new helper, which
+by itself eliminates one backlog queue traversal, required 49
+line changes3 , including logic to detect kernel support and
+fallback to the old redirection mechanism. Support for the
+new device pairs is more involved, as it requires device creation and a shift from tc-bpf to the device-native attachment
+mechanism of netkit. Implementing this in Cilium required
+463 line changes.
+Overall, we find that integrating netkit involves relatively
+straightforward changes in both the kernel and container networking software. While using netkit devices demands more
+effort, it does not necessitate major architectural changes, as
+it aligns with the existing model of one device on each side
+of the namespace boundary.
+4.2
+
+Network Performance
+
+To measure the performance impact of our changes, we deploy a two-node Kubernetes cluster with Cilium v1.19.5 handling connectivity. The Kubernetes nodes run on the same
+hardware as in Section 2, including the 3.1GHz CPU, with
+Linux v6.8. To compile the BPF programs, LLVM v19.1.7 is
+used with the eBPF instruction set v3 [17]. eBPF JIT compilation is always enabled.
+3 Line changes include added and removed lines, but not comment additions.
+
+Figure 5. Transactions per second (TCP_RR benchmark) between hosts, between containers connected with veth, and
+between containers connected with netkit.
+Cilium runs in native routing mode with BPF masquerading, the bandwidth manager, and kube-proxy replacement
+enabled. kube-proxy and its netfilter rules are removed from
+all nodes. As per the Cilium tuning guide [5], we disable Hubble and let Cilium bypass the netfilter connection tracking
+for Pod connections. In this configuration, Cilium already
+bypasses netfilter in the host and relies on BPF to implement
+policy enforcement, QoS, or load balancing. Our evaluations
+focus on the backlog queue traversals that netkit eliminates4 .
+For the Host networking scenario, netperf runs in the
+host network namespace, communicating over the loopback
+device when on the same node. For the other two scenarios, netperf runs in Kubernetes Pods. When running the
+TCP_CRR test, we increased the maximum size of the netfilter
+conntrack table to 300k entries, to ensure throughput isn’t
+limited by the table size.
+We first look at the TCP_RR results from Figure 5, which
+measure the request-response rate for small TCP packets.
+This netperf test is an indirect measurement of the latency
+impact. Throughput increases by 34% on the same node and
+37% over the wire when relying on netkit for packet delivery
+in Cilium. With netkit’s improvement, Cilium achieves the
+same performance as two processes communicating without
+any container isolation.
+A small difference remains between Cilium+netkit and
+the baseline, sometimes leading to Cilium+netkit performing
+better. Comparing flamegraphs reveals two differences. On
+one hand, Cilium+netkit can perform slightly worse because
+it takes longer to execute the BPF programs for its containers.
+On the other hand, it can sometimes perform slightly better
+4When comparing to the host-to-host setup, netkit bypasses some additional
+
+connection tracking in Linux, as Cilium only bypasses connection tracking
+for Pod connections. We discuss the impact of this difference in Section 4.3.
+
+Figure 6. Connections per second (TCP_CRR benchmark)
+between hosts, between containers connected with veth, and
+between containers connected with netkit.
+
+Figure 7. Normalized CPU consumption at the receiver for
+the TCP_RR and TCP_CRR tests over the wire.
+
+because it skips the remaining netfilter logic in the host.
+Although visible in flamegraphs, these differences remain
+within our error margin.
+We next look at the TCP_CRR results from Figure 6, which
+measure the rate at which short connections can be established. TCP_CRR represents a more realistic workload, in particular when considering applications with many short-lived
+connections, such as IAM applications. As shown in Figure
+6, netkit has a similar impact as previously, increasing the
+connection rate by 32% for containers on the same node and
+26% across the wire.
+Not only does netkit significantly improve performance,
+but it also eliminates the overhead from network namespace
+transitions. Over the wire, these results confirm that the extra
+backlog queue traversals account for most of the overhead.
+
+There is a large body of work around both container networking performance [18, 19, 22–24] and BPF-driven performance
+improvements [9, 11, 21]. Several papers [18, 19, 22] sit at
+the intersection of both, using diverse eBPF hooks to accelerate communications in the context of service meshes and
+their sidecar proxies. In particular, their use of socket-level
+redirections most closely resembles our work. Socket-level
+redirections however are not a fitting solution for container
+applications that expect a full network stack, and as noticed
+in [19], it suffers from its own performance shortcomings.
+netkit shares similarities with ipvlan [13] in Linux. In
+ipvlan-based deployments, each container is assigned its
+own ipvlan slave device, all of which are connected to a single master physical device on the host. ipvlan also eliminates
+the backlog queue traversal on ingress into the containers
+and bypasses part of the host networking stack. It however
+comes with a number of drawbacks. First, the host networking stack is not bypassed on egress, which can lead to path
+asymmetry issues5 . Second, BPF programs attached to the
+ipvlan slave devices can be removed by container applications, and they have no access to information from the host
+network namespace. Third, an ipvlan slave is bound to a
+single master at creation time, so multiple uplinks require
+one slave each or an aggregation device such as a bond.
+Fourth, ipvlan maintains an internal FIB, which is less flexible for BPF programmability than reusing the kernel FIB
+via bpf_fib_lookup. All of these issues have led the Cilium
+community to remove support for ipvlan devices [6].
+Outside of container networking, several papers discuss
+the design and use of new high-performance packet delivery mechanisms for Linux. XDP [11] enables early packet
+processing directly in Ethernet drivers, while AF_XDP [21]
+
+5
+
+4.3
+
+CPU Overhead
+
+To complete our network performance numbers, we measure
+the CPU consumption, normalized to the same throughput,
+at the receiver for the TCP_RR and TCP_CRR tests over the
+wire. Two points stand out from the results shown in Figure
+7. First, the TCP_CRR test stresses the networking stack a
+lot more than TCP_RR. This is expected as it involves many
+short TCP connections and therefore strains the connection
+tracking components in particular.
+Second, the CPU consumption decreases when using netkit,
+even compared to the Host networking case. This decrease
+is related to the remaining difference between Cilium+netkit
+and the Host networking discussed in Section 4.2. When
+using netkit, we skip the connection tracking of the Linux
+kernel on the host. Since this represents most of the overhead for the TCP_CRR test, it significantly helps reduce CPU
+consumption.
+
+Related Work
+
+5 This problem is addressed by the L3S mode, but with reduced performance.
+
+extends this capability by delivering packets to userspace via
+a new socket type. Although XDP can be used in container
+networks, AF_XDP is less practical, as it requires applications
+to adopt the new socket interface. It also has no native container integration: a container can only bind such a socket to
+its veth device. That device lacks zero-copy support and must
+convert already allocated skbs back into XDP buffers, losing
+the bypass that makes AF_XDP fast on physical devices.
+
+6
+
+Conclusion
+
+netkit demonstrates that the overhead of network namespace
+transitions in containerized environments can be entirely
+eliminated by specializing the Linux networking stack with
+eBPF. By avoiding redundant backlog queue traversals and
+introducing a new device pair that treats BPF as a first-class
+citizen, netkit achieves up to 37% throughput improvements
+and matches the performance of process-to-process communication, all while requiring minimal changes to existing
+container networking software.
+Since its introduction to the Linux kernel, netkit has been
+deployed in production at scale by Meta [15] and ByteDance
+[12] to improve container networking performance.
+
+7
+
+Acknowledgments
+
+We thank Kahina Lazri and the anonymous reviewers for
+their valuable feedback.
+
+References
+[1] Alexei Starovoitov. 2023. Re: [PATCH bpf-next v4 12/21] xdp: Add checksum hint. https://lore.kernel.org/all/CAADnVQ+vn0=1UT5_c628ovq+
+LzfrNFf0MxmZn++NqeUFJ-ykQw@mail.gmail.com/
+[2] Theophilus A. Benson, Prashanth Kannan, Prankur Gupta, Balasubramanian Madhavan, Kumar Saurabh Arora, Jie Meng, Martin Lau,
+Abhishek Dhamija, Rajiv Krishnamurthy, Srikanth Sundaresan, Neil
+Spring, and Ying Zhang. 2024. NetEdit: An Orchestration Platform
+for eBPF Network Functions at Scale. In Proceedings of the 2024 ACM
+SIGCOMM conference. doi:10.1145/3651890.3672227
+[3] Cilium Authors. 2017. Cilium: eBPF-based Networking, Security, and
+Observability. https://cilium.io/#networking
+[4] Cilium Authors. 2018. Why is the Kernel Community Replacing iptables? https://cilium.io/blog/2018/04/17/why-is-the-kernelcommunity-replacing-iptables/
+[5] Cilium Authors. 2021. Tuning Guide. https://docs.cilium.io/en/v1.19/
+operations/performance/tuning/
+[6] Cilium Authors. 2022. Remove IPVLAN support. https://github.com/
+cilium/cilium/pull/20453
+[7] Daniel Borkmann. 2020.
+bpf: Add redirect_peer helper.
+https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git/
+commit/?id=9aa1206e8f48
+[8] Daniel Borkmann. 2023. netkit, bpf: Add bpf programmable net device. https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git/
+commit/?id=35dfaad7188c
+[9] Kumar Kartikeya Dwivedi, Rishabh Iyer, and Sanidhya Kashyap. 2025.
+Towards Structurally Extensible Host Network Stacks. In Proceedings
+of the 24th ACM HotNets workshop. doi:10.1145/3772356.3772386
+[10] Facebook Engineering. 2018. Open-Sourcing Katran: A Scalable Network
+Load Balancer. https://engineering.fb.com/2018/05/22/open-source/
+open-sourcing-katran-a-scalable-network-load-balancer/
+
+[11] Toke Høiland-Jørgensen, Jesper Dangaard Brouer, Daniel Borkmann,
+John Fastabend, Tom Herbert, David Ahern, and David Miller. 2018.
+The eXpress data path: fast programmable packet processing in the
+operating system kernel. In Proceedings of the 14th CoNEXT conference.
+doi:10.1145/3281411.3281443
+[12] Joab Jackson. 2025. Netkit to Network a Million Containers for
+ByteDance. https://thenewstack.io/bytedance-to-network-a-millioncontainers-with-netkit/
+[13] Linux kernel community. 2014. IPVLAN Driver HOWTO. https:
+//www.kernel.org/doc/html/v6.18/networking/ipvlan.html
+[14] Jinyao Liu, Si Wu, Haoyuan Ma, Chaoqun Li, Hongjing Yu, Dingyi Jia,
+Feng Li, and Pengfei Hu. 2026. BeeQoS: A Cloud-Native QoS System
+for Adaptive and Scalable Multi-Priority Bandwidth Guarantees. In
+Proceedings of the 2026 ACM Web conference. doi:10.1145/3774904.
+3792487
+An Introduction to Netkit: The BPF Pro[15] Mike Willard. 2025.
+grammable Network Device.
+https://archive.fosdem.org/2025/
+schedule/event/fosdem-2025-4045-an-introduction-to-netkit-thebpf-programmable-network-device/
+[16] Tian Pan, Enge Song, Yueshang Zuo, Shaokai Zhang, Yang Song, Jiangu
+Zhao, Wengang Hou, Jianyuan Lu, Xiaoqing Sun, Shize Zhang, Ye Yang,
+Jiao Zhang, Tao Huang, Biao Lyu, Xing Li, Rong Wen, Zhigang Zong,
+and Shunmin Zhu. 2025. Hermes: Enhancing Layer-7 Cloud Load Balancers with Userspace-Directed I/O Event Notification. In Proceedings
+of the 2025 ACM SIGCOMM Conference. doi:10.1145/3718958.3750469
+[17] Paul Chaignon. 2021. eBPF Instruction Set Extensions. https://pchaigno.
+github.io/bpf/2021/10/20/ebpf-instruction-sets.html
+[18] Shixiong Qi, Leslie Monis, Ziteng Zeng, Ian-chin Wang, and K. K.
+Ramakrishnan. 2022. SPRIGHT: extracting the server from serverless computing! high-performance eBPF-based event-driven, sharedmemory processing. In Proceedings of the 2022 ACM SIGCOMM conference. doi:10.1145/3544216.3544259
+[19] Enge Song, Yang Song, Chengyun Lu, Tian Pan, Shaokai Zhang,
+Jianyuan Lu, Jiangu Zhao, Xining Wang, Xiaomin Wu, Minglan Gao,
+Zongquan Li, Ziyang Fang, Biao Lyu, Pengyu Zhang, Rong Wen, Li Yi,
+Zhigang Zong, and Shunmin Zhu. 2024. Canal Mesh: A Cloud-Scale
+Sidecar-Free Multi-Tenant Service Mesh Architecture. In Proceedings
+of the 2024 ACM SIGCOMM conference. doi:10.1145/3651890.3672221
+[20] The kernel development community. 2019. Scaling in the Linux networking stack. https://www.kernel.org/doc/html/v6.18/networking/
+scaling.html
+[21] William Tu, Yi-Hung Wei, Gianni Antichi, and Ben Pfaff. 2021. Revisiting the Open vSwitch dataplane ten years later. In Proceedings of the
+2021 ACM SIGCOMM conference. doi:10.1145/3452296.3472914
+[22] Myoungsung You, Jaehyun Nam, Minjae Seo, Taejune Park, and Seungwon Shin. 2026. HybridMesh: A Hardware-software Hybrid Approach for Accelerating Service Mesh Ingress. In Proceedings of the
+23rd USENIX NSDI conference. https://www.usenix.org/conference/
+nsdi26/presentation/you
+[23] Chenxingyu Zhao, Hongtao Zhang, Jaehong Min, Shengkai Lin, Wei
+Zhang, Kaiyuan Zhang, Ming Liu, and Arvind Krishnamurthy. 2026.
+SG-IOV: Socket-Granular I/O Virtualization for SmartNIC-Based Container Networks. In Proceedings of the 31st ACM ASPLOS conference.
+doi:10.1145/3779212.3790218
+[24] Yang Zhao, Nai Xia, Chen Tian, Bo Li, Yizhou Tang, Yi Wang, Gong
+Zhang, Rui Li, and Alex X. Liu. 2017. Performance of Container Networking Technologies. In Proceedings of the 2017 ACM HotConNet
+workshop. doi:10.1145/3094405.3094406
+

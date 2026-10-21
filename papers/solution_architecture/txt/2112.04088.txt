@@ -1,0 +1,2570 @@
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+1
+
+Communication-Efficient Distributed Learning via
+Sparse and Adaptive Stochastic Gradient
+
+arXiv:2112.04088v5 [cs.DC] 9 Jun 2024
+
+Xiaoge Deng, Dongsheng Li, Tao Sun and Xicheng Lu
+
+Abstract—Gradient-based optimization methods implemented
+on distributed computing architectures are increasingly used to
+tackle large-scale machine learning applications. A key bottleneck
+in such distributed systems is the high communication overhead for exchanging information, such as stochastic gradients,
+between workers. The inherent causes of this bottleneck are
+the frequent communication rounds and the full model gradient
+transmission in every round. In this study, we present SASG,
+a communication-efficient distributed algorithm that enjoys the
+advantages of sparse communication and adaptive aggregated
+stochastic gradients. By dynamically determining the workers
+who need to communicate through an adaptive aggregation rule
+and sparsifying the transmitted information, the SASG algorithm
+reduces both the overhead of communication rounds and the
+number of communication bits in the distributed system. For
+the theoretical analysis, we introduce an important auxiliary
+variable and define a new Lyapunov function to prove that
+the communication-efficient algorithm is convergent. The convergence result is identical to the sublinear rate of stochastic gradient
+descent, and our result also reveals that SASG scales well with the
+number of distributed workers. Finally, experiments on training
+deep neural networks demonstrate that the proposed algorithm
+can significantly reduce communication overhead compared to
+previous methods.
+Index Terms—Distributed algorithm, efficient communication,
+adaptive aggregation, gradient sparsification, stochastic gradient
+descent.
+
+I. I NTRODUCTION
+VER the past few decades, the scale and complexity of
+machine learning (ML) models and datasets have significantly increased [1], [2], leading to greater computational
+demands and spurring the development of distributed training
+[3]–[5]. A large number of distributed machine learning tasks
+can be described as
+1 X
+min F (ω) :=
+Eξm ∼Dm [fm (ω; ξm )] ,
+(1)
+d
+M
+ω∈R
+
+O
+
+m∈M
+
+where ω represents the parameter vector to be learned, d is
+the dimension of parameters, and M := {1, . . . , M } denotes
+the set of distributed workers. {fm }M
+m=1 are smooth (not
+necessarily convex) loss functions kept at worker m, and
+{ξm }M
+m=1 are independent random data samples associated
+with probability distribution {Dm }M
+m=1 . For simplicity, we
+define Fm (ω) := Eξm ∼Dm [fm (ω; ξm )]. Let ω ∗ be the optimal
+Xiaoge Deng, Dongsheng Li, Tao Sun and Xicheng Lu are with College
+of Computer, National University of Defense Technology, Changsha, Hunan,
+China. E-mail: dengxg@nudt.edu.cn, dsli@nudt.edu.cn, nudtsuntao@163.com
+Corresponding authors: Dongsheng Li and Tao Sun.
+Manuscript received April 19, 2021; revised August 16, 2021.
+
+solution and F ∗ := F (ω ∗ ). Problem (1) is encountered in a
+broad range of distributed machine learning tasks, from linear
+models to deep neural networks [3], [6].
+Stochastic gradient descent (SGD) is a widely used optimization algorithm for solving problem (1). At each iteration
+t, the algorithm updates the parameter vector ω as
+1 X
+t
+∇fm (ω t ; ξm
+),
+(2)
+ω t+1 = ω t − γ ·
+M
+m∈M
+
+t
+is a mini-batch data selected by worker m at the t-th
+where ξm
+iteration, and γ is the learning rate. In the context of distributed
+ML, parameter server (PS) is a common architecture that has
+been extensively studied in [4], [7]. This architecture involves
+M workers that parallelly compute the gradients based on
+their local data while a centralized server updates the global
+parameter ω. The distributed SGD in PS operates as follows.
+At iteration t, the server broadcasts the current model ω t to all
+workers, and each worker m ∈ M computes the local gradient
+t
+t
+∇fm (ω t ; ξm
+) with the mini-batch samples ξm
+∼ Dm , which is
+then uploaded to the server. The server aggregates the received
+gradients and updates ω t accordingly via (2). It is worth noting
+that the convergence of this distributed SGD algorithm has
+been proved under mild assumptions [8].
+Intuitively, multi-processor collaborative training for one
+task can accelerate the training process and reduce training
+time. However, the associated communication costs typically
+hinder the scalability of distributed systems [9]. More specifically, at each iteration of PS training (2), the server needs
+to communicate with all workers to obtain fresh gradients
+t
+{∇fm (ω t ; ξm
+)}M
+m=1 , which may lead to unaffordable communication overhead in distributed systems. Even worse, when
+the computation-to-communication ratio is low, e.g., using
+high-speed computing devices with low-speed interconnects to
+train a ML model, parallelization across multiple processors
+can actually result in lower performance than training on
+a single processor [10]. Consequently, the communication
+overhead between distributed workers and the server becomes
+a significant bottleneck.
+Various techniques have been proposed to alleviate this
+issue, including sparse communication [11]–[14] and adaptive
+aggregation methods [15]–[17]. The former is dedicated to
+t
+compressing each gradient information ∇fm (ω t ; ξm
+), while
+the latter focuses on reducing the number of communications
+M . Since these two techniques are orthogonal, an important
+question arises: can we integrate both approaches to obtain a
+superior mechanism for problem (1)?
+
+0000–0000/00$00.00 © 2021 IEEE
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+This study provides a positive answer. Specifically, we
+propose a communication-efficient distributed algorithm that
+simultaneously reduces the number of communication rounds
+and bits without compromising the convergence rate.
+Contributions. This paper focuses on reducing the worker-toserver uplink communication overhead in the PS architecture,
+which we also refer to as upload. Unlike the server-to-worker
+downlink communication (i.e., broadcast the same parameter
+ω), which can be performed concurrently or implemented in
+a tree-structured manner as in many MPI implementations,
+the server has to receive gradients of workers sequentially
+to avoid interference from other workers, resulting in extra
+latency. Consequently, uploads constitute the primary communication overhead in PS and are the subject of numerous
+related works [11], [15], [18]–[21]. Throughout this paper, one
+communication round signifies one upload from a worker. The
+contributions of the paper are summarized below.
+• We propose a communication-efficient algorithm for distributed learning that can reduce both the number of
+communication rounds and the number of bits.
+• We introduce an auxiliary sequence and define a new
+Lyapunov function to establish the convergence analysis
+of the proposed algorithm. The theoretical results are consistent with the sublinear convergence rate of SGD and
+exhibit scalability to the number of distributed workers.
+• We conduct extensive experiments that demonstrate the
+superiority of the proposed SASG algorithm.1
+Notation. In this paper, E[·] represents the expectation for randomly selected data samples. For a vector x ∈ Rd and a scalar
+a ∈ R, ∥x∥ denotes the ℓ2 -norm and |a| denotes the absolute
+value. The notation [d] represents the set {1, 2, · · · , d}, and
+|S| indicates the number of elements in the set S.
+II. R ELATED WORK
+Numerous communication-efficient distributed learning approaches have been proposed to fully exploit the computational
+power of distributed clusters [15], [18]–[20], [22]–[27]. More
+information can be found in a comprehensive survey [28]. This
+paper briefly reviews two kinds of related work: 1). from the
+perspective of what to communicate, the number of transmitted
+bits per communication round can be reduced via quantization
+or sparsification, and 2). from the perspective of when to
+communicate, some communication rules are used to save the
+number of communication rounds.
+A. Communication bit reduction
+This research category mainly revolves around quantization and sparsification. The quantization approach compresses
+information by transmitting lower bits instead of the data
+originally represented by 32 bits on each dimension of the
+transmitted gradient. Quantized stochastic gradient descent
+(QSGD) [18] utilizes an adjustable quantization level, allowing
+additional flexibility to control the trade-off between the
+per-iteration communication cost and the convergence rate.
+TernGrad [20] reduces the communication data size by using
+1 The code is available at https://github.com/xiaogdeng/SASG
+
+2
+
+ternary gradients. 1-bit quantization method was developed in
+[29]–[31], which reduces each component of the gradient to
+just its sign (one bit). Adaptive quantization methods are also
+investigated in [32] to reduce the communication cost.
+Sparsification methods aim to reduce the number of transmitted elements at each iteration. These methods can be
+divided into two main categories: random and deterministic
+sparsification. Random sparsification selects some entries randomly for communication [26], [33]. This ideology is named
+random-k, with k being the number of selected elements. This
+random choice method is usually an unbiased estimate of the
+original gradient, making it quite friendly for theoretical analysis. Unlike random sparsification, deterministic sparsification
+preserves only a few coordinates of the stochastic gradient with
+the largest magnitudes [11]–[14]. This ideology is also known
+as top-k. In contrast to the unbiased scheme, it is clear that this
+approach requires error feedback or accumulation procedures
+to ensure convergence [14], [34], [35].
+B. Communication round reduction
+Reducing the number of communication rounds to improve
+communication efficiency is another research focus. Shamir
+et al. [36] leveraged higher-order information (newton-type
+method) instead of traditional gradient information, thereby
+reducing the number of communication rounds. Hendrikx et al.
+[37] proposed a distributed preconditioned accelerated gradient
+method to reduce the number of communication rounds.
+Additionally, novel aggregation techniques, including periodic
+aggregation [19], [24], [38] and adaptive aggregation [15],
+[16], [21], have been explored to skip certain communications.
+Among these techniques, local SGD allows every worker to
+perform local model updates independently [24], [38], and the
+resultant models are averaged periodically. Lazily aggregated
+gradient (LAG) [15] updates the model on the server side, and
+workers only adaptively upload information that is determined
+to be informative enough. Unfortunately, while the original
+LAG has good performance in the deterministic settings
+(i.e., with full gradient), its performance in the stochastic
+setting degrades significantly [17]. Recent efforts have been
+made toward adaptive uploading in stochastic settings [17],
+[39]. Communication-censored distributed stochastic gradient
+descent (CSGD) algorithm [39] increases the batch size to
+alleviate the effect of stochastic gradient noise. Lazily aggregated stochastic gradient (LASG) [17] designed a set of new
+adaptive communication rules tailored for stochastic gradients,
+achieving remarkable empirical performance.
+We have drawn inspiration from LASG. The significant
+difference is that LASG only reduces communication round
+overhead, while our SASG method extends this idea to reduce
+the overhead of both communication rounds and bits in the
+stochastic setting. Additionally, SASG reduces the memory
+overhead required for adaptive aggregation technique by storing only the sparsified data on the server side.
+III. A LGORITHM DEVELOPMENT
+This section introduces SASG, a communication-efficient
+distributed algorithm that reduces both the number of communication rounds and bits. Firstly, we describe the motivation
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+3
+
+Fig. 1: SASG overview. At the t-th iteration, the parameter server broadcasts ω t to all workers, and workers in Mt (marked
+t
+t+1
+in green) will upload the sparsified gradient information Tk (gm
+) and reset τm
+= 1; while workers in Mtc (marked in pink)
+t+1
+t
+will increase the staleness by τm = τm + 1 and upload nothing; then the server updates parameter ω via (8).
+and challenges for developing this method, followed by the
+implementation details of the proposed algorithm.
+A. Motivation and challenges
+In the distributed learning system, an important observation
+is that not all communication rounds between the server and
+workers contribute equally to the state of the global model
+[15]–[17], [40]. Then, one can design an aggregation rule to
+skip inefficient communication rounds. LAG has developed
+an adaptive selection rule that can detect workers with slowly
+varying gradients and trigger the reuse of outdated gradients
+to improve communication efficiency. However, this technique
+only reduces the number of communication rounds and requires additional memory overhead on the server side, which
+is far from enough in resource-limited scenarios. Actually, we
+can do more beyond LAG, e.g., further reduce the transmitted
+bits of uploaded information rather than just the number of
+rounds, and reduce the storage overhead on the server side.
+Two approaches for reducing the number of transmission
+bits are quantization and sparsification. We employ the latter
+as quantization methods are limited to a compression rate
+of up to 32x (1-bit quantization method) in commonly used
+single-precision floating-point algorithms. When the model
+dimension d is large, i.e., d ≫ 32, the sparsification method
+will far outperform the quantization approach, offering a
+maximum achievable compression rate of d×.
+Although random sparsification methods ensure the unbiasedness of the compression operator and facilitate theoretical
+analysis, the top-k sparsification method tends to achieve
+better practical results [14], [33]. We will utilize the top-k
+sparsification operator, denoted by Tk (·). This operator retains
+only the largest k components (in absolute value) of the
+gradient vector, and the specific definition is as follows.
+Definition 1: For a parameter 1 ≤ k < d, the sparsification
+operator Tk (·) : Rd → Rd , is defined for x ∈ Rd as
+
+(x)π(i) , if i ≤ k,
+(Tk (x))π(i) :=
+(3)
+0,
+otherwise ,
+where π is a permutation of set [d] such that |(x)π(i) | ≥
+|(x)π(i+1) | for i = 1, . . . , d − 1.
+
+Nevertheless, these motivations encounter two significant
+challenges: 1). How to design an effective communication
+criterion in the sparsification setting? That is, in this composite
+situation, we need to determine which communications are
+non-essential exactly. 2). How can we guarantee model convergence when updating the parameters with only sparsified
+information from a subset of workers? In particular, the
+only partial gradient information we have is still biased. Our
+proposed approach will address these challenges.
+B. SASG method
+To tackle the first challenge, we need to determine an effective selection criterion. Intuitively, if the difference between
+two consecutive gradients from a worker is small, it is safe to
+skip the redundant uploads and reuse the previous one stored
+on the server. The difference is defined as
+t
+
+t−τ t
+
+t
+∆tm := ∇fm (ω t ; ξm
+) − ∇fm (ω t−τm ; ξm m ),
+
+(4)
+
+t
+is the delay count. Additionally, we need to pick a
+where τm
+threshold that varies with iteration t to measure the magnitude
+of the difference ∆tm adaptively. Following the idea of LAG,
+we have
+D
+
+∆tm ≤
+
+1 X
+2
+αd ω t+1−d − ω t−d ,
+2
+M
+
+(5)
+
+d=1
+
+where {αd ≥ 0}D
+d=1 are constant weights. This rule is a direct
+extension of LAG to the stochastic settings. Unfortunately,
+(5) is ineffective due to the non-diminishing variance of the
+stochastic gradients (4). Specifically, the variance introduced
+t−τ t
+t
+by the randomly selected samples ξm
+and ξm m across
+two iterations makes the value of ∆tm almost never small,
+rendering criterion (5) less effective. Our SASG method takes
+advantage of the adaptive selection rule from LASG [17],
+formulated as
+t
+
+t
+t
+∇fm (ω t ; ξm
+) − ∇fm (ω t−τm ; ξm
+)
+
+≤
+
+D
+X
+αd
+d=1
+
+M2
+
+ω t+1−d − ω t−d
+
+2
+
+2
+
+(6)
+.
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+4
+
+Algorithm 1 SASG algorithm.
+0
+Initialize: Errors e0m = 0, delay counters τm
+= 1, ∀m ∈ M
+Input: Learning rate γ > 0, maximum delay D, Constant
+weights {αd }D
+d=1
+1: for t = 0, 1, . . . , T do
+
+Server broadcasts ω t to all workers.
+3:
+for worker m = 1, . . . , M do
+t
+t
+4:
+Compute gm
+= γ∇fm (ω t ; ξm
+) + etm .
+t
+5:
+Divide the workers into M and Mtc according to
+the selection rule (6).
+t
+6:
+if worker m ∈ Mt or τm
+≥ D then
+t
+7:
+Worker m uploads Tk (gm
+) to the server.
+t+1
+t
+t
+t+1
+8:
+Set em = gm − Tk (gm ), τm
+= 1.
+9:
+else
+10:
+Worker m uploads nothing.
+t
+t+1
+t
+11:
+Set et+1
+m = em , τm = τm + 1.
+12:
+end if
+13:
+end for
+14:
+Server updates parameter ω according to (8).
+15: end for
+2:
+
+t
+This condition is evaluated on the same data ξm
+at two
+t
+different iterations t and t − τm . In the following, we provide
+a novel insight to demonstrate the suitability of the criterion for
+our method. According to the Lipschitz continuous property
+of the function ∇fm , we have
+t
+
+t
+t
+∇fm (ω t ; ξm
+)−∇fm (ω t−τm ; ξm
+)
+
+2
+
+t
+
+≤ Lm ω t −ω t−τm
+
+2
+
+,
+(7)
+
+where Lm is the Lipschitz constant. As the iterative sequence
+{ω t }t=0,1,... converges, the right-hand side of (7) diminishes,
+and thus the left-hand side of (6) diminishes, which eliminates
+t−τ t
+t
+the inherent variance caused by stochastic data ξm
+and ξm m .
+Additionally, this insight contributes to the determination of
+the threshold hyper-parameters in criterion (6).
+At each training iteration t, selection rule (6) divides the
+worker set M into two disjoint sets, Mt and Mtc . The parameter server only needs to receive the new gradient data from Mt
+and reuse outdated gradients (stored on the server side) from
+Mtc , which scale down the per-iteration communication rounds
+from M to |Mt |. After the adaptive selection procedure,
+selected workers transmit the sparse information derived by
+the top-k operator to the parameter server, which reduces the
+communication bits and the memory overhead on the server
+side. However, the biased nature of the top-k operator disrupts
+algorithmic convergence, intensifying challenge two.
+To address this issue, SASG incorporates error feedback
+techniques, also known as error accumulation or memory [14],
+[34]. Initially, the algorithm sparsifies the gradient information
+g to obtain Tk (g). When uploading the sparsified information
+Tk (g), we calculate the compression error e = g − Tk (g)
+and retain it for subsequent use. The next iteration involves
+adding the saved error e to the gradient information and compressing them jointly. Eventually, all the gradient information
+
+will be transmitted despite the delay caused by the error
+feedback mechanism. We introduce an auxiliary sequence
+{ν t }t=0,1,... , which can be regarded as an error approximation
+of {ω t }t=0,1,... . Leveraging the recursive properties of this
+sequence, we prove that SASG is convergent in Section IV.
+In summary, the iterative scheme of the SASG algorithm
+can be expressed as
+ X
+
+X
+1
+t−τ t
+t
+Tk (gm
+)+
+Tk (gm m ) , (8)
+ω t+1 = ω t −
+M
+t
+t
+m∈M
+
+m∈Mc
+
+where
+t
+t
+gm
+:= γ∇fm (ω t ; ξm
+) + etm ,
+
+t
+t
+et+1
+m := gm − Tk (gm ). (9)
+
+Here, Mt and Mtc denote the sets of workers that do and
+do not communicate with the server at the t-th iteration,
+t
+respectively. Staleness τm
+is determined by the selection of
+t
+the subset M at the t-th iteration. For worker m ∈ Mt ,
+t+1
+the server resets τm
+= 1, and the worker uploads the local
+gradient information. Otherwise, the server increases staleness
+t+1
+t
+by τm
+= τm
++ 1, and worker m uploads nothing. The SASG
+procedure is illustrated in Figure 1 and outlined in Algorithm
+1. Specifically, during each iteration t = 0, 1, 2, . . .,
+i. server broadcasts the learning parameter ω t to all workers;
+t
+)
+ii. each worker m calculates the local gradient ∇fm (ω t ; ξm
+t
+t
+and an auxiliary gradient ∇fm (ω t−τm ; ξm
+) for computing
+the selection rule (6);
+iii. workers in Mt identified by condition (6) sparsify the
+t
+t
+) + etm , and upload
+= γ∇fm (ω t ; ξm
+local information gm
+t
+Tk (gm ) to the server;
+t
+iv. server aggregates the fresh sparsified gradients Tk (gm
+)
+t
+from the selected workers M and the outdated gradient
+t−τ t
+information Tk (gm m ) (stored on the server) from Mtc
+to update the parameter ω via (8).
+As shown in Table I, we only need to upload the sparse
+gradient information from the selected workers, thus significantly saving the communication overhead (note that Mt
+selected in SASG and LASG is not the same due to different
+update information). Furthermore, SASG stores the sparsified
+gradient on the server, which reduces the memory overhead
+of traditional adaptive aggregation methods.
+IV. T HEORETICAL ANALYSIS
+This section provides a detailed theoretical analysis of the
+SASG algorithm. As shown in Table I, unlike LASG, the
+SASG algorithm relies solely on biased gradient information
+from partial workers for model updates, which complicates
+its convergence analysis. To overcome these challenges, we
+first prove that the residuals of the compression operator are
+bounded (Lemmas 1 and 2) and introduce a critical auxiliary
+variable that couples the model parameters with the compression error. Subsequently, we define a new Lyapunov function
+with respect to the auxiliary variable, which is also compatible
+with the selection criterion (6). The descent lemmas on the
+value of the objective function (Lemma 3) and the Lyapunov
+function (Lemma 4) derive the convergence theorem for the
+SASG algorithm (Theorem 1), and its convergence rate is
+consistent with that of the original SGD algorithm. All proof
+details are included in the Proofs (Section V).
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+5
+
+TABLE I: Comparison of different algorithms, including the number of communication rounds per iteration, communication bits
+per upload, and the total communication overhead to complete T iterations for each algorithm when training the d-dimensional
+parametric model with M distributed workers (k is the sparsification level defined in (3), which satisfies k < d).
+Method
+
+# Round
+
+# Bit
+
+Total Overhead
+
+Skip communication?
+
+Compress information?
+
+Biased estimation?
+
+SGD
+
+M
+
+32d
+
+32dM T
+
+✘
+
+✘
+
+✘
+
+Sparse
+
+M
+
+32k
+
+✘
+
+✔
+
+✔
+
+LASG
+
+|Mt |
+
+32d
+
+32kM T
+T
+P
+32d ·
+|Mt |
+
+✔
+
+✘
+
+✘
+
+32k
+
+t=1
+T
+P
+
+✔
+
+✔
+
+✔
+
+|Mt |
+
+SASG
+
+32k ·
+
+|Mt |
+
+t=1
+
+A. Assumptions
+Our analysis is based on the following assumptions, which
+are standard in analyzing SGD and its variants. The functions
+fm , Fm , and F have been specified in Section I.
+Assumption 1 (Smoothness): The loss function fm : Rd →
+R is Lm -smooth and function F : Rd → R is L-smooth, i.e.,
+∀x, y ∈ Rd ,
+∥∇fm (y) − ∇fm (x)∥ ≤ Lm ∥y − x∥,
+∥∇F (y) − ∇F (x)∥ ≤ L∥y − x∥.
+
+(10)
+
+Assumption 2 (Moment boundedness): The data sampled
+2
+1
+, . . ., are independent, and the
+, ξm
+in each iteration, i.e., ξm
+t
+) satisfies
+stochastic gradient ∇fm (ω; ξm
+t
+= ∇Fm (ω), 
+E[∇f
+ m (ω; ξm )]
+2
+t
+.
+) − ∇Fm (ω)∥2 ≤ σm
+E ∥∇fm (ω; ξm
+
+(11)
+
+Assumption 3 (Gradient boundedness): For a given parameter ω ∈ Rd , the local gradient ∇fm (ω; ·) is bounded, i.e.,
+there exists a constant Bm ∈ R such that
+E [∥∇fm (ω; ·)∥] ≤ Bm .
+
+(12)
+
+B. Technical lemmas
+
+m∈M
+
+t
+
+The sequence {ν }t=0,1,... , which can be considered as an
+error-corrected sequence of {ω t }t=0,1,... , has the following
+property (∆tm is defined in (4))
+γ X
+γ X
+t
+∇fm (ω t ; ξm
+)+
+∆tm , (16)
+ν t+1 − ν t = −
+M
+M
+t
+m∈M
+
+m∈Mc
+
+Based on this property, we have the following descent lemma
+for the loss function concerning the auxiliary variable ν t .
+Lemma 3: Let Assumptions 1 and 2 hold, and the sequence
+{ν t }t=0,1,... is defined in (15). Then, the objective function
+PM
+2
+value satisfies (with σ 2 := m=1 σm
+)
+
+5L+4 2 
+γ )E ∥∇F (ω t )∥2
+E[F (ν t+1 )] − E[F (ν t )] ≤ −(γ −
+2
+
+D 
+X
+αd
+L 2γ 2 (L+1)αd
++
++ +
+∥ω t+1−d − ω t−d ∥2
+2M 2 L
+2
+M2
+d=1
+
+ X
+2
+γ 2 σ2
+L2
+t
+e
++ [10(L + 1) + 2DL]
+E
+.
++
+m
+2
+2M
+M
+m∈M
+
+The analysis commences by highlighting a key property of
+the top-k sparsification operator Tk (·).
+Lemma 1: The operator Tk (·) is a δ-approximate compressor, i.e., there exists a constant δ = k/d ∈ (0, 1) such that
+∥Tk (x) − x∥2 ≤ (1 − δ)∥x∥2 , ∀x ∈ Rd .
+
+Definition 2: Let {ω t }t=0,1,... be the sequence generated by
+SASG, and the auxiliary variable ν t is defined as
+1 X t
+ν t := ω t −
+em .
+(15)
+M
+
+(13)
+
+With the gradient boundedness assumption, we are prepared
+to present a critical lemma, which demonstrates how to bound
+the residual error in Algorithm 1.
+Lemma 2: Under Assumption 3, at each iteration t of
+the SASG algorithm, the residual error etm in worker m is
+bounded, i.e., let δ = k/d, we have
+
+ 4(1 − δ) 2 2
+E ∥etm ∥2 ≤
+γ Bm .
+(14)
+δ2
+Lemma 2 demonstrates that the residual errors maintained in
+Algorithm 1 do not accumulate too much and are closely
+related to the sparsification coefficient k. Next, we introduce
+a crucial auxiliary sequence for subsequent analysis.
+
+(17)
+It is worth noting that all terms on the right-hand side of
+t+1−d
+inequality
+−ω t−d ∥2
+P (17) exist in SGD analysis except ∥ω
+and ∥ m∈M etm ∥2 , which arise due to stale information
+and compression errors. To deal with these terms, we will
+introduce an associated Lyapunov function. With F ∗ denoting
+the optimal value of problem (1), the Lyapunov function is
+defined as
+Lt := E[F (ν t )] − F ∗ +
+
+D
+X
+
+βd ∥ω t+1−d − ω t−d ∥2 ,
+
+(18)
+
+d=1
+
+where {βd ≥ 0}D
+d=1 are constants that will be determined later.
+The Lyapunov function is coupled with the selection rule (6)
+that contains the parameter difference terms. We also highlight
+that in the definition (18), Lt > 0 for any t ∈ N. A direct
+extension of Lemma 3 gives the following descent lemma.
+Lemma
+Assumptions
+PM 4: Let
+PM 1, 22, and 3 hold and denote
+2
+σ 2 := m=1 σm
+, B 2 := m=1 Bm
+. If the learning rate γ and
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+6
+
+constant weights {αd }D
+d=1 are chosen properly, the Lyapunov
+function satisfies
+γ 2 σ2
+γ2B2
+Lt+1 − Lt ≤ − cf E[∥∇F (ω t )∥2 ] + a
++b
+M
+M
+D
+X
+−
+cd ∥ω t+1−d − ω t−d ∥2 ,
+
+(19)
+
+d=1
+
+where cf , a, b, c1 , . . . , cD ≥ 0 depend on the learning rate γ,
+constants D, L, and {αd , βd }D
+d=1 . More specific explanatory
+notes can be found in the proof details.
+C. Main results
+In conjunction with the lemmas introduced above, we are
+ready to present the main convergence results of our SASG
+algorithm.
+Theorem 1: Under Assumptions 1, 2, and 3, let the sequence
+{ω t }t=0,1,... be generated by the SASG algorithm. If constant
+weights {αd }D
+learning rate
+d=1 are selected properly, and the √
+is chosen as γ = min{1/(5L + 4 + 16β1 ), cγ / T }, where
+cγ > 0 is a constant and β1 is defined in (18), we then have
+T −1
+ 2(5L + 4 + 16β1 )(F (ω 0 ) − F ∗ )
+1 X 
+E ∥∇F (ω t )∥2 ≤
+T t=0
+T
+
++
+
+2(F (ω 0 ) − F ∗ ) 2cγ (aσ 2 + bB 2 )
+√
+√
++
+.
+cγ T
+M T
+(20)
+
+Theorem 1 establishes the convergence guarantee of√our
+algorithm with a sublinear convergence rate of O(1/ T ),
+despite skipping many communication rounds and performing
+communication compression. In other words, the SASG algorithm, utilizing well-designed adaptive aggregation and sparse
+communication techniques, can still achieve a convergence rate
+identical to that of the SGD method.
+Remark 1: In the analysis of Theorem 1, we also delved
+into the effect of the number of workers M on the convergence
+performance. As indicated by result (20), the convergence is
+controlled by the average variance of the distributed system
+and is not affected by the number of workers, making SASG
+scale well to large-scale distributed systems.
+Remark 2: It follows from the proof of the theorem that the
+constant b is defined as
+(2L2 + 16β1 )(1 − δ)
+k
+, δ= .
+δ2
+d
+As the sparsification operation retains more components (i.e.,
+with a larger value of k), the parameter b diminishes, and
+thus it is more favorable for the algorithm to converge. This
+theoretical finding is consistent with empirical intuition. On
+the other hand, it is important to recognize that the convergence result of the algorithm depends on more than the
+2c bB 2
+term Mγ√T . Consequently, using different sparse coefficients
+cannot change the sublinear convergence rate of the algorithm.
+b :=
+
+V. P ROOFS
+This section contains proof details of Lemmas and Theorem
+in Section IV, and all the theoretical proofs are based on the
+standard Assumptions 1, 2, and 3.
+
+A. Proof of Lemma 1
+Given a vector x ∈ Rd , we observe from Definition 1 that
+only the first k largest coordinates of the vector are retained.
+Then, we can derive
+k
+∥x∥2 .
+d
+Since ⟨Tk (x) − x, Tk (x)⟩ = 0, it follows that
+∥Tk (x)∥2 ≥
+
+∥Tk (x) − x∥2 = ∥x∥2 − ∥Tk (x)∥2 .
+Let δ := k/d ∈ (0, 1), we can deduce that
+∥Tk (x) − x∥2 ≤ (1 − δ)∥x∥2 .
+B. Proof of Lemma 2
+From Algorithm 1 and Lemma 1, it follows that
+2
+t
+t
+2
+t 2
+E[∥et+1
+m ∥ ] = E[∥gm − Tk (gm )∥ ] ≤ (1 − δ)E[∥gm ∥ ]
+
+
+t
+= (1 − δ)E ∥γ∇fm (ω t , ξm
+) + etm ∥2
+
+
+1
+t
+≤ (1−δ) (1+η)E∥etm ∥2 + (1+ )γ 2 E∥∇fm (ω t , ξm
+)∥2 ,
+η
+
+where we used Young’s inequality ∥a + b∥2 ≤ (1 + η)∥a∥2 +
+(1+1/η)∥b∥2 for any η > 0. By Algorithm 1 and Assumption
+t
+) is
+3, we have that error e0m = 0 and gradient ∇fm (ω t , ξm
+bounded. Simple computation yields
+2
+E[∥et+1
+m ∥ ]
+t
+X
+
+t−l
+1
+l
+≤
+(1−δ)(1+η)
+(1−δ)(1+ )γ 2 E∥∇fm (ω l , ξm
+)∥2
+η
+l=0
+
+=
+
+(1 − δ)(1 + 1/η) 2 2
+γ Bm .
+1 − (1 − δ)(1 + η)
+
+δ
+By selecting η := 2(1−δ)
+yielding 1 + 1/η = (2 − δ)/δ ≤ 2/δ,
+we arrive at
+4(1 − δ) 2 2
+2(1 − δ)(1 + 1/η) 2 2
+2
+γ Bm ≤
+γ Bm .
+E[∥et+1
+m ∥ ]≤
+δ
+δ2
+
+C. Proof of Equation (16)
+Following Definition 2 and the iterative scheme (8), we have
+1 X t+1
+ν t+1 = ω t+1 −
+em
+M
+m∈M
+ X
+
+X
+X
+t
+1
+t−τm
+t
+t
+t+1
+=ω −
+Tk (gm )+
+Tk (gm )+
+em
+M
+m∈M
+m∈Mt
+m∈Mtc
+ X
+X t−τ t 
+1
+∗
+t
+= ωt −
+gm
++
+gm m
+M
+t
+t
+m∈M
+
+m∈Mc
+
+
+1 X
+t
+= ωt −
+γ∇fm (ω t ; ξm
+) + etm
+M
+m∈Mt
+
+
+X
+t
+1
+t−τ t
+t−τ t
+−
+γ∇fm (ω t−τm ; ξm m ) + em m
+M
+m∈Mtc
+γ X
+∗ t
+t
+=ν −
+∇fm (ω t ; ξm
+)
+M
+m∈M
+
+t
+γ X 
+t−τ t
+t
++
+∇fm (ω t ; ξm
+) − ∇fm (ω t−τm ; ξm m ) ,
+M
+t
+m∈Mc
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+7
+
+t−τ t
+
+m
+where (∗) used et+1
+, ∀m ∈ Mtc . Let
+m = em
+
+t
+∆tm := ∇fm (ω t ; ξm
+) − ∇fm (ω
+
+t
+t−τm
+
+Noticing that
+
+t−τ t
+; ξm m ),
+
+t
+
+it then follows that
+γ X
+γ X
+t
+∇fm (ω t ; ξm
+)+
+∆tm . (21)
+ν t+1 − ν t = −
+M
+M
+t
+m∈M
+
+m∈Mc
+
+D. Proof of Lemma 3
+We first present the complete derivation and then delve into
+the corresponding specifics.
+
+
+
+
+E F (ν t+1 ) − E F (ν t )
+E L
+(a) D
+≤ E ∇F (ν t ), ν t+1 − ν t + E∥ν t+1 − ν t ∥2
+2
+E
+(b) D
+γ X
+γ X
+t
+t
+≤ E ∇F (ω ), −
+∇fm (ω t ; ξm
+∆tm
+)+
+M
+M
+t
+m∈M
+
+m∈Mc
+
+L
++ E ∇F (ν ) − ∇F (ω ), ν
+− ν + E∥ν t+1 − ν t ∥2
+2
+D
+E
+X
+(c)
+γ
+E ∇F (ω t ),
+∆tm
+≤ −γE∥∇F (ω t )∥2 +
+M
+t
+t
+
+t
+
+t+1
+
+1
+L+1
++ E∥∇F (ν t ) − ∇F (ω t )∥2 +
+E∥ν t+1 − ν t ∥2
+2
+2
+(d)
+L+1
+Lγ 2
+)E∥∇F (ω t )∥2 +
+E∥ν t+1 − ν t ∥2
+≤ −(γ −
+2
+2
+
+D 
+X
+L
+αd
++
+∥ω t+1−d − ω t−d ∥2
++
+2M 2 L
+2
+
+t
+
+m∈M
+
+1
+where we use
+⟨a, b⟩ ≤ 2ε ∥a∥2 + 2ε
+∥b∥2 with
+Pnthe inequality
+P
+n
+2
+2
+ε := Dγ, ∥ i=1 θi ∥ ≤ n i=1 ∥θi ∥ , and Assumption 2.
+PM
+2
+Then, we arrive at (with σ 2 := m=1 σm
+)
+E
+D
+X
+X
+γ
+γ
+E ∇F (ω t ),
+∆tm ≤
+(I + II)
+M
+M
+t
+t
+m∈Mc
+
+≤
+
+t
+
+∇F (ω ), ∆tm
+
+D
+E
+t
+t
+t
+= E ∇F (ω t ), ∇fm (ω t ; ξm
+)−∇fm (ω t−τm ; ξm
+)
+|
+{z
+}
+I
+D
+E
+t
+t
+t−τ t
+t
++ E ∇F (ω t ), ∇fm (ω t−τm ; ξm
+)−∇fm (ω t−τm ; ξm m ) .
+|
+{z
+}
+II
+
+1
+By using the inequality ⟨a, b⟩ ≤ 2ε ∥a∥2 + 2ε
+∥b∥2 with ε := Lγ,
+and employing selection rule (6), we obtain
+
+Lγ
+1 1 X
+I≤
+E[∥∇F (ω t )∥2 ] +
+αd ∥ω t+1−d −ω t−d ∥2 .
+2
+2Lγ M 2
+
+m∈Mc
+
+Lγ 2
+E∥∇F (ω t )∥2 +
+2
+
+D
+X
+
+(
+
+d=1
+
+αd
+L
++ )∥ω t+1−d −ω t−d ∥2
+2M 2 L 2
+
+2γ 2 DLσ 2
++
+.
+M
+By further analyzing ∥∆tm ∥2 and ∥ν t+1 − ν t ∥2 , we derive (e)
+X
+X
+∥
+∆tm ∥2 ≤ |Mtc |
+∥∆tm ∥2
+m∈Mtc
+t
+
+X
+
+t
+t
+∇fm (ω t ; ξm
+) − ∇fm (ω t−τm ; ξm
+)
+
+m∈Mtc
+t
+
+t
+
+t−τ t
+
+2
+
+t
++ ∇fm (ω t−τm ; ξm
+) − ∇fm (ω t−τm ; ξm m )
+X
+t
+t
+t
+≤ 2M
+∥∇fm (ω t ; ξm
+) − ∇fm (ω t−τm ; ξm
+)∥2
+m∈Mtc
+
++ 2M
+
+t
+
+X
+
+t
+
+t−τ t
+
+t
+∥∇fm (ω t−τm ; ξm
+)−∇fm (ω t−τm ; ξm m )∥2
+
+m∈Mtc
+
+≤2
+
+(22)
+where (a) uses the L-smooth property outlined in Assumption
+1. (b) is obtained by equation (21). (c) utilizes Assumption 2
+and the inequality ∥a∥2 + ∥b∥2 ≥ 2 ⟨a, b⟩. To establish (d),
+we need to bound ⟨∇F (ω t ), ∆tm ⟩ as follows
+
+t−τ t
+
+t
+
+d=1
+
+≤ |Mtc |
+
+ 2γ 2 DLσ 2
+L  t
++
+E ∥ν − ω t ∥2 +
+2
+M
+(e)
+
+5L + 4 2 
+≤ −(γ −
+γ )E ∥∇F (ω t )∥2
+2
+
+D 
+X
+αd
+L 2γ 2 (L+1)αd
++
++
++
+∥ω t+1−d −ω t−d ∥2
+2M 2 L
+2
+M2
+d=1
+ X
+
+2
+L2
+γ 2 σ2
+t
+e
+,
++
+E
++
+[10(L
++
+1)
++
+2DL]
+m
+2M 2
+M
+
+d=1
+
+t
+
+t
+II ≤ LE⟨ω t −ω t−τm,∇fm (ω t−τm ; ξm
+)−∇fm (ω t−τm ; ξm m )⟩
+
+t
+t
+γDL 
+t−τ t
+t
+E ∥∇fm (ω t−τm ; ξm
+) − ∇fm (ω t−τm ; ξm m )∥2
+≤
+2
+t
+L
++
+∥ω t − ω t−τm ∥2
+2γD
+D
+L X t+1−d
+2
+≤ 2γDLσm
++
+∥ω
+− ω t−d ∥2 ,
+2γ
+
+m∈Mtc
+
+d=1
+2
+
+D
+
+t−τ t
+
+t
+
+we then have
+
+t
+
+m∈Mc
+
+E
+
+t
+
+t
+E⟨∇F (ω t−τm ), ∇fm (ω t−τm ; ξm
+)−∇fm (ω t−τm ; ξm m )⟩ = 0,
+
+D
+X
+
+αd ω t+1−d − ω t−d
+
+2
+
++ 8M σ 2 ,
+
+d=1
+
+(23)
+PM
+2
+where σ 2 := m=1 σm
+. Applying inequalities (21), (23), and
+Assumption 2, we can get
+E[∥ν t+1 − ν t ]∥2
+γ X
+γ X
+t
+∇fm (ω t ; ξm
+)+
+∆tm ∥2 ]
+= E[∥ −
+M
+M
+t
+m∈M
+
+2
+
+≤
+
+2γ
+E[∥
+M2
+
+X
+
+m∈Mc
+
+t
+∇fm (ω t ; ξm
+)∥2 ] +
+
+m∈M
+
+≤ 4γ 2 E∥∇F (ω t )∥2 +
+
+X
+2γ 2
+E[∥
+∆tm ∥2 ]
+2
+M
+t
+m∈Mc
+
+D
+2 X
+
+4γ
+M2
+
+d=1
+
+αd ∥ω t+1−d −ω t−d ∥2 +
+
+20γ 2 σ 2
+M
+(24)
+
+Organize and summarize these items, and we can get the final
+result (22).
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+E. Proof of Lemma 4
+According to the definition (18) and Lemma 3, a straightforward calculation yields
+Lt+1 − Lt = E[F (ν t+1 )] − E[F (ν t )]
++
+
+D
+X
+
+βd ∥ω t+2−d −ω t+1−d ∥2 −
+
+d=1
+
+D
+X
+
+βd ∥ω t+1−d −ω t−d ∥2
+
+X
+L2
+5L + 4 2
+E∥
+etm ∥2
+γ )E∥∇F (ω t )∥2 +
+2
+2
+2M
+m∈M
+
+
+D
+2
+X
+αd
+L 2γ (L+1)αd
++
+∥ω t+1−d −ω t−d ∥2
++ +
+2
+2M L
+2
+M2
+
+≤ −(γ −
+
+d=1
+
++
+
+Solving the linear equations above we can further get
+2
+PD
+(L+1)
+[ 2γ M
++ 2M12 L ] d=1 αd + LD
+2
+2
+.
+β1 =
+8γ 2 PD
+1 − M 2 d=1 αd
+We then have cd ≥ 0, d = 1, . . . , D and cf ≥ γ/2, implying
+
+d=1
+
++ [10(L + 1) + 2DL]
+
+8
+
+γ 2 σ2
++ β1 ∥ω t+1 − ω t ∥2
+M
+
+D−1
+X
+
+(βd+1 − βd )∥ω t+1−d − ω t−d ∥2
+
+d=1
+
+− βD ∥ω t+1−D − ω t−D ∥2 .
+By utilizing the properties (21), (24), and also invoking
+Lemma 2, we can establish the following inequality
+X
+2
+t
+2
+(et+1
+∥ω t+1 − ω t ∥2 ≤ 2∥ν t+1 − ν t ∥2 + 2 ∥
+m − em )∥
+M
+m∈M
+
+16(1 − δ)γ 2 B 2
+≤ 2∥ν t+1 − ν t ∥2 +
+,
+δ2 M
+PM
+2
+where B 2 := m=1 Bm
+. We then derive that
+h
+i
+5L + 4
++ 8β1 )γ 2 E[∥∇F (ω t )∥2 ]
+Lt+1 − Lt ≤ − γ − (
+2
+D
+X
+γ2B2
+γ 2 σ2
++b
+,
+−
+cd ∥ω t+1−d −ω t−d ∥2 + a
+M
+M
+d=1
+
+where
+
+5L + 4
+
+ cf := γ − (
++ 8β1 )γ 2
+
+
+2
+
+
+
+
+
+
+αd
+L 2γ 2 αd (L+1+4β1 )
+
+
+
+c
+:=
+β
+−β
+−
++
++
+d
+d
+d+1
+
+
+2M 2 L 2
+M2
+
+
+
+
+
+d = 1, . . . , D − 1
+
+
+
+αD
+L 2γ 2 αD (L + 1 + 4β1 )
+
+ cD := βD −
++ +
+
+
+2M 2 L
+2
+M2
+
+
+
+
+
+
+a := 10(L + 1) + 2DL + 40β1
+
+
+
+
+2
+
+
+ b := (2L + 16β1 )(1 − δ) .
+δ2
+(25)
+
+F. Proof of Theorem 1
+1
+Let γ ≤ γ = 5L+4+16β
+, then choose {βd }D
+d=1 such that
+1
+
+
+
+αd
+L 2γ 2 αd (L+1+4β1 )
+
+
+βd −βd+1 −
++ +
+=0
+
+
+
+2M 2 L 2
+M2
+d= 1, . . . , D − 1
+
+
+
+αD
+L 2γ 2 αD (L + 1 + 4β1 )
+
+
+ βD −
++
++
+= 0.
+2M 2 L
+2
+M2
+
+γ
+aσ 2 + bB 2 2
+Lt+1 − Lt ≤ − E[∥∇F (ω t )∥2 ] +
+γ .
+2
+M
+TP
+−1
+By taking the summation
+Lt+1 − Lt , we arrive at
+t=0
+T
+−1
+X
+
+γ
+aσ 2 + bB 2 2
+E[∥∇F (ω t )∥2 ] ≤ F (ω 0 ) − F ∗ +
+Tγ .
+2
+M
+t=0
+√
+If we choose learning rate γ = min{1/(5L+4+16β1 ), cγ / T },
+where cγ > 0 is a constant. We then have
+T−1
+
+1X
+2M (F (ω 0 )−F ∗ )+2T (aσ 2 +bB 2 )γ 2
+E[∥∇F (ω t )∥2 ] ≤
+T t=0
+MTγ
+≤
+
+2(5L + 4 + 16β1 )(F (ω 0 ) − F ∗ ) 2(F (ω 0 ) − F ∗ )
+√
++
+T
+cγ T
+
+2cγ (aσ 2 + bB 2 )
+√
+,
+M T
+which means
++
+
+T −1
+√
+
+1 X 
+E ∥∇F (ω t )∥2 = O(1/ T ).
+T t=0
+
+VI. E XPERIMENT RESULTS
+This section conducts extensive experiments to demonstrate
+the convergence properties and communication efficiency of
+our SASG algorithm. The experiments encompass simulated
+and real distributed training scenarios, examining the improvement of SASG in both communication volume and time.
+Additionally, we discuss the additional computational and
+memory overhead of SASG, the effect of sparsity rate, and
+the algorithm’s performance in heterogeneous data scenarios.
+A. Setup
+We evaluate the performance of the SASG algorithm against
+LASG [17], the sparsification method with error feedback
+[11], and distributed SGD [8]. Aji et al. [11] demonstrated
+that up to 99% of the gradients are not needed to update
+the model at each iteration. Hence, we utilize the top-1%
+(i.e., k = 0.01d) sparsification operator in SASG and the
+sparsification method. All our experimental results are based
+on the PyTorch framework [41].
+We begin by evaluating the communication volume of
+the four algorithms. We simulated ten workers, and each
+worker used ten samples per training iteration. Subsequently,
+we recorded the communication time for each algorithm in
+the real-world distributed settings. We employed ten Nvidia
+RTX-3090 GPUs as distributed workers for training, with the
+first GPU also playing the role of parameter server. During
+information uploads from the workers to the server, we utilized
+point-to-point communication with the GLOO backend by
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+90
+
+75
+
+SGD
+Sparse
+LASG
+SASG
+0.4
+0.8
+1.2
+Communication Round 1e5
+
+SGD
+Sparse
+45
+LASG
+SASG
+30 0.0
+0.5
+1.0
+1.5
+Communication Round 1e5
+
+Loss
+
+10 2
+
+(c) ResNet18+CIFAR-100
+
+SGD
+Sparse
+LASG
+SASG
+
+100
+
+10 1
+0.0
+
+0.4
+
+0.8
+
+1.2
+
+Communication Round 1e5
+(d) FC+MNIST
+
+SGD
+Sparse
+45
+LASG
+SASG
+30 0.0 0.5 1.0 1.5 2.0 2.5
+Communication Round 1e5
+
+SGD
+Sparse
+LASG
+SASG
+
+3x100
+
+Loss
+
+SGD
+Sparse
+LASG
+SASG
+
+10 1
+
+60
+
+(b) ResNet18+CIFAR-10
+
+Loss
+
+100
+
+75
+
+60
+
+(a) FC+MNIST
+
+Test Accuracy
+
+90
+
+Test Accuracy
+
+Test Accuracy
+
+98
+96
+94
+92
+90
+88 0.0
+
+9
+
+100
+
+3x10 1
+
+0.0
+
+0.5
+
+1.0
+
+1.5
+
+Communication Round 1e5
+
+(e) ResNet18+CIFAR-10
+
+0.0 0.5 1.0 1.5 2.0 2.5
+Communication Round1e5
+(f) ResNet18+CIFAR-100
+
+Fig. 2: Experimental results of test accuracy percentage and training loss versus communication round in three settings. All
+four methods are trained with the same number of epochs. Our algorithm significantly reduces the number of communication
+rounds required to achieve the same performance and complete the training.
+
+invoking the send() and recv() functions in PyTorch. We
+configured the upload bandwidth of each worker to be 1 Gbps.
+We carried out evaluations for the following three settings and
+repeated every experiment five times.
+MNIST: The MNIST [42] dataset contains 70,000 handwritten
+digits in 10 classes, with 60,000 examples in the training set
+and 10,000 examples in the test set. We consider a two-layer
+fully connected (FC) neural network model with 512 neurons
+in the second layer for 10-category classification on MNIST.
+For all algorithms, we trained 20 epochs with the learning rate
+γ = 0.005. For the adaptive aggregated algorithms SASG and
+LASG, we set D = 10, αd = 1/2γ for d = 1, 2, . . . , 10.
+CIFAR-10: The CIFAR-10 [43] dataset comprises 60,000
+colored images in 10 classes, with 6,000 images per category.
+We train ResNet18 [44] with all the algorithms mentioned
+above on the CIFAR-10 dataset. Standard data augmentation
+techniques such as random cropping, flipping, and normalization are performed. We trained 30 epochs for the four
+algorithms, and the basic learning rate is set to γ = 0.01,
+with a learning rate decay of 0.1 at epoch 20. For SASG and
+LASG, we set D = 10, αd = 1/γ for d = 1, 2, . . . , 10.
+CIFAR-100: We also train ResNet18 on the CIFAR-100 [43]
+dataset, which consists of 60,000 images in 100 classes. A data
+augmentation technique similar to CIFAR-10 was performed.
+The basic learning rate is set to γ = 0.01, with a learning rate
+decay of 0.1 at epoch 30, where the total training epoch is 50.
+In the case of SASG and LASG, we set D = 10, αd = 1/γ
+for d = 1, 2, . . . , 10.
+
+It is important to note that we did not employ training techniques such as warm-up or weight decay in our experiments,
+and thus state-of-the-art performance was not achieved in certain models. Our goal is to demonstrate, through comparative
+experiments, that the SASG algorithm can effectively reduce
+both the number of communication rounds and bits without
+sacrificing model performance.
+B. Communication volume
+This part presents the results of our simulation experiments
+on communication volume, i.e., the number of communication
+rounds and bits. Figure 2 depicts the variation of test accuracy
+and training loss against the number of communication rounds,
+whereas Figure 2c shows the top-5 test accuracy.
+The experimental results demonstrate that our SASG algorithm outperforms the previous methods. Notably, as evident
+in Figure 2a, SASG achieves higher test accuracy with the
+same number of communication rounds, indicating that our
+algorithm selects more valuable rounds for communication.
+Furthermore, SASG can significantly reduce the number of
+communication rounds while preserving the same model performance after completing the training process. Figure 2d
+shows that the SASG algorithm achieves faster and better
+convergence results with fewer communication rounds. In the
+experiments on the CIFAR-10 and CIFAR-100 datasets (Figure
+2e-2f), SASG is also able to significantly reduce the number
+of communication rounds required to complete the training
+while guaranteeing convergence.
+
+90
+
+75
+
+16
+
+Test Accuracy
+
+Test Accuracy
+
+90
+
+10
+
+75
+
+60
+
+SGD
+LASG
+Sparse
+SASG
+
+45
+30 0
+
+1
+
+2
+
+3
+
+Comm. Time (s)
+
+4
+
+5
+1e4
+
+(a) Accuracy v.s. Time
+
+Comm. Time / 100 iter.
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+14
+
+60
+45
+30 0.0
+
+12
+
+Sparse
+SASG
+
+0.5
+
+1.0
+
+1.5
+
+2.0
+
+Comm. Time (s)
+
+2.5
+1e3
+
+10
+
+(b) Accuracy v.s. Time
+
+Sparse
+SASG
+
+0
+
+5000
+
+10000
+
+Iteration
+
+15000
+
+(c) Time v.s. Iteration
+
+Fig. 3: Experimental results of classifying CIFAR-10 with ResNet18. Figures (a) and (b) show the test accuracy versus
+communication time. Figure (c) records the communication time every 100 iterations, where the learning rate decay was used
+at the 10, 000-th iteration.
+TABLE II: Number of communication rounds and bits required
+for the four algorithms to reach the same test accuracy baseline
+(average of five experiments).
+Model & Dataset
+
+Method
+
+# Rounds
+
+# Bits
+
+FC
+MNIST
+
+SGD
+Sparse
+LASG
+SASG
+
+60400
+67400
+33853
+22823
+
+7.87 E+11
+8.78 E+09
+4.41 E+11
+2.97 E+09
+
+ResNet18
+CIFAR-10
+
+SGD
+Sparse
+LASG
+SASG
+
+111200
+109800
+107389
+90846
+
+3.98 E+13
+3.93 E+11
+3.84 E+13
+3.25 E+11
+
+SGD
+Sparse
+LASG
+SASG
+
+152000
+152800
+145971
+137937
+
+5.46 E+13
+5.49 E+11
+5.24 E+13
+4.95 E+11
+
+ResNet18
+CIFAR-100
+
+According to Figure 2, we choose several baselines (around
+the best accuracy) to present the specific number of communication rounds and bits required to achieve the same performance for the four algorithms, with the accuracy baseline
+set as 98% for MNIST, 92% for CIFAR-10 and CIFAR-100
+(top-5 accuracy), respectively. As shown in Table II, thanks
+to the adaptive aggregation technique, both SASG and LASG
+algorithms reduce the number of communication rounds, while
+our SASG algorithm is more effective. The number of communication bits required by the different algorithms to reach
+the same baseline can be obtained by calculating the number
+of parameters for different models. The last column of Table II
+shows that the SASG algorithm, blending adaptive aggregation
+techniques with sparse communication, outperforms the LASG
+and sparsification methods, significantly reducing the number
+of communication bits required for the model to achieve the
+desired performance.
+
+TABLE III: Average communication time of the four algorithms and extra overhead required for the two adaptive aggregated methods when classifying CIFAR-10 with ResNet18
+(record every 100 training iterations).
+Method
+
+Communication
+
+Computation
+
+Memory
+
+SGD
+Sparse
+LASG
+SASG
+
+327.45s
+15.94s
+286.72s
+13.09s
+
+—
+—
+1.25s
+1.25s
+
+—
+—
+426.25MB
+4.26MB
+
+C. Communication time
+This part presents the communication time required for each
+algorithm in real-world distributed training. As mentioned
+in Section III, the top-k sparsification method can significantly reduce the communication bits. Thus, the sparsification
+method and the SASG algorithm require much less communication time than the LASG and SGD algorithms when
+completing the same training task, as shown in Figure 3a.
+The two methods utilizing the sparsification technique are
+compared in Figure 3b, which illustrates that SASG accomplishes the required accuracy faster and completes training
+in less communication time. Figure 3c recorded the communication time required by the sparsification method and
+the SASG algorithm for every 100 training iterations. As
+training proceeds, SASG skips more communication rounds,
+leading to a gradual decrease in required communication time,
+while the sparsification method remains the same. Besides,
+Figure 3b implies that skipping redundant information does
+not compromise the final performance of the model, which
+also indicates that our adaptive selection criterion is effective.
+The average communication time is shown in Table III.
+D. More experimental discussion
+While the aforementioned experimental results show that
+SASG can significantly improve the communication efficiency
+while guaranteeing algorithm performance, we also need to
+discuss the additional overhead associated with implementing
+this algorithm, i.e., the extra computation time for calculating
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+VII. C ONCLUSION
+This paper proposes a communication-efficient SASG algorithm for distributed learning. SASG adaptively skips several
+communication rounds with an adaptive selection rule, and
+further reduces the number of communication bits by sparsifying the transmitted information. For the biased nature of
+the top-k sparsification operator, we utilize an error feedback
+framework and provide a sublinear convergence result for
+
+90
+
+Sparse(10%)
+Sparse(5%)
+Sparse(1%)
+SASG(10%)
+SASG(5%)
+SASG(1%)
+
+Sparse(10%)
+Sparse(5%)
+Sparse(1%)
+SASG(10%)
+SASG(5%)
+SASG(1%)
+
+70
+0.0
+
+0.5
+
+1.0
+
+Comm. Round
+
+Loss
+
+Test Accuracy
+
+100
+
+80
+
+10 1
+
+1.5
+1e5
+
+0.0
+
+0.5
+
+1.0
+
+Comm. Round
+
+1.5
+1e5
+
+Fig. 4: Experimental results of training ResNet18 to classify
+CIFAR-10 using different sparsity rates.
+90
+
+45
+
+SGD
+Sparse
+LASG
+SASG
+
+30 0.0 0.5 1.0 1.5 2.0 2.5 3.0
+Comm. Round 1e5
+
+Loss
+
+60
+
+SGD
+Sparse
+LASG
+SASG
+
+100
+
+75
+
+Test Accuracy
+
+the selection rule and the memory overhead required for
+storing the stale gradients. As outlined in Algorithm 1, in
+a single SASG iteration, each worker needs to store one
+duplicate of the previous model parameters to compute the
+auxiliary gradient, and the server needs to store the old
+gradient (sparse one) from each worker. Table III presents the
+additional overhead required for the two adaptive aggregated
+methods. The computational overhead is approximately the
+same for both methods, mainly for computing an auxiliary
+gradient. However, this overhead is negligible when compared
+to the communication time. On the other hand, the SASG
+algorithm only needs to store the sparsified gradients on the
+server side compared to LASG, significantly decreasing the
+additional memory overhead.
+Additionally, we explore the effect of different sparsification
+levels on SASG, as shown in Figure 4. The results indicate
+that varying only the sparsification coefficient k has no noticeable effect on the model accuracy and loss, and SASG
+still outperforms the sparsification method with error feedback.
+Besides, the experimental results reveal that SASG skips more
+communication rounds as the sparsity rate increases. Therefore, varying the sparse coefficient k requires a corresponding
+adjustment of the parameter {αd }D
+d=1 within the adaptive aggregation selection criterion to prevent extreme sparsification
+from compromising the algorithm’s performance. Moreover,
+the results in Figures 2 and 4 show that the sparsification
+method with error feedback works better than the benchmark
+SGD algorithm, and its performance can be further improved
+by appropriately increasing the sparsification factor. The potential reason for this phenomenon can be attributed to the fact
+that the sparsification operation reduces the gradient norm (or
+the gradient upper bound), thereby improving the convergence
+[11], [14] and generalization [45]–[47] of the algorithm.
+For the heterogeneous data experiments, we simulated ten
+distributed workers and mixed CIFAR-10 and MNIST datasets
+to construct the non-i.i.d. environment. Specifically, the evennumbered workers distribute only the CIFAR-10 dataset, while
+the odd-numbered workers contain only MNIST training samples. The experimental results of training the ResNet18 model
+in this non-i.i.d. setting using the four algorithms are depicted
+in Figure 5. This result shows that the SASG algorithm can
+significantly improve the communication efficiency of the
+training system and ensure good model accuracy even in
+heterogeneous data scenarios. In addition, this experiment also
+demonstrates that judiciously skipping some communication
+rounds can compensate for the adverse impact on model
+accuracy caused by training with non-i.i.d. data (e.g., federated
+learning), which is consistent with the findings of CMFL [40].
+
+11
+
+10 1
+0.0 0.5 1.0 1.5 2.0 2.5 3.0
+Comm. Round 1e5
+
+Fig. 5: Experimental results of training the ResNet18 model
+in heterogeneous data scenarios.
+SASG with the help of a new Lyapunov analysis. Extensive
+experimental results show that SASG can reduce both the
+number of communication rounds and bits without sacrificing
+convergence performance, which corroborates our theoretical
+findings.
+R EFERENCES
+[1] T. B. Brown, B. Mann, N. Ryder, M. Subbiah, J. Kaplan, P. Dhariwal,
+A. Neelakantan, P. Shyam, G. Sastry, A. Askell, S. Agarwal, A. HerbertVoss, G. Krueger, T. Henighan, R. Child, A. Ramesh, D. M. Ziegler,
+J. Wu, C. Winter, C. Hesse, M. Chen, E. Sigler, and Others, “Language
+models are few-shot learners,” in Advances in Neural Information
+Processing Systems, vol. 33, 2020, pp. 1877–1901.
+[2] J. Deng, W. Dong, R. Socher, L.-J. Li, K. Li, and L. Fei-Fei, “Imagenet:
+A large-scale hierarchical image database,” in IEEE conference on
+computer vision and pattern recognition. IEEE, 2009, pp. 248–255.
+[3] J. Dean, G. Corrado, R. Monga, K. Chen, M. Devin, M. Mao, M. Ranzato, A. Senior, P. Tucker, K. Yang et al., “Large scale distributed deep
+networks,” in Advances in Neural Information Processing Systems, 2012,
+pp. 1223–1231.
+[4] M. Li, D. G. Andersen, J. W. Park, A. J. Smola, A. Ahmed, V. Josifovski,
+J. Long, E. J. Shekita, and B.-Y. Su, “Scaling distributed machine
+learning with the parameter server,” in 11th {USENIX} Symposium on
+Operating Systems Design and Implementation ({OSDI} 14), 2014, pp.
+583–598.
+[5] E. P. Xing, Q. Ho, W. Dai, J. K. Kim, J. Wei, S. Lee, X. Zheng, P. Xie,
+A. Kumar, and Y. Yu, “Petuum: A new platform for distributed machine
+learning on big data,” IEEE Transactions on Big Data, vol. 1, no. 2, pp.
+49–67, 2015.
+[6] A. Nedic and A. Ozdaglar, “Distributed subgradient methods for multiagent optimization,” IEEE Transactions on Automatic Control, vol. 54,
+no. 1, p. 48, 2009.
+[7] M. Li, D. G. Andersen, A. J. Smola, and K. Yu, “Communication
+efficient distributed machine learning with the parameter server,” in
+Advances in Neural Information Processing Systems, 2014, pp. 19–27.
+[8] M. A. Zinkevich, M. Weimer, A. Smola, and L. Li, “Parallelized stochastic gradient descent,” in Advances in Neural Information Processing
+Systems, vol. 23, 2010, pp. 2595–2603.
+[9] M. I. Jordan, J. D. Lee, and Y. Yang, “Communication-efficient distributed statistical inference,” Journal of the American Statistical Association, vol. 114, no. 526, pp. 668–681, 2019.
+
+JOURNAL OF LATEX CLASS FILES, VOL. 14, NO. 8, AUGUST 2021
+
+[10] Y. Lin, S. Han, H. Mao, Y. Wang, and B. Dally, “Deep gradient
+compression: Reducing the communication bandwidth for distributed
+training,” in International Conference on Learning Representations,
+2018.
+[11] A. F. Aji and K. Heafield, “Sparse communication for distributed
+gradient descent,” in Proceedings of the 2017 Conference on Empirical
+Methods in Natural Language Processing, 2017, pp. 440–445.
+[12] D. Alistarh, T. Hoefler, M. Johansson, N. Konstantinov, S. Khirirat,
+and C. Renggli, “The convergence of sparsified gradient methods,” in
+Advances in Neural Information Processing Systems, vol. 31, 2018, pp.
+5977–5987.
+[13] M. Elibol, L. Lei, and M. I. Jordan, “Variance reduction with sparse
+gradients,” in International Conference on Learning Representations,
+2020.
+[14] S. U. Stich, J.-B. Cordonnier, and M. Jaggi, “Sparsified SGD with memory,” in Advances in Neural Information Processing Systems, vol. 31,
+2018, pp. 4447–4458.
+[15] T. Chen, G. Giannakis, T. Sun, and W. Yin, “LAG: Lazily aggregated
+gradient for communication-efficient distributed learning,” in Advances
+in Neural Information Processing Systems, 2018, pp. 5050–5060.
+[16] T. Chen, Z. Guo, Y. Sun, and W. Yin, “CADA: Communication-adaptive
+distributed adam,” in International Conference on Artificial Intelligence
+and Statistics. PMLR, 2021, pp. 613–621.
+[17] T. Chen, Y. Sun, and W. Yin, “Communication-adaptive stochastic
+gradient methods for distributed learning,” IEEE Trans. Signal Process.,
+vol. 69, pp. 4637–4651, 2021.
+[18] D. Alistarh, D. Grubic, J. Li, R. Tomioka, and M. Vojnovic, “QSGD:
+Communication-efficient sgd via gradient quantization and encoding,” in
+Advances in Neural Information Processing Systems, 2017, pp. 1709–
+1720.
+[19] D. Basu, D. Data, C. Karakus, and S. N. Diggavi, “Qsparse-local-SGD:
+Distributed SGD with quantization, sparsification and local computations,” in Advances in Neural Information Processing Systems, 2019,
+pp. 14 668–14 679.
+[20] W. Wen, C. Xu, F. Yan, C. Wu, Y. Wang, Y. Chen, and H. Li, “TernGrad:
+ternary gradients to reduce communication in distributed deep learning,”
+in Advances in Neural Information Processing Systems, 2017, pp. 1508–
+1518.
+[21] J. Sun, T. Chen, G. Giannakis, and Z. Yang, “Communication-efficient
+distributed learning via lazily aggregated quantized gradients,” in Advances in Neural Information Processing Systems, 2019, pp. 3365–3375.
+[22] X. Deng, T. Sun, F. Liu, and D. Li, “SignGD with error feedback
+meets lazily aggregated technique: Communication-efficient algorithms
+for distributed learning,” Tsinghua Science and Technology, vol. 27,
+no. 1, pp. 174–185, 2022.
+[23] S. Horváth and P. Richtárik, “A better alternative to error feedback for
+communication-efficient distributed learning,” in International Conference on Learning Representations, 2021.
+[24] S. U. Stich, “Local SGD converges fast and communicates little,” in
+International Conference on Learning Representations, 2019.
+[25] T. Vogels, S. P. Karimireddy, and M. Jaggi, “PowerSGD: Practical lowrank gradient compression for distributed optimization,” in Advances in
+Neural Information Processing Systems, vol. 32. Curran Associates,
+Inc., 2019, pp. 14 236–14 245.
+[26] H. Wang, S. Sievert, Z. Charles, S. Liu, S. Wright, and D. Papailiopoulos, “ATOMO: Communication-efficient learning via atomic
+sparsification,” in Advances in Neural Information Processing Systems,
+2018, pp. 9872–9883.
+[27] C. Li, G. Li, and P. K. Varshney, “Communication-efficient federated
+learning based on compressed sensing,” IEEE Internet of Things Journal,
+vol. 8, no. 20, pp. 15 531–15 541, 2021.
+[28] Z. Tang, S. Shi, X. Chu, W. Wang, and B. Li, “Communicationefficient distributed deep learning: A comprehensive survey,” CoRR, vol.
+abs/2003.06307, 2020.
+[29] J. Bernstein, Y. Wang, K. Azizzadenesheli, and A. Anandkumar,
+“signSGD: Compressed optimisation for non-convex problems,” in Proceedings of the 35th International Conference on Machine Learning,
+vol. 80. PMLR, 2018, pp. 559–568.
+[30] F. Seide, H. Fu, J. Droppo, G. Li, and D. Yu, “1-bit stochastic gradient
+descent and its application to data-parallel distributed training of speech
+DNNs,” in Fifteenth Annual Conference of the International Speech
+Communication Association, 2014, pp. 1058–1062.
+[31] X. Fan, Y. Wang, Y. Huo, and Z. Tian, “1-bit compressive sensing for
+efficient federated learning over the air,” IEEE Transactions on Wireless
+Communications, vol. 22, no. 3, pp. 2139–2155, 2022.
+[32] F. Faghri, I. Tabrizian, I. Markov, D. Alistarh, D. M. Roy, and
+A. Ramezani-Kebrya, “Adaptive gradient quantization for data-parallel
+
+12
+
+SGD,” in Advances in Neural Information Processing Systems, vol. 33,
+2020, pp. 3174–3185.
+[33] J. Wangni, J. Wang, J. Liu, and T. Zhang, “Gradient sparsification
+for communication-efficient distributed optimization,” in Advances in
+Neural Information Processing Systems, 2018, pp. 1306–1316.
+[34] S. P. Karimireddy, Q. Rebjock, S. Stich, and M. Jaggi, “Error feedback
+fixes signSGD and other gradient compression schemes,” in International Conference on Machine Learning, 2019, pp. 3252–3261.
+[35] C. Xie, S. Zheng, S. Koyejo, I. Gupta, M. Li, and H. Lin, “CSER:
+Communication-efficient SGD with error reset,” in Advances in Neural
+Information Processing Systems, vol. 33, 2020, pp. 12 593–12 603.
+[36] O. Shamir, N. Srebro, and T. Zhang, “Communication-efficient distributed optimization using an approximate newton-type method,” in
+International Conference on Machine Learning, 2014, pp. 1000–1008.
+[37] H. Hendrikx, L. Xiao, S. Bubeck, F. R. Bach, and L. Massoulié,
+“Statistically preconditioned accelerated gradient method for distributed
+optimization,” in International Conference on Machine Learning, vol.
+119. PMLR, 2020, pp. 4203–4227.
+[38] T. Lin, S. U. Stich, K. K. Patel, and M. Jaggi, “Don’t use large
+mini-batches, use local SGD,” in International Conference on Learning
+Representations, 2019.
+[39] W. Li, Z. Wu, T. Chen, L. Li, and Q. Ling, “Communication-censored
+distributed stochastic gradient descent,” IEEE Transactions on Neural
+Networks and Learning Systems, pp. 1–13, 2021.
+[40] L. Wang, W. Wang, and B. Li, “CMFL: Mitigating communication
+overhead for federated learning,” in 39th IEEE International Conference
+on Distributed Computing Systems, ICDCS 2019. IEEE, 2019, pp. 954–
+964.
+[41] A. Paszke, S. Gross, F. Massa, A. Lerer, J. Bradbury, G. Chanan,
+T. Killeen, Z. Lin, N. Gimelshein, L. Antiga, A. Desmaison, A. Köpf,
+E. Yang, Z. DeVito, M. Raison, A. Tejani, S. Chilamkurthy, B. Steiner,
+L. Fang, J. Bai, and S. Chintala, “PyTorch: An imperative style, highperformance deep learning library,” in Advances in Neural Information
+Processing Systems, 2019, pp. 8024–8035.
+[42] Y. LeCun, L. Bottou, Y. Bengio, and P. Haffner, “Gradient-based learning
+applied to document recognition,” Proceedings of the IEEE, vol. 86,
+no. 11, pp. 2278–2324, 1998.
+[43] A. Krizhevsky, G. Hinton et al., “Learning multiple layers of features
+from tiny images,” pp. 32–33, 2009.
+[44] K. He, X. Zhang, S. Ren, and J. Sun, “Deep residual learning for image
+recognition,” in Proceedings of the IEEE conference on computer vision
+and pattern recognition, 2016, pp. 770–778.
+[45] M. Hardt, B. Recht, and Y. Singer, “Train faster, generalize better:
+Stability of stochastic gradient descent,” in International Conference on
+Machine Learning, M. F. Balcan and K. Q. Weinberger, Eds., vol. 48.
+PMLR, 2016, pp. 1225–1234.
+[46] T. Sun, D. Li, and B. Wang, “Stability and generalization of decentralized stochastic gradient descent,” in Proceedings of the AAAI Conference
+on Artificial Intelligence, vol. 35, 2021, pp. 9756–9764.
+[47] X. Deng, T. Sun, S. Li, and D. Li, “Stability-based generalization
+analysis of the asynchronous decentralized SGD,” in Proceedings of
+the AAAI Conference on Artificial Intelligence, vol. 37, 2023, pp. 7340–
+7348.
+
