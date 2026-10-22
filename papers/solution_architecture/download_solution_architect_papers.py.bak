@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Download papers related to solution architecture/solution architect.
+
+Queries (phrase-based to reduce noise):
+- "solution architect"
+- "solution architecture"
+- "software architecture" (overlap, but targeted)
+- "enterprise architecture" (broader context)
+- "application architecture"
+
+Filters:
+- Publication year 2015-2026
+- Prefer Open Access PDFs
+- Deduplicate by OpenAlex ID and normalized title
+- Skip event-related ERP noise (rare here, but safe)
+
+Outputs in papers/solution_architecture/:
+- papers.csv, papers.jsonl
+- <openalex_id>.pdf
+- unavailable.json, failed.csv, download_summary.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+OUT_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(OUT_DIR, "papers.csv")
+JSONL_PATH = os.path.join(OUT_DIR, "papers.jsonl")
+FAILED_PATH = os.path.join(OUT_DIR, "failed.csv")
+UNAVAILABLE_PATH = os.path.join(OUT_DIR, "unavailable.json")
+SUMMARY_PATH = os.path.join(OUT_DIR, "download_summary.json")
+
+API_BASE = "https://api.openalex.org"
+UA = "solution-arch-downloader/1.0 (mailto:noman@example.com)"
+ARXIV_SOURCE = "S4306400194"  # arXiv
+
+# Phrase queries
+QUERIES = [
+    '"solution architect"',
+    '"solution architecture"',
+    '"software architecture design"',
+    '"application architecture"',
+    '"enterprise architecture"',
+]
+
+MAX_PER_QUERY = 200  # enough to get OA hits
+TARGET = 200  # download up to 200 OA PDFs by default
+
+def norm_title(t: str | None) -> str:
+    if not t: return ""
+    s = t.lower()
+    s = re.sub(r'\s+', ' ', s)
+    s = re.sub(r'[^a-z0-9 ]', '', s)
+    return s.strip()
+
+def openalex_get(url: str, params: dict | None = None, retries: int = 5):
+    if params:
+        qs = urllib.parse.urlencode(params)
+        url = f"{url}?{qs}"
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    for i in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                return data
+        except Exception as e:
+            wait = i * 2
+            print(f"GET failed ({i}/{retries}): {e}; retry in {wait}s")
+            time.sleep(wait)
+    raise RuntimeError(f"Failed to GET {url}")
+
+def fetch_oa_pdf(work: dict) -> str | None:
+    # 1) best_oa_location
+    loc = work.get("best_oa_location") or {}
+    if loc.get("pdf_url"):
+        return loc["pdf_url"]
+    # 2) locations
+    for l in work.get("locations", []):
+        if l.get("pdf_url"):
+            return l["pdf_url"]
+    return None
+
+def main(target: int = TARGET, year_min: int = 2015, year_max: int = 2026):
+    seen_id, seen_title = set(), set()
+    collected = []  # list of work dicts
+    unavailable = []
+
+    for q in QUERIES:
+        print(f"Querying: {q}  ({year_min}-{year_max})")
+        params = {
+            "filter": f"from_publication_date:{year_min}-01-01,to_publication_date:{year_max}-12-31,language:en",
+            "search": q,
+            "per-page": 200,
+            "sort": "cited_by_count:desc",
+            "select": "id,display_name,publication_year,doi,cited_by_count,primary_location,locations,best_oa_location,host_venue,open_access",
+        }
+        data = openalex_get(f"{API_BASE}/works", params)
+        for w in data.get("results", []):
+            wid = w.get("id", "")
+            if wid in seen_id: continue
+            nt = norm_title(w.get("display_name"))
+            if nt and nt in seen_title: continue
+            # quick filter: must relate to solution architecture in a general sense
+            # keep as-is; mostly relevant
+            seen_id.add(wid); seen_title.add(nt)
+            pdf = fetch_oa_pdf(w)
+            if pdf:
+                w["_pdf_url"] = pdf
+                collected.append(w)
+            else:
+                unavailable.append({"id": wid, "title": w.get("display_name"), "year": w.get("publication_year")})
+        time.sleep(0.5)
+
+    # sort by citations desc
+    collected.sort(key=lambda x: x.get("cited_by_count", 0) or 0, reverse=True)
+    collected = collected[:target]
+
+    print(f"Collected OA candidates: {len(collected)} (target {target})")
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    with open(UNAVAILABLE_PATH, "w", encoding="utf-8") as f:
+        json.dump(unavailable, f, indent=2)
+
+    fieldnames = ["rank", "id", "doi", "title", "year", "citations", "pdf_url", "openalex_url"]
+    with open(CSV_PATH, "w", newline="", encoding="utf-8") as cf, open(JSONL_PATH, "w", encoding="utf-8") as jf:
+        wcsv = csv.DictWriter(cf, fieldnames=fieldnames)
+        wcsv.writeheader()
+        for i, wk in enumerate(collected, 1):
+            rec = {
+                "rank": i,
+                "id": wk.get("id"),
+                "doi": wk.get("doi"),
+                "title": wk.get("display_name"),
+                "year": wk.get("publication_year"),
+                "citations": wk.get("cited_by_count"),
+                "pdf_url": wk.get("_pdf_url"),
+                "openalex_url": wk.get("id"),
+            }
+            wcsv.writerow(rec)
+            jf.write(json.dumps(wk) + "\n")
+
+    failed = []
+    ok = 0
+    def dl(iwk):
+        i, wk = iwk
+        oid = wk.get("id", "").rsplit("/", 1)[-1]
+        out = os.path.join(OUT_DIR, f"{oid}.pdf")
+        if os.path.exists(out) and os.path.getsize(out) > 1000:
+            return ("skip", oid, None)
+        url = wk.get("_pdf_url")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=120) as r, open(out, "wb") as f:
+                f.write(r.read())
+            return ("ok", oid, None)
+        except Exception as e:
+            return ("fail", oid, str(e))
+
+    items = list(enumerate(collected))
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for res in as_completed(ex.submit(dl, x) for x in items):
+            st, oid, err = res.result()
+            if st == "ok":
+                ok += 1; print(f"  [{ok}] {oid}.pdf")
+            elif st == "fail":
+                failed.append({"id": oid, "error": err}); print(f"  FAIL {oid}: {err}")
+            # skip silent
+
+    with open(FAILED_PATH, "w", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=["id", "error"]).writeheader()
+        for x in failed: csv.DictWriter(f, fieldnames=["id", "error"]).writerow(x)
+
+    summary = {"total_collected_oa": len(collected), "downloaded": ok, "failed": len(failed), "skipped_existing": len(collected)-ok-len(failed)}
+    with open(SUMMARY_PATH, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"Done. Downloaded {ok}/{len(collected)} PDFs. Failed {len(failed)}. See {OUT_DIR}")
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--target", type=int, default=TARGET)
+    args = ap.parse_args()
+    main(args.target)
