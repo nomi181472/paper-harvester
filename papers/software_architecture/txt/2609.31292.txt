@@ -1,0 +1,1469 @@
+Dynamic Sampling for Telemetry in Microservices:
+A Reinforcement Learning and Entropy-Based
+Approach
+
+arXiv:2609.31292v1 [cs.NI] 25 Sep 2026
+
+Renan Martins Alves1 , Jéferson Campos Nobre1 ,
+Juliano Araujo Wickboldt1*
+1*
+
+Federal University of Rio Grande do Sul, UFRGS, Av. Bento
+Gonçalves 9500, Porto Alegre, 90046-900, RS, Brazil.
+
+*Corresponding author(s). E-mail(s): jwickboldt@inf.ufrgs.br;
+Contributing authors: rmalves@inf.ufrgs.br; jcnobre@inf.ufrgs.br;
+Abstract
+Microservices architectures are increasingly deployed in cloud-based distributed
+environments, making application development and maintenance more dynamic,
+but also increasing the complexity of troubleshooting and observability. Distributed tracing tools are therefore essential for request analysis and debugging,
+despite introducing additional overhead that can be amplified by excessive and
+inefficient data collection. This article proposes RADAR (Reinforcement Learning Agent for Dynamic And Relevant trace sampling), an agent that combines
+reinforcement learning with a data entropy assessment to achieve more efficient
+capture of traces relevant to system monitoring, based on the OpenTelemetry
+standard. RADAR tests different sampling rules to discover which combination
+is most efficient. A test environment simulating a minimalist online store with
+several microservices distributed across a Kubernetes cluster served as the basis
+for the experiments, which evaluated the agent’s convergence and the system’s
+performance in terms of resource consumption and collected data quality. Results
+showed that RADAR reduced network bandwidth consumption by 97.4% and
+CPU usage by 99.0% compared to full data collection, also outperforming a fixedrate sampling baseline. Beyond these resource savings, the approach preserved
+observability of critical scenarios, retaining approximately 85.6% of rare trace
+patterns and increasing the average entropy of the stored information by approximately 25%, validating the feasibility of using entropy to orchestrate telemetry
+autonomously and efficiently.
+
+1
+
+Keywords: Microservices, Distributed Tracing, OpenTelemetry, Reinforcement
+Learning, Entropy, Autonomic Computing
+
+1 Introduction
+The transition from monolithic architectures to microservices has allowed organizations to increase development agility and application scalability [1]. However,
+this transition has also increased the complexity of performing system observability
+tasks [2]. In microservices environments, a single user request may traverse dozens of
+independent services, making distributed tracing an indispensable tool for understanding execution flow and diagnosing latent failures [2]. OpenTelemetry has emerged as
+an open standard that enables the generation, collection, and export of telemetry data
+across a wide range of languages and platforms, allowing end-to-end request tracing.
+Despite its importance, collecting traces in full at large scale is infeasible: the resulting data volume can overwhelm network bandwidth, consume excessive CPU cycles
+for processing, and lead to prohibitive storage costs [3]. To mitigate this problem, sampling strategies are applied. Traditional methods, such as probabilistic head-sampling,
+decide whether to discard data at the beginning of a transaction, failing to capture
+rare events or errors that only manifest later in the flow. Tail-sampling, in turn, allows
+for more informed decisions, but its manual configuration is rigid and unable to adapt
+to the dynamic load and behavior variations typical of cloud environments [4]. Robust
+solutions such as Hindsight [3], which generates and retains all traces locally and only
+forwards them to the collector once an anomaly is detected, or the work of Las-Casas
+et al. [5], which clusters similar and common traces into tree nodes and prioritizes their
+discard when resources need to be freed, still leave notable gaps, such as rigid trigger
+definitions for anomalies or a lack of compatibility with more modern observability
+tooling.
+The decision of which traces to retain depends on (i) the dynamic characteristics
+of traffic, (ii) the occurrence of errors and anomalies, and (iii) the diversity and informational richness of the executed paths. This decision must be made continuously,
+since system behavior changes over time; static, manually defined sampling heuristics are unable to adapt efficiently to complex and variable scenarios. This leads to
+the central challenge addressed in this work: how to significantly reduce the volume of traces collected in distributed systems while preserving the high
+informational value required for observability?
+In this scenario, there is a need for observability mechanisms that can
+autonomously select the most relevant data. This work proposes RADAR (Reinforcement Learning Agent for Dynamic And Relevant trace sampling), a framework
+that uses Reinforcement Learning (RL) to dynamically adjust sampling policies in
+OpenTelemetry collectors. RADAR uses Shannon entropy as its reward metric,
+allowing the system to prioritize traces that present greater informational diversity,
+while discarding redundant requests that add no diagnostic value.
+
+2
+
+The main objective of this article is to present a dynamic sampling architecture
+capable of selecting, from a catalog of tail-sampling rules, the combination that preserves the traces with the highest diversity and diagnostic utility, balancing operational
+cost against information quality, without relying on statistical heuristics or prior data
+labeling. The main contributions of this work include:
+
+• The RADAR framework: the design and practical implementation of an RL
+agent integrated into the OpenTelemetry ecosystem, capable of adjusting sampling
+policies at runtime;
+• An entropy-based reward metric: a methodology for quantifying the relevance
+of distributed traces, balancing operational cost and information value, without
+requiring prior data labeling;
+• An experimental microservices environment: a test environment with controllable traffic and fault injection, used to evaluate the agent’s convergence and the
+system’s performance.
+The remainder of this article is organized as follows. Section 2 presents the theoretical background on observability, OpenTelemetry, Shannon entropy, and reinforcement
+learning. Section 3 discusses related work on sampling strategies and telemetry optimization. Section 4 describes the proposed methodology, system architecture, and
+problem modeling. Section 5 details the RADAR prototype implementation. Section 6
+presents the experimental evaluation and results. Finally, Section 7 presents concluding
+remarks and directions for future work.
+
+2 Fundamentals
+Distributed systems composed of independent, communicating components have
+become the standard architecture for modern cloud applications, with microservices further decomposing these systems into small, independently deployable services
+that communicate over the network [6, 7]. Containerization, popularized by Docker,
+and orchestration platforms such as Kubernetes are the de facto infrastructure for
+deploying and scaling such systems [8, 9].
+Observability allows the internal state of a complex system to be inferred from data
+exposed externally, overcoming the limitations of traditional metrics and logs in highly
+dynamic microservices environments [2, 10]. Solving this problem requires context
+propagation and automatic correlation between events; the system must be natively
+instrumented to emit traces, logs, and metrics, ensuring the information needed for
+diagnosis is available without further intervention [10]. A widely adopted concept in
+modern observability is the structured event: a record of everything that happened
+during a service’s execution, organized as a map of keys for easy data access. A set
+of related structured events forms a distributed trace, offering a continuous, detailed
+view of a request’s flow from start to end, rather than isolated metrics [10].
+OpenTelemetry has established itself as the standardized framework for collecting
+telemetry data from complex systems, offering tools for logging, metrics, and tracing
+across a wide range of programming languages [10]. Its two central components are
+traces, the record of the complete path taken by a request, and spans, the individual
+
+3
+
+units of work that compose a trace, together providing detailed context for each step of
+execution in a distributed system [10]. Telemetry data is typically collected, processed,
+and exported by an OpenTelemetry Collector, a pipeline composed of receivers (which
+ingest data), processors (which filter, transform, or sample it), and exporters (which
+forward it to one or more observability backends such as Jaeger [11]).
+To optimize processing and storage costs without compromising observability, sampling techniques are employed [4]. Head-based sampling decides whether to collect a
+trace at the very start of a request, which is simple and inexpensive but lacks the
+context of the complete request. Tail-based sampling, in contrast, defers the decision
+until after a trace concludes, enabling more granular and sophisticated criteria, such
+as always retaining traces with errors or abnormal latency, at the cost of buffering all
+of a trace’s spans until the decision is made [4, 10].
+Shannon entropy is a central concept in information theory, introduced by Claude
+E. Shannon in his classic 1948 paper A Mathematical Theory of Communication.
+Shannon formalized communication as the transmission of messages through possibly
+noisy channels and proposed a quantitative measure of the uncertainty associated
+with a source of symbols, which he termed entropy [12]. Formally, consider a discrete
+random variable X taking values in a finite alphabet {x1 , x2 , . . . , xn } with probabilities
+P (xi ). Shannon entropy is defined as [13]:
+
+H (X ) = −
+
+n
+X
+
+P (xi ) logb P (xi )
+
+(1)
+
+i=1
+
+where b is the base of the logarithm (commonly b = 2). Intuitively, this expression
+represents the average amount of information per symbol emitted by the source: rare
+events contribute more information (a larger − log P (xi )), while highly probable events
+contribute less. Entropy is always non-negative, equals zero only when the source is
+deterministic, and reaches its maximum value logb n when all symbols are equally
+likely, characterizing the state of maximum uncertainty. Beyond telecommunications,
+Shannon entropy is widely used in statistics and machine learning as a measure of
+disorder, spread, or uncertainty in complex systems [14].
+Reinforcement learning (RL) is a machine learning approach in which an agent
+learns to make decisions through trial and error, interacting with an environment and
+receiving reward signals in response to its actions. Unlike supervised learning, where a
+model is given correct labels for each example, in RL the agent receives only a scalar
+feedback signal (the reward) and must discover, from that signal alone, a decision
+policy that maximizes the cumulative return over time [15].
+The classical RL setting is formalized as a Markov Decision Process (MDP),
+described by a set of states, a set of actions, a state-transition function, and a reward
+function. At each time step t, the agent observes a state st , selects an action at according to a policy π (a|s), and the environment responds with a scalar reward rt+1 and
+a new state st+1 ; the agent’s objective is to maximize the expected return, typically
+the discounted sum of future rewards. This scheme highlights the three central components of RL: the agent (who decides), the environment (with which it interacts),
+
+4
+
+and the reward (the signal that guides learning) [15]. The agent implements the decision policy, mapping observations to actions, and must balance exploration (trying
+new actions to gather information) and exploitation (leveraging knowledge already
+acquired). The reward function is critical to this process: a poorly designed reward
+can lead the agent to undesirable behavior, even if that behavior is mathematically
+“optimal” for the specified metric [15].
+A relevant special case arises when the environment has no meaningful observable
+state, i.e., the outcome of an action does not depend on any state that changes between
+decisions. This setting is known as a Multi-Armed Bandit, a stateless simplification of
+the MDP in which the agent repeatedly chooses among a fixed set of actions (“arms”)
+to maximize cumulative reward, relying solely on the history of rewards obtained
+rather than on state transitions [15]. This formulation is particularly suited to problems
+where decisions are made independently at each round, without requiring the agent
+to track or infer an evolving system state.
+Reinforcement learning agents such as RADAR’s are increasingly used to realize
+autonomic management loops, in which a system monitors itself, analyzes and plans
+corrective or adaptive actions, and executes them with minimal human intervention.
+This pattern is commonly described by the MAPE-K reference model [16]: a Monitor stage collects data about the managed system, an Analyze stage derives relevant
+metrics or symptoms, a Plan stage decides on an adaptation, and an Execute stage
+applies it, with a shared Knowledge base persisting across cycles. Recent network
+and service management research applies this pattern with RL agents that periodically reconfigure a system to meet a management objective – for example, dynamically
+tuning routing, traffic blocking, and scaling to satisfy end-to-end performance objectives on a service mesh [17], or combining attention-based workload forecasting with
+policy-gradient RL for SLA-aware autoscaling in edge-cloud environments [18].
+
+3 Related Work
+Beyond adaptive sampling strategies, distributed tracing has increasingly become a
+first-class data source for network and service management research. Recent work uses
+trace data for root-cause localization of microservice anomalies, aggregating invocations at the operation level and ranking candidate root causes with a personalized
+PageRank algorithm [19], and for anomaly detection via a dual autoencoder that
+jointly models the structural and temporal properties of service invocation graphs [20].
+These works illustrate the growing role of tracing infrastructure in network and service management, but both assume traces have already been fully collected; RADAR
+instead addresses the complementary, upstream problem of deciding which traces are
+worth collecting in the first place.
+Las-Casas et al. propose increasing the probability of collecting unique traces by
+computing the Euclidean distance between traces represented as numerical vectors
+derived from event graphs [5]. Using this distance metric, traces are organized via
+hierarchical clustering into a tree, with frequent events forming deep branches and
+rare traces remaining close to the root. Sampling is performed by having the algorithm
+walk randomly from the root to a leaf, which favors selecting the rare traces near the
+
+5
+
+root. Although this approach exploits the structural diversity of the data, it depends
+on static clustering algorithms and a custom vector representation. In contrast, this
+work replaces the fixed heuristic with a reinforcement learning agent that adapts
+its policy dynamically, operating directly on standard OpenTelemetry infrastructure
+without requiring complex data conversions.
+Poghosyan et al. initially combine head- and tail-sampling to reduce the volume of
+data passed to their proposed solution [21]. The remaining data then undergoes a noisereduction step in which rare traces are discarded and common ones preserved, since
+recurring errors are more likely to explain a systemic failure; the data is subsequently
+converted into tabular form and fed into a machine learning system (RIPPER), which
+generates simple rules pointing to failure conditions, each weighted by DempsterShafer theory to measure its uncertainty. In contrast to this noise-reduction step,
+which actively discards rare events, the approach proposed here seeks to maximize
+entropy specifically to capture rare and anomalous cases; it also replaces static rule
+generation with a continuous, reward-guided feedback loop, eliminating the need to
+convert hierarchical traces into flat tables for processing.
+Luo et al. propose a blame-proportional logging system that uses lightweight triggers to detect the first occurrence of a problem at low cost, then assigns a blame
+ranking to the application’s methods, indicating each one’s likelihood of being relevant
+to the root cause [22]. Once a problem is detected, the system activates heavy logging
+only on the methods most likely to be responsible, combining continuous low-cost monitoring, an analysis of the request’s call graph, and specific criteria for exceptions or
+performance issues. This strategy concentrates aggressive data collection only where
+it is needed. In contrast, while this approach relies on manually defined declarative
+triggers and dynamic runtime instrumentation, the present work proposes a partially
+autonomous solution based on multiple rules and on entropy as a universal signal of
+interest, acting solely on the telemetry collector’s sampling configuration.
+Sharma and Nadig propose using kernel-level observability via eBPF for distributed
+systems [23]. eBPF agents are deployed on every node of the cluster, collecting detailed
+system metrics directly from the operating system kernel and exposing tracing points
+that are not accessible from user space; distributed tracing is then performed using the
+eBPF library Deepflow, which natively parses kernel network packets to extract tracing
+headers, producing complete distributed traces without requiring a user-space proxy.
+While this approach provides deep visibility, it requires privileged kernel access, which
+makes it unsuitable for many managed container environments. This work differs by
+operating entirely in user space through OpenTelemetry, ensuring greater portability,
+and by adding an active intelligence layer to optimize data volume, whereas the eBPFbased solution focuses primarily on passive metrics collection.
+Targeting a different domain, Luo et al. propose Hubble, which addresses method
+tracing for rare, intermittent problems on Android devices, where production overhead
+is a critical constraint [24]. Hubble uses just-in-time tracing to continuously record
+tracing data in a circular in-memory queue, where older data is constantly overwritten; this queue is only persisted to disk when the system’s anomaly detector fires,
+preserving the crucial execution history that led to the problem. To achieve near-zero
+performance overhead, Hubble relies on aggressive low-level optimizations, inserting
+
+6
+
+tracing logic directly into each method’s compiled code through modifications to the
+Android compiler, with the most performance-critical code hand-written in assembly.
+The key distinction lies in domain and applicability: Hubble is a highly specialized
+solution for mobile devices that requires invasive compiler and hand-written assembly
+modifications, whereas the present work targets microservice orchestration in cloud
+backends, prioritizing compatibility with industry standards and language-agnostic
+instrumentation, without requiring low-level component rewrites.
+Zhang et al. propose Hindsight, a distributed tracing system designed to efficiently
+and reliably capture edge cases in large-scale environments [3]. Hindsight is based on
+retroactive sampling: all spans are generated locally, but only collected and forwarded
+to the backend once a symptom of anomaly is detected, through programmable triggers
+that identify, for example, elevated latency, errors, or anomalous behavior. Hindsight
+retroactively recovers the data belonging to the problematic request by querying distributed agents that temporarily buffer spans in memory. The authors show that,
+by decoupling trace generation from ingestion, the system captures nearly all rare
+cases with minimal impact on application performance, operating with nanosecondscale latency per generated event, and that it is compatible with existing APIs such
+as OpenTelemetry and X-Trace. Despite this compatibility, Hindsight operates reactively, depending on predefined anomaly triggers to decide what data to preserve;
+the present work advances this by using reinforcement learning to proactively discover which traces are relevant through entropy maximization, capturing scenarios of
+interest that would not activate a conventional static trigger.
+Table 1 summarizes these related approaches alongside RADAR, highlighting the
+conceptual and technical differences in sampling and observability strategy. Unlike the
+existing solutions, RADAR combines reinforcement learning with entropy maximization to perform dynamic adjustments without relying on manual triggers or invasive
+instrumentation. Its native compatibility with OpenTelemetry further distinguishes it
+from approaches based on static heuristics, predefined rules, or reactive mechanisms,
+reinforcing its original contribution in the context of adaptive telemetry sampling.
+
+4 Proposal
+This section describes the methodological approach adopted for the design and implementation of RADAR (Reinforcement Learning Agent for Dynamic And Relevant
+trace sampling). The methodology rests on four pillars: (1) grounding in observability standards; (2) formalizing the sampling problem as an RL environment; (3) using
+Shannon entropy as the informational relevance metric; and (4) implementing an automated feedback loop on containerized infrastructure. The central goal is to let the
+system autonomously learn which sets of sampling rules preserve the data with the
+highest diagnostic utility, reducing observability cost.
+
+4.1 RADAR system architecture
+The proposed architecture relies on a closed feedback loop connecting the monitored
+application to an autonomous decision-making pipeline, as illustrated in Figure 1.
+The Distributed Application generates traces during normal operation, which are
+7
+
+Table 1 Comparison between related work and RADAR
+Related
+Work
+
+RL
+
+Prioritizes
+rare traces
+
+Dynamic
+Triggers
+
+OTel
+Compatible
+
+Microservices
+
+This work
+(RADAR)
+
+✓
+
+✓
+
+✓
+
+✓
+
+✓
+
+Weighted
+Sampling [5]
+
+×
+(clustering)
+
+✓
+
+✓
+
+×
+(custom)
+
+✓
+
+DiagnosisEffective [21]
+
+×
+(rules/ML)
+
+×
+(discards rare)
+
+✓
+
+×
+
+✓
+
+BlameProportional [22]
+
+×
+
+×
+
+×
+
+×
+(dynamic instr.)
+
+✓
+
+eBPFEnhanced [23]
+
+×
+
+×
+
+✓
+
+✓
+
+✓
+
+Hubble [24]
+
+×
+
+×
+
+×
+
+×
+(custom)
+
+×
+(Android)
+
+Hindsight [3]
+
+×
+
+✓
+
+×
+
+✓
+
+✓
+
+Distributed
+Application
+
+Generates
+Traces
+
+OpenTelemetry
+Collector
+
+Exports
+Traces
+
+Tracing Backend
+
+Persists
+Traces
+
+Updates
+Configurations
+
+Rules Manager
+
+Database
+
+Queries Trace
+Information
+
+Calculates
+Rewards
+
+Reinforcement
+Learning Agent
+
+Feeds Trace
+Information
+
+Metrics Extractor
+
+Fig. 1 RADAR architecture: the Distributed Application’s traces flow through the OpenTelemetry
+Collector to a Tracing Backend and Database; the Metrics Extractor queries this data to compute
+entropy and volume statistics for the Reinforcement Learning Agent, which selects a new sampling
+policy; the Rules Manager then applies this decision as an updated Collector configuration, closing
+the loop.
+
+exported to an OpenTelemetry Collector enforcing the currently active sampling
+rules. The Collector exports the resulting traces to a Tracing Backend, which persists them in a Database. A Metrics Extractor queries this database to compute
+statistical features of the collected traces – namely their entropy and volume – and
+feeds this information to the Reinforcement Learning Agent. The agent uses these
+statistics to compute the reward (Eq. (2)) and select a new subset of sampling policies
+from its catalog. Finally, a Rules Manager translates the agent’s decision into an
+updated configuration for the OpenTelemetry Collector, closing the loop for the next
+episode. The concrete tools implementing the Tracing Backend, Database, and Rules
+Manager are described in Section 5.
+
+8
+
+This architecture instantiates the classical MAPE-K autonomic control loop [16]:
+the OpenTelemetry Collector and Tracing Backend/Database jointly realize the Monitor stage, continuously collecting traces from the Distributed Application; the Metrics
+Extractor performs the Analyze stage, deriving entropy and volume statistics from the
+raw trace data; the Reinforcement Learning Agent realizes the Plan stage, using the
+reward signal (Eq. (2)) to select a new sampling configuration; and the Rules Manager performs the Execute stage, applying this configuration back to the Collector.
+The agent’s learned policy probabilities (Section 5) act as the shared Knowledge that
+persists and is refined across episodes.
+
+4.2 Reinforcement learning problem formalization
+As RADAR acts on the telemetry collector’s global configuration without observing
+the environment’s prior state (such as the exact CPU usage, memory, or traffic volume
+at the moment of decision), the adaptive sampling challenge does not constitute a
+traditional Markov Decision Process (MDP): there is no observable state on which
+the agent could condition its decisions, and therefore no state transition for it to
+learn. Instead, the problem is formalized as a combinatorial Multi-Armed Bandit,
+defined by the tuple (A, R): an action space A and a reward function R.
+To solve this problem, we adapt the REINFORCE policy-gradient algorithm
+to a stateless setting, in which the agent learns the best probability distribution for
+selecting rule combinations based solely on the history of rewards obtained.
+The action space A is discrete and combinatorial. RADAR maintains a predefined
+catalog of N independent sampling policies (e.g., rules based on an error status code,
+latency above a threshold, or business-specific attributes such as cart value). At each
+episode t, the agent’s action at ∈ {0, 1}N consists of selecting a binary vector, where
+each position i indicates whether the corresponding policy is active (at,i = 1) or
+inactive (at,i = 0) in the OpenTelemetry Collector’s configuration. Listing 1 shows an
+example of one such policy, expressed as the JSON rule the Collector consumes. The
+probability of selecting each rule is maintained internally by the agent and updated
+via gradient ascent.
+Listing 1 Example sampling policy (a latency-based rule)
+
+{
+‘ name ’ : ‘ l a t e n c y − p o l i c y −500ms ’ ,
+‘ type ’ : ‘ l a t e n c y ’ ,
+‘ l a t e n c y ’ : { ‘ t h r e s h o l d m s ’ : 500 }
+
+}
+The reward function R is the core of this methodology, designed to balance
+information richness against operational cost. It is formalized as:
+
+R = α · H (X ) − β · P (n)
+
+(2)
+
+where H (X ) is the Shannon entropy of the collected traces (Eq. (1)), measuring the
+diversity of the information gathered – higher entropy indicates the system is collecting varied, rare traces rather than repeating common, trivial paths. P (n) is a
+9
+
+volume penalty – a sigmoid- or logistic-shaped function of the number of collected
+traces n – designed to keep the collected volume under an acceptable threshold C : the
+penalty stays low while n ≪ C , but grows sharply as n approaches C . Through gradient ascent, the agent increases the probability of selecting rule combinations that
+yield high entropy at low volume. α and β are weighting hyperparameters that control the trade-off between information diversity and resource savings: increasing α
+adapts RADAR to environments more tolerant of cost, while increasing β suits highly
+resource-constrained environments.
+
+4.3 Informational relevance via entropy
+To quantify data usefulness without human supervision, RADAR relies on Shannon
+entropy (Section 2). In the context of telemetry, entropy measures the variability of
+execution paths. To compute it, traces – complex trees of spans – are converted into
+deterministic textual representations. This conversion involves hierarchically ordering
+the spans and filtering out irrelevant high-cardinality attributes (such as dynamic IP
+addresses); additionally, continuous values such as latency are discretized into intervals
+(buckets) to prevent natural network variation from artificially inflating the metric.
+The final entropy is computed over the frequency distribution of these unique trace
+representations, allowing the agent to prioritize anomalous behavior.
+
+4.4 Training loop
+RADAR’s training proceeds as an iterative, episode-based process. At the start of each
+episode, the agent selects a new sampling configuration according to its current policy
+probabilities. This configuration is then deployed to the telemetry collector, and the
+system waits for a stabilization period before beginning measurement, ensuring the
+new configuration is fully active (the mechanics of this deployment step are detailed
+in Section 5). Traces collected under the new policy during this window are converted
+into their textual representations and used to compute the frequency distribution –
+and hence the entropy H (X ) – of the observed data, alongside the collected volume n.
+The resulting reward R is then used to update the agent’s rule-selection probabilities
+via gradient ascent, increasing the likelihood of selecting combinations that yield high
+entropy at low volume in future episodes.
+
+5 Prototype
+This section details the software implementation of the proposed system, translating the mathematical and architectural models described in Section 4 into functional
+components. The implementation is written in Python, using libraries for container
+orchestration (Kubernetes), numerical computation (NumPy), and interaction with
+the observability backend (Elasticsearch).
+
+10
+
+5.1 Experimental infrastructure
+RADAR’s software components are deployed alongside a standard distributed tracing
+stack, illustrated in the top panel of Figure 3. Traces generated by the monitored application are received by an OpenTelemetry Collector, which applies the currently
+active sampling rules and exports the retained traces to Jaeger – the concrete Tracing
+Backend introduced in Section 4 – for storage and visualization. Jaeger persists trace
+data in Elasticsearch, which serves as the Database queried by the Metrics Extractor (es utils.py). The RADAR modules (agent.py, manager.py, and es utils.py)
+close the loop by querying Elasticsearch, computing the reward, and updating the
+Collector’s configuration through the Rules Manager, as detailed below. The full stack
+– application, tracing backend, and RADAR modules – can be deployed locally via
+Docker Compose or across a Kubernetes cluster; the experiments reported in Section 6
+used the Kubernetes deployment.
+
+5.2 RADAR implementation
+The codebase is organized into three main modules: the RADAR agent (agent.py),
+the Rules Manager (manager.py), and the Metrics Extractor (es utils.py).
+The system’s decision-making core is encapsulated in the ReinforceAgent class.
+Rather than a traditional Q-learning approach with tables over discrete state spaces,
+RADAR implements the REINFORCE policy-gradient algorithm, adapted to the
+combinatorial Multi-Armed Bandit formulation introduced in Section 4, since the
+environment’s “state” does not vary explicitly between iterations – only the active
+policy configuration does.
+The action space is modeled as a vector of independent probabilities, where each
+sampling policy in the catalog (defined in tail sampling policies.json) has a probability pi of being activated. In the select actions method, the decision to activate
+each policy is made through an independent Bernoulli sample for every item in the
+catalog:
+Listing 2 Action selection
+
+i f np . random . rand ( ) < s e l f . p r o b s [ i ] :
+s e l e c t e d . append ( p o l i c y )
+a c t i o n s . append ( 1 )
+To encourage exploration and avoid premature convergence to local minima, probabilities are clipped to the [0.01, 0.99] range during the update step, ensuring no policy
+is ever permanently disabled or permanently fixed.
+The update rule applies gradient ascent to adjust these probabilities based on the
+received reward. A baseline, computed as an exponential moving average (EMA) of
+past rewards, is used to reduce the variance of the gradient estimate and stabilize
+learning:
+At = Rt − bt ,
+bt = γ · bt−1 + (1 − γ ) · Rt
+(3)
+where At is the advantage at step t – positive if the chosen action performed better than
+the agent’s recent historical average, negative otherwise – Rt is the reward returned for
+the current episode (Eq. (2)), and bt is the EMA baseline, with γ (baseline decay,
+11
+
+which defaults to 0.9 in our implementation) controlling how much short-term reward
+fluctuations are smoothed. The probability vector is then updated in the direction of
+the estimated policy gradient:
+
+θt+1 = θt + η · At · (at − θt )
+
+(4)
+
+where θt is the vector of per-policy probabilities (self.probs), η is the learning rate
+(lr, which defaults to 0.2 in our implementation), and (at − θt ) approximates the
+gradient direction: if policy i was activated (at,i = 1) under a positive advantage, this
+term pushes θt,i toward 1; if it was not activated (at,i = 0) under a positive advantage,
+its probability is reduced instead.
+
+5.3 Reward function implementation
+The reward function implements the multi-objective logic introduced in Section 4,
+combining a normalized entropy term with a sigmoid-shaped volume penalty:
+Listing 3 Reward function implementation
+
+def t r a c e p e n a l t y ( t r a c e s , C, k=25 , midpoint = 0 . 2 0 ) :
+x = traces / C
+return 1 / ( 1 + math . exp(− k ∗ ( x − midpoint ) ) )
+def reward ( entropy , t r a c e s , a l p h a =1.0 , b e t a =1.0 , C=10000):
+norm entropy = e n t r o p y / 10
+p e n a l t y = t r a c e p e n a l t y ( t r a c e s , C)
+return a l p h a ∗ norm entropy − b e t a ∗ p e n a l t y
+Here, alpha and beta are the α and β weighting hyperparameters of Eq. (2); in this
+implementation they default to α = 1.0 and β = 1.0, with the volume threshold set
+at C = 10,000 traces. The penalty function is a logistic curve 1/(1 + e−k(x−midpoint) ),
+shown in Figure 2 for k = 25 and midpoint = 0.20: it penalizes trace volume mildly
+below the threshold and sharply beyond it, letting RADAR operate freely under the
+cost budget while suffering a strong penalty for exceeding it.
+
+5.4 Metrics extraction and entropy calculation
+Data quality evaluation is performed by the es utils.py module, which queries Elasticsearch to retrieve the traces tagged with the current experiment’s hash. Computing
+Shannon entropy requires converting each trace’s complex, hierarchical span tree into
+a comparable, discrete (string) representation. This is done by the trace to string
+function in three steps: (1) ordering – spans are sorted hierarchically (parents
+before children) and temporally, so the same logical execution always yields the
+same string; (2) noise filtering – high-cardinality attributes irrelevant to behavioral structure (e.g., span.kind, peer port, dynamic IP addresses) are removed
+via a configurable tag blacklist; and (3) quantization – continuous values such
+as latency (duration ms) are discretized into buckets (e.g., 200 ms intervals) by
+quantize value if applicable, preventing small, natural network timing variations
+from being interpreted as distinct behaviors and artificially inflating entropy.
+12
+
+Sigmoid: f(x) = 1 / (1 + e^(-k(x - midpoint))) (midpoint=0.2, k=25)
+
+1.0
+0.8
+
+f(x)
+
+0.6
+0.4
+0.2
+0.0
+
+1.00
+
+0.75
+
+0.50
+
+0.25
+
+0.00
+x
+
+0.25
+
+0.50
+
+0.75
+
+1.00
+
+Fig. 2 Sigmoid penalty function for trace volume.
+
+Once traces are converted into unique strings, their frequency distribution is used
+to compute entropy:
+Listing 4 Entropy calculation
+
+def c a l c u l a t e e n t r o p y ( t r a c e s ) :
+strings = [ ]
+for t r a c e i d , s p a n s in t r a c e s . i t e m s ( ) :
+s = t r a c e t o s t r i n g ( spans )
+s t r i n g s . append ( s )
+i f not s t r i n g s :
+return 0 . 0
+c o u n t e r = Counter ( s t r i n g s )
+t o t a l = sum ( c o u n t e r . v a l u e s ( ) )
+ps = [ c / t o t a l for c in c o u n t e r . v a l u e s ( ) ]
+a l p h a = ENTROPY ALPHA
+
+i f abs ( a l p h a − 1 . 0 ) < 1 e − 12:
+e n t r o p y = −sum ( p ∗ math . l o g 2 ( p ) for p in ps i f p > 0 )
+return e n t r o p y
+sum p alpha = sum ( ( p ∗∗ a l p h a ) for p in ps )
+sum p alpha = max( sum p alpha , 1 e − 300)
+e n t r o p y = ( 1 . 0 / ( 1 . 0 − a l p h a ) ) ∗ math . l o g 2 ( sum p alpha )
+return e n t r o p y
+
+13
+
+Note that this implementation is slightly more general than the Shannon entropy
+defined in Section 2: it computes the Rényi entropy of order ENTROPY ALPHA, which
+reduces exactly to Shannon entropy when ENTROPY ALPHA= 1 – the configuration used
+throughout this work.
+
+5.5 Deployment orchestration
+The manager.py script (the Rules Manager introduced in Section 4) acts as the main
+controller, implementing the experiment’s lifecycle as a continuous loop. It is responsible for interfacing with the Kubernetes API and applying RADAR’s decisions to the
+live environment.
+At the start of each episode, the current collector configuration file must be
+replaced. The generate config function translates RADAR’s abstract decision into
+a manifest the OpenTelemetry Collector understands: it builds a Python dictionary
+mirroring the collector’s required hierarchy (receivers, processors, exporters,
+service sections), injects the list of policies selected by RADAR directly into
+processors → tail sampling → policies, and tags the configuration with a hash
+of the current experiment in processors → attributes – so every trace the collector
+processes is automatically annotated with an experiment hash, letting the Metrics
+Extractor later identify which rule set produced it. The dictionary is then serialized
+to YAML and written to the environment’s Kubernetes ConfigMap.
+Simply updating the ConfigMap is not enough, since running pods do not
+automatically reload static configuration. To force an update without downtime, the system uses the Kubernetes API to patch the Collector’s Deployment
+object, inserting the new configuration hash as a config-hash annotation in
+spec.template.metadata.annotations. Kubernetes interprets any change to the
+Pod template specification – even a metadata-only annotation – as a change to the
+application definition, and automatically triggers a rolling update: a new ReplicaSet
+is created with the updated template, new pods are started gradually (mounting the
+already-updated ConfigMap as they come up), and old pods are terminated only once
+the new ones are ready. manager.py then enters a polling loop against the Kubernetes API, waiting until the number of available replicas matches the desired count,
+ensuring RADAR only begins measuring the environment once the new configuration
+is fully active. Table 2 summarizes this episode lifecycle. The RADAR implementation
+is publicly available at https://github.com/ComputerNetworks-UFRGS/RADAR.
+
+6 Experimental Evaluation
+This section presents the experimental evaluation of RADAR, covering the test environment, the agent’s convergence behavior, resource consumption, and its effectiveness
+at preserving rare, diagnostically valuable traces.
+
+14
+
+Table 2 Implementation flow: RADAR’s episode lifecycle
+Step
+
+Component
+
+Action
+
+1. Initialization
+2. Persistence
+3. Trigger
+
+Python script
+K8s ConfigMap
+K8s API (patch)
+
+4. Orchestration
+5. Stabilization
+
+K8s Controller
+New OTel Pods
+
+Generates the dynamic YAML file + hash.
+Updates the ConfigMap with the new OTel policy.
+Updates the Deployment, injecting the hash into
+its metadata.
+Detects the change and starts the Rolling Update.
+The Collector comes up and starts measuring once
+ready.
+
+6.1 Experimental environment
+RADAR was validated on Minimal Boutique, a microservices-based online store
+distributed across a Kubernetes cluster.1 Minimal Boutique was developed in-house
+by this research group specifically to retain full control over the source code and service topology, allowing an isolated baseline environment in which anomalies detected
+by RADAR could be attributed exclusively to the scenarios produced by the experiment, without noise intrinsic to third-party benchmarks. It is a reduced, optimized
+adaptation of the Google Online Boutique2 reference application, focused specifically
+on generating rich telemetry (distributed traces) for observability experiments. The
+application follows the Database-per-Service pattern, forcing all inter-service communication through HTTP/REST APIs and maximizing the generation of network spans,
+essential for testing the capture of distributed latencies. It comprises seven services –
+a web frontend; a backend acting as API gateway and authentication layer; and the
+products, cart, checkout, payment, and orders services – each implemented in
+Python with Flask and SQLAlchemy, sharing a common OpenTelemetry instrumentation module so that generated telemetry is structurally homogeneous across services.
+The payment service in particular simulates an external payment gateway and interacts with both the orders and cart/backend services to confirm and finalize purchases,
+introducing extra network hops that enrich the generated traces. The bottom panel of
+Figure 3 shows the application’s service topology, including each service’s dedicated
+database, consistent with the Database-per-Service pattern.
+To simulate realistic traffic, Locust3 is configured to generate stochastic load.
+Virtual user behavior is modeled as a Markov chain, transitioning between browsing,
+adding items to the cart, and checkout with different probabilities, weighted to reflect
+a typical sales funnel (browsing most frequent, checkout least). This ensures a heterogeneous mix of telemetry: a large number of simple, repetitive traces and a small
+number of long, complex ones, challenging the agent’s ability to select intelligently.
+
+6.2 Convergence experiments
+To evaluate how the method’s efficiency scales with the number of rules available to the
+agent, four incremental experiments were conducted. Available rules were grouped into
+1
+2
+3
+
+Minimal Boutique is available at https://github.com/ComputerNetworks-UFRGS/minimal-boutique.
+Google Online Boutique is available at: https://github.com/googlecloudplatform/microservices-demo.
+Locust: an open-source load testing tool, https://locust.io/
+
+15
+
+RADAR Experiment Infrastructure
+OTel
+Collector
+
+Locust
+
+Jaeger
+
+Elastic
+
+RADAR
+Modules
+
+Minimal Boutique
+Frontend
+Auth DB
+Backend
+
+Cart DB
+
+Cart
+
+Products
+
+Checkout
+
+Orders
+
+Prod DB
+
+Payment
+
+Ord DB
+
+Fig. 3 RADAR experiment infrastructure and Minimal Boutique architecture. Top: Locust generates load against the application; traces flow from the OpenTelemetry Collector to Jaeger and
+Elasticsearch, from which the RADAR modules compute the reward and update the Collector’s configuration, closing the loop. Bottom: Minimal Boutique’s service topology, with the Frontend routing
+through the Backend (API gateway/authentication) to the Cart, Products, Checkout, Orders, and
+Payment services, each backed by its own database.
+
+three categories: structural rules, related to overall service behavior and performance
+(e.g., latency above 500 ms, traces with more than 20 spans, database queries slower
+than 500 ms, all system errors); probabilistic rules, applied to fixed proportions
+of requests (e.g., 10% or 20% of all traces, 1% of all state-changing requests, 1%
+of all operations on the products service); and business-specific rules, configured
+for scenarios particularly relevant to the application domain (e.g., purchases above
+R$500, declined payments, carts with more than 10 items, orders with more than 4
+items). Table 3 shows the four experiments, each incrementally adding rules from these
+categories.
+Table 3 Rules selected per experiment (incremental)
+Experiment
+1
+2
+3
+4
+
+Selected rules
+
+Total
+
+Latency > 500 ms; 10% probability; purchases > R$500
+Previous experiment’s rules + traces with more than 20 spans;
+20% probability; declined payments
+Previous experiment’s rules + slow database queries; 1% of all
+system-changing operations; more than 10 items in cart
+Previous experiment’s rules + errors; 1% of all operations on the
+products service; more than 4 orders placed
+
+16
+
+3
+6
+9
+12
+
+The following metrics were monitored to assess convergence: cumulative reward,
+indicating RADAR’s performance at optimizing its collection criteria; trace entropy,
+representing the informational diversity that is the work’s central objective; and the
+total number of collected traces, assessing the impact on observability cost.
+Results show that, regardless of the number of rules available, RADAR converged
+to a stable policy, maximizing the reward received over episodes (Figure 4); entropy
+was likewise maximized, converging to a value higher than at the start of the experiment (Figure 5). The experiment with three rules constrained the number of collected
+traces more sharply, having fewer options to explore, while the twelve-rule scenario
+reached higher levels of data richness at the cost of a longer convergence time (Figure 6)
+– interestingly, the twelve-rule configuration ultimately collected more traces than the
+three-rule one, a cost the reward function deemed worth paying in exchange for higher
+entropy in the sampled data. For clarity, only the two most extreme cases (3 and 12
+rules) are shown; the 6- and 9-rule scenarios were also tested and exhibited the same
+trends.
+
+RADAR 3 rules
+RADAR 12 rules
+
+0.8
+
+Reward
+
+0.6
+
+0.4
+
+0.2
+
+0.0
+
+0.2
+0
+
+25
+
+50
+
+75
+
+100
+
+125
+
+150
+
+175
+
+Episode
+
+Fig. 4 Reward convergence with 3 and 12 rules.
+
+6.3 Resource consumption
+To assess resource usage, three collector configurations were run for five hours each:
+a collector storing 100% of received traces; a collector storing a fixed 20% of received
+traces, which is the midpoint value used in the volume penalty function (Eq. (2)), and
+the maximum RADAR could reach before incurring heavy penalties; and RADAR
+itself, selecting policies via the trained agent.
+Figure 7 shows the average outbound bandwidth used by each collector over time.
+RADAR reduced bandwidth to an average of 9 Kbit/s, compared to 344 Kbit/s for
+the 100% collector (a 97.4% reduction) and 73 Kbit/s for the 20% collector (an 87.7%
+
+17
+
+RADAR 3 rules
+RADAR 12 rules
+
+8
+
+Entropy
+
+6
+
+4
+
+2
+
+0
+0
+
+25
+
+50
+
+75
+
+100
+
+125
+
+150
+
+175
+
+Episode
+
+Fig. 5 Entropy convergence with 3 and 12 rules.
+
+RADAR 3 rules
+RADAR 12 rules
+2000
+
+Traces
+
+1500
+
+1000
+
+500
+
+0
+0
+
+25
+
+50
+
+75
+
+100
+
+125
+
+150
+
+175
+
+Episode
+
+Fig. 6 Number of traces collected per episode with 3 and 12 rules.
+
+reduction), which is equivalent to a fixed sampling rule of roughly 2.5%, without the
+probabilistic error-collection component.
+Figure 8 shows the average CPU usage in percentage for each collector. The collector configured to store 100% of traces used roughly an average of 1.99% versus 0.02%
+for RADAR, which represents a 99.0% reduction in CPU usage. In turn, 0.38% was
+the average CPU usage for the 20% collector, against which RADAR still represents a
+94.7% reduction. These significant reductions are explained by the discarding of traces
+that are never processed and forwarded to Jaeger.
+Figure 9 shows average memory usage for the three collector configurations. The
+100% collector used 476 MB on average, while RADAR consumed roughly 200 MB
+
+18
+
+Transmitted Bandwidth in Kbit/s
+
+350
+
+300
+
+250
+
+200
+
+150
+100%
+20%
+RADAR
+
+100
+
+50
+
+0
+0
+
+50
+
+100
+
+150
+
+200
+
+250
+
+300
+
+Time in Seconds
+
+Fig. 7 Bandwidth usage at 100%, 20%, and with RADAR.
+
+2.0
+
+CPU in %
+
+1.5
+
+1.0
+100%
+20%
+RADAR
+
+0.5
+
+0.0
+0
+
+50
+
+100
+
+150
+
+200
+
+250
+
+300
+
+Time in Seconds
+
+Fig. 8 CPU usage at 100%, 20%, and with RADAR.
+
+(representing a 58.0% reduction). Against the 20% collector, which shows an average
+memory usage of 372 MB, RADAR uses 46.2% less memory.
+Figures 10–12 compare RADAR directly against the 100% collector, episode by
+episode. The 100% collector’s reward remained stable around an average of −0.43,
+while RADAR’s reward rose to an average of 0.74, peaking at 0.79 (Figure 10). Average entropy rose from 5.76 (100% collector) to 7.63 with RADAR, an increase of
+approximately 24.5% (Figure 11). The average number of traces collected per episode
+fell from 5,083 (100% collector) to 439 with RADAR, a reduction of approximately
+91.4% (Figure 12).
+
+6.4 Rare trace preservation
+To test whether rare traces were effectively captured, an OpenTelemetry collector was
+configured with two independent processing pipelines: one using RADAR’s selected
+19
+
+600
+
+Memory in MB
+
+500
+
+400
+
+300
+
+200
+
+100
+
+100%
+20%
+RADAR
+
+0
+0
+
+50
+
+100
+
+150
+
+200
+
+250
+
+300
+
+Time in Seconds
+
+Fig. 9 Memory usage at 100%, 20%, and with RADAR.
+
+1.0
+0.8
+0.6
+
+Reward
+
+0.4
+0.2
+0.0
+0.2
+0.4
+RADAR
+100% Collector
+
+0.6
+0
+
+50
+
+100
+
+150
+
+200
+
+250
+
+300
+
+Episode
+
+Fig. 10 Reward evolution: RADAR vs. the 100% collector.
+
+rule set as the optimal configuration, and another configured to collect 100% of traces.
+Each pipeline’s output was tagged with an identifying key, baseline for the full collection, experiment for RADAR’s configuration, to distinguish the two data flows during
+analysis.
+After the collection period, traces from both pipelines were passed through
+RADAR’s classification and normalization functions, converting them into canonical
+textual representations and removing unique variable attributes to reduce noise and
+enable structural comparison. From this classification and normalization, we can distinguish how many unique trace patterns are actually contained within the whole
+dataset (traces with the same canonical representation are considered redundant). In
+addition, the least frequent trace patterns were then ranked from the baseline pipeline’s
+dataset, and their presence was checked in the experiment pipeline’s collected set to
+
+20
+
+10
+
+RADAR
+100% Collector
+
+9
+
+Entropy
+
+8
+
+7
+
+6
+
+5
+
+4
+
+3
+0
+
+50
+
+100
+
+150
+
+200
+
+250
+
+300
+
+Episode
+
+Fig. 11 Entropy comparison: RADAR vs. the 100% collector.
+
+Collected Traces
+
+5000
+
+4000
+
+RADAR
+100% Collector
+
+3000
+
+2000
+
+1000
+
+0
+0
+
+50
+
+100
+
+150
+
+200
+
+250
+
+300
+
+Episode
+
+Fig. 12 Traces collected per episode: RADAR vs. the 100% collector.
+
+compute a coverage percentage. We consider a trace to be rare if it appears only once
+during the entire test run.
+The experiment was run across ten one-hour test cases with the dual pipeline.
+Table 4 shows the average traces collected and how many of those represent unique
+patterns.
+Table 4 Trace summary
+Type
+
+# traces
+
+# unique patterns
+
+baseline
+experiment
+
+484,967
+61,122
+
+63,237
+57,460
+
+21
+
+Unique patterns represent approximately 13.0% of the baseline pipeline’s total
+traces, compared to 94.0% for RADAR’s – a direct consequence of RADAR discarding
+redundant, repetitive traces. Of the rare patterns (i.e., traces that appeared only once
+in a given test run) identified from the baseline pipeline, we looked into RADAR’s
+collected traces to verify if they were also included there. We found that on average
+85.6% of rare traces were also present in RADAR’s collected set, a high retention
+rate given the substantial reduction in both trace volume and the number of unique
+patterns collected.
+
+6.5 Discussion
+The results confirm that observability in microservices architectures presents a fundamental dilemma: the need to collect detailed data versus the prohibitive cost of
+processing the resulting volume of telemetry. RADAR’s approach offers a viable
+strategy for balancing this dilemma by using entropy as a universal signal of interest.
+Efficiency and resource balance. The 97.4% reduction in bandwidth and the
+99.0% reduction in CPU usage show that intelligently discarding redundant data is
+more effective than collecting at a fixed probabilistic rate. While the 100% collector
+generates a massive volume of repetitive data reflecting successful operations, RADAR
+learned to identify and prioritize the execution paths that genuinely add informational
+value. Compared to a fixed 20% sampling rate, RADAR not only consumed fewer
+resources but did so while maximizing its reward, indicating that these savings did
+not come at the cost of randomly discarding information, but rather through qualitative filtering; demonstrating the viability of a multi-objective reward function that
+penalizes excessive volume while rewarding structural diversity in the collected traces.
+Observability preservation and informational value. Retaining 85.6% of
+rare trace patterns is one of the most significant results, since rare events are precisely
+the ones most relevant for diagnosis and anomaly detection. By increasing the average
+entropy of stored information by approximately 24.5%, RADAR demonstrated its
+ability to distinguish between repetitive, redundant traces and anomalous ones. Unlike
+systems such as Hindsight, which operate reactively and depend on predefined anomaly
+triggers, RADAR acts proactively: the agent discovered which traces were relevant
+through entropy maximization alone, capturing scenarios of interest that would not
+have activated a conventional static trigger. Moreover, by operating entirely in user
+space through OpenTelemetry, RADAR ensures greater portability and avoids the
+complexity of dynamic code injection or invasive kernel modifications.
+Viability of autonomous orchestration. The stable convergence of the policy,
+even as the number of rules grows, reinforces RADAR’s potential as a practical, loosely
+coupled solution for modern distributed systems. The methodology showed that it
+is possible to drastically reduce data volume without sacrificing the observability of
+critical scenarios, validating the feasibility of using entropy to orchestrate telemetry
+autonomously and efficiently. We conclude that entropy-based intelligent agents offer a
+more dynamic balance than the manual tail-sampling configurations that are difficult
+to maintain in dynamic cloud environments.
+
+22
+
+7 Conclusion
+Observability in microservices architectures presents a fundamental dilemma: the need
+to collect detailed data for failure diagnosis versus the prohibitive cost of storing
+and processing the resulting volume of telemetry. Traditional approaches, such as
+probabilistic (head-based) sampling, prove ineffective by indiscriminately discarding
+rare and critical events, while manually configured tail-sampling rules are difficult to
+maintain in dynamic environments.
+This work addressed this challenge through RADAR (Reinforcement Learning
+Agent for Dynamic And Relevant trace sampling), a framework that combines reinforcement learning with information theory to dynamically adjust sampling policies.
+By using Shannon entropy as a diversity metric, the agent distinguishes between
+repetitive, redundant traces and information-rich, anomalous ones, adjusting the
+OpenTelemetry collector’s rules autonomously and without requiring direct user
+intervention.
+Experimental results confirmed the efficacy of this approach: RADAR reduced
+bandwidth consumption by 97.4% and CPU usage by 99.0% compared to full data
+collection, also outperforming a fixed 20% sampling rate in resource efficiency. Informational quality was preserved: the system retained approximately 85.6% of rare trace
+patterns while increasing the average entropy of stored data by approximately 25%.
+These results validate the hypothesis that entropy-based autonomous orchestration
+offers a superior dynamic balance compared to conventional strategies, sustaining high
+observability at a drastically reduced computational cost.
+We conclude that the application of entropy-based intelligent agents is a viable and
+efficient strategy for telemetry orchestration in distributed systems, offering a dynamic
+balance between operational cost and informational value.
+
+7.1 Contributions
+The main contributions of this work can be summarized as follows:
+
+• Autonomous sampling mechanism (RADAR): an agent capable of interacting
+directly with the OpenTelemetry collector, eliminating the need for manual, static
+configuration of tail-sampling rules.
+• Entropy-based reward function: a reward formulation that penalizes excessive
+volume while rewarding structural diversity in traces, proving to be an effective
+method for qualifying telemetry data “usefulness” without human supervision.
+• Experimental testbed: the creation and public availability of an instrumented,
+containerized microservices testbed capable of generating realistic workloads, serving as a basis for future observability experiments.
+
+7.2 Threats to validity
+Despite these promising results in resource reduction and entropy preservation, this
+study has several limitations. First, regarding external validity, the experimental evaluation was conducted exclusively on Minimal Boutique, an environment built by the
+research group itself; although the load generator simulates a realistic e-commerce
+
+23
+
+environment, the architecture and communication patterns reflect a single application
+domain, so the agent’s convergence stability and optimal hyperparameter configuration may vary under more complex topologies or unforeseen workloads. Second, the
+evaluation does not include a comparison against a static configuration using the same
+rule catalog with fixed or uniform activation probabilities. Such a comparison could
+help more directly isolate the contribution of the learned policy from the value of the
+underlying rule catalog itself. Third, the reward function’s hyperparameters (α, β ,
+C , k , and midpoint, Section 5) were selected through manual experimentation rather
+than systematic sensitivity analysis. While the reported configuration produced stable, reproducible behavior throughout our experiments, we do not characterize how
+performance degrades outside this configuration. Finally, each policy update triggers a
+Kubernetes rolling update of the collector (Section 5), and this work does not quantify
+the operational cost or transient disruption of that reconfiguration step itself, which
+would be relevant for assessing RADAR’s overhead in a production setting. Generalizing RADAR’s empirical model to heterogeneous production systems still requires
+validation on independent benchmarks, a systematic hyperparameter study, and a
+static-baseline comparison – directions we leave for future work (Section 7).
+
+7.3 Future work
+The approach presents opportunities for expansion and refinement. Future work
+directions include:
+
+• Evolving rule discarding: replacing the total deactivation of a rule with a probabilistic activation rate, making it possible to discover the activation probability that
+optimizes a rule’s own entropy contribution while reducing the traces it collects.
+• State contextualization: expanding the problem’s modeling to consider cluster state (e.g., current CPU usage, time of day) in the decision-making process,
+transforming the current Bandit formulation into a full Markov Decision Process.
+• Integration with business metrics: incorporating business-impact metrics into
+the reward function, aligning the sampling strategy not only with technical diversity
+but also with business priorities.
+• Validation on independent benchmarks: extending RADAR’s experimental
+evaluation to industry- and academia-standard reference applications, to test the
+approach’s generalization under denser service topologies, different programming
+languages, and independent stress workloads.
+Acknowledgements. This work was supported by the Coordination for the
+Improvement of Higher Education Personnel (CAPES) – Funding Code 001 – and
+by the National Council for Scientific and Technological Development (CNPq), PQ
+Scholarships process no. 308075/2025-0 and 315427/2023-0.
+
+References
+[1] Kratzke, N.: A brief history of cloud application architectures. Applied Sciences
+8(8), 1368 (2018)
+
+24
+
+[2] Zhou, X., Peng, X., Xie, T., Sun, J., Ji, C., Li, W., Ding, D.: Fault analysis
+and debugging of microservice systems: Industrial survey, benchmark system,
+and empirical study. IEEE Transactions on Software Engineering 47(2), 243–260
+(2018)
+[3] Zhang, L., Xie, Z., Anand, V., Vigfusson, Y., Mace, J.: The benefit of hindsight: Tracing edge-cases in distributed systems. In: 20th USENIX Symposium on
+Networked Systems Design and Implementation (NSDI 23), pp. 321–339 (2023)
+[4] Gomez Blanco, D.: Practical OpenTelemetry: Adopting Open Observability Standards Across Your Organization. Apress, Berkeley, CA (2023).
+https://link.springer.com/book/10.1007/978-1-4842-9075-0
+[5] Las-Casas, P., Mace, J., Guedes, D., Fonseca, R.: Weighted sampling of execution
+traces: Capturing more needles and less hay. In: ACM Symposium on Cloud
+Computing. SoCC ’18, pp. 326–332, New York, NY, USA (2018). https://doi.
+org/10.1145/3267809.3267841
+[6] Steen, M., Tanenbaum, A.S.: A brief introduction to distributed systems.
+Computing 98(10), 967–1009 (2016) https://doi.org/10.1007/s00607-016-0508-7
+[7] Dragoni, N., Giallorenzo, S., Lafuente, A.L., Mazzara, M., Montesi, F., Mustafin,
+R., Safina, L.: In: Mazzara, M., Meyer, B. (eds.) Microservices: Yesterday, Today,
+and Tomorrow, pp. 195–216. Springer, Cham (2017). https://doi.org/10.1007/
+978-3-319-67425-4 12 . https://doi.org/10.1007/978-3-319-67425-4 12
+[8] Merkel, D.: Docker: lightweight linux containers for consistent development and
+deployment. Linux J. 2014(239) (2014)
+[9] Burns, B., Beda, J., Hightower, K.: Kubernetes: Up and Running: Dive Into
+the Future of Infrastructure. O’Reilly Media, Sebastopol, CA, USA (2019).
+https://books.google.com.br/books?id=-5izDwAAQBAJ
+[10] Majors, C., Fong-Jones, L., Miranda, G.: Observability Engineering, 1st edn., p. 320. O’Reilly Media, Sebastopol, CA, USA (2022).
+https://books.google.com.br/books?id=KGZuEAAAQBAJ
+[11] Jaeger Authors: Jaeger Documentation - Version 2.8. Accessed: 2025-08-04 (2025).
+https://www.jaegertracing.io/docs/2.8/
+[12] Shannon, C.E.: A mathematical theory of communication. Bell System Technical Journal 27(3), 379–423 (1948) https://doi.org/10.1002/j.1538-7305.1948.
+tb01338.x
+[13] Cover, T.M., Thomas, J.A.: Elements of Information Theory, 2nd edn. WileyInterscience, Hoboken (2006)
+
+25
+
+[14] MacKay, D.J.C.: Information Theory, Inference, and Learning Algorithms. Cambridge University Press, Cambridge (2003)
+[15] Sutton, R.S., Barto, A.G.: Reinforcement Learning: An Introduction, 2nd edn.
+MIT Press, Cambridge, MA (2018)
+[16] Kephart, J.O., Chess, D.M.: The vision of autonomic computing. Computer
+36(1), 41–50 (2003) https://doi.org/10.1109/MC.2003.1160055
+[17] Samani, F.S., Stadler, R.: A framework for dynamically meeting performance
+objectives on a service mesh. IEEE Transactions on Network and Service Management 21(6), 5992–6007 (2024) https://doi.org/10.1109/TNSM.2024.3434328
+[18] Shaikh, F., Reali, G., Femminella, M.: Intelligent autoscaling with attentionbased reinforcement learning for sla-aware resource management in edge-cloud
+environments. In: 2025 21st International Conference on Network and Service Management (CNSM) (2025). https://doi.org/10.23919/CNSM67658.2025.
+11297411
+[19] Yang, J., Guo, Y., Chen, Y., Zhao, Y.: Micronet: Operation aware root cause identification of microservice system anomalies. IEEE Transactions on Network and
+Service Management 21(4), 4255–4267 (2024) https://doi.org/10.1109/TNSM.
+2024.3387552
+[20] Li, J., Ying, S., Li, T., Tian, X.: Tracedae: Trace-based anomaly detection in
+microservice systems via dual autoencoder. IEEE Transactions on Network and
+Service Management 22(5), 4884–4897 (2025) https://doi.org/10.1109/TNSM.
+2025.3583213
+[21] Poghosyan, A., Harutyunyan, A., Davtyan, E., Petrosyan, K., Baloian, N.: The
+diagnosis-effective sampling of application traces. Applied Sciences 14(13) (2024)
+https://doi.org/10.3390/app14135779
+[22] Luo, L., Nath, S., Sivalingam, L.R., Musuvathi, M., Ceze, L.: Troubleshooting
+transiently-recurring problems in production systems with blame-proportional
+logging. In: Proceedings of the 2018 USENIX Conference on Usenix Annual Technical Conference. USENIX ATC ’18, pp. 321–334. USENIX Association, USA
+(2018)
+[23] Sharma, B., Nadig, D.: eBPF-Enhanced Complete Observability Solution for
+Cloud-native Microservices. In: ICC 2024 - IEEE International Conference on
+Communications, pp. 1980–1985 (2024). https://doi.org/10.1109/ICC51166.2024.
+10622329
+[24] Luo, Y., Rodrigues, K., Li, C., Zhang, F., Jiang, L., Xia, B., Lion, D., Yuan,
+D.: Hubble: Performance debugging with In-Production, Just-In-Time method
+tracing on android. In: 16th USENIX Symposium on Operating Systems Design
+
+26
+
+and Implementation (OSDI 22), pp. 787–803. USENIX Association, Carlsbad,
+CA (2022). https://www.usenix.org/conference/osdi22/presentation/luo
+
+27
+
+
